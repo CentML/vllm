@@ -33,6 +33,12 @@ class BlockTable:
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
+        self.prev_block_table_cpu = torch.zeros(
+            (max_num_reqs, max_num_blocks_per_req),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
         self.block_table_np = self.block_table_cpu.numpy()
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
@@ -67,12 +73,16 @@ class BlockTable:
         self.block_table_np[[src, tgt]] = self.block_table_np[[tgt, src]]
 
     def commit(self, num_reqs: int) -> None:
+        if (self.prev_block_table_cpu[:num_reqs] == self.block_table_cpu[:num_reqs]).all():
+            return
         self.block_table[:num_reqs].copy_(self.block_table_cpu[:num_reqs],
                                           non_blocking=True)
+        self.prev_block_table_cpu[:num_reqs].copy_(self.block_table_cpu[:num_reqs], non_blocking=False)
 
     def clear(self) -> None:
         self.block_table.fill_(0)
         self.block_table_cpu.fill_(0)
+        self.prev_block_table_cpu.fill_(0)
 
     def get_device_tensor(self) -> torch.Tensor:
         """Ruturns the device tensor of the block table."""
