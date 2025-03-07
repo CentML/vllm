@@ -962,6 +962,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for k, v in self.intermediate_tensors.items()
             })
 
+        torch.cuda.synchronize()
+
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(attn_metadata, self.vllm_config):
@@ -1030,7 +1032,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
             # No spec decode tokens.
-            valid_sampled_token_ids = sampled_token_ids.tolist()
+            valid_sampled_token_ids = (torch.ones_like(sampled_token_ids, device='cpu') * 220).tolist()
         else:
             # Includes spec decode tokens.
             valid_mask = sampled_token_ids != INVALID_TOKEN_ID
