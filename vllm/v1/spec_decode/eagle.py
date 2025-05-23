@@ -88,6 +88,8 @@ class EagleProposer:
         cu_num_tokens: torch.Tensor,
         # [batch_size, max_num_blocks_per_req]
         block_table: torch.Tensor,
+        max_seq_len: int,
+        max_num_tokens: int,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
@@ -111,10 +113,6 @@ class EagleProposer:
         seq_lens = (target_positions[last_token_indices] + 1).int()
 
         if self.method in ["eagle", "eagle3"]:
-            # FIXME(woosuk): The below two ops cause synchronization. Optimize.
-            max_seq_len = seq_lens.max().item()
-            max_num_tokens = (cu_num_tokens[1:] -
-                              cu_num_tokens[:-1]).max().item()
             attn_metadata = FlashAttentionMetadata(
                 num_actual_tokens=num_tokens,
                 max_query_len=max_num_tokens,

@@ -1269,6 +1269,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
+        num_computed_tokens_np = np.fromiter(
+            (self.requests[req_id].num_computed_tokens
+             for req_id in self.input_batch.req_ids), np.int32)
+        num_scheduled_tokens_np = np.fromiter(
+            (scheduler_output.num_scheduled_tokens[req_id]
+             for req_id in self.input_batch.req_ids), np.int32)
+        num_tokens_np = np.fromiter((self.requests[req_id].num_tokens
+                                     for req_id in self.input_batch.req_ids),
+                                    np.int32)
+
+        # Record the index of the request that should not be sampled,
+        # so that we could clear the sampled tokens before returning.
+        discard_sampled_tokens_req_indices = np.nonzero(
+            (num_computed_tokens_np +
+             num_scheduled_tokens_np) < num_tokens_np)[0]
+
+        for i in discard_sampled_tokens_req_indices:
+            # Ignore the sampled token for partial prefills.
+            # Rewind the generator state as if the token was not sampled.
+            # This relies on cuda-specific torch-internal impl details
+            gen = self.input_batch.generators.get(int(i))
+            if gen is not None:
+                gen.set_offset(gen.get_offset() - 4)
+        """
         # TODO(woosuk): The following loop can be slow since it iterates over
         # the requests one by one. Optimize.
         discard_sampled_tokens_req_indices = []
@@ -1286,6 +1310,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
+        """
 
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
@@ -1371,6 +1396,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 block_table = None
 
+            num_rejected_tokens_np = np.zeros(len(self.input_batch.req_ids))
+
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids[:num_scheduled_tokens]
@@ -1386,12 +1413,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 # TODO(woosuk): Refactor this.
                 num_draft_tokens = spec_decode_metadata.num_draft_tokens
-                num_rejected_tokens = [
-                    n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
-                    for i, n in enumerate(num_draft_tokens)
-                ]
+                num_rejected_tokens_np = np.fromiter(
+                    (n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
+                     for i, n in enumerate(num_draft_tokens)), np.int32)
                 num_rejected_tokens = torch.tensor(
-                    num_rejected_tokens,
+                    num_rejected_tokens_np,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -1409,6 +1435,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
 
+            max_seq_len = int(
+                (num_computed_tokens_np + num_scheduled_tokens_np -
+                 num_rejected_tokens_np).max())
+            max_num_tokens = int(
+                (num_scheduled_tokens_np - num_rejected_tokens_np
+                 ).max()) if spec_decode_metadata else max_seq_len
+
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -1418,6 +1451,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cu_num_tokens=cu_num_tokens,
                 block_table=block_table,
                 sampling_metadata=sampling_metadata,
+                max_seq_len=max_seq_len,
+                max_num_tokens=max_num_tokens,
             )
             spec_token_ids = draft_token_ids.tolist()
 
