@@ -90,6 +90,8 @@ class EagleProposer:
         cu_num_tokens: torch.Tensor,
         # [batch_size, max_num_blocks_per_req]
         block_table: torch.Tensor,
+        max_seq_len: int,
+        max_num_tokens: int,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
@@ -113,10 +115,6 @@ class EagleProposer:
         seq_lens = (target_positions[last_token_indices] + 1).int()
 
         if self.method in ["eagle", "eagle3"]:
-            # FIXME(woosuk): The below two ops cause synchronization. Optimize.
-            max_seq_len = seq_lens.max().item()
-            max_num_tokens = (cu_num_tokens[1:] -
-                              cu_num_tokens[:-1]).max().item()
             attn_metadata = FlashAttentionMetadata(
                 num_actual_tokens=num_tokens,
                 max_query_len=max_num_tokens,
@@ -133,9 +131,6 @@ class EagleProposer:
                 suffix_kv_lens=None,
             )
         elif self.method == "deepseek_mtp":
-            query_lens = cu_num_tokens[1:] - cu_num_tokens[:-1]
-            max_query_len = query_lens.max().item()
-
             common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=cu_num_tokens, seq_lens=seq_lens)
 
@@ -145,7 +140,7 @@ class EagleProposer:
             attn_metadata = self.runner.attn_metadata_builder.build(
                 num_reqs=batch_size,
                 num_actual_tokens=num_tokens,
-                max_query_len=max_query_len,
+                max_query_len=max_num_tokens,
                 common_prefix_len=0,
                 common_attn_metadata=common_attn_metadata,
             )
@@ -298,7 +293,7 @@ class EagleProposer:
         # [0, a - n1, a + b - n1 - n2, a + b + c - n1 - n2 - n3]
         cu_num_tokens = torch.zeros_like(cu_target_query_lens)
         torch.cumsum(num_tokens_per_req, dim=0, out=cu_num_tokens[1:])
-        token_indices = torch.empty(
+        token_indices = torch.zeros(
             num_tokens,
             dtype=torch.int32,
             device=cu_target_query_lens.device,

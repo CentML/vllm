@@ -35,8 +35,8 @@ from vllm.multimodal.utils import group_mm_inputs_by_modality
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        GiB_bytes, LazyLoader, async_tensor_h2d, cdiv,
-                        check_use_alibi, is_pin_memory_available)
+                        GiB_bytes, LazyLoader, cdiv, check_use_alibi,
+                        is_pin_memory_available)
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
@@ -213,6 +213,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.slot_mapping = torch.zeros(self.max_num_tokens,
                                         dtype=torch.int64,
                                         device=self.device)
+        self.remaining_req_indices = torch.zeros(self.max_num_reqs,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
+        self.backup_next_token_ids = torch.zeros(self.max_num_reqs,
+                                                 dtype=torch.int32,
+                                                 device=self.device)
 
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
@@ -274,6 +280,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+        self.remaining_req_indices_cpu = torch.zeros(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory)
+        self.remaining_req_indices_np = self.remaining_req_indices_cpu.numpy()
+        self.remaining_req_count = 0
+        self.discard_req_np = np.zeros(self.max_num_reqs)
+        self.backup_next_token_ids_cpu = torch.zeros(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory)
+        self.backup_next_token_ids_np = self.backup_next_token_ids_cpu.numpy()
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> bool:
         """
@@ -607,6 +627,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
+
+        num_tokens = [
+            self.requests[r].num_tokens for r in self.input_batch.req_ids
+        ]
+        num_tokens_np = np.array(num_tokens, dtype=np.int32)
+
+        self.discard_req_np[:num_reqs] = \
+                            self.seq_lens_np[:num_reqs] < num_tokens_np
+
+        self.remaining_req_count = np.count_nonzero(
+            self.discard_req_np[:num_reqs] == 0)
+        self.remaining_req_indices_np[:self.remaining_req_count] = np.nonzero(
+            self.discard_req_np == 0)[0][:self.remaining_req_count]
+
+        self.remaining_req_indices[:self.remaining_req_count].copy_(
+            self.remaining_req_indices_cpu[:self.remaining_req_count],
+            non_blocking=True)
+
+        self.backup_next_token_ids_np[:num_reqs] = np.array([
+            self.requests[self.input_batch.req_ids[i]].get_token_id(
+                self.seq_lens_np[i]) for i in range(num_reqs)
+        ])
+
+        self.backup_next_token_ids[:num_reqs].copy_(
+            self.backup_next_token_ids_cpu[:num_reqs])
 
         # Copy the tensors to the GPU.
         self.input_ids[:total_num_scheduled_tokens].copy_(
@@ -1305,23 +1350,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
-        # TODO(woosuk): The following loop can be slow since it iterates over
-        # the requests one by one. Optimize.
-        discard_sampled_tokens_req_indices = []
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            req_state = self.requests[req_id]
-            seq_len = (req_state.num_computed_tokens +
-                       scheduler_output.num_scheduled_tokens[req_id])
-            if seq_len < req_state.num_tokens:
-                # Ignore the sampled token for partial prefills.
-                # Rewind the generator state as if the token was not sampled.
-                # This relies on cuda-specific torch-internal impl details
-                generator = self.input_batch.generators.get(i)
-                if generator is not None:
-                    generator.set_offset(generator.get_offset() - 4)
-                # Record the index of the request that should not be sampled,
-                # so that we could clear the sampled tokens before returning.
-                discard_sampled_tokens_req_indices.append(i)
+        num_reqs = self.input_batch.num_reqs
+
+        discard_sampled_tokens_req_indices = np.nonzero(
+            self.discard_req_np[:num_reqs])[0]
+
+        for i in discard_sampled_tokens_req_indices:
+            # Ignore the sampled token for partial prefills.
+            # Rewind the generator state as if the token was not sampled.
+            # This relies on cuda-specific torch-internal impl details
+            gen = self.input_batch.generators.get(int(i))
+            if gen is not None:
+                gen.set_offset(gen.get_offset() - 4)
 
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
@@ -1338,18 +1378,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
         max_gen_len = sampled_token_ids.shape[-1]
-        if max_gen_len == 1:
-            # No spec decode tokens.
-            valid_sampled_token_ids = sampled_token_ids.tolist()
-        else:
-            # Includes spec decode tokens.
-            valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                sampled_token_ids,
-                self.input_batch.vocab_size,
-            )
-        # Mask out the sampled tokens that should not be sampled.
-        for i in discard_sampled_tokens_req_indices:
-            valid_sampled_token_ids[i].clear()
+
+        if not self.speculative_config or not self.speculative_config.use_eagle(
+        ):
+            if max_gen_len == 1:
+                # No spec decode tokens.
+                valid_sampled_token_ids = sampled_token_ids.tolist()
+            else:
+                # Includes spec decode tokens.
+                valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                )
+            # Mask out the sampled tokens that should not be sampled.
+            for i in discard_sampled_tokens_req_indices:
+                valid_sampled_token_ids[i].clear()
 
         if not self.speculative_config:
             # Speculative decoding is not enabled.
@@ -1381,24 +1424,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
-            # TODO(woosuk): Refactor the loop.
-            next_token_ids: list[int] = []
-            for i, token_ids in enumerate(valid_sampled_token_ids):
-                if token_ids:
-                    # Common case.
-                    next_token_id = token_ids[-1]
-                else:
-                    # Partial prefill (rare case).
-                    # Get the next token id from the request state.
-                    req_id = self.input_batch.req_ids[i]
-                    req_state = self.requests[req_id]
-                    seq_len = (req_state.num_computed_tokens +
-                               scheduler_output.num_scheduled_tokens[req_id])
-                    next_token_id = req_state.get_token_id(seq_len)
-                next_token_ids.append(next_token_id)
-            next_token_ids = torch.tensor(next_token_ids,
-                                          dtype=torch.int32,
-                                          device=self.device)
+
+            valid_sampled_token_ids_gpu = sampled_token_ids[
+                self.remaining_req_indices[:self.remaining_req_count], :]
+
+            if max_gen_len == 1:
+                valid_mask = torch.ones_like(valid_sampled_token_ids_gpu,
+                                             dtype=torch.bool)
+            else:
+                # Includes speculative decode tokens — apply rejection mask
+                valid_mask = ((valid_sampled_token_ids_gpu != -1) &
+                              (valid_sampled_token_ids_gpu
+                               < self.input_batch.vocab_size))
+
+            valid_sampled_count = valid_mask.sum(dim=1)
+
+            batch, seq_length = valid_sampled_token_ids_gpu.shape
+            device = valid_sampled_token_ids_gpu.device
+
+            # Compute positions (row-wise) of valid tokens
+            indices = torch.arange(seq_length,
+                                   device=device).expand(batch, seq_length)
+            masked_indices = torch.where(valid_mask, indices,
+                                         torch.full_like(indices, -1))
+
+            # Get the rightmost valid index per row
+            last_valid_indices = masked_indices.max(dim=1).values
+
+            # Get next_token_ids for common case
+            row_indices = torch.arange(batch, device=device)
+            has_valid_token = last_valid_indices != -1
+
+            # Fill with -1 first (or PLACEHOLDER_ID)
+            # tokens selected for every row (valid or not)
+            selected_tokens = valid_sampled_token_ids_gpu[row_indices,
+                                                          last_valid_indices]
+
+            # one-liner: keep backup unless row is valid
+            next_token_ids_gpu = torch.where(
+                has_valid_token, selected_tokens,
+                self.backup_next_token_ids[:batch])
             # At this moment, we assume all eagle layers belong to the same KV
             # cache group, thus using the same attention metadata.
             eagle_attn_metadata = attn_metadata[
@@ -1409,6 +1474,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_table = eagle_attn_metadata.block_table
             else:
                 block_table = None
+
+            num_rejected_tokens_np = np.zeros(len(self.input_batch.req_ids))
 
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
@@ -1422,23 +1489,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
                 target_slot_mapping = eagle_attn_metadata.slot_mapping
                 cu_num_tokens = eagle_attn_metadata.query_start_loc
+                num_tokens = num_scheduled_tokens
             else:
-                # TODO(woosuk): Refactor this.
-                num_draft_tokens = spec_decode_metadata.num_draft_tokens
-                num_rejected_tokens = [
-                    n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
-                    for i, n in enumerate(num_draft_tokens)
-                ]
-                num_rejected_tokens_tensor = async_tensor_h2d(
-                    num_rejected_tokens,
-                    dtype=torch.int32,
-                    target_device=self.device,
-                    pin_memory=True)
-                num_tokens = num_scheduled_tokens - sum(num_rejected_tokens)
+                num_draft_tokens_gpu = torch.cat([
+                    spec_decode_metadata.cu_num_draft_tokens[:1],
+                    spec_decode_metadata.cu_num_draft_tokens[1:] -
+                    spec_decode_metadata.cu_num_draft_tokens[:-1]
+                ])
+
+                num_rejected_tokens_gpu = torch.where(
+                    num_draft_tokens_gpu > 0,
+                    num_draft_tokens_gpu + 1 - valid_sampled_count,
+                    torch.zeros_like(num_draft_tokens_gpu))
                 cu_num_tokens, token_indices = self.drafter.prepare_inputs(
                     eagle_attn_metadata.query_start_loc,
-                    num_rejected_tokens_tensor,
-                    num_tokens,
+                    num_rejected_tokens_gpu,
+                    num_scheduled_tokens,
                 )
                 target_token_ids = self.input_ids[token_indices]
                 target_positions = positions[token_indices]
@@ -1449,15 +1515,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_hidden_states = hidden_states[token_indices]
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
+
+            if max_gen_len == 1:
+                # No spec decode tokens.
+                valid_sampled_token_ids = sampled_token_ids.tolist()
+            else:
+                # Includes spec decode tokens.
+                valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                    sampled_token_ids,
+                    self.input_batch.vocab_size,
+                )
+            # Mask out the sampled tokens that should not be sampled.
+            for i in discard_sampled_tokens_req_indices:
+                valid_sampled_token_ids[i].clear()
+
+            if self.speculative_config.use_eagle(
+            ) and spec_decode_metadata is not None:
+                # TODO(woosuk): Refactor this.
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens
+
+                num_rejected_tokens_np = [
+                    n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
+                    for i, n in enumerate(num_draft_tokens)
+                ]
+
+                num_tokens = num_scheduled_tokens - sum(num_rejected_tokens_np)
+
+            max_seq_len = int(
+                (self.seq_lens_np[:num_reqs] - num_rejected_tokens_np).max())
+            max_num_tokens = int(
+                (self.seq_lens_np[:num_reqs] -
+                 self.input_batch.num_computed_tokens_cpu[:num_reqs] -
+                 num_rejected_tokens_np
+                 ).max()) if spec_decode_metadata else max_seq_len
+
             draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                target_slot_mapping=target_slot_mapping,
-                next_token_ids=next_token_ids,
+                target_token_ids=target_token_ids[:num_tokens],
+                target_positions=target_positions[:num_tokens],
+                target_hidden_states=target_hidden_states[:num_tokens],
+                target_slot_mapping=target_slot_mapping[:num_tokens],
+                next_token_ids=next_token_ids_gpu,
                 cu_num_tokens=cu_num_tokens,
                 block_table=block_table,
                 sampling_metadata=sampling_metadata,
+                max_seq_len=max_seq_len,
+                max_num_tokens=max_num_tokens,
             )
             spec_token_ids = draft_token_ids.tolist()
 
