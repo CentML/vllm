@@ -29,6 +29,7 @@ from vllm.forward_context import (DPMetadata, get_forward_context,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
+from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.multimodal.utils import group_mm_inputs_by_modality
@@ -1381,18 +1382,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.speculative_config or not self.speculative_config.use_eagle(
         ):
-            if max_gen_len == 1:
-                # No spec decode tokens.
-                valid_sampled_token_ids = sampled_token_ids.tolist()
-            else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                )
-            # Mask out the sampled tokens that should not be sampled.
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+            valid_sampled_token_ids = self.get_valid_sampled_token_ids(
+                max_gen_len, sampled_token_ids,
+                discard_sampled_tokens_req_indices)
 
         if not self.speculative_config:
             # Speculative decoding is not enabled.
@@ -1426,44 +1418,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
 
             valid_sampled_token_ids_gpu = sampled_token_ids[
-                self.remaining_req_indices[:self.remaining_req_count], :]
+                self.remaining_req_indices[:self.remaining_req_count]]
 
             if max_gen_len == 1:
                 valid_mask = torch.ones_like(valid_sampled_token_ids_gpu,
                                              dtype=torch.bool)
             else:
-                # Includes speculative decode tokens — apply rejection mask
                 valid_mask = ((valid_sampled_token_ids_gpu != -1) &
                               (valid_sampled_token_ids_gpu
                                < self.input_batch.vocab_size))
 
             valid_sampled_count = valid_mask.sum(dim=1)
 
-            batch, seq_length = valid_sampled_token_ids_gpu.shape
-            device = valid_sampled_token_ids_gpu.device
-
-            # Compute positions (row-wise) of valid tokens
-            indices = torch.arange(seq_length,
-                                   device=device).expand(batch, seq_length)
-            masked_indices = torch.where(valid_mask, indices,
-                                         torch.full_like(indices, -1))
+            batch = valid_sampled_token_ids_gpu.shape[0]
 
             # Get the rightmost valid index per row
-            last_valid_indices = masked_indices.max(dim=1).values
-
-            # Get next_token_ids for common case
-            row_indices = torch.arange(batch, device=device)
-            has_valid_token = last_valid_indices != -1
+            last_valid_indices = valid_sampled_count - 1
 
             # Fill with -1 first (or PLACEHOLDER_ID)
             # tokens selected for every row (valid or not)
-            selected_tokens = valid_sampled_token_ids_gpu[row_indices,
+            selected_tokens = valid_sampled_token_ids_gpu[:batch,
                                                           last_valid_indices]
 
-            # one-liner: keep backup unless row is valid
             next_token_ids_gpu = torch.where(
-                has_valid_token, selected_tokens,
+                last_valid_indices != -1, selected_tokens,
                 self.backup_next_token_ids[:batch])
+
             # At this moment, we assume all eagle layers belong to the same KV
             # cache group, thus using the same attention metadata.
             eagle_attn_metadata = attn_metadata[
@@ -1474,8 +1454,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_table = eagle_attn_metadata.block_table
             else:
                 block_table = None
-
-            num_rejected_tokens_np = np.zeros(len(self.input_batch.req_ids))
 
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
@@ -1489,7 +1467,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
                 target_slot_mapping = eagle_attn_metadata.slot_mapping
                 cu_num_tokens = eagle_attn_metadata.query_start_loc
-                num_tokens = num_scheduled_tokens
             else:
                 num_draft_tokens_gpu = torch.cat([
                     spec_decode_metadata.cu_num_draft_tokens[:1],
@@ -1516,30 +1493,52 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 target_slot_mapping = eagle_attn_metadata.slot_mapping[
                     token_indices]
 
-            if max_gen_len == 1:
-                # No spec decode tokens.
-                valid_sampled_token_ids = sampled_token_ids.tolist()
-            else:
-                # Includes spec decode tokens.
-                valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                    sampled_token_ids,
-                    self.input_batch.vocab_size,
-                )
-            # Mask out the sampled tokens that should not be sampled.
-            for i in discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+            # Moved from EagleProposer.propose() to here
+            if self.drafter.method == "eagle3":
+                assert isinstance(self.drafter.model, Eagle3LlamaForCausalLM)
+                target_hidden_states = self.drafter.model.combine_hidden_states(
+                    target_hidden_states)
+                assert target_hidden_states.shape[
+                    -1] == self.drafter.hidden_size
 
-            if self.speculative_config.use_eagle(
-            ) and spec_decode_metadata is not None:
-                # TODO(woosuk): Refactor this.
+            # Shift the input ids by one token.
+            # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+            self.drafter.input_ids[:num_scheduled_tokens -
+                                   1] = target_token_ids[:
+                                                         num_scheduled_tokens][
+                                                             1:]
+
+            # Replace the last token with the next token.
+            # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+            last_token_indices = cu_num_tokens[1:] - 1
+            self.drafter.input_ids[last_token_indices] = next_token_ids_gpu
+
+            # FA requires seq_len to have dtype int32.
+            seq_lens = (target_positions[last_token_indices] + 1).int()
+
+            # copy inputs to buffer for cudagraph
+            self.drafter.positions[:num_scheduled_tokens] = \
+                                                target_positions[:num_scheduled_tokens]
+            self.drafter.hidden_states[:num_scheduled_tokens] = \
+                                                target_hidden_states[:num_scheduled_tokens]
+
+            if self.speculative_config and self.speculative_config.use_eagle():
+                valid_sampled_token_ids = self.get_valid_sampled_token_ids(
+                    max_gen_len, sampled_token_ids,
+                    discard_sampled_tokens_req_indices)
+
+            if spec_decode_metadata is not None:
                 num_draft_tokens = spec_decode_metadata.num_draft_tokens
-
                 num_rejected_tokens_np = [
                     n + 1 - len(valid_sampled_token_ids[i]) if n > 0 else 0
                     for i, n in enumerate(num_draft_tokens)
                 ]
+            else:
+                num_rejected_tokens_np = np.zeros(len(
+                    self.input_batch.req_ids))
 
-                num_tokens = num_scheduled_tokens - sum(num_rejected_tokens_np)
+            num_tokens = num_scheduled_tokens - int(
+                sum(num_rejected_tokens_np))
 
             max_seq_len = int(
                 (self.seq_lens_np[:num_reqs] - num_rejected_tokens_np).max())
@@ -1550,17 +1549,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  ).max()) if spec_decode_metadata else max_seq_len
 
             draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids[:num_tokens],
-                target_positions=target_positions[:num_tokens],
-                target_hidden_states=target_hidden_states[:num_tokens],
-                target_slot_mapping=target_slot_mapping[:num_tokens],
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                target_slot_mapping=target_slot_mapping,
                 next_token_ids=next_token_ids_gpu,
                 cu_num_tokens=cu_num_tokens,
                 block_table=block_table,
                 sampling_metadata=sampling_metadata,
-                max_seq_len=max_seq_len,
+                num_tokens=num_tokens,
                 max_num_tokens=max_num_tokens,
-            )
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                last_token_indices=last_token_indices)
             spec_token_ids = draft_token_ids.tolist()
 
         # Clear KVConnector state after all KVs are generated.
@@ -1577,6 +1578,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_sending=finished_sending,
             finished_recving=finished_recving,
         )
+
+    def get_valid_sampled_token_ids(
+            self, max_gen_len: int, sampled_token_ids: torch.Tensor,
+            discard_sampled_tokens_req_indices: np.ndarray) -> list[list[int]]:
+        if max_gen_len == 1:
+            # No spec decode tokens.
+            valid_sampled_token_ids = sampled_token_ids.tolist()
+        else:
+            # Includes spec decode tokens.
+            valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                sampled_token_ids,
+                self.input_batch.vocab_size,
+            )
+        # Mask out the sampled tokens that should not be sampled.
+        for i in discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
+
+        return valid_sampled_token_ids
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:

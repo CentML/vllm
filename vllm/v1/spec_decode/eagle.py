@@ -10,7 +10,6 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.flash_attn import (CommonAttentionMetadata,
                                                    FlashAttentionMetadata)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -90,29 +89,14 @@ class EagleProposer:
         cu_num_tokens: torch.Tensor,
         # [batch_size, max_num_blocks_per_req]
         block_table: torch.Tensor,
-        max_seq_len: int,
-        max_num_tokens: int,
         sampling_metadata: SamplingMetadata,
+        num_tokens: int,
+        max_num_tokens: int,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        last_token_indices: torch.Tensor,
     ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
-        last_token_indices = cu_num_tokens[1:] - 1
-
-        if self.method == "eagle3":
-            assert isinstance(self.model, Eagle3LlamaForCausalLM)
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states)
-            assert target_hidden_states.shape[-1] == self.hidden_size
-
-        # Shift the input ids by one token.
-        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        self.input_ids[:num_tokens - 1] = target_token_ids[1:]
-        # Replace the last token with the next token.
-        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-        self.input_ids[last_token_indices] = next_token_ids
-
-        # FA requires seq_len to have dtype int32.
-        seq_lens = (target_positions[last_token_indices] + 1).int()
 
         if self.method in ["eagle", "eagle3"]:
             attn_metadata = FlashAttentionMetadata(
@@ -122,7 +106,7 @@ class EagleProposer:
                 max_seq_len=max_seq_len,
                 seq_lens=seq_lens,
                 block_table=block_table,
-                slot_mapping=target_slot_mapping,
+                slot_mapping=target_slot_mapping[:num_tokens],
                 # TODO(woosuk): Support cascade attention.
                 use_cascade=False,
                 common_prefix_len=0,
@@ -157,9 +141,6 @@ class EagleProposer:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
         else:
             num_input_tokens = num_tokens
-        # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
 
         with set_forward_context(per_layer_attn_metadata,
                                  self.vllm_config,
