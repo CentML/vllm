@@ -1438,8 +1438,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Fill with -1 first (or PLACEHOLDER_ID)
             # tokens selected for every row (valid or not)
-            selected_tokens = valid_sampled_token_ids_gpu[:batch,
-                                                          last_valid_indices]
+            selected_tokens = torch.gather(
+                valid_sampled_token_ids_gpu, 1,
+                last_valid_indices.unsqueeze(1)).squeeze(1)
 
             next_token_ids_gpu = torch.where(
                 last_valid_indices != -1, selected_tokens,
