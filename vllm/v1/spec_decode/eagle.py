@@ -11,6 +11,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.v1.attention.backends.flash_attn import (CommonAttentionMetadata,
                                                    FlashAttentionMetadata)
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -74,6 +75,13 @@ class EagleProposer:
                                    device=device,
                                    dtype=torch.int32)
 
+        self.last_token_indices = torch.zeros(self.max_num_tokens,
+                                              dtype=torch.int32,
+                                              device=device)
+        self.seq_lens = torch.zeros(self.max_num_tokens,
+                                    dtype=torch.int32,
+                                    device=device)
+
     def propose(
         self,
         # [num_tokens]
@@ -93,9 +101,7 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         num_tokens: int,
         max_num_tokens: int,
-        seq_lens: torch.Tensor,
         max_seq_len: int,
-        last_token_indices: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = next_token_ids.shape[0]
 
@@ -105,7 +111,7 @@ class EagleProposer:
                 max_query_len=max_num_tokens,
                 query_start_loc=cu_num_tokens,
                 max_seq_len=max_seq_len,
-                seq_lens=seq_lens,
+                seq_lens=self.seq_lens,
                 block_table=block_table,
                 slot_mapping=target_slot_mapping[:num_tokens],
                 # TODO(woosuk): Support cascade attention.
@@ -117,7 +123,7 @@ class EagleProposer:
             )
         elif self.method == "deepseek_mtp":
             common_attn_metadata = CommonAttentionMetadata(
-                query_start_loc=cu_num_tokens, seq_lens=seq_lens)
+                query_start_loc=cu_num_tokens, seq_lens=self.seq_lens)
 
             assert self.runner is not None
 
@@ -155,7 +161,7 @@ class EagleProposer:
                 last_hidden_states = ret_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        sample_hidden_states = last_hidden_states[self.last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states, None)
         draft_token_ids = logits.argmax(dim=-1)
 
@@ -171,8 +177,8 @@ class EagleProposer:
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
-        positions = target_positions[last_token_indices]
-        hidden_states = hidden_states[last_token_indices]
+        positions = target_positions[self.last_token_indices]
+        hidden_states = hidden_states[self.last_token_indices]
         if self.use_cuda_graph and \
             batch_size <= self.cudagraph_batch_sizes[-1]:
             input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
@@ -289,6 +295,41 @@ class EagleProposer:
             BLOCK_SIZE=BLOCK_SIZE,
         )
         return cu_num_tokens, token_indices
+
+    def load_inputs(self, target_token_ids: torch.Tensor,
+                    target_positions: torch.Tensor,
+                    target_hidden_states: torch.Tensor,
+                    next_token_ids_gpu: torch.Tensor,
+                    cu_num_tokens: torch.Tensor, num_scheduled_tokens: int):
+        # Loads token ids, positions, etc. into the eagle model
+        # Moved from EagleProposer.propose() to here
+        self.last_token_indices = cu_num_tokens[1:] - 1
+
+        # FA requires seq_len to have dtype int32.
+        self.seq_lens = (target_positions[self.last_token_indices] + 1).int()
+
+        if self.method == "eagle3":
+            assert isinstance(self.model, Eagle3LlamaForCausalLM)
+            target_hidden_states = self.model.combine_hidden_states(
+                target_hidden_states)
+            assert target_hidden_states.shape[-1] == self.hidden_size
+
+        # Shift the input ids by one token.
+        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+        self.input_ids[:num_scheduled_tokens -
+                       1] = target_token_ids[:num_scheduled_tokens][1:]
+
+        # Replace the last token with the next token.
+        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+        self.input_ids[self.last_token_indices] = next_token_ids_gpu
+
+        # copy inputs to buffer for cudagraph
+        self.positions[:
+                       num_scheduled_tokens] = target_positions[:
+                                                                num_scheduled_tokens]
+        self.hidden_states[:
+                           num_scheduled_tokens] = target_hidden_states[:
+                                                                        num_scheduled_tokens]
 
     def load_model(self, target_model: nn.Module) -> None:
         draft_model_config = \
