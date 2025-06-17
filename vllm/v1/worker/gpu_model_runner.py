@@ -3,6 +3,7 @@
 
 import copy
 import gc
+import json
 import time
 import weakref
 from contextlib import contextmanager
@@ -174,6 +175,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler()
+        
+        # HACK
+        self.use_aux_hidden_state_outputs = False
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1304,6 +1308,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states, aux_hidden_states = model_output
         else:
             hidden_states = model_output
+
+        if input_ids.shape[0] > 5 and get_tp_group().is_first_rank:
+            # Serializing the hidden states. Let's read the metadata:
+            with open("/tmp/meta.json", "r") as f:
+                meta = json.load(f)
+            meta_index = meta["idx"]
+            meta_orig_index = meta["orig_idx"]
+            meta_base_path = meta["base_path"]
+            data_to_save = {
+                # "hidden_state_features": torch.cat(
+                #     [aux_hidden_layer.cpu().detach().clone() for aux_hidden_layer in aux_hidden_states], dim=-1
+                # ),
+                "hidden_states": hidden_states.cpu().detach().clone(),
+                "input_ids": input_ids.cpu().detach().clone(),
+                "id": meta_index,
+                "orig_id": meta_orig_index,
+            }
+            torch.save(data_to_save, f"{meta_base_path}/data_{meta_orig_index}.pt")
+        
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
         # TODO: Support overlapping mirco-batches
