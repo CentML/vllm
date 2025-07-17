@@ -1,0 +1,2 @@
+# Run vLLM with MAX-NUM-SEQS (batch size) set to 1, Prefix caching disabled, and a modified chat template that does not strip the reasoning portion of the incoming messages.
+vllm serve deepseek-ai/DeepSeek-R1-0528 --disable-log-requests --tensor-parallel-size 8 --max-model-len 4096 --max-num-batched-tokens 4096 --max-num-seqs 1 -O3 --chat-template chat-template-deepseek-with-tokens.jinja --no-enable-prefix-caching --gpu-memory-utilization 0.8
