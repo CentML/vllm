@@ -1386,20 +1386,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             try:
                 with open("/tmp/meta.json", "r") as f:
                     meta = json.load(f)
-                meta_index = meta["idx"]
-                meta_orig_index = meta["orig_idx"]
-                meta_file_name = meta["file_name"]
+                target_file = meta["target_file"]
+                conv_id = meta["conversation_id"]
                 data_to_save = {
                     "hidden_states": hidden_states.cpu().detach().clone(),
                     "input_ids": input_ids.cpu().detach().clone(),
-                    "id": meta_index,
-                    "orig_id": meta_orig_index,
+                    "conversation_id": conv_id,
                 }
                 if aux_hidden_states is not None:
                     data_to_save["hidden_state_features"] = torch.cat(
                         [aux_hidden_layer.cpu().detach().clone() for aux_hidden_layer in aux_hidden_states], dim=-1
                     )
-                torch.save(data_to_save, meta_file_name)
+                torch.save(data_to_save, target_file)
             except FileNotFoundError:
                 # If the metadata file is not found, we just skip saving.
                 logger.warning(
