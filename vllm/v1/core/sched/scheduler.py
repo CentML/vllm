@@ -353,7 +353,8 @@ class Scheduler(SchedulerInterface):
                 # for FSM compilation.
                 if request.status == RequestStatus.WAITING_FOR_FSM:
                     structured_output_req = request.structured_output_request
-                    if structured_output_req and structured_output_req.grammar:
+                    if structured_output_req and \
+                            structured_output_req.is_grammar_ready:
                         request.status = RequestStatus.WAITING
                     else:
                         self.waiting.pop_request()
@@ -531,11 +532,13 @@ class Scheduler(SchedulerInterface):
                 self.kv_cache_manager.get_num_common_prefix_blocks(
                     any_request, len(self.running)))
 
-        grammar_bitmask = self.structured_output_manager.grammar_bitmask(
-            self.requests,
-            structured_output_request_ids,
-            scheduled_spec_decode_tokens,
-        )
+        grammar_bitmask = \
+            self.structured_output_manager.submit_grammar_bitmask(
+                self.requests,
+                structured_output_request_ids,
+                scheduled_spec_decode_tokens)
+
+
         # Construct the scheduler output.
         new_reqs_data = [
             NewRequestData.from_request(req,
@@ -757,6 +760,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
+        structured_list = []
+        spec_structured_list = {}
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: Optional[SpecDecodingStats] = None
@@ -830,11 +835,7 @@ class Scheduler(SchedulerInterface):
 
             if new_token_ids and self.structured_output_manager.should_advance(
                     request):
-                # NOTE: structured_output_request
-                # should not be None if use_structured_output, we have
-                # check above, so safe to ignore type warning
-                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
-                    req_id, new_token_ids)
+                structured_list.append((req_id, new_token_ids))
 
             # spec_token_ids comes from the model runner output
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
@@ -843,10 +844,7 @@ class Scheduler(SchedulerInterface):
             # Add newly generated spec token ids to the request.
             if spec_token_ids is not None:
                 if self.structured_output_manager.should_advance(request):
-                    metadata = request.structured_output_request
-                    # Needs to happen after new_token_ids are accepted.
-                    request.spec_token_ids = metadata.grammar.validate_tokens(  # type: ignore[union-attr]
-                        spec_token_ids[req_index])
+                    spec_structured_list[req_id] = spec_token_ids[req_index]
                 else:
                     request.spec_token_ids = spec_token_ids[req_index]
 
@@ -882,6 +880,18 @@ class Scheduler(SchedulerInterface):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+
+        self.structured_output_manager.submit_batch_accept_tokens(
+            structured_list)
+
+        spec_structured_list = (
+            self.structured_output_manager.submit_batch_validate_tokens(
+                spec_structured_list))
+        for request in self.running:
+            req_index = request.request_id
+            if (req_index in spec_structured_list):
+                request.spec_token_ids = (
+                    spec_structured_list[req_index])
 
         # KV Connector: update state for finished KV Transfers.
         self._update_from_kv_xfer_finished(model_runner_output)
