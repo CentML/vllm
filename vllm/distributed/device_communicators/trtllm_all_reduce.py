@@ -56,6 +56,7 @@ class TRTLLMAllReduce:
             device = torch.device(device)
         self.device = device
         
+        logger.info("initializing TRTLLM all-reduce workspace.")
         self._initialize_workspace()
         self.disabled = False
         logger.info("Using TRTLLM all-reduce.")
