@@ -32,20 +32,25 @@ class TRTLLMAllReduce:
             logger.info("TRTLLM all-reduce is disabled because "
                        "flashinfer is not available")
             return
+        logger.info("Past flashinfer is available check.")
             
         if not current_platform.is_cuda():
             logger.info("TRTLLM all-reduce is disabled because "
                        "it requires CUDA platform")
             return
+        logger.info("Past CUDA platform check.")
             
         if not current_platform.is_device_capability(100):
             logger.info("TRTLLM all-reduce is disabled because "
                        "it requires Blackwell architecture (compute capability 10.0)")
             return
+        logger.info("Past Blackwell architecture check.")
             
         self.group = group
         self.world_size = dist.get_world_size(self.group)
+        logger.info(f"Past world size check. world_size={self.world_size}")
         self.rank = dist.get_rank(self.group)
+        logger.info(f"Past rank check. rank={self.rank}")
         
         if self.world_size == 1:
             return
@@ -55,6 +60,7 @@ class TRTLLMAllReduce:
         elif isinstance(device, str):
             device = torch.device(device)
         self.device = device
+        logger.info(f"Past device check. device={self.device}")
         
         logger.info("initializing TRTLLM all-reduce workspace.")
         self._initialize_workspace()
