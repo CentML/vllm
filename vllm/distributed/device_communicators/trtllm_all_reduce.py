@@ -58,6 +58,7 @@ class TRTLLMAllReduce:
         
         self._initialize_workspace()
         self.disabled = False
+        logger.info("Using TRTLLM all-reduce.")
     
     def _initialize_workspace(self):
         gpus_per_node = 4
