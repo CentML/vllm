@@ -46,6 +46,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             QuickAllReduce)
         from vllm.distributed.device_communicators.symm_mem import (
             SymmMemCommunicator)
+        from vllm.distributed.device_communicators.trtllm_all_reduce import (
+            TRTLLMAllReduce)
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
@@ -59,6 +61,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: Optional[SymmMemCommunicator] = None
         if envs.VLLM_ALLREDUCE_USE_SYMM_MEM and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+        self.trtllm_comm: Optional[TRTLLMAllReduce] = None
+        if (envs.VLLM_ALLREDUCE_USE_TRTLLM and current_platform.is_cuda() 
+            and self.world_size > 1):
+            self.trtllm_comm = TRTLLMAllReduce(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -105,10 +114,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_):
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
+        # Use trtllm for Blackwell multi-node NVLink whenever possible.
         qr_comm = self.qr_comm
         if qr_comm is not None and not qr_comm.disabled and \
             qr_comm.should_quick_allreduce(input_):
             out = qr_comm.quick_all_reduce(input_)
+            assert out is not None
+            return out
+        trtllm_comm = self.trtllm_comm
+        if trtllm_comm is not None and \
+            trtllm_comm.should_use_trtllm_ar(input_):
+            out = trtllm_comm.all_reduce(input_)
             assert out is not None
             return out
         ca_comm = self.ca_comm
@@ -230,6 +246,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.trtllm_comm is not None:
+            self.trtllm_comm.destroy()
+            self.trtllm_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None
