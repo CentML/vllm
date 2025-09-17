@@ -65,8 +65,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
         self.trtllm_comm: Optional[TRTLLMAllReduce] = None
-        if (envs.VLLM_ALLREDUCE_USE_TRTLLM and current_platform.is_cuda() 
-            and self.world_size > 1):
+        if current_platform.is_cuda() and self.world_size > 1:
             self.trtllm_comm = TRTLLMAllReduce(
                 group=self.cpu_group,
                 device=self.device,
