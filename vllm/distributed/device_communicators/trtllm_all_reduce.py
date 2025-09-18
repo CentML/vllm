@@ -55,17 +55,17 @@ class TRTLLMAllReduce:
         self.rank = dist.get_rank(self.group)
         logger.info(f"Past rank check. rank={self.rank}")
         
-        # if self.world_size == 1:
-        #     return
+        if self.world_size == 1:
+            return
             
-        # if isinstance(device, int):
-        #     device = torch.device(f"cuda:{device}")
-        # elif isinstance(device, str):
-        #     device = torch.device(device)
-        # self.device = device
-        # logger.info(f"Past device check. device={self.device}")
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        logger.info(f"Past device check. device={self.device}")
         
-        # logger.info("initializing TRTLLM all-reduce workspace.")
+        logger.info("initializing TRTLLM all-reduce workspace.")
         # self._initialize_workspace()
         # self.disabled = False
         # logger.info("Using TRTLLM all-reduce.")
