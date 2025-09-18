@@ -9,6 +9,7 @@ from torch.distributed import ProcessGroup
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.distributed.parallel_state import in_the_same_node_as
 
 logger = init_logger(__name__)
 
@@ -50,6 +51,11 @@ class TRTLLMAllReduce:
         if self.world_size == 1:
             return
             
+        if not self._is_mnnvl():
+            logger.info("TRTLLM all-reduce is disabled because "
+                       "it is only used under Multi-Node NVLINK setup")
+            return
+            
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
@@ -59,8 +65,22 @@ class TRTLLMAllReduce:
         self._initialize_workspace()
         self.disabled = False
     
+    def _is_mnnvl(self) -> bool:
+        """
+        Check if current environment is a Multi-Node NVLINK setup.
+        """
+
+        all_on_same_node = all(in_the_same_node_as(self.group, source_rank=0))
+        if all_on_same_node:
+            return False
+            
+        #TODO: is_fully_connected
+        return True
+    
+    
     def _initialize_workspace(self):
-        gpus_per_node = 4
+
+        gpus_per_node = sum(in_the_same_node_as(self.group, source_rank=0))
         
         mapping = Mapping(
             world_size=self.world_size,

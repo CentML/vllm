@@ -70,7 +70,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 group=self.cpu_group,
                 device=self.device,
             )
-            logger.info("Initialized TRTLLM all-reduce communicator.")
 
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
