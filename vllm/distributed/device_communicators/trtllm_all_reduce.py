@@ -49,11 +49,11 @@ class TRTLLMAllReduce:
             return
         logger.info("Past Blackwell architecture check.")
             
-        # self.group = group
-        # self.world_size = dist.get_world_size(self.group)
-        # logger.info(f"Past world size check. world_size={self.world_size}")
-        # self.rank = dist.get_rank(self.group)
-        # logger.info(f"Past rank check. rank={self.rank}")
+        self.group = group
+        self.world_size = dist.get_world_size(self.group)
+        logger.info(f"Past world size check. world_size={self.world_size}")
+        self.rank = dist.get_rank(self.group)
+        logger.info(f"Past rank check. rank={self.rank}")
         
         # if self.world_size == 1:
         #     return
