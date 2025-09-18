@@ -12,15 +12,15 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-try:
-    logger.info("Importing flashinfer.comm.trtllm_mnnvl_ar")
-    import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
-    logger.info("Imported flashinfer.comm.trtllm_mnnvl_ar")
-    from flashinfer.comm.mapping import Mapping
-    logger.info("Imported flashinfer.comm.mapping")
-    fi_trtllm_available = True
-except ImportError:
-    fi_trtllm_available = False
+# try:
+#     logger.info("Importing flashinfer.comm.trtllm_mnnvl_ar")
+#     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+#     logger.info("Imported flashinfer.comm.trtllm_mnnvl_ar")
+#     from flashinfer.comm.mapping import Mapping
+#     logger.info("Imported flashinfer.comm.mapping")
+#     fi_trtllm_available = True
+# except ImportError:
+#     fi_trtllm_available = False
 
 
 class TRTLLMAllReduce:
@@ -28,6 +28,7 @@ class TRTLLMAllReduce:
     def __init__(self,
                  group: ProcessGroup,
                  device: Union[int, str, torch.device]):
+        return
 
         self.disabled = True
         
