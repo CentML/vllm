@@ -28,7 +28,6 @@ class TRTLLMAllReduce:
     def __init__(self,
                  group: ProcessGroup,
                  device: Union[int, str, torch.device]):
-        return
 
         self.disabled = True
         
