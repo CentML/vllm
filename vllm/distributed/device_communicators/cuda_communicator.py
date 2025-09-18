@@ -65,13 +65,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
         self.trtllm_comm: Optional[TRTLLMAllReduce] = None
-        if current_platform.is_cuda() and self.world_size > 1:
-            logger.info("Initializing TRTLLM all-reduce.")
-            self.trtllm_comm = TRTLLMAllReduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
-            logger.info("Initialized TRTLLM all-reduce.")
+        # if current_platform.is_cuda() and self.world_size > 1:
+        #     logger.info("Initializing TRTLLM all-reduce.")
+        #     self.trtllm_comm = TRTLLMAllReduce(
+        #         group=self.cpu_group,
+        #         device=self.device,
+        #     )
+        #     logger.info("Initialized TRTLLM all-reduce.")
 
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
