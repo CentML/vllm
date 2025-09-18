@@ -66,12 +66,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         self.trtllm_comm: Optional[TRTLLMAllReduce] = None
         if current_platform.is_cuda() and self.world_size > 1:
-            logger.info("Initializing TRTLLM all-reduce.")
             self.trtllm_comm = TRTLLMAllReduce(
                 group=self.cpu_group,
                 device=self.device,
             )
-            logger.info("Initialized TRTLLM all-reduce.")
+            logger.info("Initialized TRTLLM all-reduce communicator.")
 
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -123,11 +122,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             return out
         trtllm_comm = self.trtllm_comm
-        if trtllm_comm is not None and \
-            trtllm_comm.should_use_trtllm_ar(input_):
-            out = trtllm_comm.all_reduce(input_)
-            assert out is not None
-            return out
+        # if trtllm_comm is not None and \
+        #     trtllm_comm.should_use_trtllm_ar(input_):
+        #     out = trtllm_comm.all_reduce(input_)
+        #     assert out is not None
+        #     return out
         ca_comm = self.ca_comm
         if ca_comm is not None and not ca_comm.disabled and \
             ca_comm.should_custom_ar(input_):

@@ -13,11 +13,8 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 try:
-    logger.info("Importing flashinfer.comm.trtllm_mnnvl_ar")
     import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
-    logger.info("Imported flashinfer.comm.trtllm_mnnvl_ar")
     from flashinfer.comm.mapping import Mapping
-    logger.info("Imported flashinfer.comm.mapping")
     fi_trtllm_available = True
 except ImportError:
     fi_trtllm_available = False
@@ -35,25 +32,20 @@ class TRTLLMAllReduce:
             logger.info("TRTLLM all-reduce is disabled because "
                        "flashinfer is not available")
             return
-        logger.info("Past flashinfer is available check.")
             
         if not current_platform.is_cuda():
             logger.info("TRTLLM all-reduce is disabled because "
                        "it requires CUDA platform")
             return
-        logger.info("Past CUDA platform check.")
             
         if not current_platform.is_device_capability(100):
             logger.info("TRTLLM all-reduce is disabled because "
                        "it requires Blackwell architecture (compute capability 10.0)")
             return
-        logger.info("Past Blackwell architecture check.")
             
         self.group = group
         self.world_size = dist.get_world_size(self.group)
-        logger.info(f"Past world size check. world_size={self.world_size}")
         self.rank = dist.get_rank(self.group)
-        logger.info(f"Past rank check. rank={self.rank}")
         
         if self.world_size == 1:
             return
@@ -63,12 +55,9 @@ class TRTLLMAllReduce:
         elif isinstance(device, str):
             device = torch.device(device)
         self.device = device
-        logger.info(f"Past device check. device={self.device}")
         
-        logger.info("initializing TRTLLM all-reduce workspace.")
         self._initialize_workspace()
         self.disabled = False
-        logger.info("Using TRTLLM all-reduce.")
     
     def _initialize_workspace(self):
         gpus_per_node = 4
@@ -79,12 +68,10 @@ class TRTLLMAllReduce:
             rank=self.rank,
             gpus_per_node=gpus_per_node,
         )
-        logger.info("Past mapping initialization.")
         
         self.mcast_buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
             trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16, group=self.group)
         )
-        logger.info("Past workspace initialization.")
         
     
     def should_use_trtllm_ar(self, input_tensor: torch.Tensor) -> bool:
