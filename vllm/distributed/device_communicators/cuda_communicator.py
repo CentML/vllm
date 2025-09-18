@@ -127,7 +127,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = trtllm_comm.all_reduce(input_)
             assert out is not None
             print("Using TRTLLM all-reduce.")
-            assert False
             return out
         ca_comm = self.ca_comm
         if ca_comm is not None and not ca_comm.disabled and \
