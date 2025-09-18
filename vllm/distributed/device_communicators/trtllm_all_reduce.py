@@ -132,7 +132,7 @@ class TRTLLMAllReduce:
             rank=self.rank,
             wait_for_results=True,
             launch_with_pdl=False,
-            output=output_tensor,
+            out=output_tensor,
         )
         
         return output_tensor
