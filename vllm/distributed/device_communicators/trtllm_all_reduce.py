@@ -82,7 +82,7 @@ class TRTLLMAllReduce:
         logger.info("Past mapping initialization.")
         
         self.mcast_buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
-            trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
+            trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16, group=self.group)
         )
         logger.info("Past workspace initialization.")
         
