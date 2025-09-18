@@ -66,23 +66,25 @@ class TRTLLMAllReduce:
         logger.info(f"Past device check. device={self.device}")
         
         logger.info("initializing TRTLLM all-reduce workspace.")
-        # self._initialize_workspace()
-        # self.disabled = False
-        # logger.info("Using TRTLLM all-reduce.")
+        self._initialize_workspace()
+        self.disabled = False
+        logger.info("Using TRTLLM all-reduce.")
     
     def _initialize_workspace(self):
         gpus_per_node = 4
         
+        logger.info("Initializing mapping.")
         mapping = Mapping(
             world_size=self.world_size,
             tp_size=self.world_size,
             rank=self.rank,
             gpus_per_node=gpus_per_node,
         )
+        logger.info("Past mapping initialization.")
         
-        self.mcast_buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
-            trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
-        )
+        # self.mcast_buffer_mnnvl, self.buffer_flags_mnnvl, self.max_num_elements_mnnvl = (
+        #     trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
+        # )
     
     def should_use_trtllm_ar(self, input_tensor: torch.Tensor) -> bool:
         if self.disabled:
