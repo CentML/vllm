@@ -46,6 +46,30 @@ def is_weak_contiguous(inp: torch.Tensor):
                                    == inp.numel() * inp.element_size())
 
 
+def get_physical_device_ids(group: ProcessGroup, 
+                            device: torch.device) -> list[int]:
+    world_size = dist.get_world_size(group=group)
+    
+    cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+    if cuda_visible_devices:
+        device_ids = list(map(int, cuda_visible_devices.split(",")))
+    else:
+        device_ids = list(range(cuda_device_count_stateless()))
+
+    physical_device_id = device_ids[device.index]
+    tensor = torch.tensor([physical_device_id],
+                          dtype=torch.int,
+                          device="cpu")
+    gather_list = [
+        torch.tensor([0], dtype=torch.int, device="cpu")
+        for _ in range(world_size)
+    ]
+    dist.all_gather(gather_list, tensor, group=group)
+    physical_device_ids = [t.item() for t in gather_list]
+    
+    return physical_device_ids
+
+
 class CustomAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
@@ -117,29 +141,13 @@ class CustomAllreduce:
             max_size = min(
                 CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability][world_size],
                 max_size)
-        cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            device_ids = list(range(cuda_device_count_stateless()))
-
-        physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id],
-                              dtype=torch.int,
-                              device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu")
-            for _ in range(world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
+        physical_device_ids = get_physical_device_ids(self.group, device)
 
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
-        fully_connected = current_platform.is_fully_connected(
-            physical_device_ids)
+        fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"

@@ -48,6 +48,12 @@ class TRTLLMAllReduce:
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        
         if self.world_size == 1:
             return
             
@@ -55,12 +61,6 @@ class TRTLLMAllReduce:
             logger.info("TRTLLM all-reduce is disabled because "
                        "it is only used under Multi-Node NVLINK setup")
             return
-            
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
         
         self._initialize_workspace()
         self.disabled = False
@@ -69,13 +69,19 @@ class TRTLLMAllReduce:
         """
         Check if current environment is a Multi-Node NVLINK setup.
         """
-
         all_on_same_node = all(in_the_same_node_as(self.group, source_rank=0))
+        # Do not use TRTLLM all-reduce for single-node setup.
         if all_on_same_node:
             return False
-            
-        #TODO: is_fully_connected
-        return True
+
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            get_physical_device_ids)
+        
+        # Check if the GPUs are fully connected by NVLINK
+        physical_device_ids = get_physical_device_ids(self.group, self.device)
+        fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        
+        return fully_connected
     
     
     def _initialize_workspace(self):
