@@ -61,6 +61,8 @@ class TRTLLMAllReduce:
             logger.info("TRTLLM all-reduce is disabled because "
                        "it is only used under Multi-Node NVLINK setup")
             return
+        logger.info("Using TRTLLM all-reduce because "
+                    "it is a Multi-Node NVLINK setup")
         
         self._initialize_workspace()
         self.disabled = False
@@ -147,6 +149,7 @@ class TRTLLMAllReduce:
             launch_with_pdl=False,
             out=output_tensor,
         )
+        logger.info("**************TRTLLM all-reduce**************")
         
         return output_tensor
     
