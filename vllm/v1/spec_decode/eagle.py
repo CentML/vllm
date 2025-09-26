@@ -171,7 +171,15 @@ class SpecDecodeBaseProposer:
         cudagraph_args: "CudaGraphArgs",
         mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        num_tokens = target_token_ids.shape[0]
+        (input_ids, positions, last_token_indices,
+         common_attn_metadata) = self.update_inputs_for_prefill_tokens(
+             target_token_ids=target_token_ids,
+             target_positions=target_positions,
+             last_token_indices=last_token_indices,
+             next_token_ids=next_token_ids,
+             common_attn_metadata=common_attn_metadata,
+         )
+        num_tokens = input_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
         if last_token_indices is None:
@@ -183,8 +191,9 @@ class SpecDecodeBaseProposer:
                 target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        self.set_input_ids_first_pass(target_token_ids, next_token_ids,
-                                      num_tokens, last_token_indices)
+        self.input_ids[:num_tokens] = input_ids
+        # self.set_input_ids_first_pass(target_token_ids, next_token_ids,
+        #                               num_tokens, last_token_indices)
 
         assert self.runner is not None
 
@@ -207,7 +216,7 @@ class SpecDecodeBaseProposer:
         else:
             num_input_tokens = num_tokens
         # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
+        self.positions[:num_tokens] = positions
         if self.pass_hidden_states_to_model:
             # target_hidden_states and self.hidden_states can have different
             # hidden dims. E.g. large target model and small draft model.
@@ -258,7 +267,7 @@ class SpecDecodeBaseProposer:
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
 
-        positions = target_positions[last_token_indices]
+        positions = positions[last_token_indices]
         hidden_states = hidden_states[last_token_indices]
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
