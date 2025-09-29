@@ -42,6 +42,179 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
 # yapf: enable
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+
+@triton.jit
+def _pad_kernel(
+        query_start_loc_ptr,  # Pointer to query_start_loc tensor
+        query_ptr,  # Pointer to input query tensor
+        padded_query_ptr,  # Pointer to output padded_query tensor
+        num_heads,  # Number of attention heads
+        head_size,  # Dimension of each attention head
+        max_q_len,  # The length to pad each sequence to
+        query_stride_0,  # Strides for navigating the query tensor
+        query_stride_1,
+        query_stride_2,
+        padded_query_stride_0,  # Strides for navigating the padded_query tensor
+        padded_query_stride_1,
+        padded_query_stride_2,
+        BLOCK_SIZE_HS: tl.constexpr,  # Block size for the head_size dimension
+):
+    """
+    Triton kernel to pad a ragged query tensor using start locations.
+    Each program instance handles one row of `head_size` elements
+    for a specific head.
+    """
+    # --- Get Program IDs ---
+    pid_row = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    # --- Calculate Output Coordinates ---
+    batch_idx = pid_row // max_q_len
+    seq_idx = pid_row % max_q_len
+
+    # --- Determine if this is a padding or data element ---
+    # Load the start and end location for the current sequence
+    # to find its length.
+    q_start = tl.load(query_start_loc_ptr + batch_idx)
+    q_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    q_len = q_end - q_start
+
+    # Create an offset range for the head_size dimension.
+    hs_offsets = tl.arange(0, BLOCK_SIZE_HS)
+
+    # Calculate the pointer to the destination row in the padded_query tensor.
+    dest_ptr = (padded_query_ptr + pid_row * padded_query_stride_0 +
+                pid_head * padded_query_stride_1 +
+                hs_offsets * padded_query_stride_2)
+
+    # Core logic: only copy if the target sequence index
+    # is within the actual length.
+    if seq_idx < q_len:
+        # --- Copy Data from Source `query` Tensor ---
+        src_row_idx = q_start + seq_idx
+
+        # Calculate the pointer to the source row in the query tensor.
+        src_ptr = (query_ptr + src_row_idx * query_stride_0 +
+                   pid_head * query_stride_1 + hs_offsets * query_stride_2)
+
+        # Load the data from the source and store it in the destination.
+        data_to_write = tl.load(src_ptr)
+        tl.store(dest_ptr, data_to_write)
+    else:
+        # --- Write Zeros for Padding ---
+        zeros = tl.zeros((BLOCK_SIZE_HS, ), dtype=query_ptr.dtype.element_ty)
+        tl.store(dest_ptr, zeros)
+
+
+def pad_query(query_start_loc: torch.Tensor, query: torch.Tensor,
+              max_q_len: int) -> torch.Tensor:
+    """Pad query tensor to max_q_len."""
+    batch_size, num_heads, head_size = query_start_loc.shape[
+        0] - 1, query.shape[1], query.shape[2]
+    padded_query = torch.empty((batch_size * max_q_len, num_heads, head_size),
+                               dtype=query.dtype,
+                               device=query.device)
+    grid = (batch_size * max_q_len, num_heads)
+    _pad_kernel[grid](
+        query_start_loc,
+        query,
+        padded_query,
+        num_heads,
+        head_size,
+        max_q_len,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        padded_query.stride(0),
+        padded_query.stride(1),
+        padded_query.stride(2),
+        BLOCK_SIZE_HS=head_size,
+    )
+    return padded_query
+
+
+@triton.jit
+def _unpad_kernel(
+        padded_query_ptr,  # Pointer to input padded_query tensor
+        unpadded_query_ptr,  # Pointer to output unpadded_query tensor
+        query_start_loc_ptr,  # Pointer to query_start_loc tensor
+        max_q_len,  # The sequence length of the padded tensor
+        padded_query_stride_0,  # Strides for navigating padded_query tensor
+        padded_query_stride_1,
+        padded_query_stride_2,
+        unpadded_query_stride_0,  # Strides for navigating unpadded_query tensor
+        unpadded_query_stride_1,
+        unpadded_query_stride_2,
+        BLOCK_SIZE_HS: tl.constexpr,  # Block size for the head_size dimension
+):
+    """
+    Triton kernel to un-pad a query tensor back to its original ragged format.
+    The grid for this kernel matches the padded tensor's shape.
+    Threads corresponding to padding elements will do no work.
+    """
+    # --- Get Program IDs ---
+    # `pid_row` corresponds to a row in the SOURCE (padded) tensor.
+    pid_row = tl.program_id(axis=0)
+    pid_head = tl.program_id(axis=1)
+
+    # --- Determine if this is a padding element ---
+    batch_idx = pid_row // max_q_len
+    seq_idx = pid_row % max_q_len
+
+    q_start = tl.load(query_start_loc_ptr + batch_idx)
+    q_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    q_len = q_end - q_start
+
+    # Core logic: only work for non-padding elements.
+    if seq_idx < q_len:
+        # --- Calculate Source and Destination Coordinates ---
+        src_row_idx = pid_row
+        dest_row_idx = q_start + seq_idx
+
+        # --- Perform the Copy ---
+        hs_offsets = tl.arange(0, BLOCK_SIZE_HS)
+
+        # Source pointer in the padded tensor.
+        src_ptr = (padded_query_ptr + src_row_idx * padded_query_stride_0 +
+                   pid_head * padded_query_stride_1 +
+                   hs_offsets * padded_query_stride_2)
+
+        # Destination pointer in the unpadded tensor.
+        dest_ptr = (unpadded_query_ptr +
+                    dest_row_idx * unpadded_query_stride_0 +
+                    pid_head * unpadded_query_stride_1 +
+                    hs_offsets * unpadded_query_stride_2)
+
+        data_to_copy = tl.load(src_ptr)
+        tl.store(dest_ptr, data_to_copy)
+
+
+def unpad_query(query_start_loc: torch.Tensor, padded_query: torch.Tensor,
+                dest_tensor: torch.Tensor) -> torch.Tensor:
+    batch_size = query_start_loc.shape[0] - 1
+    padded_len, num_heads, head_size = padded_query.shape
+    max_q_len = padded_len // batch_size
+
+    # --- Launch Triton Kernel ---
+    # The grid is now based on the padded tensor's shape.
+    grid = (padded_len, num_heads)
+
+    _unpad_kernel[grid](
+        padded_query,
+        dest_tensor,
+        query_start_loc,
+        max_q_len,
+        padded_query.stride(0),
+        padded_query.stride(1),
+        padded_query.stride(2),
+        dest_tensor.stride(0),
+        dest_tensor.stride(1),
+        dest_tensor.stride(2),
+        BLOCK_SIZE_HS=head_size,
+    )
+    return dest_tensor
+
+
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -225,6 +398,7 @@ class FlashInferMetadata:
     # For flashinfer trtllm batch decode
     max_q_len: int
     max_q_len_prefill: int
+    max_q_len_decode: int
     max_seq_len: int
     seq_lens: torch.Tensor
     block_table_tensor: torch.Tensor
@@ -246,6 +420,9 @@ class FlashInferMetadata:
 
     qo_indptr_gpu: Optional[torch.Tensor] = None
     paged_kv_indptr_gpu: Optional[torch.Tensor] = None
+
+    qo_indptr_gpu_prefill: Optional[torch.Tensor] = None
+    qo_indptr_gpu_decode: Optional[torch.Tensor] = None
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -423,7 +600,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
             split_decodes_and_prefills(common_attn_metadata,
                                        decode_threshold=self.reorder_batch_threshold,
-                                       require_uniform=True)
+                                       require_uniform=False)
 
         page_size = self.page_size
         max_q_len = common_attn_metadata.max_query_len
@@ -534,6 +711,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             slot_mapping=common_attn_metadata.slot_mapping,
             max_q_len=max_q_len,
             max_q_len_prefill=max_q_len,
+            max_q_len_decode=max_q_len,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             block_table_tensor=block_table_tensor,
@@ -574,6 +752,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # according to reorder_batch()
             num_prefills = attn_metadata.num_prefills
             num_decodes = attn_metadata.num_decodes
+
+            if (num_decodes > 0 and decode_use_trtllm) or \
+                (num_prefills > 0 and prefill_use_trtllm):
+                attn_metadata.qo_indptr_gpu = qo_indptr_cpu.to(
+                    self.device, non_blocking=True)
+            if num_decodes > 0 and decode_use_trtllm:
+                assert attn_metadata.qo_indptr_gpu is not None
+                attn_metadata.qo_indptr_gpu_decode = \
+                    attn_metadata.qo_indptr_gpu[0:num_decodes + 1]
+            if num_prefills > 0 and prefill_use_trtllm:
+                assert attn_metadata.qo_indptr_gpu is not None
+                attn_metadata.qo_indptr_gpu_prefill = \
+                    attn_metadata.qo_indptr_gpu[num_decodes:] - \
+                        attn_metadata.qo_indptr_gpu[num_decodes]
+
             if num_prefills > 0:
                 # Decodes are first so prefills start after the last decode
                 prefill_start = num_decodes
@@ -617,8 +810,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_data_type=self.kv_cache_dtype,
                     )
                 else:
-                    attn_metadata.qo_indptr_gpu = qo_indptr_cpu.to(
-                        self.device, non_blocking=True)
                     attn_metadata.paged_kv_indptr_gpu = paged_kv_indptr_cpu.to(
                         self.device, non_blocking=True)
 
@@ -669,6 +860,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         q_data_type=self.q_data_type,
                         kv_data_type=self.kv_cache_dtype,
                     )
+                else:
+                    qo_indptr_cpu_decode = qo_indptr_cpu[:num_decodes + 1]
+                    query_lens_decode = qo_indptr_cpu_decode[1:] - \
+                        qo_indptr_cpu_decode[:-1]
+                    attn_metadata.max_q_len_decode = \
+                        int(query_lens_decode.max().item())
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -949,7 +1146,7 @@ class FlashInferImpl(AttentionImpl):
                     bmm1_scale=self.bmm1_scale,
                     bmm2_scale=self.bmm2_scale,
                     batch_size=attn_metadata.num_prefills,
-                    cum_seq_lens_q=attn_metadata.qo_indptr_gpu,
+                    cum_seq_lens_q=attn_metadata.qo_indptr_gpu_prefill,
                     cum_seq_lens_kv=attn_metadata.paged_kv_indptr_gpu,
                     window_left=self.window_left,
                     sinks=self.sinks,
@@ -1001,13 +1198,22 @@ class FlashInferImpl(AttentionImpl):
                     assert self.o_sf_scale is None
                     out = output[:num_decode_tokens]
 
-                if num_decode_tokens % attn_metadata.num_decodes != 0:
-                    # This gets triggered when the dummy_run forces
-                    # attention to be initialized with q_len = 0
-                    q_len_per_req = 1
+                needs_padding = num_decode_tokens % \
+                    attn_metadata.num_decodes != 0
+                if needs_padding:
+                    q_len_per_req = attn_metadata.max_q_len_decode
+                    decode_query = pad_query(
+                        attn_metadata.qo_indptr_gpu_decode, decode_query,
+                        q_len_per_req)
+                    output_ref = torch.empty(
+                        (q_len_per_req * attn_metadata.num_decodes,
+                         out.shape[1], out.shape[2]),
+                        dtype=out.dtype,
+                        device=out.device)
                 else:
                     q_len_per_req = \
-                        num_decode_tokens // attn_metadata.num_decodes
+                        int(num_decode_tokens // attn_metadata.num_decodes)
+                    output_ref = out
 
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
@@ -1021,8 +1227,13 @@ class FlashInferImpl(AttentionImpl):
                     window_left=self.window_left,
                     sinks=self.sinks,
                     o_sf_scale=self.o_sf_scale,
-                    out=out,
+                    out=output_ref,
                     q_len_per_req=q_len_per_req)
+
+                if needs_padding:
+                    unpad_query(attn_metadata.qo_indptr_gpu_decode, output_ref,
+                                out)
+
         return output_padded
 
 
