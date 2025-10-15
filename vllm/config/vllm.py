@@ -678,9 +678,34 @@ class VllmConfig:
                 assert max_graph_size >= 1, (
                     "Maximum cudagraph size should be greater than or equal to 1."
                 )
-                batch_size_capture_list = [
-                    i for i in [1, 2, 4] if i <= max_graph_size
-                ] + list(range(8, max_graph_size + 1, 8))
+                if max_graph_size <= 512:
+                    batch_size_capture_list = [1, 2, 4] + list(
+                        range(8, max_graph_size + 1, 8)
+                    )
+                elif max_graph_size > 512:
+                    batch_size_capture_list = (
+                        [1, 2, 4]
+                        + list(range(8, 513, 8))
+                        + list(range(520, max_graph_size + 1, 16))
+                    )
+                elif max_graph_size > 1024:
+                    batch_size_capture_list = (
+                        [1, 2, 4]
+                        + list(range(8, 513, 8))
+                        + list(range(520, 1025, 16))
+                        + list(range(1040, max_graph_size + 1, 32))
+                    )
+                else:
+                    batch_size_capture_list = (
+                        [1, 2, 4]
+                        + list(range(8, 513, 8))
+                        + list(range(520, 1025, 16))
+                        + list(range(1040, 2049, 32))
+                        + list(range(2080, max_graph_size + 1, 64))
+                    )
+                # batch_size_capture_list = [
+                #     i for i in [1, 2, 4] if i <= max_graph_size
+                # ] + list(range(8, max_graph_size + 1, 8))
             elif len(cuda_graph_sizes) > 1:
                 batch_size_capture_list = sorted(cuda_graph_sizes)
             else:
