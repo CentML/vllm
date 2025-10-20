@@ -12,7 +12,7 @@ import os
 import random
 from contextlib import contextmanager
 from dataclasses import asdict
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 from huggingface_hub import snapshot_download
 from transformers import AutoTokenizer
@@ -28,8 +28,8 @@ from vllm.utils import FlexibleArgumentParser
 class ModelRequestData(NamedTuple):
     engine_args: EngineArgs
     prompts: list[str]
-    stop_token_ids: Optional[list[int]] = None
-    lora_requests: Optional[list[LoRARequest]] = None
+    stop_token_ids: list[int] | None = None
+    lora_requests: list[LoRARequest] | None = None
 
 
 # NOTE: The default `max_num_seqs` and `max_model_len` may result in OOM on
@@ -90,6 +90,33 @@ def run_aya_vision(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
+# Bee-8B
+def run_bee(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+    model_name = "Open-Bee/Bee-8B-RL"
+
+    prompts = [
+        (
+            f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<image>\n{question}<|im_end|>"
+            f"<|im_start|>assistant\n<think>\n"
+        )
+        for question in questions
+    ]
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=16384,
+        limit_mm_per_prompt={modality: 1},
+        trust_remote_code=True,
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # BLIP-2
 def run_blip2(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -118,6 +145,23 @@ def run_chameleon(questions: list[str], modality: str) -> ModelRequestData:
         max_model_len=4096,
         max_num_seqs=2,
         limit_mm_per_prompt={modality: 1},
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Dots-OCR
+def run_dots_ocr(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    prompts = [f"<|img|><|imgpad|><|endofimg|>{question}" for question in questions]
+    engine_args = EngineArgs(
+        model="rednote-hilab/dots.ocr",
+        limit_mm_per_prompt={modality: 1},
+        trust_remote_code=True,
     )
 
     return ModelRequestData(
@@ -204,28 +248,6 @@ def run_ernie45_vl(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# Florence2
-def run_florence2(questions: list[str], modality: str) -> ModelRequestData:
-    assert modality == "image"
-
-    engine_args = EngineArgs(
-        model="microsoft/Florence-2-large",
-        tokenizer="Isotr0py/Florence-2-tokenizer",
-        max_model_len=4096,
-        max_num_seqs=2,
-        trust_remote_code=True,
-        dtype="bfloat16",
-        limit_mm_per_prompt={modality: 1},
-    )
-
-    prompts = ["<MORE_DETAILED_CAPTION>" for _ in questions]
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
-
-
 # Fuyu
 def run_fuyu(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -253,7 +275,8 @@ def run_gemma3(questions: list[str], modality: str) -> ModelRequestData:
         model=model_name,
         max_model_len=2048,
         max_num_seqs=2,
-        mm_processor_kwargs={"do_pan_and_scan": True},
+        # TODO: Support this in transformers backend
+        # mm_processor_kwargs={"do_pan_and_scan": True},
         limit_mm_per_prompt={modality: 1},
     )
 
@@ -581,7 +604,7 @@ def run_idefics3(questions: list[str], modality: str) -> ModelRequestData:
 
 # Intern-S1
 def run_interns1(questions: list[str], modality: str) -> ModelRequestData:
-    model_name = "internlm/Intern-S1"
+    model_name = "internlm/Intern-S1-mini"
 
     engine_args = EngineArgs(
         model=model_name,
@@ -729,6 +752,26 @@ def run_kimi_vl(questions: list[str], modality: str) -> ModelRequestData:
         model="moonshotai/Kimi-VL-A3B-Instruct",
         trust_remote_code=True,
         max_model_len=4096,
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# LightOnOCR
+def run_lightonocr(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    prompts = [
+        "<|im_start|>system<|im_end|>\n<|im_start|>user\n<|image_pad|><|im_end|>\n<|im_start|>assistant\n"
+        for _ in questions
+    ]
+
+    engine_args = EngineArgs(
+        model="lightonai/LightOnOCR-1B",
         limit_mm_per_prompt={modality: 1},
     )
 
@@ -1008,44 +1051,6 @@ def run_mistral3(questions: list[str], modality: str) -> ModelRequestData:
     )
 
 
-# LLama 3.2
-def run_mllama(questions: list[str], modality: str) -> ModelRequestData:
-    assert modality == "image"
-
-    model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-
-    # Note: The default setting of max_num_seqs (256) and
-    # max_model_len (131072) for this model may cause OOM.
-    # You may lower either to run this example on lower-end GPUs.
-
-    # The configuration below has been confirmed to launch on a single L40 GPU.
-    engine_args = EngineArgs(
-        model=model_name,
-        max_model_len=8192,
-        max_num_seqs=2,
-        limit_mm_per_prompt={modality: 1},
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    messages = [
-        [
-            {
-                "role": "user",
-                "content": [{"type": "image"}, {"type": "text", "text": question}],
-            }
-        ]
-        for question in questions
-    ]
-    prompts = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
-
-
 # Molmo
 def run_molmo(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -1183,14 +1188,10 @@ def run_ovis2_5(questions: list[str], modality: str) -> ModelRequestData:
     elif modality == "video":
         placeholder = "<video>"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    messages = [
-        [{"role": "user", "content": f"{placeholder}\n{question}"}]
+    prompts = [
+        f"<|im_start|>user\n\n{placeholder}\n{question}<|im_end|>\n<|im_start|>assistant\n"
         for question in questions
     ]
-    prompts = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
 
     return ModelRequestData(
         engine_args=engine_args,
@@ -1497,6 +1498,80 @@ def run_qwen2_5_omni(questions: list[str], modality: str):
     )
 
 
+# Qwen3-VL-Dense
+def run_qwen3_vl(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "Qwen/Qwen3-VL-4B-Instruct"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": 1,
+        },
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    if modality == "image":
+        placeholder = "<|image_pad|>"
+    elif modality == "video":
+        placeholder = "<|video_pad|>"
+
+    prompts = [
+        (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"{question}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+# Qwen3-VL-MOE
+def run_qwen3_vl_moe(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": 1,
+        },
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    if modality == "image":
+        placeholder = "<|image_pad|>"
+    elif modality == "video":
+        placeholder = "<|video_pad|>"
+
+    prompts = [
+        (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+            f"{question}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        for question in questions
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 # R-4B
 def run_r_vl(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
@@ -1660,12 +1735,13 @@ def run_tarsier2(questions: list[str], modality: str) -> ModelRequestData:
 model_example_map = {
     "aria": run_aria,
     "aya_vision": run_aya_vision,
+    "bee": run_bee,
     "blip-2": run_blip2,
     "chameleon": run_chameleon,
+    "dots_ocr": run_dots_ocr,
     "command_a_vision": run_command_a_vision,
     "deepseek_vl_v2": run_deepseek_vl2,
     "ernie45_vl": run_ernie45_vl,
-    "florence2": run_florence2,
     "fuyu": run_fuyu,
     "gemma3": run_gemma3,
     "gemma3n": run_gemma3n,
@@ -1681,6 +1757,7 @@ model_example_map = {
     "keye_vl": run_keye_vl,
     "keye_vl1_5": run_keye_vl1_5,
     "kimi_vl": run_kimi_vl,
+    "lightonocr": run_lightonocr,
     "llama4": run_llama4,
     "llava": run_llava,
     "llava-next": run_llava_next,
@@ -1691,7 +1768,6 @@ model_example_map = {
     "minicpmv": run_minicpmv,
     "minimax_vl_01": run_minimax_vl_01,
     "mistral3": run_mistral3,
-    "mllama": run_mllama,
     "molmo": run_molmo,
     "nemotron_vl": run_nemotron_vl,
     "NVLM_D": run_nvlm_d,
@@ -1707,6 +1783,8 @@ model_example_map = {
     "qwen2_vl": run_qwen2_vl,
     "qwen2_5_vl": run_qwen2_5_vl,
     "qwen2_5_omni": run_qwen2_5_omni,
+    "qwen3_vl": run_qwen3_vl,
+    "qwen3_vl_moe": run_qwen3_vl_moe,
     "rvl": run_r_vl,
     "skywork_chat": run_skyworkr1v,
     "smolvlm": run_smolvlm,
@@ -1720,6 +1798,8 @@ MODELS_NEED_VIDEO_METADATA = [
     "glm4_1v",
     "glm4_5v",
     "glm4_5v_fp8",
+    "qwen3_vl",
+    "qwen3_vl_moe",
 ]
 
 
