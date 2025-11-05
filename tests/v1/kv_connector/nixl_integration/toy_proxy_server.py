@@ -24,13 +24,18 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize client pools for prefiller and decoder services
     app.state.prefill_clients = []
     app.state.decode_clients = []
+    limits = httpx.Limits(
+        max_keepalive_connections=None, max_connections=None, keepalive_expiry=None
+    )
 
     # Create prefill clients
     for i, (host, port) in enumerate(global_args.prefiller_instances):
         prefiller_base_url = f"http://{host}:{port}/v1"
         app.state.prefill_clients.append(
             {
-                "client": httpx.AsyncClient(timeout=None, base_url=prefiller_base_url),
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=prefiller_base_url, limits=limits
+                ),
                 "host": host,
                 "port": port,
                 "id": i,
@@ -42,7 +47,9 @@ async def lifespan(app: FastAPI):
         decoder_base_url = f"http://{host}:{port}/v1"
         app.state.decode_clients.append(
             {
-                "client": httpx.AsyncClient(timeout=None, base_url=decoder_base_url),
+                "client": httpx.AsyncClient(
+                    timeout=None, base_url=decoder_base_url, limits=limits
+                ),
                 "host": host,
                 "port": port,
                 "id": i,
