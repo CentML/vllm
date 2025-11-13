@@ -9,6 +9,7 @@
 # ruff: noqa: E501
 import warnings
 
+import nvtx
 import torch
 from einops import rearrange
 
@@ -109,6 +110,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
 
 @torch.compiler.disable
+@nvtx.annotate("chunk_gated_delta_rule", color="gold")
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,

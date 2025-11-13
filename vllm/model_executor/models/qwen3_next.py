@@ -5,6 +5,7 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import nvtx
 import torch
 from einops import rearrange
 from torch import nn
@@ -491,6 +492,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
+    @nvtx.annotate("Qwen3NextGatedDeltaNet._forward_core", color="yellow")
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1228,11 +1230,14 @@ class Qwen3NextForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        with nvtx.annotate(
+            f"Qwen3NextForCausalLM.forward {input_ids.shape[0]}", color="blue"
+        ):
+            hidden_states = self.model(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
 
-        return hidden_states
+            return hidden_states
 
     @classmethod
     def get_mamba_state_dtype_from_config(

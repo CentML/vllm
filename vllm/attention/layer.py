@@ -5,6 +5,7 @@
 from collections.abc import Callable
 from typing import cast
 
+import nvtx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -932,6 +933,7 @@ direct_register_custom_op(
 
 
 @maybe_transfer_kv_layer
+@nvtx.annotate("unified_attention_with_output", color="orange")
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,

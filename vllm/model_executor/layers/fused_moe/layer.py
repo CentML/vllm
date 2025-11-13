@@ -1880,6 +1880,9 @@ class FusedMoE(CustomOp):
         return s
 
 
+import nvtx
+
+@nvtx.annotate("moe_forward", color="red")
 def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
