@@ -2935,13 +2935,6 @@ class GPUModelRunner(
             assert isinstance(self.drafter, EagleProposer)
 
             if self.speculative_config.disable_padded_drafter_batch:
-                # When padded-batch is disabled, the sampled_token_ids should be
-                # the cpu-side list[list[int]] of valid sampled tokens for each
-                # request, with invalid requests having empty lists.
-                assert isinstance(sampled_token_ids, list), (
-                    "sampled_token_ids should be a python list when"
-                    "padded-batch is disabled."
-                )
                 next_token_ids = self.drafter.prepare_next_token_ids_cpu(
                     sampled_token_ids,
                     self.requests,
@@ -2981,9 +2974,20 @@ class GPUModelRunner(
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
-                if self.speculative_config.disable_padded_drafter_batch:
-                    token_indices_to_sample = None
-                    common_attn_metadata, token_indices = self.drafter.prepare_inputs(
+                if True or self.speculative_config.disable_padded_drafter_batch:
+                    if isinstance(sampled_token_ids, torch.Tensor):
+                        max_gen_len = sampled_token_ids.shape[-1]
+                        if max_gen_len == 1:
+                            # No spec decode tokens.
+                            sampled_token_ids = self._to_list(sampled_token_ids)
+                        else:
+                            # Includes spec decode tokens.
+                            sampled_token_ids = self.rejection_sampler.parse_output(
+                                sampled_token_ids,
+                                self.input_batch.vocab_size,
+                            )
+                    # token_indices_to_sample = None
+                    common_attn_metadata, token_indices, token_indices_to_sample = self.drafter.prepare_inputs(
                         common_attn_metadata,
                         sampled_token_ids,
                         spec_decode_metadata.num_draft_tokens,

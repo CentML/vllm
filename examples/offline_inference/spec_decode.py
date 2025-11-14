@@ -139,6 +139,7 @@ def main(args):
         max_model_len=args.max_model_len,
         limit_mm_per_prompt={"image": 5},
         disable_chunked_mm_input=True,
+        max_num_seqs=1
     )
 
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.output_len)

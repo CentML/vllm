@@ -364,6 +364,13 @@ class EagleProposer:
             input_batch_size = batch_size
             cudagraph_runtime_mode = CUDAGraphMode.NONE
 
+        num_rejected_tokens = (common_attn_metadata.slot_mapping == PADDING_SLOT_ID).sum().item()
+        print("Propose() got num_rejected_tokens:", num_rejected_tokens)
+
+        common_attn_metadata.seq_lens_cpu -= num_rejected_tokens
+        common_attn_metadata.seq_lens -= num_rejected_tokens
+        common_attn_metadata.max_seq_len -= num_rejected_tokens
+
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
@@ -401,6 +408,7 @@ class EagleProposer:
             # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens_cpu += 1
+            print(common_attn_metadata.seq_lens, common_attn_metadata.seq_lens_cpu)
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
 
@@ -898,22 +906,60 @@ class EagleProposer:
         token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
 
         spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
-            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
-            query_start_loc_cpu=new_query_start_loc_cpu,
-            seq_lens_cpu=new_seq_lens_cpu,
+            query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True), # new
+            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True), # new
+            query_start_loc_cpu=new_query_start_loc_cpu, # new
+            seq_lens_cpu=new_seq_lens_cpu, # new
+            num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=total_num_tokens, # new
+            max_query_len=new_query_len_per_req.max().item(), # new
+            max_seq_len=new_seq_lens_cpu.max().item(),
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping[token_indices], # new by proxy
+            causal=True,
+            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+        )
+
+        # PADDED PREPARE_INPUTS OVERRIDE
+
+        total_num_tokens = common_attn_metadata.query_start_loc_cpu[-1].item()
+        token_indices = torch.arange(total_num_tokens, device=device)
+
+        spec_common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=common_attn_metadata.query_start_loc,
+            seq_lens=common_attn_metadata.seq_lens,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
             num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
-            max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=new_seq_lens_cpu.max().item(),
+            max_query_len=common_attn_metadata.max_query_len,
+            max_seq_len=common_attn_metadata.max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
 
-        return spec_common_attn_metadata, token_indices
+        # set slot_mapping to -1 for rejected tokens using a slow loop (debugging)
+        for i in range(common_attn_metadata.num_reqs):
+            start = common_attn_metadata.query_start_loc_cpu[i].item()
+            end = common_attn_metadata.query_start_loc_cpu[i + 1].item()
+            num_rejected = num_rejected_tokens[i].item()
+            if num_rejected > 0:
+                token_indices_to_sample = torch.arange(
+                    end - num_rejected, end, device=device
+                )
+                print(f"Request {i}: Marking tokens {token_indices_to_sample.tolist()} as rejected (rejected tokens: {num_rejected})")
+                spec_common_attn_metadata.slot_mapping[token_indices_to_sample] = -1
+
+        token_indices_to_sample = (
+            common_attn_metadata.query_start_loc[1:] - 1 - num_rejected_tokens.to(device)
+        )
+        print("Sampling at indices:", token_indices_to_sample.tolist())
+
+        return spec_common_attn_metadata, token_indices, token_indices_to_sample
 
     def get_model_name(self, model: nn.Module) -> str:
         if hasattr(model, "module"):  # multi-GPU
