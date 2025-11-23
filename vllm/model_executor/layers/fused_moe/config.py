@@ -324,6 +324,10 @@ class FusedMoEQuantConfig:
         return self._a1.dtype is None and self._w1.dtype == "int4"
 
     @property
+    def use_mxfp8_fake_w8a8(self) -> bool:
+        return self.quant_dtype == "mxfp8"
+
+    @property
     def ocp_mx_scheme(self) -> str | None:
         if not hasattr(self, "_ocp_mx_scheme"):
             if (self._a1.dtype is not None and not isinstance(self._a1.dtype, str)) or (
@@ -458,6 +462,7 @@ class FusedMoEQuantConfig:
             "mxfp4",
             "mxfp6_e3m2",
             "mxfp6_e2m3",
+            "mxfp8",
         }
         assert not isinstance(weight_dtype, str) or weight_dtype in {
             "nvfp4",
@@ -465,6 +470,7 @@ class FusedMoEQuantConfig:
             "mxfp6_e3m2",
             "mxfp6_e2m3",
             "int4",
+            "mxfp8",
         }
 
         if weight_dtype is None:
@@ -576,6 +582,20 @@ def gptq_marlin_moe_quant_config(
         _a2=FusedMoEQuantDesc(dtype=None, shape=a_shape),
         _w1=FusedMoEQuantDesc(weight_dtype, w_shape, w1_scale, None, w1_zp, w1_bias),
         _w2=FusedMoEQuantDesc(weight_dtype, w_shape, w2_scale, None, w2_zp, w2_bias),
+    )
+
+
+def mxfp8_fake_w8a8_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> FusedMoEQuantConfig:
+    return FusedMoEQuantConfig.make(
+        "mxfp8",
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        per_act_token_quant=False,
+        per_out_ch_quant=False,
+        block_shape=None,
     )
 
 
