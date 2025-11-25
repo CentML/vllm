@@ -352,9 +352,10 @@ class FusedMoE(CustomOp):
         expert_mapping: list[tuple[str, str, int, str]] | None = None,
         n_shared_experts: int | None = None,
         routing_method_type: int | None = None,
+        is_gated: bool = True,
     ):
         super().__init__()
-
+        self.is_gated = is_gated
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
@@ -593,23 +594,23 @@ class FusedMoE(CustomOp):
 
         if not self.moe_config.is_act_and_mul:
             # Avoid circular import
-            from vllm.model_executor.layers.quantization.modelopt import (
-                ModelOptFp8MoEMethod,
-                ModelOptNvFp4FusedMoE,
-            )
+            # from vllm.model_executor.layers.quantization.modelopt import (
+            #     ModelOptFp8MoEMethod,
+            #     ModelOptNvFp4FusedMoE,
+            # )
 
-            if not isinstance(
-                self.quant_method,
-                (
-                    UnquantizedFusedMoEMethod,
-                    ModelOptFp8MoEMethod,
-                    ModelOptNvFp4FusedMoE,
-                ),
-            ):
-                raise NotImplementedError(
-                    "is_act_and_mul=False is supported only for unquantized "
-                    ", ModelOpt FP8, and ModelOpt NvFp4 checkpoints"
-                )
+            # if not isinstance(
+            #     self.quant_method,
+            #     (
+            #         UnquantizedFusedMoEMethod,
+            #         ModelOptFp8MoEMethod,
+            #         ModelOptNvFp4FusedMoE,
+            #     ),
+            # ):
+            #     raise NotImplementedError(
+            #         "is_act_and_mul=False is supported only for unquantized "
+            #         ", ModelOpt FP8, and ModelOpt NvFp4 checkpoints"
+            #     )
             if not current_platform.is_cuda():
                 raise NotImplementedError(
                     "is_act_and_mul=False is supported only for CUDA for now"
@@ -904,7 +905,10 @@ class FusedMoE(CustomOp):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = loaded_weight
+            if self.is_gated:
+                param_data[expert_id][idx] = loaded_weight
+            else:
+                param_data[expert_id] = loaded_weight   
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
