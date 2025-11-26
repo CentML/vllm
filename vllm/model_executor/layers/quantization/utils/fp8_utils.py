@@ -234,6 +234,28 @@ class W8A8BlockFp8LinearOp:
             if self.is_deep_gemm_supported
             else None
         )
+        
+        # Check if flashinfer is available and should be used
+        # Do this check in __init__ to avoid issues with torch.compile
+        # Only prefer FlashInfer if we're not explicitly using CUTLASS or AITER
+        from vllm.utils.flashinfer import has_flashinfer
+        
+        self.use_flashinfer = (
+            has_flashinfer() 
+            and current_platform.has_device_capability(100)
+        )
+        
+        # Setup flashinfer input quant if available
+        self.flashinfer_input_quant_op = (
+            QuantFP8(
+                False,
+                self.act_quant_group_shape,
+                column_major_scales=True,
+                use_ue8m0=False,
+            )
+            if self.use_flashinfer
+            else None
+        )
 
     def apply(
         self,
@@ -249,7 +271,16 @@ class W8A8BlockFp8LinearOp:
         output_shape = [*input.shape[:-1], weight.shape[0]]
         output_dtype = input.dtype
 
-        if should_use_deepgemm_for_fp8_linear(
+        # Prefer flashinfer for Blackwell (SM100) devices
+        # use_flashinfer is set in __init__ to avoid torch.compile issues
+        if (
+            self.use_flashinfer
+            and not should_use_deepgemm_for_fp8_linear(
+                output_dtype, weight, self.is_deep_gemm_supported
+            )
+        ):
+            output = self._run_flashinfer(input_2d, weight, weight_scale, input_scale)
+        elif should_use_deepgemm_for_fp8_linear(
             output_dtype, weight, self.is_deep_gemm_supported
         ):
             output = self._run_deepgemm(input_2d, weight, weight_scale)
@@ -364,6 +395,28 @@ class W8A8BlockFp8LinearOp:
         assert self.input_quant_op is not None
         q_input, input_scale = self.input_quant_op(input_2d)
         return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            list(self.weight_group_shape),
+            input_2d.dtype,
+        )
+
+    def _run_flashinfer(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert input_scale is None
+        assert self.flashinfer_input_quant_op is not None
+        q_input, input_scale = self.flashinfer_input_quant_op(input_2d)
+        
+        from vllm.utils.flashinfer import flashinfer_scaled_blockwise_fp8_mm
+        
+        return flashinfer_scaled_blockwise_fp8_mm(
             q_input,
             weight,
             input_scale,

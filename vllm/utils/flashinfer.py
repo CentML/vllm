@@ -500,6 +500,208 @@ def flashinfer_scaled_fp8_mm(
     return output
 
 
+if has_flashinfer():
+
+    @torch.library.custom_op(
+        "vllm::flashinfer_gemm_fp8_blockwise",
+        mutates_args=[],
+        device_types="cuda",
+    )
+    def flashinfer_gemm_fp8_blockwise(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        block_size: list[int],
+        dtype: torch.dtype,
+        scale_major_mode: str,
+    ) -> torch.Tensor:
+        from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+        # Input:
+        # A: [M, K] (row-major)
+        # B: [N, K] (row-major) 
+        # A_scale: [M, K // block_k] (can be row-major or column-major)
+        # B_scale: [N // block_n, K // block_k] (row-major)
+        
+        # FlashInfer gemm_fp8_nt_groupwise backend requirements:
+        #
+        # TRTLLM backend (preferred for SM100/SM103):
+        #   a: [M, K] (row-major) - M must be padded to multiple of 4, K >= 256
+        #   b: [N, K] (row-major)
+        #   a_scale: [M, K // block_k] (row-major) - NO transformation needed!
+        #   b_scale: [K // block_k, N // block_n] (row-major)
+        #   scale_major_mode: None
+        #
+        # CUTLASS backend (for SM110, SM120, SM121 or if K < 256):
+        #   a: [M, K] (row-major) - M must be padded to multiple of 4
+        #   b: [N, K] (row-major)
+        #   a_scale: [K // block_k, M] (row-major)
+        #   b_scale: [K // block_k, N // block_n] (row-major)
+        #   scale_major_mode: "MN"
+        
+        
+        # Determine which backend to use
+        # Prefer TRTLLM for SM100/SM103 when K >= 256
+        k_dim = A.shape[1]
+        device_capability = torch.cuda.get_device_capability(A.device)
+        is_sm100_or_sm103 = device_capability[0] == 10 and device_capability[1] in [0, 3]
+        
+        use_trtllm = k_dim >= 256 and is_sm100_or_sm103
+        
+        # Pad M dimension to multiple of 4 if needed (FlashInfer requirement)
+        m_orig = A.shape[0]
+        m_padded = ((m_orig + 3) // 4) * 4  # Round up to nearest multiple of 4
+        needs_padding = m_padded != m_orig
+        
+        # Check A_scale layout BEFORE any transformations
+        A_scale_is_colmajor = A_scale.stride(0) == 1
+        
+        if needs_padding:
+            # Pad A from [M, K] to [M_padded, K]
+            A_padded = torch.zeros(
+                m_padded, A.shape[1], dtype=A.dtype, device=A.device
+            )
+            A_padded[:m_orig] = A
+            A = A_padded
+            
+            # Pad A_scale from [M, K//block_k] to [M_padded, K//block_k]
+            # torch.ones creates row-major tensor
+            A_scale_padded = torch.ones(
+                m_padded, A_scale.shape[1], dtype=A_scale.dtype, device=A_scale.device
+            )
+            A_scale_padded[:m_orig] = A_scale
+            A_scale = A_scale_padded
+            # After padding, A_scale is always row-major
+            A_scale_is_colmajor = False  # Update flag
+        
+        # B: Keep as [N, K] row-major
+        B_for_flashinfer = B  # [N, K] row-major
+        
+        # Transform scales based on backend
+        # FlashInfer's quantize_fp8 returns a_scale=[K//block, M], b_scale=[K//block, N//block]
+        # vLLM has A_scale=[M, K//block], B_scale=[N//block, K//block]
+        #
+        # TRTLLM expects (per docs line 2217-2218, 2224-2226):
+        #   a_scale: [M, K//block] - vLLM format (no change!)
+        #   b_scale: [K//block, N//block] - need transpose from vLLM
+        #
+        # But FlashInfer test (line 128-129) transposes b_scale for TRTLLM:
+        #   b_scale.t().contiguous() converts [K//block, N//block] → [N//block, K//block]
+        # This means TRTLLM actually wants [N//block, K//block] (vLLM format!)
+        #
+        # So for TRTLLM from vLLM tensors:
+        #   a_scale: [M, K//block] → needs transpose to [K//block, M]
+        #   b_scale: [N//block, K//block] → keep as-is!
+        
+        if use_trtllm:
+            # TRTLLM: a_scale needs transpose, b_scale doesn't
+            if A_scale_is_colmajor:
+                A_scale_row = A_scale.contiguous()  # [M, K//block] row-major
+                A_scale_for_flashinfer = A_scale_row.T.contiguous()  # [K//block, M]
+            else:
+                A_scale_for_flashinfer = A_scale.T.contiguous()  # [K//block, M]
+            
+            B_scale_for_flashinfer = B_scale  # Keep as [N//block, K//block]
+        else:
+            # CUTLASS: both need transpose
+            if A_scale_is_colmajor:
+                A_scale_row = A_scale.contiguous()
+                A_scale_for_flashinfer = A_scale_row.T.contiguous()  # [K//block, M]
+            else:
+                A_scale_for_flashinfer = A_scale.T.contiguous()  # [K//block, M]
+            
+            B_scale_for_flashinfer = B_scale.T.contiguous()  # [K//block, N//block]
+        
+        scale_granularity_mnk = (1, block_size[0], block_size[1])
+        
+        # Call appropriate backend
+        if use_trtllm:
+            output = gemm_fp8_nt_groupwise(
+                A,
+                B_for_flashinfer,
+                A_scale_for_flashinfer,
+                B_scale_for_flashinfer,
+                scale_major_mode=None,  # TRTLLM doesn't use scale_major_mode
+                scale_granularity_mnk=scale_granularity_mnk,
+                out_dtype=dtype,
+                backend="trtllm",
+            )
+        else:
+            output = gemm_fp8_nt_groupwise(
+                A,
+                B_for_flashinfer,
+                A_scale_for_flashinfer,
+                B_scale_for_flashinfer,
+                scale_major_mode=scale_major_mode,
+                scale_granularity_mnk=scale_granularity_mnk,
+                out_dtype=dtype,
+                backend="cutlass",
+            )
+        
+        # Remove padding from output if we added it
+        if needs_padding:
+            output = output[:m_orig]
+        
+        return output
+
+    @torch.library.register_fake("vllm::flashinfer_gemm_fp8_blockwise")
+    def flashinfer_gemm_fp8_blockwise_fake(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+        block_size: list[int],
+        dtype: torch.dtype,
+        scale_major_mode: str,
+    ) -> torch.Tensor:
+        return torch.empty(A.shape[0], B.shape[0], dtype=dtype, device=A.device)
+
+
+def flashinfer_scaled_blockwise_fp8_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    block_size: list[int],
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Blockwise scaled FP8 matrix multiplication using FlashInfer.
+    
+    Args:
+        a: Input tensor of shape (m, k) in FP8 format
+        b: Weight tensor of shape (n, k) in FP8 format  
+        scale_a: Per-token scale tensor of shape (m, k // block_size[1])
+        scale_b: Per-block scale tensor of shape (n // block_size[0], k // block_size[1])
+        block_size: Block size [block_n, block_k]
+        out_dtype: Output data type
+        bias: Optional bias tensor of shape (n,)
+    
+    Returns:
+        Output tensor of shape (m, n) in out_dtype
+    """
+    assert a.ndim == 2 and b.ndim == 2
+    assert a.shape[1] == b.shape[1]  # Both have k dimension
+    assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
+    assert a.device.type == "cuda" and b.device.type == "cuda"
+    assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
+    
+    output = flashinfer_gemm_fp8_blockwise(
+        a,
+        b,
+        scale_a,
+        scale_b,
+        block_size,
+        out_dtype,
+        "MN",  # scale_major_mode
+    )
+    
+    if bias is not None:
+        output = output + bias
+    return output
+
+
 @functools.cache
 def flashinfer_disable_q_quantization() -> bool:
     """Cache result which only depends on the environment"""
@@ -529,4 +731,5 @@ __all__ = [
     "flashinfer_disable_q_quantization",
     "flashinfer_scaled_fp4_mm",
     "flashinfer_scaled_fp8_mm",
+    "flashinfer_scaled_blockwise_fp8_mm",
 ]
