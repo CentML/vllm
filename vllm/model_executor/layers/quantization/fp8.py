@@ -79,6 +79,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     is_layer_skipped,
+    swizzle_blockscale,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
@@ -624,6 +625,9 @@ class Fp8LinearMethod(LinearMethodBase):
                         assert input_scale is not None
                         input_scale = input_scale.max()
                 weight = weight.t()
+
+            if self.quant_config.is_mx:
+                weight_scale = swizzle_blockscale(weight_scale)
 
             # Update layer with new values.
             replace_parameter(layer, "weight", weight.data)
