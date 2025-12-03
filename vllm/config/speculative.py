@@ -109,11 +109,17 @@ class SpeculativeConfig:
     disable_by_batch_size: int | None = Field(default=None, ge=2)
     """Disable speculative decoding for new incoming requests when the number
     of enqueued requests is larger than this value, if provided."""
-    disable_padded_drafter_batch: bool = False
+    disable_padded_drafter_batch: bool = True
     """Disable input padding for speculative decoding. If set to True,
     speculative input batches can contain sequences of different lengths,
-    which may only be supported by certain attention backends. This currently
-    only affects the EAGLE method of speculation."""
+    which may only be supported by certain attention backends."""
+    parallel_draft_block_sizes: list[int] | None = None
+    """Only used for draft-model decoding, to enable parallel drafting of multiple
+    tokens at a time. The list specifies the block sizes for each parallel draft step,
+    and if provided must sum to num_speculative_tokens. For example, to draft 
+    4 tokens in two steps, one drafting 1 token and the other drafting 3 tokens, 
+    set this to [1, 3]. If not provided, autoregressive drafting
+    (i.e. [1] * num_speculative_tokens) is used."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)

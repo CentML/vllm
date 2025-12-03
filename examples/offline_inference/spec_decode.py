@@ -73,8 +73,15 @@ def parse_args():
     parser.add_argument("--draft-model", type=str, default=None)
     parser.add_argument("--custom-mm-prompts", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
-    parser.add_argument("--disable-padded-drafter-batch", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument(
+        "--parallel-block-sizes",
+        type=str,
+        default=None,
+        help="Comma separated list of integers specifying "
+        "the block sizes for each parallel draft step. "
+        "Only used for draft_model method.",
+    )
     return parser.parse_args()
 
 
@@ -115,7 +122,6 @@ def main(args):
             "method": args.method,
             "model": eagle_dir,
             "num_speculative_tokens": args.num_spec_tokens,
-            "disable_padded_drafter_batch": args.disable_padded_drafter_batch,
         }
     elif args.method == "ngram":
         speculative_config = {
@@ -130,10 +136,14 @@ def main(args):
             "method": args.method,
             "model": args.draft_model,
             "num_speculative_tokens": args.num_spec_tokens,
-            "disable_padded_drafter_batch": True,
             "enforce_eager": args.enforce_eager,
             "max_model_len": args.max_model_len,
         }
+        if args.parallel_block_sizes is not None:
+            parallel_block_sizes = [
+                int(x) for x in args.parallel_block_sizes.split(",")
+            ]
+            speculative_config["parallel_draft_block_sizes"] = parallel_block_sizes
     elif args.method == "mtp":
         speculative_config = {
             "method": "mtp",

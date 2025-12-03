@@ -5,19 +5,17 @@ from typing import Any
 
 import torch
 
-from vllm.triton_utils import triton, tl
-
 from vllm.attention.layer import Attention
-from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import set_forward_context
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     extend_all_queries,
-    extend_flat_seqs,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, SpecDecodeBaseProposer
@@ -49,9 +47,13 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         except Exception:
             self.pard_token_id = None
         if self.pard_token_id is None:
-            logger.warning("Could not find pard token ID in draft model hf config: %s", 
-                           self.draft_model_config.hf_config)
-            raise ValueError("PARD token ID must be specified in the draft model hf config.")
+            logger.warning(
+                "Could not find pard token ID in draft model hf config: %s",
+                self.draft_model_config.hf_config,
+            )
+            raise ValueError(
+                "PARD token ID must be specified in the draft model hf config."
+            )
 
     @torch.cuda.nvtx.range("DraftModelProposer.propose")
     def propose(
@@ -79,105 +81,151 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             positions=target_positions,
         )
 
-        all_next_token_ids = [next_token_ids]
-        for i in range(1, self.num_speculative_tokens):
-            all_next_token_ids.append(
-                torch.full_like(next_token_ids, fill_value=self.pard_token_id)
-            )
-        next_token_ids = torch.stack(all_next_token_ids, dim=0)
-
-        with torch.cuda.nvtx.range("merge_next_token_ids_into_token_ids"):
-            inputs = merge_next_token_ids_into_token_ids(
-                inputs=inputs,
-                next_token_ids=next_token_ids,
-                block_size=self.block_size,
-                max_model_len=self.max_model_len,
-                arange=self.arange,
-            )
-
-        common_attn_metadata = inputs.cad
-        target_token_ids = inputs.token_ids
-        target_positions = inputs.positions
-
-        num_tokens = target_token_ids.shape[0]
-        self.input_ids[:num_tokens] = target_token_ids
-
-        assert last_token_indices is None
-        assert self.runner is not None
-
-        # Build ATTN Metadata
-        if self.attn_metadata_builder is None:
-            attn_metadata_builder = self._get_attention_metadata_builder()
-        else:
-            attn_metadata_builder = self.attn_metadata_builder
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata, draft_index=0
+        num_spec_tokens = self.num_speculative_tokens
+        parallel_block_sizes = (
+            self.vllm_config.speculative_config.parallel_draft_block_sizes
         )
-        assert not self.draft_indexer_metadata_builder
-        assert not self.indexer_layer_names
-
-        # At this moment, we assume all layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-
-        cudagraph_runtime_mode = CUDAGraphMode.NONE
-        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
-            cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
-        else:
-            num_input_tokens = num_tokens
-
-        # copy inputs to buffer for cudagraph
-        self._set_positions(num_tokens, target_positions)
-
-        assert not self.pass_hidden_states_to_model
-        assert not self.supports_mm_inputs
-        input_ids = self.input_ids[:num_input_tokens]
-        inputs_embeds = None
-
-        model_kwargs = {
-            "input_ids": input_ids,
-            "positions": self._get_positions(num_input_tokens),
-            "inputs_embeds": inputs_embeds,
-        }
-
-        with torch.cuda.nvtx.range("draft_model_forward"):
-            with set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_input_tokens,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-            ):
-                last_hidden_states = self.model(**model_kwargs)
-                assert isinstance(last_hidden_states, torch.Tensor)
-        
-        # with torch.cuda.nvtx.range("draft_model_sample"):
-        #     draft_sampled_tokens = []
-        #     for i in range(self.num_speculative_tokens):
-        #         last_token_indices = common_attn_metadata.query_start_loc[1:] - self.num_speculative_tokens + i
-        #         sample_hidden_states = last_hidden_states[last_token_indices]
-        #         logits = self.model.compute_logits(sample_hidden_states)
-        #         draft_token_ids = logits.argmax(dim=-1)
-        #         draft_sampled_tokens.append(draft_token_ids)
-        # return torch.stack(draft_sampled_tokens, dim=1)
-
-        with torch.cuda.nvtx.range("draft_model_sample"):
-            seq_ends = common_attn_metadata.query_start_loc[1:]
-            step_offsets = torch.arange(
-                self.num_speculative_tokens, 
-                device=last_hidden_states.device, 
-                dtype=torch.long
+        if parallel_block_sizes is None:
+            parallel_block_sizes = [1] * num_spec_tokens
+            logger.warning_once(
+                "'parallel_draft_block_sizes' not provided, "
+                "using autoregressive drafting with num_speculative_tokens=%d.",
+                num_spec_tokens,
             )
-            
-            base_starts = seq_ends - self.num_speculative_tokens
-            all_indices = base_starts.unsqueeze(1) + step_offsets.unsqueeze(0)
-            flat_indices = all_indices.view(-1)
-            sample_hidden_states = last_hidden_states[flat_indices]
-            logits = self.model.compute_logits(sample_hidden_states)
-            draft_token_ids_flat = logits.argmax(dim=-1)
-            return draft_token_ids_flat.view(-1, self.num_speculative_tokens)
+        else:
+            logger.info_once(
+                "Using parallel draft block sizes: %s (total of %d model steps generating %d total draft tokens)",
+                str(parallel_block_sizes),
+                len(parallel_block_sizes),
+                sum(parallel_block_sizes),
+            )
+
+        assert len(parallel_block_sizes) > 0
+        assert min(parallel_block_sizes) > 0
+        assert num_spec_tokens == sum(parallel_block_sizes)
+
+        num_tokens_for_next_tokens = next_token_ids.shape[0]
+        assert len(next_token_ids.shape) == 1
+        all_new_token_ids = next_token_ids.unsqueeze(0)
+
+        original_inputs = inputs
+
+        all_draft_token_blocks = []
+        for draft_step_idx, draft_step_num_parallel_tokens in enumerate(
+            parallel_block_sizes
+        ):
+            with torch.cuda.nvtx.range(
+                f"draft_step_{draft_step_idx}_size_{draft_step_num_parallel_tokens}"
+            ):
+                with torch.cuda.nvtx.range("add_padding_tokens"):
+                    if draft_step_num_parallel_tokens > 1:
+                        padding_tokens_block = torch.full(
+                            (
+                                draft_step_num_parallel_tokens - 1,
+                                num_tokens_for_next_tokens,
+                            ),
+                            fill_value=self.pard_token_id,
+                            dtype=next_token_ids.dtype,
+                            device=next_token_ids.device,
+                        )
+                        current_stacked_next_token_ids = torch.cat(
+                            [all_new_token_ids, padding_tokens_block], dim=0
+                        )
+                    else:
+                        current_stacked_next_token_ids = all_new_token_ids
+
+                with torch.cuda.nvtx.range("merge_next_token_ids_into_token_ids"):
+                    inputs = merge_next_token_ids_into_token_ids(
+                        inputs=original_inputs,
+                        next_token_ids=current_stacked_next_token_ids,
+                        block_size=self.block_size,
+                        max_model_len=self.max_model_len,
+                        arange=self.arange,
+                    )
+
+                common_attn_metadata = inputs.cad
+                target_token_ids = inputs.token_ids
+                target_positions = inputs.positions
+
+                num_tokens = target_token_ids.shape[0]
+                self.input_ids[:num_tokens] = target_token_ids
+
+                assert last_token_indices is None
+                assert self.runner is not None
+
+                # Build ATTN Metadata
+                if self.attn_metadata_builder is None:
+                    attn_metadata_builder = self._get_attention_metadata_builder()
+                else:
+                    attn_metadata_builder = self.attn_metadata_builder
+                attn_metadata = attn_metadata_builder.build_for_drafting(
+                    common_attn_metadata=common_attn_metadata, draft_index=0
+                )
+                assert not self.draft_indexer_metadata_builder
+                assert not self.indexer_layer_names
+
+                # At this moment, we assume all layers belong to the same KV
+                # cache group, thus using the same attention metadata.
+                per_layer_attn_metadata = {}
+                for layer_name in self.attn_layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+
+                cudagraph_runtime_mode = CUDAGraphMode.NONE
+                if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
+                    num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
+                    cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+                else:
+                    num_input_tokens = num_tokens
+
+                # copy inputs to buffer for cudagraph
+                self._set_positions(num_tokens, target_positions)
+
+                assert not self.pass_hidden_states_to_model
+                assert not self.supports_mm_inputs
+                input_ids = self.input_ids[:num_input_tokens]
+                inputs_embeds = None
+
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "positions": self._get_positions(num_input_tokens),
+                    "inputs_embeds": inputs_embeds,
+                }
+
+                with torch.cuda.nvtx.range("draft_model_forward"):
+                    with set_forward_context(
+                        per_layer_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_input_tokens,
+                        cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    ):
+                        last_hidden_states = self.model(**model_kwargs)
+                        assert isinstance(last_hidden_states, torch.Tensor)
+
+                with torch.cuda.nvtx.range("draft_model_sample"):
+                    seq_ends = common_attn_metadata.query_start_loc[1:]
+                    step_offsets = torch.arange(
+                        draft_step_num_parallel_tokens,
+                        device=last_hidden_states.device,
+                        dtype=torch.long,
+                    )
+
+                    base_starts = seq_ends - draft_step_num_parallel_tokens
+                    all_indices = base_starts.unsqueeze(1) + step_offsets.unsqueeze(0)
+                    flat_indices = all_indices.view(-1)
+                    sample_hidden_states = last_hidden_states[flat_indices]
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    draft_token_ids_flat = logits.argmax(dim=-1)
+
+                draft_token_ids_block = draft_token_ids_flat.view(
+                    -1, draft_step_num_parallel_tokens
+                )
+                all_draft_token_blocks.append(draft_token_ids_block)
+                all_new_token_ids = torch.cat(
+                    [all_new_token_ids, draft_token_ids_block.transpose(0, 1)], dim=0
+                )
+        # Concatenate all draft token blocks along the token dimension
+        proposed_token_ids = torch.cat(all_draft_token_blocks, dim=1)
+        return proposed_token_ids
 
     def _raise_if_multimodal(self):
         if self.supports_mm_inputs:
@@ -288,89 +336,93 @@ class DraftModelInputs:
     positions: torch.Tensor
     cad: CommonAttentionMetadata
 
+
 @triton.jit
 def _fused_extend_kernel(
     # Pointers
-    old_tokens_ptr, old_pos_ptr,       # Input sequences
-    new_tokens_ptr, new_pos_ptr,       # Output sequences
-    next_tokens_ptr,                   # New tokens to append [K, B]
-    base_end_pos_ptr,                  # Last position of existing seqs [B]
-    query_start_loc_ptr,               # Start indices of existing seqs [B+1]
-    
+    old_tokens_ptr,
+    old_pos_ptr,  # Input sequences
+    new_tokens_ptr,
+    new_pos_ptr,  # Output sequences
+    next_tokens_ptr,  # New tokens to append [K, B]
+    base_end_pos_ptr,  # Last position of existing seqs [B]
+    query_start_loc_ptr,  # Start indices of existing seqs [B+1]
     # Strides
-    stride_next_k, stride_next_b,      # Strides for next_token_ids
-    
+    stride_next_k,
+    stride_next_b,  # Strides for next_token_ids
     # Shapes / Constants
-    K,                                 # Number of tokens to extend per sequence
-    BLOCK_SIZE: tl.constexpr           # Triton block size
+    K,  # Number of tokens to extend per sequence
+    BLOCK_SIZE: tl.constexpr,  # Triton block size
 ):
     # Map the program ID to a specific sequence (batch index)
     seq_idx = tl.program_id(0)
-    
+
     # Get the start and end of the *original* sequence
     # query_start_loc usually has shape [B+1], so we load i and i+1
     curr_start = tl.load(query_start_loc_ptr + seq_idx)
     next_start = tl.load(query_start_loc_ptr + seq_idx + 1)
     old_len = next_start - curr_start
-    
+
     # Calculate the start index in the *new* buffer.
     # Logic: The previous sequences (0 to seq_idx-1) have all grown by K.
     # So the shift is exactly (seq_idx * K).
     new_start_offset = curr_start + (seq_idx * K)
-    
+
     # The total length of the sequence after extension
     total_new_len = old_len + K
 
     # Handle the block offset for the sequence
     block_offset = tl.program_id(1) * BLOCK_SIZE
     offs = block_offset + tl.arange(0, BLOCK_SIZE)
-    
+
     # Mask to prevent writing out of bounds for this specific sequence
     mask = offs < total_new_len
 
     # --- Logic: Am I processing an old token or a new token? ---
     is_old_data = offs < old_len
-    
+
     # 1. Handle Token IDs
     # -------------------
-    
+
     # Path A: Read from old tokens (simple copy)
     # We use 'other=0' to prevent OOB reads, though mask handles the store.
     old_val_ptr = old_tokens_ptr + curr_start + offs
     old_vals = tl.load(old_val_ptr, mask=is_old_data, other=0)
-    
+
     # Path B: Read from next_token_ids
     # We need to map the flat offset 'offs' to the K index.
-    # k_idx = offs - old_len. 
+    # k_idx = offs - old_len.
     # Example: if old_len is 100, and offs is 101, this is the 2nd new token (index 1).
     k_indices = offs - old_len
-    
-    # Calculate pointer for next_tokens. 
+
+    # Calculate pointer for next_tokens.
     # Assumes next_token_ids is [K, B] or similar, handled by strides.
     # Address = base + (k_idx * stride_k) + (seq_idx * stride_b)
-    next_val_ptr = next_tokens_ptr + (k_indices * stride_next_k) + (seq_idx * stride_next_b)
-    
+    next_val_ptr = (
+        next_tokens_ptr + (k_indices * stride_next_k) + (seq_idx * stride_next_b)
+    )
+
     # Only load if we are in the "new" section and within total bounds
     is_new_data = ~is_old_data & mask
     new_vals = tl.load(next_val_ptr, mask=is_new_data, other=0)
-    
+
     # Merge and Store
     res_tokens = tl.where(is_old_data, old_vals, new_vals)
     tl.store(new_tokens_ptr + new_start_offset + offs, res_tokens, mask=mask)
 
     # 2. Handle Positions
     # -------------------
-    
+
     # Path A: Read old positions
     old_pos_ptr_loc = old_pos_ptr + curr_start + offs
     old_pos_vals = tl.load(old_pos_ptr_loc, mask=is_old_data, other=0)
-    
+
     # Path B: Calculate new positions
     # Logic: base_end_positions[seq_idx] + 1 + k_index
     # We load the base_end_pos just once per program instance (it's uniform for the seq)
     base_pos = tl.load(base_end_pos_ptr + seq_idx)
     calc_pos_vals = base_pos + 1 + k_indices
-    
+
     # Merge and Store
     res_pos = tl.where(is_old_data, old_pos_vals, calc_pos_vals)
     tl.store(new_pos_ptr + new_start_offset + offs, res_pos, mask=mask)
@@ -386,8 +438,8 @@ def extend_seqs_fused(
     """
     # 1. Prepare Metadata
     batch_size = cad.query_start_loc.shape[0] - 1
-    num_extend_tokens = next_token_ids.shape[0] # K
-    
+    num_extend_tokens = next_token_ids.shape[0]  # K
+
     if num_extend_tokens == 0:
         return inputs.token_ids, inputs.positions
 
@@ -395,10 +447,10 @@ def extend_seqs_fused(
     # (Computation on CPU is negligible compared to repeated kernel launches)
     seqlens = cad.query_start_loc_cpu[1:] - cad.query_start_loc_cpu[:-1]
     max_new_len = seqlens.max().item() + num_extend_tokens
-    
+
     # 2. Allocate Output Tensors
     total_new_tokens = inputs.token_ids.shape[0] + (batch_size * num_extend_tokens)
-    
+
     new_token_ids = torch.empty(
         total_new_tokens, dtype=inputs.token_ids.dtype, device=inputs.token_ids.device
     )
@@ -435,10 +487,11 @@ def extend_seqs_fused(
         next_token_ids.stride(1),
         # Constants
         num_extend_tokens,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
     )
 
     return new_token_ids, new_positions
+
 
 def merge_next_token_ids_into_token_ids(
     inputs: DraftModelInputs,
@@ -453,12 +506,10 @@ def merge_next_token_ids_into_token_ids(
     and updates the common_attn_metadata. The inputs are not modified in-place.
     """
     cad: CommonAttentionMetadata = inputs.cad
-    
+
     num_extend_tokens = next_token_ids.shape[0]
     new_token_ids, new_positions = extend_seqs_fused(
-        inputs=inputs, 
-        cad=inputs.cad, 
-        next_token_ids=next_token_ids
+        inputs=inputs, cad=inputs.cad, next_token_ids=next_token_ids
     )
     # query_end_locs = cad.query_start_loc[1:] - 1
     # base_end_positions = inputs.positions[query_end_locs]
@@ -480,7 +531,9 @@ def merge_next_token_ids_into_token_ids(
     # recompute slot mapping
     batch_size, n_blocks_per_req = cad.block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
-    req_indices = torch.repeat_interleave(req_indices, cad.query_lens() + num_extend_tokens)
+    req_indices = torch.repeat_interleave(
+        req_indices, cad.query_lens() + num_extend_tokens
+    )
     block_table_indices = req_indices * n_blocks_per_req + new_positions // block_size
     block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
     block_offsets = new_positions % block_size
@@ -493,7 +546,10 @@ def merge_next_token_ids_into_token_ids(
 
     # update common_attn_metadata
     new_cad: CommonAttentionMetadata = extend_all_queries(
-        cad, arange=arange, new_slot_mapping=new_slot_mapping, num_extend_tokens=num_extend_tokens
+        cad,
+        arange=arange,
+        new_slot_mapping=new_slot_mapping,
+        num_extend_tokens=num_extend_tokens,
     )
     return DraftModelInputs(
         token_ids=new_token_ids, positions=new_positions, cad=new_cad
