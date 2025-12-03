@@ -118,10 +118,11 @@ def slice_query_start_locs(
     )
 
 
-def extend_all_queries_by_1(
+def extend_all_queries(
     common_attn_metadata: CommonAttentionMetadata,
     arange: torch.Tensor,
     new_slot_mapping: torch.Tensor,
+    num_extend_tokens: int = 1,
 ) -> CommonAttentionMetadata:
     """
     Creates a new CommonAttentionMetadata with all query lengths increased by 1.
@@ -132,8 +133,8 @@ def extend_all_queries_by_1(
     """
     cad = common_attn_metadata
     # query start loc must be increased by [+0, +1, +2, ..., +batch_size]
-    new_query_start_loc = cad.query_start_loc + arange[: len(cad.query_start_loc)]
-    new_seq_lens = cad.seq_lens + 1
+    new_query_start_loc = cad.query_start_loc + (arange[: len(cad.query_start_loc)] * num_extend_tokens)
+    new_seq_lens = cad.seq_lens + num_extend_tokens
 
     new_cad = CommonAttentionMetadata(
         query_start_loc=new_query_start_loc,
@@ -141,12 +142,12 @@ def extend_all_queries_by_1(
         seq_lens=new_seq_lens,
         seq_lens_cpu=new_seq_lens.to("cpu", non_blocking=True),
         num_reqs=cad.num_reqs,  # num requests stays unchanged
-        num_computed_tokens_cpu=cad.num_computed_tokens_cpu + 1,
+        num_computed_tokens_cpu=cad.num_computed_tokens_cpu + num_extend_tokens,
         # each request is extended by 1 token -> batch_size tokens are added
-        num_actual_tokens=cad.num_actual_tokens + cad.batch_size(),
+        num_actual_tokens=cad.num_actual_tokens + cad.batch_size() * num_extend_tokens,
         # All query lens increase by 1, so max query len increases by 1
-        max_query_len=cad.max_query_len + 1,
-        max_seq_len=cad.max_seq_len + 1,
+        max_query_len=cad.max_query_len + num_extend_tokens,
+        max_seq_len=cad.max_seq_len + num_extend_tokens,
         # block table tensor depends on num requests, which stays constant
         block_table_tensor=cad.block_table_tensor,
         slot_mapping=new_slot_mapping,
