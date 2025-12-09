@@ -658,6 +658,13 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         # if batch invariant mode is enabled, prefer DeepGEMM FP8 path
         # we will use BF16 dequant when DeepGEMM is not supported.
+
+        # Hacky asserts for RL team:
+        assert self.quant_config.is_mx , "Only MXFP8 is supported"
+        assert not self.block_quant, "Block quantization is not supported"
+        assert layer.weight.dtype == torch.float8_e4m3fn, "Weight must be FP8" 
+        assert layer.weight_scale.dtype == torch.uint8, "Weight scale must be uint8"
+               
         if vllm_is_batch_invariant():
             if self.block_quant:
                 assert self.weight_block_size is not None
@@ -1331,6 +1338,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        
+        # Hacky asserts for RL team:
+        assert self.quant_config.is_mx , "Only MXFP8 is supported"
+        assert not self.block_quant, "Block quantization is not supported"
+        assert layer.w13_weight.dtype == torch.bfloat16, "Weights must be BF16 when using fake quant MXFP8" 
+        assert layer.w2_weight.dtype == torch.bfloat16, "Weights must be BF16 when using fake quant MXFP8" 
+
         if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
             # TODO(rob): convert this to MK.
             if layer.enable_eplb:

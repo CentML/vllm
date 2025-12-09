@@ -272,6 +272,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert layer.w13_weight.dtype == torch.float16 or layer.w13_weight.dtype == torch.bfloat16, (
+            "Only FP16/BF16 UnquantizedFusedMoEMethod is supported"
+        )
+        assert layer.w2_weight.dtype == torch.float16 or layer.w2_weight.dtype == torch.bfloat16, (
+            "Only FP16/BF16 UnquantizedFusedMoEMethod is supported"
+        )
+        
         return self.forward(
             layer=layer,
             x=x,
