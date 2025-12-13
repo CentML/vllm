@@ -3114,8 +3114,14 @@ class GPUModelRunner(
                         with open(f"/tmp/meta_{META_CHANNEL_ID}.json") as f:
                             meta = json.load(f)
                         output_file = meta["output_file"]
+                        hidden_states_cpu = hidden_states.cpu().detach().clone()
+                        # check if any nans in hidden states
+                        if torch.isnan(hidden_states_cpu).any().item():
+                            logger.warning(
+                                f"NaNs detected in hidden states for {output_file}. Saving anyway."
+                            )
                         data_to_save = {
-                            "hidden_states": hidden_states.cpu().detach().clone(),
+                            "hidden_states": hidden_states_cpu,
                             "input_ids": input_ids.cpu().detach().clone(),
                             "conversation_id": meta["conversation_id"],
                         }
