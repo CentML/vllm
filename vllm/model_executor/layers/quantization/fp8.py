@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+    log_quant_method_call
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
@@ -322,7 +323,8 @@ class Fp8Config(QuantizationConfig):
         elif isinstance(layer, Attention):
             return Fp8KVCacheMethod(self)
         return None
-
+    
+    @log_quant_method_call
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
