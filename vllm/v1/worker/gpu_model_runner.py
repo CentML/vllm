@@ -3114,7 +3114,7 @@ class GPUModelRunner(
                         with open(f"/tmp/meta_{META_CHANNEL_ID}.json") as f:
                             meta = json.load(f)
                         output_file = meta["output_file"]
-                        hidden_states_cpu = hidden_states.cpu().detach().clone()
+                        hidden_states_cpu = hidden_states.to(torch.float8_e4m3fn).cpu().detach().clone()
                         # check if any nans in hidden states
                         if torch.isnan(hidden_states_cpu).any().item():
                             logger.warning(
