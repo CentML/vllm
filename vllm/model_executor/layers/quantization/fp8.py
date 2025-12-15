@@ -663,8 +663,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale = swizzle_blockscale(weight_scale)
 
             # Update layer with new values.
-            replace_parameter(layer, "weight", weight.data)
-            replace_parameter(layer, "weight_scale", weight_scale.data)
+            if self.quant_config.is_mx:
+                layer.weight_for_apply = Parameter(weight.data, requires_grad=False)
+                layer.weight_scale_for_apply = Parameter(weight_scale.data, requires_grad=False)
+            else:
+                replace_parameter(layer, "weight", weight.data)
+                replace_parameter(layer, "weight_scale", weight_scale.data)
 
         if input_scale is not None:
             replace_parameter(layer, "input_scale", input_scale)
@@ -694,7 +698,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # asserts for RL team:
         assert self.quant_config.is_mx, "Only MXFP8 is supported"
         assert not self.block_quant, "Block quantization is not supported"
-        assert layer.weight.dtype == torch.float8_e4m3fn, "Weight must be FP8"
+        assert layer.weight.dtype == torch.float8_e4m3fn or (self.quant_config.is_mx and layer.weight_for_apply.dtype == torch.float8_e4m3fn), "Weight must be FP8" 
         assert layer.weight_scale.dtype == torch.uint8, "Weight scale must be uint8"
 
         if vllm_is_batch_invariant():
@@ -760,10 +764,12 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.quant_config.is_mx:
+            assert layer.weight_for_apply.dtype == torch.float8_e4m3fn, "Weight for apply must be FP8"
+            assert layer.weight_scale_for_apply.dtype == torch.uint8, "Weight scale for apply must be uint8"
             return self.fp8_linear.apply(
                 input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
+                weight=layer.weight_for_apply,
+                weight_scale=layer.weight_scale_for_apply,
                 out_dtype=self.out_dtype,
                 bias=bias,
             )
