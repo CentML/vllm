@@ -3543,11 +3543,12 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
             )
 
-            draft_token_ids = draft_token_ids.tolist()
-            for i in range(common_attn_metadata.num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                if req_id in self.input_batch.spec_decode_unsupported_reqs:
-                    draft_token_ids[i] = []
+            if not self.use_async_scheduling:
+                draft_token_ids = draft_token_ids.tolist()
+                for i in range(common_attn_metadata.num_reqs):
+                    req_id = self.input_batch.req_ids[i]
+                    if req_id in self.input_batch.spec_decode_unsupported_reqs:
+                        draft_token_ids[i] = []
 
         return draft_token_ids
 
