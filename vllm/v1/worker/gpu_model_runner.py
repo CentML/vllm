@@ -1047,11 +1047,9 @@ class GPUModelRunner(
             )
             .int()
             .argmax(-1)
-            .cpu()
-            .numpy()
         )
         for i, num_tokens in enumerate(num_accepted_tokens):
-            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+            self.input_batch.num_accepted_tokens_gpu[i] = num_tokens
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
         model = self.get_model()
@@ -1569,11 +1567,10 @@ class GPUModelRunner(
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
         if use_spec_decode:
-            self.num_accepted_tokens.np[:num_reqs] = (
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            self.num_accepted_tokens.gpu[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_gpu[:num_reqs]
             )
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
+            self.num_accepted_tokens.gpu[num_reqs:].fill_(1)
 
         # Used in the below loop, uses padded shapes
         query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]

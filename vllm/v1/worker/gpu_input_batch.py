@@ -211,10 +211,9 @@ class InputBatch:
         self.repetition_penalties_reqs: set[str] = set()
 
         # Speculative decoding
-        self.num_accepted_tokens_cpu_tensor = torch.ones(
-            (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        self.num_accepted_tokens_gpu = torch.ones(
+            (max_num_reqs,), dtype=torch.int64, device=device
         )
-        self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -433,7 +432,7 @@ class InputBatch:
             raise NotImplementedError("Unrecognized request type")
 
         # Speculative decoding: by default 1 token is generated.
-        self.num_accepted_tokens_cpu[req_index] = 1
+        self.num_accepted_tokens_gpu[req_index] = 1
 
         # Add request lora ID
         if request.lora_request:
@@ -595,9 +594,9 @@ class InputBatch:
             self.repetition_penalties_cpu[i2],
             self.repetition_penalties_cpu[i1],
         )
-        self.num_accepted_tokens_cpu[i1], self.num_accepted_tokens_cpu[i2] = (
-            self.num_accepted_tokens_cpu[i2],
-            self.num_accepted_tokens_cpu[i1],
+        self.num_accepted_tokens_gpu[i1], self.num_accepted_tokens_gpu[i2] = (
+            self.num_accepted_tokens_gpu[i2],
+            self.num_accepted_tokens_gpu[i1],
         )
 
         swap_dict_values(self.generators, i1, i2)
@@ -719,7 +718,7 @@ class InputBatch:
             self.repetition_penalties_cpu[empty_index] = self.repetition_penalties_cpu[
                 last_req_index
             ]
-            self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
+            self.num_accepted_tokens_gpu[empty_index] = self.num_accepted_tokens_gpu[
                 last_req_index
             ]
             generator = self.generators.pop(last_req_index, None)

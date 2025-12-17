@@ -312,20 +312,40 @@ class Mamba2AttentionMetadataBuilder(
         ):
             # No spec decode sequences
             spec_sequence_masks = None
+            spec_sequence_masks_idxs = None
+            spec_sequence_mask_neg_idxs = None
+            spec_sequence_mask_neg_idxs_cpu = None
+            spec_sequence_masks_cpu = None
             num_spec_decodes = 0
         else:
             # We have spec decode sequences
-            spec_sequence_masks = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks.sum().item()
+            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
+                spec_sequence_masks_idxs = None
+                spec_sequence_mask_neg_idxs = None
+                spec_sequence_mask_neg_idxs_cpu = None
+                # spec_sequence_masks_cpu = None
             else:
-                spec_sequence_masks = spec_sequence_masks.to(
+                spec_sequence_mask_neg_idxs_cpu = torch.nonzero(
+                    ~spec_sequence_masks_cpu, as_tuple=False
+                ).squeeze(1)
+                spec_sequence_mask_idxs_cpu = torch.nonzero(
+                    spec_sequence_masks_cpu, as_tuple=False
+                ).squeeze(1)
+                spec_sequence_mask_neg_idxs = spec_sequence_mask_neg_idxs_cpu.to(
+                    common_attn_metadata.query_start_loc.device, non_blocking=True
+                )
+                spec_sequence_masks_idxs = spec_sequence_mask_idxs_cpu.to(
+                    common_attn_metadata.query_start_loc.device, non_blocking=True
+                )
+                spec_sequence_masks = spec_sequence_masks_cpu.to(
                     common_attn_metadata.query_start_loc.device, non_blocking=True
                 )
 
         # Compute decode/prefill split
-        if spec_sequence_masks is None:
+        if spec_sequence_mask_neg_idxs is None:
             # No spec decode - use standard split
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
@@ -348,20 +368,23 @@ class Mamba2AttentionMetadataBuilder(
                 common_attn_metadata.query_start_loc[1:]
                 - common_attn_metadata.query_start_loc[:-1]
             )
-
-            non_spec_query_lens = query_lens[~spec_sequence_masks]
-            num_decodes = (non_spec_query_lens == 1).sum().item()
-            num_prefills = non_spec_query_lens.size(0) - num_decodes
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1:]
+                - common_attn_metadata.query_start_loc_cpu[:-1]
+            )
+            non_spec_query_lens_cpu = query_lens_cpu[spec_sequence_mask_neg_idxs_cpu]
+            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes
             num_decode_tokens = num_decodes
-            num_prefill_tokens = non_spec_query_lens.sum().item() - num_decode_tokens
+            num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
             num_spec_decode_tokens = (
-                query_lens.sum().item() - num_prefill_tokens - num_decode_tokens
+                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
             )
 
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
-                    common_attn_metadata.query_start_loc[-1].item(),
+                    common_attn_metadata.query_start_loc_cpu[-1].item(),
                 )
                 spec_token_indx = torch.arange(
                     spec_token_size,
@@ -397,13 +420,13 @@ class Mamba2AttentionMetadataBuilder(
                 assert block_idx_first_scheduled_token is not None
                 if self.vllm_config.cache_config.enable_prefix_caching:
                     block_idx_first_scheduled_token = block_idx_first_scheduled_token[
-                        ~spec_sequence_masks
+                        spec_sequence_mask_neg_idxs
                     ]
                     block_idx_last_scheduled_token = block_idx_last_scheduled_token[
-                        ~spec_sequence_masks
+                        spec_sequence_mask_neg_idxs
                     ]
                     block_idx_last_computed_token = block_idx_last_computed_token[
-                        ~spec_sequence_masks
+                        spec_sequence_mask_neg_idxs
                     ]
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks, query_lens
@@ -416,24 +439,24 @@ class Mamba2AttentionMetadataBuilder(
 
                 if self.vllm_config.cache_config.enable_prefix_caching:
                     num_cacheable_blocks = num_computed_tokens // mamba_block_size
-                    block_indices = num_cacheable_blocks[spec_sequence_masks].unsqueeze(
+                    block_indices = num_cacheable_blocks[spec_sequence_masks_idxs].unsqueeze(
                         1
                     ) + torch.arange(self.num_spec + 1, device=self.device).unsqueeze(0)
                     batch_indices = torch.arange(
-                        spec_sequence_masks.sum().item(), device=self.device
+                        spec_sequence_masks_cpu.sum().item(), device=self.device
                     ).unsqueeze(1)
                     spec_state_indices_tensor = common_attn_metadata.block_table_tensor[
-                        spec_sequence_masks
+                        spec_sequence_masks_idxs
                     ][batch_indices, block_indices]
                     non_spec_state_indices_tensor = (
-                        common_attn_metadata.block_table_tensor[~spec_sequence_masks]
+                        common_attn_metadata.block_table_tensor[spec_sequence_mask_neg_idxs]
                     )
                 else:
                     spec_state_indices_tensor = common_attn_metadata.block_table_tensor[
-                        spec_sequence_masks, : self.num_spec + 1
+                        spec_sequence_masks_idxs, : self.num_spec + 1
                     ]
                     non_spec_state_indices_tensor = (
-                        common_attn_metadata.block_table_tensor[~spec_sequence_masks, 0]
+                        common_attn_metadata.block_table_tensor[spec_sequence_mask_neg_idxs, 0]
                     )
 
                 spec_query_start_loc = torch.zeros(
@@ -442,7 +465,7 @@ class Mamba2AttentionMetadataBuilder(
                     device=common_attn_metadata.query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[spec_sequence_masks], dim=0, out=spec_query_start_loc[1:]
+                    query_lens[spec_sequence_masks_idxs], dim=0, out=spec_query_start_loc[1:]
                 )
                 non_spec_query_start_loc = torch.zeros(
                     query_lens.size(0) - num_spec_decodes + 1,
@@ -450,14 +473,14 @@ class Mamba2AttentionMetadataBuilder(
                     device=common_attn_metadata.query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[~spec_sequence_masks],
+                    query_lens[spec_sequence_mask_neg_idxs],
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )
 
             # Filter num_accepted_tokens to only spec sequences
             if num_accepted_tokens is not None:
-                num_accepted_tokens_filtered = num_accepted_tokens[spec_sequence_masks]
+                num_accepted_tokens_filtered = num_accepted_tokens[spec_sequence_masks_idxs]
 
         # Compute seq_idx for prefill only
         if num_prefills > 0:
@@ -488,7 +511,7 @@ class Mamba2AttentionMetadataBuilder(
                     common_attn_metadata.query_start_loc[1:]
                     - common_attn_metadata.query_start_loc[:-1]
                 )
-                query_lens_non_spec = query_lens_all[~spec_sequence_masks]
+                query_lens_non_spec = query_lens_all[spec_sequence_mask_neg_idxs]
                 query_lens_prefills = query_lens_non_spec[num_decodes:]
                 query_start_loc_p = torch.zeros(
                     num_prefills + 1,
@@ -527,7 +550,7 @@ class Mamba2AttentionMetadataBuilder(
                 assert num_computed_tokens is not None
                 if spec_sequence_masks is not None:
                     num_computed_tokens_non_spec = num_computed_tokens[
-                        ~spec_sequence_masks
+                        spec_sequence_masks_neg_idxs
                     ]
                 else:
                     num_computed_tokens_non_spec = num_computed_tokens
