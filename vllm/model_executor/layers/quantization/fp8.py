@@ -659,7 +659,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
             if self.quant_config.is_mx:
                 if self.quant_config.weight_scheme == "dynamic":
-                    weight, weight_scale = mxfp8_e4m3_quantize_python(.weight.data.to(torch.bfloat16))
+                    weight, weight_scale = mxfp8_e4m3_quantize_python(weight.data.to(torch.bfloat16))
                 weight_scale = swizzle_blockscale(weight_scale)
 
             # Update layer with new values.
