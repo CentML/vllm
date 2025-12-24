@@ -1144,7 +1144,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             if self.quant_config.is_mx:
+
+                def maybe_quantize(weight, weight_scale_attr):
+                    """Quantize dynamically or use prequantized weights."""
+                    if self.quant_config.weight_scheme == "dynamic":
+                        return mxfp8_e4m3_quantize_python(
+                            weight.data.to(torch.bfloat16)
+                        )
+                    else:
+                        return weight, weight_scale_attr
+                        
                 if self.flashinfer_moe_backend is not None:
+                    w13_q, w13_scale = maybe_quantize(
+                        layer.w13_weight, layer.w13_weight_scale
+                    )
+                    w2_q, w2_scale = maybe_quantize(
+                        layer.w2_weight, layer.w2_weight_scale
+                    )
                     # This is a hack for mxfp8 only
                     assert (
                         self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
@@ -1157,13 +1173,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     layer.w13_weight = Parameter(
                         pad_to(
-                            layer.w13_weight, 1, layer.intermediate_size_per_partition
+                            w13_q, 1, layer.intermediate_size_per_partition
                         ).contiguous(),
                         requires_grad=False,
                     )
                     layer.w13_weight_scale = Parameter(
                         pad_to(
-                            layer.w13_weight_scale,
+                            w13_scale,
                             1,
                             layer.intermediate_size_per_partition,
                         )
@@ -1173,13 +1189,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     layer.w2_weight = Parameter(
                         pad_to(
-                            layer.w2_weight, 2, layer.intermediate_size_per_partition
+                            w2_q, 2, layer.intermediate_size_per_partition
                         ).contiguous(),
                         requires_grad=False,
                     )
                     layer.w2_weight_scale = Parameter(
                         pad_to(
-                            layer.w2_weight_scale,
+                            w2_scale,
                             2,
                             layer.intermediate_size_per_partition // 32,
                         )
@@ -1206,14 +1222,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     del layer.w2_weight_scale
                 else:
 
-                    def maybe_quantize(weight, weight_scale_attr):
-                        """Quantize dynamically or use prequantized weights."""
-                        if self.quant_config.weight_scheme == "dynamic":
-                            return mxfp8_e4m3_quantize_python(
-                                weight.data.to(torch.bfloat16)
-                            )
-                        else:
-                            return weight, weight_scale_attr
+
 
                     # -------------------------
                     # w13 processing
