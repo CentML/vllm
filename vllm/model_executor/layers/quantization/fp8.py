@@ -1545,6 +1545,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from flashinfer import mxfp8_quantize
                 from flashinfer.fused_moe.core import trtllm_mxfp8_block_scale_moe
 
+                e_score_correction_bias = (
+                    layer.e_score_correction_bias.to(x.dtype)
+                    if layer.e_score_correction_bias is not None
+                    else None
+                )
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
                 flashinfer_output = trtllm_mxfp8_block_scale_moe(
@@ -1556,14 +1561,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     gemm1_weights_scale=layer.w13_scales_shuffled,
                     gemm2_weights=layer.w2_weight_shuffled,
                     gemm2_weights_scale=layer.w2_scales_shuffled,
-                    num_experts=global_num_experts,
-                    top_k=top_k,
-                    n_group=num_expert_group,
-                    topk_group=topk_group,
+                    num_experts=layer.global_num_experts,
+                    top_k=layer.top_k,
+                    n_group=layer.num_expert_group,
+                    topk_group=layer.topk_group,
                     intermediate_size=layer.intermediate_size_per_partition,
                     local_expert_offset=0,
-                    local_num_experts=global_num_experts,
-                    routed_scaling_factor=routed_scaling_factor,
+                    local_num_experts=layer.global_num_experts,
+                    routed_scaling_factor=layer.routed_scaling_factor,
                     routing_method_type=2,  # deepseek
                     gemm1_bias=None,
                 )[0]
