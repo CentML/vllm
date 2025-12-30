@@ -1077,6 +1077,11 @@ def main():
                 max_token_num=max_num_token,
             )
 
+            if workspace.backend == "mnnvl" and quant_modes & {"fp8", "fp4"}:
+                if rank == 0:
+                    logger.warning("MNNVL backend does not suppory quant patterns, skipping them.")
+                quant_modes = {"none"}
+
     # Collect all results for markdown export
     all_results = []
 
