@@ -1010,6 +1010,7 @@ class EngineArgs:
             "via torch.multiprocessing shared memory for zero-copy IPC. "
             "When disabled, all tensors use standard serialization. "
             "If not specified, defaults to VLLM_MULTIMODAL_TENSOR_IPC env var (default: False).",
+            dest="multimodal_tensor_ipc",
         )
 
         # LoRA related configs
