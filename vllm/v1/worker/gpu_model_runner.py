@@ -4,7 +4,7 @@
 import functools
 import gc
 import itertools
-import json
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -13,10 +13,6 @@ from copy import copy, deepcopy
 from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
-import os
-
-META_CHANNEL_ID = os.environ.get("VLLM_META_CHANNEL_ID", None)
-print("Engine META_CHANNEL_ID:", META_CHANNEL_ID)
 
 import numpy as np
 import torch
@@ -188,6 +184,10 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+META_CHANNEL_ID = os.environ.get("VLLM_META_CHANNEL_ID", None)
+print("Engine META_CHANNEL_ID:", META_CHANNEL_ID)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -411,6 +411,8 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+
+        self.use_aux_hidden_state_outputs = True
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -3107,29 +3109,45 @@ class GPUModelRunner(
                 aux_hidden_states = None
 
                 assert isinstance(input_ids, torch.Tensor)
-                if input_ids.shape[0] > 2 and get_tp_group().is_first_rank and get_pp_group().is_last_rank:
-                    assert META_CHANNEL_ID is not None, "META_CHANNEL_ID must be set to save hidden states."
+                if (
+                    input_ids.shape[0] > 2
+                    and get_tp_group().is_first_rank
+                    and get_pp_group().is_last_rank
+                ):
+                    assert META_CHANNEL_ID is not None, (
+                        "META_CHANNEL_ID must be set to save hidden states."
+                    )
                     # Serializing the hidden states. Let's read the metadata:
                     try:
-                        with open(f"/tmp/meta_{META_CHANNEL_ID}.json") as f:
-                            meta = json.load(f)
-                        output_file = meta["output_file"]
-                        hidden_states_cpu = hidden_states.to(torch.float8_e4m3fn).cpu().detach().clone()
+                        output_file = f"/tmp/hiddens_out_{META_CHANNEL_ID}.pt"
+                        hidden_states_cpu = (
+                            hidden_states[:num_scheduled_tokens].cpu().detach().clone()
+                        )
                         # check if any nans in hidden states
                         if torch.isnan(hidden_states_cpu).any().item():
                             logger.warning(
-                                f"NaNs detected in hidden states for {output_file}. Saving anyway."
+                                "NaNs detected in hidden states. Saving anyway.",
                             )
+                        aux_hidden_states_cpu = (
+                            torch.cat(
+                                [h[:num_scheduled_tokens] for h in aux_hidden_states],
+                                dim=-1,
+                            )
+                            .cpu()
+                            .detach()
+                            .clone()
+                        )
                         data_to_save = {
                             "hidden_states": hidden_states_cpu,
+                            "aux_hidden_states": aux_hidden_states_cpu,
                             "input_ids": input_ids.cpu().detach().clone(),
-                            "conversation_id": meta["conversation_id"],
                         }
                         torch.save(data_to_save, output_file)
                     except FileNotFoundError:
                         # If the metadata file is not found, we just skip saving.
                         logger.warning(
-                            "Metadata file not found. Skipping saving hidden states.")
+                            "Metadata file not found. Skipping saving hidden states."
+                        )
 
             if not self.broadcast_pp_output:
                 # Common case.
