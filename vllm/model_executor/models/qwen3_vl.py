@@ -396,6 +396,7 @@ class Qwen3_VisionTransformer(nn.Module):
 
         if self.attn_backend not in {
             AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
         }:
@@ -538,6 +539,7 @@ class Qwen3_VisionTransformer(nn.Module):
         max_seqlen = torch.zeros([], device=cu_seqlens.device)
         if (
             self.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            or self.attn_backend == AttentionBackendEnum.FLASH_ATTN_CUTE
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
         ):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()

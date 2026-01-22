@@ -67,7 +67,17 @@ class AttentionConfig:
     def validate_backend_before(cls, value: Any) -> Any:
         """Enable parsing of the `backend` enum type from string."""
         if isinstance(value, str):
-            return AttentionBackendEnum[value.upper()]
+            value = AttentionBackendEnum[value.upper()]
+
+        # Disallow ViT-only attention tags in the KV-cache attention config.
+        if value == AttentionBackendEnum.FLASH_ATTN_CUTE:
+            raise ValueError(
+                "AttentionConfig.backend does not support FLASH_ATTN_CUTE "
+                "(FA4 / flash_attn.cute). This is a ViT/MM-encoder-only attention "
+                "tag. Use --mm-encoder-attn-backend / MultiModalConfig.mm_encoder_attn_backend "
+                "instead."
+            )
+
         return value
 
     def _set_from_env_if_set(self, field_name: str, env_var_name: str) -> None:

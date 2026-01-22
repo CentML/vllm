@@ -361,6 +361,7 @@ class CudaPlatformBase(Platform):
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
         return [
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.FLASH_ATTN,
         ]
 
@@ -371,11 +372,43 @@ class CudaPlatformBase(Platform):
         dtype: torch.dtype,
         backend: Optional["AttentionBackendEnum"] = None,
     ) -> "AttentionBackendEnum":
+        cc = cls.get_device_capability()
+
         if backend is not None:
             assert backend in cls.get_supported_vit_attn_backends(), (
                 f"Backend {backend} is not supported for vit attention. "
                 f"Supported backends are: {cls.get_supported_vit_attn_backends()}"
             )
+
+            # FA4 is Blackwell-only and opt-in (via --mm-encoder-attn-backend).
+            if backend == AttentionBackendEnum.FLASH_ATTN_CUTE:
+                if cc is None or cc.major != 10:
+                    raise ValueError(
+                        "FLASH_ATTN_CUTE (FA4 / flash_attn.cute) is only supported on "
+                        "Blackwell GPUs (compute capability 10.x)."
+                    )
+
+                from vllm.v1.attention.backends.fa4_utils import (
+                    is_flash_attn_cute_available,
+                    supports_dtype as fa4_supports_dtype,
+                    warn_if_unoptimized_head_size,
+                )
+
+                if not fa4_supports_dtype(dtype):
+                    raise ValueError(
+                        "FLASH_ATTN_CUTE (FA4 / flash_attn.cute) only supports "
+                        "float16/bfloat16 for ViT attention."
+                    )
+
+                if not is_flash_attn_cute_available():
+                    raise ImportError(
+                        "FLASH_ATTN_CUTE (FA4 / flash_attn.cute) selected, but "
+                        "`flash_attn.cute.interface` is not available in this "
+                        "environment."
+                    )
+
+                warn_if_unoptimized_head_size(head_size)
+
             logger.info_once(f"Using backend {backend} for vit attention")
             return backend
 
