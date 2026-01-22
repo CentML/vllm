@@ -649,7 +649,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         workspace_buffer = (
             None
             if self.attn_backend != AttentionBackendEnum.FLASHINFER
-            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         )
         with set_model_tag("Qwen2_5_VisionBlock", is_encoder=True):
             self.blocks = nn.ModuleList(
