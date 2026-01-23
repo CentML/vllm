@@ -229,7 +229,7 @@ def _pad_to_batch_bucket(
     pad_size = batch_size_padded - batch_size
     device = actual_seq_lens.device
 
-    # Pad actual_seq_lens with zeros
+    # Pad actual_seq_lens with zeros (padded sequences have length 0)
     zeros_seq_lens = torch.zeros(
         (pad_size, 1, 1, 1),
         dtype=actual_seq_lens.dtype,
@@ -237,22 +237,21 @@ def _pad_to_batch_bucket(
     )
     actual_seq_lens_padded = torch.cat([actual_seq_lens, zeros_seq_lens], dim=0)
 
-    # Pad each batch_offsets with zeros
-    # Note: batch_offsets has shape (batch_size + 1, 1, 1, 1), so we need to pad
-    # (batch_size_padded + 1) - (batch_size + 1) = batch_size_padded - batch_size
-    zeros_offsets = torch.zeros(
-        (pad_size, 1, 1, 1),
-        dtype=batch_offsets_q.dtype,
-        device=device,
-    )
+    # Pad each batch_offsets by repeating the last offset value
+    # The last offset is the end of the last real sequence, and padded
+    # sequences (with length 0) should all start at that same position
+    # Note: batch_offsets has shape (batch_size + 1, 1, 1, 1)
+    def pad_offsets(offsets: torch.Tensor) -> torch.Tensor:
+        last_offset = offsets[-1:].expand(pad_size, 1, 1, 1)
+        return torch.cat([offsets, last_offset], dim=0)
 
     return (
         batch_size_padded,
         actual_seq_lens_padded,
-        torch.cat([batch_offsets_q, zeros_offsets], dim=0),
-        torch.cat([batch_offsets_k, zeros_offsets], dim=0),
-        torch.cat([batch_offsets_v, zeros_offsets], dim=0),
-        torch.cat([batch_offsets_o, zeros_offsets], dim=0),
+        pad_offsets(batch_offsets_q),
+        pad_offsets(batch_offsets_k),
+        pad_offsets(batch_offsets_v),
+        pad_offsets(batch_offsets_o),
     )
 
 
