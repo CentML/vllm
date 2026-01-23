@@ -575,52 +575,32 @@ class Qwen3_VisionTransformer(nn.Module):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 
-    def compute_flashinfer_cu_seqlens(self, cu_seqlens: np.ndarray) -> np.ndarray:
-        scale = self.hidden_size // self.tp_size
-        return np.concatenate([
-            cu_seqlens * scale * 2,  # q, k stride
-            cu_seqlens * scale * 3,  # v stride  
-            cu_seqlens * scale,      # o stride
-        ])
-
-    def pad_to_batch_bucket(
-        self,
-        cu_seqlens: np.ndarray,
-        sequence_lengths: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Pad cu_seqlens and sequence_lengths to match the nearest batch bucket.
-        
-        This follows the same padding strategy as cuDNN frontend's SDPA caching:
-        https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_sdpa_with_caching.py
-        
-        Args:
-            cu_seqlens: Array of shape (batch_size + 1,) with cumulative offsets
-            sequence_lengths: Array of shape (batch_size,) with sequence lengths
-        
-        Returns:
-            Tuple of (padded_cu_seqlens, padded_sequence_lengths)
-        """
-        batch_size = len(sequence_lengths)
-        # Find the nearest bucket size >= actual batch size
+    def add_padding_to_fi_seqlens(self, seq: np.ndarray, batch_size: int, padding_value: int) -> np.ndarray:
         batch_size_padded = next(
             (b for b in BATCH_BUCKETS if b >= batch_size), BATCH_BUCKETS[-1]
         )
-        
         if batch_size_padded == batch_size:
-            return cu_seqlens, sequence_lengths
-        
-        pad_count = batch_size_padded - batch_size
-        
-        # Pad actual_seq_lens with zeros
-        zeros_seq_lens = np.zeros((pad_count, ), dtype=sequence_lengths.dtype)
-        sequence_lengths_padded = np.concatenate([sequence_lengths, zeros_seq_lens], axis=0)
-        
-        # Pad cu_seqlens with zeros
-        zeros_offsets = np.zeros((pad_count, ), dtype=cu_seqlens.dtype)
-        cu_seqlens_padded = np.concatenate([cu_seqlens, zeros_offsets], axis=0)
+            return seq
+        return np.concatenate([seq, np.full((batch_size_padded - batch_size, ), padding_value, dtype=seq.dtype)])
 
-        return cu_seqlens_padded, sequence_lengths_padded
+    def compute_flashinfer_cu_seqlens(self,
+        cu_seqlens: np.ndarray,
+        rotary_pos_emb_cos: torch.Tensor | None = None,
+        rotary_pos_emb_sin: torch.Tensor | None = None,
+    ) -> np.ndarray:
+        batch_size = len(cu_seqlens) - 1
+        scale = self.hidden_size // self.tp_size
+        cu_seqlens = cu_seqlens * scale
+        if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+            cu_seqlens_qk = cu_seqlens * 2
+        else:
+            cu_seqlens_qk = cu_seqlens * 3
+        cu_seqlens_v = cu_seqlens * 3
+        cu_seqlens_o = cu_seqlens
+        cu_seqlens_qk = self.add_padding_to_fi_seqlens(cu_seqlens_qk, batch_size, cu_seqlens_qk[-1])
+        cu_seqlens_v = self.add_padding_to_fi_seqlens(cu_seqlens_v, batch_size, cu_seqlens_v[-1])
+        cu_seqlens_o = self.add_padding_to_fi_seqlens(cu_seqlens_o, batch_size, cu_seqlens_o[-1])
+        return np.concatenate([cu_seqlens_qk, cu_seqlens_v, cu_seqlens_o])
 
     def forward(
         self,
@@ -647,9 +627,8 @@ class Qwen3_VisionTransformer(nn.Module):
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
         sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if self.attn_backend == AttentionBackendEnum.FLASHINFER:
-            cu_seqlens, sequence_lengths = self.pad_to_batch_bucket(cu_seqlens, sequence_lengths)
-            cu_seqlens = self.compute_flashinfer_cu_seqlens(cu_seqlens)
-
+            sequence_lengths = self.add_padding_to_fi_seqlens(sequence_lengths, len(sequence_lengths), 0)
+            cu_seqlens = self.compute_flashinfer_cu_seqlens(cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
         cu_seqlens = torch.from_numpy(cu_seqlens)
         sequence_lengths = torch.from_numpy(sequence_lengths)
         hidden_states = hidden_states.unsqueeze(1)
@@ -657,6 +636,7 @@ class Qwen3_VisionTransformer(nn.Module):
             if self.attn_backend == AttentionBackendEnum.FLASHINFER \
             else self.compute_attn_mask_seqlen(cu_seqlens)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
