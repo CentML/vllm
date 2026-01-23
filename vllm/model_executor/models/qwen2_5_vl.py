@@ -368,7 +368,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
@@ -402,15 +402,14 @@ class Qwen2_5_VisionAttention(nn.Module):
             q, k = qk_rotated.unbind(dim=0)
         else:
             q, k, v = qkv.unbind(dim=2)
-        if self.attn.attn_backend == AttentionBackendEnum.FLASHINFER:
-            cu_seqlens = cu_seqlens // self.tp_size
+
         context_layer = self.attn(
             query=q,
             key=k,
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            act_seq_lens=act_seq_lens,
+            sequence_lengths=sequence_lengths,
         )
 
         context_layer = einops.rearrange(

@@ -263,60 +263,6 @@ def vit_torch_sdpa_wrapper(
 ) -> torch.Tensor:
     return torch.ops.vllm.torch_sdpa_wrapper(q, k, v, scale, cu_seqlens)
 
-
-# Batch buckets for cuDNN graph caching - graphs are cached per bucket size
-# This avoids creating a new graph for each unique batch size at runtime
-BATCH_BUCKETS = [8, 16, 32, 64]
-
-
-def _pad_to_batch_bucket(
-    batch_size: int,
-    actual_seq_lens: torch.Tensor,
-    batch_offsets: torch.Tensor,
-) -> tuple[int, torch.Tensor, torch.Tensor]:
-    """
-    Pad actual_seq_lens and batch_offsets to match the nearest batch bucket.
-    
-    This follows the same padding strategy as cuDNN frontend's SDPA caching:
-    https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_sdpa_with_caching.py
-    
-    Args:
-        batch_size: Actual batch size
-        actual_seq_lens: Tensor of shape (batch_size, 1, 1, 1) with sequence lengths
-        batch_offsets: Tensor of shape (batch_size + 1, 1, 1, 1) with cumulative offsets
-    
-    Returns:
-        Tuple of (padded_batch_size, padded_actual_seq_lens, padded_batch_offsets)
-    """
-    # Find the nearest bucket size >= actual batch size
-    batch_size_padded = next(
-        (b for b in BATCH_BUCKETS if b >= batch_size), BATCH_BUCKETS[-1]
-    )
-    
-    if batch_size_padded == batch_size:
-        return batch_size, actual_seq_lens, batch_offsets
-    
-    # Pad actual_seq_lens with zeros
-    zeros_seq_lens = torch.zeros(
-        (batch_size_padded - batch_size, 1, 1, 1),
-        dtype=actual_seq_lens.dtype,
-        device=actual_seq_lens.device,
-    )
-    actual_seq_lens_padded = torch.cat([actual_seq_lens, zeros_seq_lens], dim=0)
-    
-    # Pad batch_offsets with zeros
-    # Note: batch_offsets has shape (batch_size + 1, 1, 1, 1), so we need to pad
-    # (batch_size_padded + 1) - (batch_size + 1) = batch_size_padded - batch_size
-    zeros_offsets = torch.zeros(
-        (batch_size_padded - batch_size, 1, 1, 1),
-        dtype=batch_offsets.dtype,
-        device=batch_offsets.device,
-    )
-    batch_offsets_padded = torch.cat([batch_offsets, zeros_offsets], dim=0)
-    
-    return batch_size_padded, actual_seq_lens_padded, batch_offsets_padded
-
-
 def flashinfer_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -325,27 +271,25 @@ def flashinfer_wrapper(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
-    act_seq_lens: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from vllm.v1.attention.backends.flashinfer import cudnn_batch_prefill_with_kv_cache
 
     is_reshaped = q.dim() == 4
-    batch_size = q.shape[0] if is_reshaped else (cu_seqlens.shape[0] - 1)
-    
+
     if is_reshaped:
+        reshape_batch_size = q.shape[0]
         q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
 
-    q_len = q.size(0)
-    batch_offsets = cu_seqlens.view(-1, 1, 1, 1)
-    actual_seq_lens = act_seq_lens.view(-1, 1, 1, 1)
-    max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
+    assert len(cu_seqlens) % 3 == 0, "cu_seqlens must be divisible by 3"
+    cu_seqlength = len(cu_seqlens) // 3
+    batch_offsets_qk = cu_seqlens[: cu_seqlength].view(-1, 1, 1, 1)
+    batch_offsets_v = cu_seqlens[cu_seqlength : cu_seqlength * 2].view(-1, 1, 1, 1)
+    batch_offsets_o = cu_seqlens[cu_seqlength * 2 :].view(-1, 1, 1, 1)
+    sequence_lengths = sequence_lengths.view(-1, 1, 1, 1)
+    max_seqlen = max_seqlen.item()
 
-    # Pad batch_offsets and actual_seq_lens to nearest batch bucket
-    # This enables cuDNN graph caching for better performance
-    padded_batch_size, actual_seq_lens_padded, batch_offsets_padded = \
-        _pad_to_batch_bucket(batch_size, actual_seq_lens, batch_offsets)
-
-    output = cudnn_batch_prefill_with_kv_cache(
+    output, _ = cudnn_batch_prefill_with_kv_cache(
         q,
         k,
         v,
@@ -353,21 +297,18 @@ def flashinfer_wrapper(
         workspace_buffer,
         max_token_per_sequence=max_seqlen,
         max_sequence_kv=max_seqlen,
-        actual_seq_lens_q=actual_seq_lens_padded,
-        actual_seq_lens_kv=actual_seq_lens_padded,
+        actual_seq_lens_q=sequence_lengths,
+        actual_seq_lens_kv=sequence_lengths,
         causal=False,
         return_lse=False,
-        batch_offsets_q=batch_offsets_padded,
-        batch_offsets_o=batch_offsets_padded,
-        batch_offsets_k=batch_offsets_padded,
-        batch_offsets_v=batch_offsets_padded,
+        batch_offsets_q=batch_offsets_qk,
+        batch_offsets_k=batch_offsets_qk,
+        batch_offsets_v=batch_offsets_v,
+        batch_offsets_o=batch_offsets_o,
     )
-    if isinstance(output, tuple):
-        for i in output:
-            if isinstance(i, torch.Tensor):
-                output = i
+
     if is_reshaped:
-        output = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+        output = einops.rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
 
     return output
 
@@ -380,7 +321,7 @@ def vit_flashinfer_wrapper_fake(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
-    act_seq_lens: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -400,8 +341,8 @@ def vit_flashinfer_wrapper(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
-    act_seq_lens: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.flashinfer_wrapper(
-        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen, act_seq_lens
+        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen, sequence_lengths
     )

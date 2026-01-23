@@ -52,6 +52,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.distributed import get_pp_group
+from vllm.distributed import parallel_state
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.conv import Conv3dLayer
@@ -130,6 +131,10 @@ logger = init_logger(__name__)
 
 # Official recommended max pixels is 24576 * 32 * 32
 _MAX_FRAMES_PER_VIDEO = 24576
+
+# Batch buckets for cuDNN graph caching - graphs are cached per bucket size
+# This avoids creating a new graph for each unique batch size at runtime
+BATCH_BUCKETS = [8, 16, 32, 64]
 
 
 class Qwen3_VisionPatchEmbed(nn.Module):
@@ -247,7 +252,7 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -255,7 +260,7 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
-            act_seq_lens=act_seq_lens,
+            sequence_lengths=sequence_lengths,
         )
 
         x = x + self.mlp(self.norm2(x))
@@ -338,6 +343,17 @@ class Qwen3_VisionTransformer(nn.Module):
         self.temporal_patch_size = vision_config.temporal_patch_size
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
+
+        use_data_parallel = (
+            multimodal_config.mm_encoder_tp_mode == "data"
+            if multimodal_config
+            else False
+        )
+        self.tp_size = (
+            1
+            if use_data_parallel
+            else parallel_state.get_tensor_model_parallel_world_size()
+        )
 
         # NOTE: This is used for creating empty tensor for all_gather for
         # DP ViT. Here out_hidden_size is enlarged due to deepstack
@@ -559,6 +575,53 @@ class Qwen3_VisionTransformer(nn.Module):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 
+    def compute_flashinfer_cu_seqlens(self, cu_seqlens: np.ndarray) -> np.ndarray:
+        scale = self.hidden_size // self.tp_size
+        return np.concatenate([
+            cu_seqlens * scale * 2,  # q, k stride
+            cu_seqlens * scale * 3,  # v stride  
+            cu_seqlens * scale,      # o stride
+        ])
+
+    def pad_to_batch_bucket(
+        self,
+        cu_seqlens: np.ndarray,
+        sequence_lengths: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Pad cu_seqlens and sequence_lengths to match the nearest batch bucket.
+        
+        This follows the same padding strategy as cuDNN frontend's SDPA caching:
+        https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_sdpa_with_caching.py
+        
+        Args:
+            cu_seqlens: Array of shape (batch_size + 1,) with cumulative offsets
+            sequence_lengths: Array of shape (batch_size,) with sequence lengths
+        
+        Returns:
+            Tuple of (padded_cu_seqlens, padded_sequence_lengths)
+        """
+        batch_size = len(sequence_lengths)
+        # Find the nearest bucket size >= actual batch size
+        batch_size_padded = next(
+            (b for b in BATCH_BUCKETS if b >= batch_size), BATCH_BUCKETS[-1]
+        )
+        
+        if batch_size_padded == batch_size:
+            return cu_seqlens, sequence_lengths
+        
+        pad_count = batch_size_padded - batch_size
+        
+        # Pad actual_seq_lens with zeros
+        zeros_seq_lens = np.zeros((pad_count, ), dtype=sequence_lengths.dtype)
+        sequence_lengths_padded = np.concatenate([sequence_lengths, zeros_seq_lens], axis=0)
+        
+        # Pad cu_seqlens with zeros
+        zeros_offsets = np.zeros((pad_count, ), dtype=cu_seqlens.dtype)
+        cu_seqlens_padded = np.concatenate([cu_seqlens, zeros_offsets], axis=0)
+
+        return cu_seqlens_padded, sequence_lengths_padded
+
     def forward(
         self,
         x: torch.Tensor,
@@ -582,15 +645,17 @@ class Qwen3_VisionTransformer(nn.Module):
             axis=0, dtype=np.int32
         )
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
-        act_seq_lens = torch.from_numpy(cu_seqlens[1:] - cu_seqlens[:-1])
-        act_seq_lens = act_seq_lens.to(self.device, non_blocking=True)
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            cu_seqlens, sequence_lengths = self.pad_to_batch_bucket(cu_seqlens, sequence_lengths)
+            cu_seqlens = self.compute_flashinfer_cu_seqlens(cu_seqlens)
 
         cu_seqlens = torch.from_numpy(cu_seqlens)
-
+        sequence_lengths = torch.from_numpy(sequence_lengths)
         hidden_states = hidden_states.unsqueeze(1)
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
-            cu_seqlens = cu_seqlens * self.hidden_size
+        max_seqlen = torch.tensor(128 * 1024, device=self.device) \
+            if self.attn_backend == AttentionBackendEnum.FLASHINFER \
+            else self.compute_attn_mask_seqlen(cu_seqlens)
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
@@ -601,7 +666,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
-                act_seq_lens=act_seq_lens,
+                sequence_lengths=sequence_lengths,
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)

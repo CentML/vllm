@@ -194,7 +194,7 @@ class MMEncoderAttention(CustomOp):
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         return vit_flashinfer_wrapper(
             q=query,
@@ -203,8 +203,8 @@ class MMEncoderAttention(CustomOp):
             scale=self.scale,
             workspace_buffer=self.workspace_buffer,
             cu_seqlens=cu_seqlens,
-            max_seqlen=torch.tensor(128 * 1024), #Hard code for now, This will remove the dependency on max_seqlen. Set it to arbitrarily large  (128K)
-            act_seq_lens=act_seq_lens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
         )
 
     def _forward_fa4(
@@ -248,7 +248,7 @@ class MMEncoderAttention(CustomOp):
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -259,7 +259,7 @@ class MMEncoderAttention(CustomOp):
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         if self.is_fa4_backend:
             return self._forward_fa4(query, key, value, cu_seqlens, max_seqlen)
@@ -267,7 +267,7 @@ class MMEncoderAttention(CustomOp):
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:
             return self._forward_flashinfer(
-                query, key, value, cu_seqlens, max_seqlen, act_seq_lens
+                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
             )
         elif self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
             return self._forward_sdpa(query, key, value, cu_seqlens)
@@ -284,7 +284,7 @@ class MMEncoderAttention(CustomOp):
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -295,7 +295,7 @@ class MMEncoderAttention(CustomOp):
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
-        act_seq_lens: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None, # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         assert self.is_flash_attn_backend, (
             "XPU only supports FLASH_ATTN for vision attention."
