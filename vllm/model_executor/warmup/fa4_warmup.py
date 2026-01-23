@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _get_default_qwen3_vit_warmup_seqlens(max_positions: int | None) -> list[int]:
+def _get_default_qwen3_vit_warmup_seqlens(max_positions: int | None = None) -> list[int]:
     candidates = [
         16**2,  # 256
         24**2,  # 576
@@ -111,10 +111,7 @@ def fa4_vit_warmup(worker: "Worker") -> None:
 
     warn_if_unoptimized_head_size(head_size)
 
-    max_positions = getattr(visual, "num_position_embeddings", None)
-    seqlens = _get_default_qwen3_vit_warmup_seqlens(
-        int(max_positions) if max_positions is not None else None
-    )
+    seqlens = tuple(_get_default_qwen3_vit_warmup_seqlens())
 
     logger.info_once(
         "Warming up FA4 (flash_attn.cute) ViT kernels for seqlens=%s (head_size=%d, num_heads=%d, dtype=%s).",

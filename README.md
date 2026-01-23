@@ -1,4 +1,35 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# FA4 Integration
+
+### (1) Support fa4 in vllm.
+
+From low-level to high-level:
+1. Add `FLASH_ATTN_CUTE` (FA4 / `flash_attn.cute`) to `vllm/v1/attention/backends/registry.py` (`AttentionBackendEnum`).
+2. Create a new file `vllm/v1/attention/backends/fa4_utils.py`, for the utils / imports for fa4 (keep imports lazy).
+3. Register the new backend in `vllm/platforms/cuda.py` (FA4 is **Blackwell-only (CC 10.x)** and **opt-in** via `--mm-encoder-attn-backend FLASH_ATTN_CUTE`; default remains FA2/3 or Torch SDPA).
+4. Add the fa4 custom op under `vllm/v1/attention/ops/vit_attn_wrappers.py`.
+5. Update `vllm/model_executor/layers/attention/mm_encoder_attention.py` to add another _forward_impl method for fa4 (`FLASH_ATTN_CUTE`).
+6. Update `vllm/model_executor/models/qwen3_vl.py` and (optionally) `qwen2_5_vl.py` to accept `FLASH_ATTN_CUTE` and compute `max_seqlen` for it.
+
+Notes:
+- FA4 (`flash_attn.cute`) is only considered on **Blackwell** (compute capability 10.x) in this vLLM fork.
+- To force FA4 for ViT/MM encoder attention (Blackwell only): `--mm-encoder-attn-backend FLASH_ATTN_CUTE`.
+
+### (2) Do the kernel_warmup in vllm.
+
+- Add a FA4 ViT warmup in `vllm/model_executor/warmup/kernel_warmup.py` (see `vllm/model_executor/warmup/fa4_warmup.py`).
+- Scope: **Qwen3-VL / Qwen3-VL-MoE** vision transformer only, **Blackwell-only**, and only when `--mm-encoder-attn-backend FLASH_ATTN_CUTE` is set.
+- Candidate seqlens (only varying seqlen): `[64, 256, 576, 1024, 2304, 4096, 9216, 16384, 36864, 65536]` (filtered by `vision_config.num_position_embeddings` if smaller).
+
+### (3) Minor fixes for FA4 integration.
+
+- In `vllm/model_executor/layers/rotary_embedding/common.py`, there is a logic of `if find_spec("flash_attn") is not None:`
+  However, flash_attn original package is actually not installed, not `flash_attn.cute` is installed.
+  Therefore, minor fix is needed for the import error.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
