@@ -193,49 +193,67 @@ BATCH_BUCKETS = [8, 16, 32, 64]
 def _pad_to_batch_bucket(
     batch_size: int,
     actual_seq_lens: torch.Tensor,
-    batch_offsets: torch.Tensor,
-) -> tuple[int, torch.Tensor, torch.Tensor]:
+    batch_offsets_q: torch.Tensor,
+    batch_offsets_k: torch.Tensor,
+    batch_offsets_v: torch.Tensor,
+    batch_offsets_o: torch.Tensor,
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad actual_seq_lens and batch_offsets to match the nearest batch bucket.
-    
+
     This follows the same padding strategy as cuDNN frontend's SDPA caching:
     https://github.com/NVIDIA/cudnn-frontend/blob/main/test/python/test_sdpa_with_caching.py
-    
+
     Args:
         batch_size: Actual batch size
         actual_seq_lens: Tensor of shape (batch_size, 1, 1, 1) with sequence lengths
-        batch_offsets: Tensor of shape (batch_size + 1, 1, 1, 1) with cumulative offsets
-    
+        batch_offsets_q: Tensor of shape (batch_size + 1, 1, 1, 1) with offsets for q
+        batch_offsets_k: Tensor of shape (batch_size + 1, 1, 1, 1) with offsets for k
+        batch_offsets_v: Tensor of shape (batch_size + 1, 1, 1, 1) with offsets for v
+        batch_offsets_o: Tensor of shape (batch_size + 1, 1, 1, 1) with offsets for output
+
     Returns:
-        Tuple of (padded_batch_size, padded_actual_seq_lens, padded_batch_offsets)
+        Tuple of (padded_batch_size, padded_actual_seq_lens,
+                  padded_batch_offsets_q, padded_batch_offsets_k,
+                  padded_batch_offsets_v, padded_batch_offsets_o)
     """
     # Find the nearest bucket size >= actual batch size
     batch_size_padded = next(
         (b for b in BATCH_BUCKETS if b >= batch_size), BATCH_BUCKETS[-1]
     )
-    
+
     if batch_size_padded == batch_size:
-        return batch_size, actual_seq_lens, batch_offsets
-    
+        return (batch_size, actual_seq_lens,
+                batch_offsets_q, batch_offsets_k, batch_offsets_v, batch_offsets_o)
+
+    pad_size = batch_size_padded - batch_size
+    device = actual_seq_lens.device
+
     # Pad actual_seq_lens with zeros
     zeros_seq_lens = torch.zeros(
-        (batch_size_padded - batch_size, 1, 1, 1),
+        (pad_size, 1, 1, 1),
         dtype=actual_seq_lens.dtype,
-        device=actual_seq_lens.device,
+        device=device,
     )
     actual_seq_lens_padded = torch.cat([actual_seq_lens, zeros_seq_lens], dim=0)
-    
-    # Pad batch_offsets with zeros
+
+    # Pad each batch_offsets with zeros
     # Note: batch_offsets has shape (batch_size + 1, 1, 1, 1), so we need to pad
     # (batch_size_padded + 1) - (batch_size + 1) = batch_size_padded - batch_size
     zeros_offsets = torch.zeros(
-        (batch_size_padded - batch_size, 1, 1, 1),
-        dtype=batch_offsets.dtype,
-        device=batch_offsets.device,
+        (pad_size, 1, 1, 1),
+        dtype=batch_offsets_q.dtype,
+        device=device,
     )
-    batch_offsets_padded = torch.cat([batch_offsets, zeros_offsets], dim=0)
-    
-    return batch_size_padded, actual_seq_lens_padded, batch_offsets_padded
+
+    return (
+        batch_size_padded,
+        actual_seq_lens_padded,
+        torch.cat([batch_offsets_q, zeros_offsets], dim=0),
+        torch.cat([batch_offsets_k, zeros_offsets], dim=0),
+        torch.cat([batch_offsets_v, zeros_offsets], dim=0),
+        torch.cat([batch_offsets_o, zeros_offsets], dim=0),
+    )
 
 
 def flashinfer_wrapper(
@@ -251,20 +269,44 @@ def flashinfer_wrapper(
     from vllm.v1.attention.backends.flashinfer import cudnn_batch_prefill_with_kv_cache
 
     is_reshaped = q.dim() == 4
-    batch_size = q.shape[0] if is_reshaped else (cu_seqlens.shape[0] - 1)
-    
+    batch_size = q.shape[0] if is_reshaped else act_seq_lens.shape[0]
+
     if is_reshaped:
         q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
 
     q_len = q.size(0)
-    batch_offsets = cu_seqlens.view(-1, 1, 1, 1)
-    actual_seq_lens = act_seq_lens.view(-1, 1, 1, 1)
     max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
+
+    # Compute cumulative token offsets from act_seq_lens
+    # act_seq_lens contains token counts per sequence (not scaled)
+    token_offsets = torch.zeros(
+        act_seq_lens.shape[0] + 1,
+        dtype=torch.int32,
+        device=act_seq_lens.device,
+    )
+    token_offsets[1:] = act_seq_lens.cumsum(0)
+
+    # Compute batch_offsets for each tensor using their actual stride(0)
+    # This correctly handles both contiguous and strided (non-contiguous) tensors
+    # stride(0) = number of elements to skip in memory per token
+    batch_offsets_q = (token_offsets * q.stride(0)).view(-1, 1, 1, 1)
+    batch_offsets_k = (token_offsets * k.stride(0)).view(-1, 1, 1, 1)
+    batch_offsets_v = (token_offsets * v.stride(0)).view(-1, 1, 1, 1)
+
+    # Output is allocated as contiguous by the kernel, so use contiguous stride
+    output_stride = q.shape[1] * q.shape[2]  # num_heads * head_dim
+    batch_offsets_o = (token_offsets * output_stride).view(-1, 1, 1, 1)
+
+    actual_seq_lens = act_seq_lens.view(-1, 1, 1, 1)
 
     # Pad batch_offsets and actual_seq_lens to nearest batch bucket
     # This enables cuDNN graph caching for better performance
-    padded_batch_size, actual_seq_lens_padded, batch_offsets_padded = \
-        _pad_to_batch_bucket(batch_size, actual_seq_lens, batch_offsets)
+    (padded_batch_size, actual_seq_lens_padded,
+     batch_offsets_q_padded, batch_offsets_k_padded,
+     batch_offsets_v_padded, batch_offsets_o_padded) = _pad_to_batch_bucket(
+        batch_size, actual_seq_lens,
+        batch_offsets_q, batch_offsets_k, batch_offsets_v, batch_offsets_o,
+    )
 
     output = cudnn_batch_prefill_with_kv_cache(
         q,
@@ -278,10 +320,10 @@ def flashinfer_wrapper(
         actual_seq_lens_kv=actual_seq_lens_padded,
         causal=False,
         return_lse=False,
-        batch_offsets_q=batch_offsets_padded,
-        batch_offsets_o=batch_offsets_padded,
-        batch_offsets_k=batch_offsets_padded,
-        batch_offsets_v=batch_offsets_padded,
+        batch_offsets_q=batch_offsets_q_padded,
+        batch_offsets_o=batch_offsets_o_padded,
+        batch_offsets_k=batch_offsets_k_padded,
+        batch_offsets_v=batch_offsets_v_padded,
     )
     if isinstance(output, tuple):
         for i in output:
