@@ -423,6 +423,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
         libsm6 \
         libxext6 \
         libgl1 \
+        git \
     && if [ ! -z ${DEADSNAKES_MIRROR_URL} ] ; then \
         if [ ! -z "${DEADSNAKES_GPGKEY_URL}" ] ; then \
             mkdir -p -m 0755 /etc/apt/keyrings ; \
