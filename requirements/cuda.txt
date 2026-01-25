@@ -11,3 +11,5 @@ torchaudio==2.9.1
 torchvision==0.24.1 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
 # FlashInfer should be updated together with the Dockerfile
 flashinfer-python==0.5.3
+# FA4
+flash-attn-cute @ git+https://github.com/Dao-AILab/flash-attention.git@2580b5a4882562640f3cfbffd2bb8d2de9268f9f#subdirectory=flash_attn/cute

@@ -110,6 +110,85 @@ def vit_flash_attn_wrapper(
     )
 
 
+def fa4_flash_attn_maxseqlen_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FA4 (flash_attn.cute) wrapper for ViT attention.
+
+    flash_attn.cute returns (out, lse); we only return out.
+    """
+    from vllm.v1.attention.backends.fa4_utils import (
+        flash_attn_varlen_func as fa4_flash_attn_varlen_func,
+    )
+
+    q_len = q.size(1)
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
+        )
+    max_seqlen_int = q_len if max_seqlen is None else max_seqlen.item()
+
+    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    output = fa4_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen_int,
+        max_seqlen_k=max_seqlen_int,
+        softmax_scale=scale,
+        causal=False,
+    )
+    context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+    return context_layer
+
+
+def fa4_flash_attn_maxseqlen_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="fa4_flash_attn_maxseqlen_wrapper",
+    op_func=fa4_flash_attn_maxseqlen_wrapper,
+    fake_impl=fa4_flash_attn_maxseqlen_wrapper_fake,
+)
+
+
+def vit_fa4_flash_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.fa4_flash_attn_maxseqlen_wrapper(
+        q,
+        k,
+        v,
+        batch_size,
+        scale,
+        cu_seqlens,
+        max_seqlen,
+    )
+
+
 def apply_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
