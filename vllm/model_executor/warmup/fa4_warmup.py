@@ -29,7 +29,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _get_default_qwen3_vit_warmup_seqlens(max_positions: int | None = None) -> list[int]:
+def _get_default_qwen3_vit_warmup_seqlens(
+    max_positions: int | None = None,
+) -> list[int]:
     candidates = [
         16**2,  # 256
         24**2,  # 576
@@ -37,16 +39,16 @@ def _get_default_qwen3_vit_warmup_seqlens(max_positions: int | None = None) -> l
         48**2,  # 2304
         64**2,  # 4096
         96**2,  # 9216
-        128**2, # 16384
-        192**2, # 36864
-        256**2, # 65536
+        128**2,  # 16384
+        192**2,  # 36864
+        256**2,  # 65536
     ]
     if max_positions is None:
         return candidates
     return [s for s in candidates if s <= max_positions]
 
 
-def should_fa4_vit_warmup(worker: "Worker") -> bool:
+def should_fa4_vit_warmup(worker: Worker) -> bool:
     """Fast predicate used by `kernel_warmup` to gate FA4 warmup."""
     if not current_platform.is_cuda():
         return False
@@ -61,7 +63,7 @@ def should_fa4_vit_warmup(worker: "Worker") -> bool:
     )
 
 
-def fa4_vit_warmup(worker: "Worker") -> None:
+def fa4_vit_warmup(worker: Worker) -> None:
     """Warm up FA4 kernels for Qwen3-VL(-MoE) ViT attention."""
 
     # Config gating: only warm up when explicitly selected for mm encoder.
@@ -85,9 +87,7 @@ def fa4_vit_warmup(worker: "Worker") -> None:
     visual = getattr(model, "visual", None)
     if visual is None:
         # Not a Qwen3-VL(-MoE) style model, or vision tower disabled.
-        logger.warning(
-            "Skipping FA4 warmup: not a Qwen3-VL(-MoE) style model, or vision tower disabled."
-        )
+        logger.warning("Skipping FA4 warmup: vision tower disabled or not found.")
         return
 
     # Derive head shape and dtype from the actual vision attention module.
@@ -114,7 +114,8 @@ def fa4_vit_warmup(worker: "Worker") -> None:
     seqlens = tuple(_get_default_qwen3_vit_warmup_seqlens())
 
     logger.info_once(
-        "Warming up FA4 (flash_attn.cute) ViT kernels for seqlens=%s (head_size=%d, num_heads=%d, dtype=%s).",
+        "Warming up FA4 (flash_attn.cute) ViT kernels for seqlens=%s "
+        "(head_size=%d, num_heads=%d, dtype=%s).",
         seqlens,
         head_size,
         num_heads,
@@ -145,4 +146,3 @@ def fa4_vit_warmup(worker: "Worker") -> None:
                 softmax_scale=scale,
                 causal=False,
             )
-

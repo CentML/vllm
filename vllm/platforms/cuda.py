@@ -390,8 +390,10 @@ class CudaPlatformBase(Platform):
 
                 from vllm.v1.attention.backends.fa4_utils import (
                     is_flash_attn_cute_available,
-                    supports_dtype as fa4_supports_dtype,
                     warn_if_unoptimized_head_size,
+                )
+                from vllm.v1.attention.backends.fa4_utils import (
+                    supports_dtype as fa4_supports_dtype,
                 )
 
                 if not fa4_supports_dtype(dtype):

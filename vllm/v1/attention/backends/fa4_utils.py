@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from importlib.util import find_spec
-from typing import Optional, Tuple
 
 import torch
 
@@ -64,15 +63,15 @@ def flash_attn_varlen_func(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    window_size: tuple[int | None, int | None] = (None, None),
     deterministic: bool = False,
 ) -> torch.Tensor:
     """FA4 (Cute-DSL) FlashAttention varlen forward.
@@ -108,4 +107,3 @@ def flash_attn_varlen_func(
         deterministic=deterministic,
     )
     return out
-

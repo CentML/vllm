@@ -74,8 +74,8 @@ class AttentionConfig:
             raise ValueError(
                 "AttentionConfig.backend does not support FLASH_ATTN_CUTE "
                 "(FA4 / flash_attn.cute). This is a ViT/MM-encoder-only attention "
-                "tag. Use --mm-encoder-attn-backend / MultiModalConfig.mm_encoder_attn_backend "
-                "instead."
+                "tag. Use --mm-encoder-attn-backend / "
+                "MultiModalConfig.mm_encoder_attn_backend instead."
             )
 
         return value
