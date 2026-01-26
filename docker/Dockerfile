@@ -392,29 +392,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
-# Install FlashInfer from CentML fork (source build with AOT kernels)
-# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
-# https://docs.flashinfer.ai/installation.html
-ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
-ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
-RUN --mount=type=cache,target=/root/.cache/uv \
-    # Set CUDA arch list based on CUDA version
-    # Clone and build FlashInfer
-    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
-    cd /tmp/flashinfer && \
-    uv pip install --system --no-build-isolation -v . && \
-    # Build flashinfer-cubin (subshell isolates cd)
-    (cd flashinfer-cubin && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
-    # Build flashinfer-jit-cache (subshell isolates cd)
-    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0f" && \
-    (cd flashinfer-jit-cache && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
-    rm -rf /tmp/flashinfer && \
-    flashinfer show-config
-
 #################### DEV IMAGE ####################
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
@@ -515,6 +492,29 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /tmp/requirements-cuda.txt \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
+
+# Install FlashInfer from CentML fork (source build with AOT kernels)
+# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
+# https://docs.flashinfer.ai/installation.html
+ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
+ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    # Set CUDA arch list based on CUDA version
+    # Clone and build FlashInfer
+    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
+    cd /tmp/flashinfer && \
+    uv pip install --system --no-build-isolation -v . && \
+    # Build flashinfer-cubin (subshell isolates cd)
+    (cd flashinfer-cubin && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
+    # Build flashinfer-jit-cache (subshell isolates cd)
+    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" && \
+    (cd flashinfer-jit-cache && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
+    rm -rf /tmp/flashinfer && \
+    flashinfer show-config
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
