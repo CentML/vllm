@@ -67,8 +67,11 @@
     "RUN_WHEEL_CHECK": {
       "default": "true"
     },
-    "FLASHINFER_VERSION": {
-      "default": "0.5.3"
+    "FLASHINFER_REPO": {
+      "default": "https://github.com/CentML/flashinfer.git"
+    },
+    "FLASHINFER_BRANCH": {
+      "default": "mlperf-inf-mm-q3vl-v6.0"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
