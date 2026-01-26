@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     CompletionOutput,
@@ -34,6 +37,19 @@ from vllm.v1.metrics.stats import (
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+
+logger = init_logger(__name__)
+
+
+def _log_mlperf_trace(event: str, request_id: str) -> None:
+    if not envs.MLPERF_FINEGRAINED_TRACE:
+        return
+    logger.info(
+        "MLPERF_TRACE event=%s request_id=%s ts_ns=%d",
+        event,
+        request_id,
+        time.time_ns(),
+    )
 
 
 class RequestOutputCollector:
@@ -535,7 +551,10 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+            was_prefilling = req_state.is_prefilling
             req_state.is_prefilling = False
+            if was_prefilling and req_state.external_req_id is not None:
+                _log_mlperf_trace("vllm.prefill_done", req_state.external_req_id)
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -570,6 +589,8 @@ class OutputProcessor:
 
             # Free completed requests.
             if finish_reason is not None:
+                if req_state.external_req_id is not None:
+                    _log_mlperf_trace("vllm.decode_done", req_state.external_req_id)
                 self.request_states.pop(req_id)
 
                 internal_ids = self.external_req_ids[req_state.external_req_id]

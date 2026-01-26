@@ -182,6 +182,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _mlperf_trace_request_id(request_id: str) -> str:
+    if "-" in request_id:
+        return request_id.split("-", 1)[0]
+    return request_id
+
+
+def _log_mlperf_trace(event: str, request_id: str) -> None:
+    if not envs.MLPERF_FINEGRAINED_TRACE:
+        return
+    logger.info(
+        "MLPERF_TRACE event=%s request_id=%s ts_ns=%d",
+        event,
+        _mlperf_trace_request_id(request_id),
+        time.time_ns(),
+    )
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -2196,6 +2213,12 @@ class GPUModelRunner(
         if not mm_kwargs:
             return []
 
+        req_ids = None
+        if envs.MLPERF_FINEGRAINED_TRACE:
+            req_ids = {req_id for req_id, _ in mm_lora_refs}
+            for req_id in req_ids:
+                _log_mlperf_trace("vllm.mm_encoder_begin", req_id)
+
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
         # we process it separately to preserve item order.
@@ -2323,6 +2346,10 @@ class GPUModelRunner(
             self.encoder_cache[mm_hash] = output
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+        if req_ids is not None:
+            for req_id in req_ids:
+                _log_mlperf_trace("vllm.mm_encoder_done", req_id)
 
         return encoder_outputs
 
@@ -3131,6 +3158,10 @@ class GPUModelRunner(
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            if envs.MLPERF_FINEGRAINED_TRACE:
+                for req_data in scheduler_output.scheduled_new_reqs:
+                    _log_mlperf_trace("vllm.scheduled", req_data.req_id)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(

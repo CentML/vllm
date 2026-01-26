@@ -411,6 +411,13 @@ class AsyncLLM(EngineClient):
         returning the RequestOutput back to the caller.
         """
 
+        if envs.MLPERF_FINEGRAINED_TRACE:
+            logger.info(
+                "MLPERF_TRACE event=vllm.request_received request_id=%s ts_ns=%d",
+                request_id,
+                time.time_ns(),
+            )
+
         q: RequestOutputCollector | None = None
         try:
             q = await self.add_request(

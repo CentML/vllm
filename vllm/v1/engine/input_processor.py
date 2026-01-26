@@ -6,6 +6,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Literal, cast
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
@@ -583,7 +584,7 @@ class InputProcessor:
                     )
                 )
 
-        return EngineCoreRequest(
+        request = EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
@@ -598,6 +599,15 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
         )
+
+        if envs.MLPERF_FINEGRAINED_TRACE:
+            logger.info(
+                "MLPERF_TRACE event=vllm.input_processed request_id=%s ts_ns=%d",
+                request_id,
+                time.time_ns(),
+            )
+
+        return request
 
     def _validate_model_inputs(
         self, encoder_inputs: SingletonInputs | None, decoder_inputs: SingletonInputs

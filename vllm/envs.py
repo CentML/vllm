@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
+    MLPERF_FINEGRAINED_TRACE: bool = False
     VLLM_ATTENTION_BACKEND: str | None = None
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -677,6 +678,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, vllm will trace function calls
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
+    # Fine-grained MLPerf tracing (disabled by default)
+    "MLPERF_FINEGRAINED_TRACE": lambda: os.getenv(
+        "MLPERF_FINEGRAINED_TRACE", "0"
+    ).strip().lower() in ("1", "true", "yes"),
     # Backend for attention computation
     # Example options:
     # - "TORCH_SDPA": use torch.nn.MultiheadAttention
@@ -1744,6 +1749,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+        "MLPERF_FINEGRAINED_TRACE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
