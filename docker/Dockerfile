@@ -273,6 +273,29 @@ ENV UV_LINK_MODE=copy
 
 WORKDIR /workspace
 
+# Install FlashInfer from CentML fork (source build with AOT kernels)
+# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
+# https://docs.flashinfer.ai/installation.html
+ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
+ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    # Set CUDA arch list based on CUDA version
+    # Clone and build FlashInfer
+    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
+    cd /tmp/flashinfer && \
+    uv pip install --system --no-build-isolation -v . && \
+    # Build flashinfer-cubin (subshell isolates cd)
+    (cd flashinfer-cubin && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
+    # Build flashinfer-jit-cache (subshell isolates cd)
+    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" && \
+    (cd flashinfer-jit-cache && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
+    rm -rf /tmp/flashinfer && \
+    flashinfer show-config
+
 # Build DeepGEMM wheel
 # Default moved here from tools/install_deepgemm.sh for centralized version management
 ARG DEEPGEMM_GIT_REF=594953acce41793ae00a1233eb516044d604bcb6
@@ -367,29 +390,6 @@ RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
     else \
         echo "Skipping wheel size check."; \
     fi
-
-# Install FlashInfer from CentML fork (source build with AOT kernels)
-# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
-# https://docs.flashinfer.ai/installation.html
-ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
-ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
-RUN --mount=type=cache,target=/root/.cache/uv \
-    # Set CUDA arch list based on CUDA version
-    # Clone and build FlashInfer
-    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
-    cd /tmp/flashinfer && \
-    uv pip install --system --no-build-isolation -v . && \
-    # Build flashinfer-cubin (subshell isolates cd)
-    (cd flashinfer-cubin && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
-    # Build flashinfer-jit-cache (subshell isolates cd)
-    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" && \
-    (cd flashinfer-jit-cache && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
-    rm -rf /tmp/flashinfer && \
-    flashinfer show-config
 #################### EXTENSION Build IMAGE ####################
 
 #################### DEV IMAGE ####################
