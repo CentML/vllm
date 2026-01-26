@@ -492,29 +492,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer pre-compiled kernel cache and binaries
-# This is ~1.1GB and only changes when FlashInfer version bumps
-# https://docs.flashinfer.ai/installation.html
-# From versions.json: .flashinfer.version
-# Install FlashInfer from CentML fork (source build)
+# Install FlashInfer from CentML fork (source build with AOT kernels)
 # https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
+# https://docs.flashinfer.ai/installation.html
+ARG CUDA_VERSION
 ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
 ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 RUN --mount=type=cache,target=/root/.cache/uv \
+    # Set CUDA arch list based on CUDA version
+    if [[ "${CUDA_VERSION}" == 11.* ]]; then \
+        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9"; \
+    elif [[ "${CUDA_VERSION}" == 12.[0-7]* ]]; then \
+        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a"; \
+    elif [[ "${CUDA_VERSION}" == 12.[8-9]* ]]; then \
+        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0"; \
+    else \
+        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0f 12.0"; \
+    fi && \
+    # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
-    # Install the main flashinfer package
-    uv pip install --system -v . && \
-    # Build and install flashinfer-cubin
-    cd /tmp/flashinfer/flashinfer-cubin && \
-    uv pip install --system build && \
-    python3 -m build --no-isolation --wheel && \
-    uv pip install --system dist/*.whl && \
-    # Build and install flashinfer-jit-cache
-    cd /tmp/flashinfer/flashinfer-jit-cache && \
-    python3 -m build --no-isolation --wheel && \
-    uv pip install --system dist/*.whl && \
-    # Cleanup
+    # Set environment for build
+    export UV_TORCH_BACKEND=cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
+    export TORCH_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}" && \
+    export FLASHINFER_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}" && \
+    python3 -m flashinfer.aot && \
+    uv pip install --system --no-build-isolation --force-reinstall -v . && \
     rm -rf /tmp/flashinfer && \
     flashinfer show-config
 
