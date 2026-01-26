@@ -58,12 +58,6 @@
     "DEEPEP_COMMIT_HASH": {
       "default": "73b6ea4"
     },
-    "FLASHINFER_REPO": {
-      "default": "https://github.com/CentML/flashinfer.git"
-    },
-    "FLASHINFER_BRANCH": {
-      "default": "mlperf-inf-mm-q3vl-v6.0"
-    },
     "GIT_REPO_CHECK": {
       "default": "0"
     },
@@ -72,6 +66,12 @@
     },
     "RUN_WHEEL_CHECK": {
       "default": "true"
+    },
+    "FLASHINFER_REPO": {
+      "default": "https://github.com/CentML/flashinfer.git"
+    },
+    "FLASHINFER_BRANCH": {
+      "default": "mlperf-inf-mm-q3vl-v6.0"
     },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
