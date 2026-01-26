@@ -274,7 +274,7 @@ def flashinfer_wrapper(
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    from vllm.v1.attention.backends.flashinfer import cudnn_batch_prefill_with_kv_cache
+    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
     is_reshaped = q.dim() == 4
 
