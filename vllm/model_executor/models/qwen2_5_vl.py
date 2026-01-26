@@ -440,7 +440,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        workspace_buffer: torch.Tensor | None = None,  # Only used for FlashInfer
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -454,7 +453,6 @@ class Qwen2_5_VisionBlock(nn.Module):
             quant_config=quant_config,
             multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
-            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen2_5_VisionMLP(
             dim,
@@ -641,16 +639,11 @@ class Qwen2_5_VisionTransformer(nn.Module):
             AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
-            AttentionBackendEnum.FLASHINFER,
         }:
             raise RuntimeError(
                 f"Qwen2.5-VL does not support {self.attn_backend} backend now."
             )
-        workspace_buffer = (
-            None
-            if self.attn_backend != AttentionBackendEnum.FLASHINFER
-            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
-        )
+
         with set_model_tag("Qwen2_5_VisionBlock", is_encoder=True):
             self.blocks = nn.ModuleList(
                 [
@@ -663,7 +656,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
                         quant_config=quant_config,
                         multimodal_config=multimodal_config,
                         prefix=f"{prefix}.blocks.{layer_idx}",
-                        workspace_buffer=workspace_buffer,
                     )
                     for layer_idx in range(depth)
                 ]
