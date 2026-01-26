@@ -509,7 +509,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         uv build --no-build-isolation --wheel . && \
         uv pip install --system dist/*.whl) && \
     # Build flashinfer-jit-cache (subshell isolates cd)
-    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" && \
+    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0f 10.3a" && \
     (cd flashinfer-jit-cache && \
         uv build --no-build-isolation --wheel . && \
         uv pip install --system dist/*.whl) && \
