@@ -496,12 +496,27 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # This is ~1.1GB and only changes when FlashInfer version bumps
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
-ARG FLASHINFER_VERSION=0.5.3
+# Install FlashInfer from CentML fork (source build)
+# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
+ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
+ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system flashinfer-cubin==${FLASHINFER_VERSION} \
-    && uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-    && flashinfer show-config
+    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
+    cd /tmp/flashinfer && \
+    # Install the main flashinfer package
+    uv pip install --system -v . && \
+    # Build and install flashinfer-cubin
+    cd /tmp/flashinfer/flashinfer-cubin && \
+    uv pip install --system build && \
+    python -m build --no-isolation --wheel && \
+    uv pip install --system dist/*.whl && \
+    # Build and install flashinfer-jit-cache
+    cd /tmp/flashinfer/flashinfer-jit-cache && \
+    python -m build --no-isolation --wheel && \
+    uv pip install --system dist/*.whl && \
+    # Cleanup
+    rm -rf /tmp/flashinfer && \
+    flashinfer show-config
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
