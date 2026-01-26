@@ -495,29 +495,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Install FlashInfer from CentML fork (source build with AOT kernels)
 # https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
 # https://docs.flashinfer.ai/installation.html
-ARG CUDA_VERSION
 ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
 ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 RUN --mount=type=cache,target=/root/.cache/uv \
     # Set CUDA arch list based on CUDA version
-    if [[ "${CUDA_VERSION}" == 11.* ]]; then \
-        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9"; \
-    elif [[ "${CUDA_VERSION}" == 12.[0-7]* ]]; then \
-        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a"; \
-    elif [[ "${CUDA_VERSION}" == 12.[8-9]* ]]; then \
-        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0"; \
-    else \
-        FI_TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0f 12.0"; \
-    fi && \
     # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
-    # Set environment for build
-    export UV_TORCH_BACKEND=cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
-    export TORCH_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}" && \
-    export FLASHINFER_CUDA_ARCH_LIST="${FI_TORCH_CUDA_ARCH_LIST}" && \
-    python3 -m flashinfer.aot && \
     uv pip install --system --no-build-isolation --force-reinstall -v . && \
+    uv pip install --system nvidia-nvshmem-cu12 && \
+    cd flashinfer-cubin && \
+    uv build --no-build-isolation --wheel . && \
+    uv pip install --system dist/*.whl &&  \
+    export FLASHINFER_CUDA_ARCH_LIST=="10.0a 10.0f 12.0"; \
+    cd flashinfer-jit-cache && \
+    uv build --no-build-isolation --wheel . && \
+    uv pip install --system dist/*.whl && \
     rm -rf /tmp/flashinfer && \
     flashinfer show-config
 
