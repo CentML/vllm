@@ -507,7 +507,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cd flashinfer-cubin && \
     uv build --no-build-isolation --wheel . && \
     uv pip install --system dist/*.whl &&  \
-    export FLASHINFER_CUDA_ARCH_LIST="13.0"; \
+    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 12.0"; \
     cd flashinfer-jit-cache && \
     uv build --no-build-isolation --wheel . && \
     uv pip install --system dist/*.whl && \
