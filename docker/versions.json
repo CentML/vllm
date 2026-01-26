@@ -49,12 +49,6 @@
     "vllm_target_device": {
       "default": "cuda"
     },
-    "FLASHINFER_REPO": {
-      "default": "https://github.com/CentML/flashinfer.git"
-    },
-    "FLASHINFER_BRANCH": {
-      "default": "mlperf-inf-mm-q3vl-v6.0"
-    },
     "DEEPGEMM_GIT_REF": {
       "default": "594953acce41793ae00a1233eb516044d604bcb6"
     },
@@ -63,6 +57,12 @@
     },
     "DEEPEP_COMMIT_HASH": {
       "default": "73b6ea4"
+    },
+    "FLASHINFER_REPO": {
+      "default": "https://github.com/CentML/flashinfer.git"
+    },
+    "FLASHINFER_BRANCH": {
+      "default": "mlperf-inf-mm-q3vl-v6.0"
     },
     "GIT_REPO_CHECK": {
       "default": "0"
