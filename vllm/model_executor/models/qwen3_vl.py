@@ -51,8 +51,7 @@ from transformers.video_utils import VideoMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
-from vllm.distributed import get_pp_group
-from vllm.distributed import parallel_state
+from vllm.distributed import get_pp_group, parallel_state
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.conv import Conv3dLayer
@@ -252,7 +251,7 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
-        sequence_lengths: torch.Tensor, # Only used for FlashInfer CuDNN backend
+        sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -575,15 +574,25 @@ class Qwen3_VisionTransformer(nn.Module):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
 
-    def add_padding_to_fi_seqlens(self, seq: np.ndarray, batch_size: int, padding_value: int) -> np.ndarray:
+    def add_padding_to_fi_seqlens(
+        self, seq: np.ndarray, batch_size: int, padding_value: int
+    ) -> np.ndarray:
         batch_size_padded = next(
             (b for b in BATCH_BUCKETS if b >= batch_size), BATCH_BUCKETS[-1]
         )
         if batch_size_padded == batch_size:
             return seq
-        return np.concatenate([seq, np.full((batch_size_padded - batch_size, ), padding_value, dtype=seq.dtype)])
+        return np.concatenate(
+            [
+                seq,
+                np.full(
+                    (batch_size_padded - batch_size,), padding_value, dtype=seq.dtype
+                ),
+            ]
+        )
 
-    def compute_flashinfer_cu_seqlens(self,
+    def compute_flashinfer_cu_seqlens(
+        self,
         cu_seqlens: np.ndarray,
         rotary_pos_emb_cos: torch.Tensor | None = None,
         rotary_pos_emb_sin: torch.Tensor | None = None,
@@ -597,9 +606,15 @@ class Qwen3_VisionTransformer(nn.Module):
             cu_seqlens_qk = cu_seqlens * 3
         cu_seqlens_v = cu_seqlens * 3
         cu_seqlens_o = cu_seqlens
-        cu_seqlens_qk = self.add_padding_to_fi_seqlens(cu_seqlens_qk, batch_size, cu_seqlens_qk[-1])
-        cu_seqlens_v = self.add_padding_to_fi_seqlens(cu_seqlens_v, batch_size, cu_seqlens_v[-1])
-        cu_seqlens_o = self.add_padding_to_fi_seqlens(cu_seqlens_o, batch_size, cu_seqlens_o[-1])
+        cu_seqlens_qk = self.add_padding_to_fi_seqlens(
+            cu_seqlens_qk, batch_size, cu_seqlens_qk[-1]
+        )
+        cu_seqlens_v = self.add_padding_to_fi_seqlens(
+            cu_seqlens_v, batch_size, cu_seqlens_v[-1]
+        )
+        cu_seqlens_o = self.add_padding_to_fi_seqlens(
+            cu_seqlens_o, batch_size, cu_seqlens_o[-1]
+        )
         return np.concatenate([cu_seqlens_qk, cu_seqlens_v, cu_seqlens_o])
 
     def forward(
@@ -627,14 +642,20 @@ class Qwen3_VisionTransformer(nn.Module):
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
         sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if self.attn_backend == AttentionBackendEnum.FLASHINFER:
-            sequence_lengths = self.add_padding_to_fi_seqlens(sequence_lengths, len(sequence_lengths), 0)
-            cu_seqlens = self.compute_flashinfer_cu_seqlens(cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin)
+            sequence_lengths = self.add_padding_to_fi_seqlens(
+                sequence_lengths, len(sequence_lengths), 0
+            )
+            cu_seqlens = self.compute_flashinfer_cu_seqlens(
+                cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
         cu_seqlens = torch.from_numpy(cu_seqlens)
         sequence_lengths = torch.from_numpy(sequence_lengths)
         hidden_states = hidden_states.unsqueeze(1)
-        max_seqlen = torch.tensor(128 * 1024, device=self.device) \
-            if self.attn_backend == AttentionBackendEnum.FLASHINFER \
+        max_seqlen = (
+            torch.tensor(128 * 1024, device=self.device)
+            if self.attn_backend == AttentionBackendEnum.FLASHINFER
             else self.compute_attn_mask_seqlen(cu_seqlens)
+        )
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
 

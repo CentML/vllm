@@ -368,7 +368,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
-        sequence_lengths: torch.Tensor, # Only used for FlashInfer CuDNN backend
+        sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)

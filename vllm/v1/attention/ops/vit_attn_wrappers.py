@@ -263,6 +263,7 @@ def vit_torch_sdpa_wrapper(
 ) -> torch.Tensor:
     return torch.ops.vllm.torch_sdpa_wrapper(q, k, v, scale, cu_seqlens)
 
+
 def flashinfer_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -283,7 +284,7 @@ def flashinfer_wrapper(
 
     assert len(cu_seqlens) % 3 == 0, "cu_seqlens must be divisible by 3"
     cu_seqlength = len(cu_seqlens) // 3
-    batch_offsets_qk = cu_seqlens[: cu_seqlength].view(-1, 1, 1, 1)
+    batch_offsets_qk = cu_seqlens[:cu_seqlength].view(-1, 1, 1, 1)
     batch_offsets_v = cu_seqlens[cu_seqlength : cu_seqlength * 2].view(-1, 1, 1, 1)
     batch_offsets_o = cu_seqlens[cu_seqlength * 2 :].view(-1, 1, 1, 1)
     sequence_lengths = sequence_lengths.view(-1, 1, 1, 1)
