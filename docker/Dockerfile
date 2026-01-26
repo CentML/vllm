@@ -504,13 +504,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     cd /tmp/flashinfer && \
     uv pip install --system --no-build-isolation --force-reinstall -v . && \
     uv pip install --system nvidia-nvshmem-cu12 && \
-    cd flashinfer-cubin && \
-    uv build --no-build-isolation --wheel . && \
-    uv pip install --system dist/*.whl &&  \
-    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 12.0"; \
-    cd flashinfer-jit-cache && \
-    uv build --no-build-isolation --wheel . && \
-    uv pip install --system dist/*.whl && \
+    # Build flashinfer-cubin (subshell isolates cd)
+    (cd flashinfer-cubin && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
+    # Build flashinfer-jit-cache (subshell isolates cd)
+    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 12.0" && \
+    (cd flashinfer-jit-cache && \
+        uv build --no-build-isolation --wheel . && \
+        uv pip install --system dist/*.whl) && \
     rm -rf /tmp/flashinfer && \
     flashinfer show-config
 
