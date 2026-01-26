@@ -508,11 +508,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     # Build and install flashinfer-cubin
     cd /tmp/flashinfer/flashinfer-cubin && \
     uv pip install --system build && \
-    python -m build --no-isolation --wheel && \
+    python3 -m build --no-isolation --wheel && \
     uv pip install --system dist/*.whl && \
     # Build and install flashinfer-jit-cache
     cd /tmp/flashinfer/flashinfer-jit-cache && \
-    python -m build --no-isolation --wheel && \
+    python3 -m build --no-isolation --wheel && \
     uv pip install --system dist/*.whl && \
     # Cleanup
     rm -rf /tmp/flashinfer && \
