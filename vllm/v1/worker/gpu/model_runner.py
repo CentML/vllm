@@ -107,6 +107,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 hidden_size=self.inputs_embeds_size,
                 dtype=self.dtype,
                 device=self.device,
+                vllm_config=self.vllm_config,
             )
         self.uses_mrope = self.model_config.uses_mrope
         if self.uses_mrope:
@@ -424,6 +425,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if all("FLASHINFER" in b.get_name() for b in self.attn_backends.values()):
             self._dummy_run(self.max_num_tokens, skip_attn=False)
             torch.cuda.synchronize()
+
+        # Capture encoder CUDA graphs if enabled
+        if self.supports_mm_inputs:
+            self.encoder_runner.capture_encoder_cudagraphs(self.model)
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
         if scheduler_output.preempted_req_ids is not None:
