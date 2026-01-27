@@ -70,6 +70,18 @@
     "FLASHINFER_VERSION": {
       "default": "0.6.2"
     },
+    "FLASHINFER_REPO": {
+      "default": "https://github.com/CentML/flashinfer.git"
+    },
+    "FLASHINFER_BRANCH": {
+      "default": "zhanda-mlperf-try-latest"
+    },
+    "FLASHINFER_CUBIN_VERSION": {
+      "default": "0.6.2"
+    },
+    "FLASHINFER_JIT_CACHE_VERSION": {
+      "default": "0.6.2"
+    },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
     },

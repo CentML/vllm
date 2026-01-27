@@ -379,6 +379,7 @@ class CudaPlatformBase(Platform):
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.FLASH_ATTN,
+            AttentionBackendEnum.FLASHINFER,
         ]
 
     @classmethod

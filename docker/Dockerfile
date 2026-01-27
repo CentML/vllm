@@ -584,11 +584,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
 ARG FLASHINFER_VERSION=0.6.2
+# Install FlashInfer from CentML fork
+# https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
+ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
+ARG FLASHINFER_BRANCH=zhanda-mlperf-try-latest
+ARG FLASHINFER_CUBIN_VERSION=0.6.2
+ARG FLASHINFER_JIT_CACHE_VERSION=0.6.2
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system flashinfer-cubin==${FLASHINFER_VERSION} \
-    && uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
-    && flashinfer show-config
+    # Clone and build FlashInfer
+    git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
+    cd /tmp/flashinfer && \
+    uv pip install --system --no-build-isolation -v . && \
+    uv pip install --system flashinfer-cubin==${FLASHINFER_CUBIN_VERSION} && \
+    uv pip install --system flashinfer-jit-cache==${FLASHINFER_JIT_CACHE_VERSION} \
+    --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
+    rm -rf /tmp/flashinfer && \
+    flashinfer show-config
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
