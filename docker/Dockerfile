@@ -445,8 +445,6 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv \
         libibverbs-dev \
-        gcc \
-        g++ \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
@@ -501,22 +499,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # https://docs.flashinfer.ai/installation.html
 ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
 ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
+ARG FLASHINFER_CUBIN_VERSION=0.5.3
+ARG FLASHINFER_JIT_CACHE_VERSION=0.5.3
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system cmake ninja && \
     # Set CUDA arch list based on CUDA version
     # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
     uv pip install --system --no-build-isolation -v . && \
-    # Build flashinfer-cubin (subshell isolates cd)
-    (cd flashinfer-cubin && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
-    # Build flashinfer-jit-cache (subshell isolates cd)
-    export FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" && \
-    (cd flashinfer-jit-cache && \
-        uv build --no-build-isolation --wheel . && \
-        uv pip install --system dist/*.whl) && \
+    uv pip install --system flashinfer-cubin==${FLASHINFER_CUBIN_VERSION} && \
+    uv pip install --system flashinfer-jit-cache==${FLASHINFER_JIT_CACHE_VERSION} \
+    --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
     rm -rf /tmp/flashinfer && \
     flashinfer show-config
 

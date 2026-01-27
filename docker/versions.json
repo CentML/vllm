@@ -73,6 +73,12 @@
     "FLASHINFER_BRANCH": {
       "default": "mlperf-inf-mm-q3vl-v6.0"
     },
+    "FLASHINFER_CUBIN_VERSION": {
+      "default": "0.5.3"
+    },
+    "FLASHINFER_JIT_CACHE_VERSION": {
+      "default": "0.5.3"
+    },
     "GDRCOPY_CUDA_VERSION": {
       "default": "12.8"
     },
