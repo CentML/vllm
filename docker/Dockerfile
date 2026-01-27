@@ -304,7 +304,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
         ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
     find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
-
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -392,7 +391,6 @@ COPY requirements/dev.txt requirements/dev.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python3 -r requirements/dev.txt \
     --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
-
 #################### DEV IMAGE ####################
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
@@ -494,15 +492,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
     rm /tmp/requirements-cuda.txt /tmp/common.txt
 
-# Install FlashInfer from CentML fork (source build with AOT kernels)
+# Install FlashInfer from CentML fork
 # https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
-# https://docs.flashinfer.ai/installation.html
 ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
 ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 ARG FLASHINFER_CUBIN_VERSION=0.5.3
 ARG FLASHINFER_JIT_CACHE_VERSION=0.5.3
 RUN --mount=type=cache,target=/root/.cache/uv \
-    # Set CUDA arch list based on CUDA version
     # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
