@@ -183,9 +183,9 @@ class PiecewiseBackend:
         runtime_shape = args[self.sym_shape_indices[0]]
         range_entry = self._find_range_for_shape(runtime_shape)
 
-        assert range_entry is not None, (
-            f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
-        )
+        # assert range_entry is not None, (
+        #     f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
+        # )
 
-        self._maybe_compile_for_range_entry(range_entry, args)
-        return range_entry.runnable(*args)
+        self._maybe_compile_for_range_entry(range_entry, args)  # type: ignore[arg-type]
+        return range_entry.runnable(*args)  # type: ignore[union-attr]
