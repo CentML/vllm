@@ -438,6 +438,46 @@ class CompilationConfig:
     on selected platforms. Disabled by default until more models
     are supported/tested to work."""
 
+    # Encoder (ViT) CUDA graph settings
+    cudagraph_mm_encoder: bool = False
+    """Whether to enable CUDA graph capture for multimodal encoders (ViT).
+    When enabled, CUDA graphs are captured for the vision encoder to eliminate
+    kernel launch overhead. Requires fixed input sizes via bucketing.
+    Experimental feature - use with caution."""
+
+    encoder_cudagraph_bucket_sizes: list[int] | None = None
+    """Bucket sizes for encoder CUDA graph capture. Each size represents the
+    number of visual tokens (after spatial merge) to capture a graph for.
+    If None, auto-generates based on common image resolutions:
+    [64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]"""
+
+    encoder_cudagraph_grid_configs: list[tuple[int, int, int]] | None = None
+    """Grid configurations (T, H, W in patch units) to capture encoder CUDA
+    graphs for. Each tuple represents a specific image dimension configuration.
+    If None, uses default common configurations for Qwen-VL models.
+    Example: [(1, 16, 16), (1, 24, 24), (1, 32, 32)] for 448x448, 672x672,
+    and 896x896 images with patch_size=14 and merge_size=2."""
+
+    encoder_cudagraph_token_buckets: list[int] | str | None = None
+    """Token bucket sizes for encoder CUDA graphs with padding support.
+    Instead of requiring exact grid matches, inputs are padded to the smallest
+    bucket that fits. This trades some compute (padding overhead) for higher
+    CUDA graph utilization.
+
+    Can be a list of token counts or a preset name:
+    - "shopify_fine": [1024, 2048, 3072, 4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192, 8464]
+    - "shopify_medium": [1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 8464]
+    - "shopify_coarse": [2048, 4096, 6144, 8192, 8464]
+    - "shopify_single": [8464] (all images padded to max)
+
+    When set, overrides encoder_cudagraph_grid_configs."""
+
+    encoder_cudagraph_padded_mode: bool = True
+    """Whether to use padded execution for encoder CUDA graphs.
+    When True, inputs smaller than a captured bucket are padded to fit,
+    enabling higher CUDA graph hit rates at the cost of padding overhead.
+    When False, only exact grid matches use CUDA graphs."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
