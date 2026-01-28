@@ -220,6 +220,10 @@ class EncoderCudaGraphManager:
         self.input_buffers: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.output_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
 
+        # Cached pre-computed tensors for CUDA graph replay
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary embeddings, cu_seqlens, etc.
+        self.cached_tensors: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+
         # Store metadata about captured graphs
         self.captured_metadata: dict[tuple[int, int, int], dict[str, Any]] = {}
 
@@ -466,6 +470,10 @@ class EncoderCudaGraphManager:
         """
         Capture a CUDA graph for the given grid configuration.
 
+        This method pre-computes and caches all grid-dependent tensors
+        (position embeddings, rotary embeddings, cu_seqlens) to eliminate
+        CPU operations during CUDA graph replay.
+
         Args:
             grid_config: Tuple of (T, H, W) in patch units
             vision_encoder: The vision encoder module
@@ -490,29 +498,75 @@ class EncoderCudaGraphManager:
             "patch_input_channels": dummy_inputs["patch_input_channels"],
         }
 
-        # Warmup run (required before capture)
-        with torch.cuda.stream(torch.cuda.current_stream()):
-            warmup_output = vision_encoder(pixel_values, grid_thw=grid_thw)
+        # Check if vision encoder supports optimized CUDA graph forward
+        has_cudagraph_forward = hasattr(vision_encoder, 'forward_cudagraph') and \
+                                hasattr(vision_encoder, 'precompute_for_cudagraph')
 
-            # Allocate output buffer based on actual output shape
-            self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+        if has_cudagraph_forward:
+            # Pre-compute and cache all grid-dependent tensors
+            cached = vision_encoder.precompute_for_cudagraph(grid_thw)
+            self.cached_tensors[grid_config] = cached
+            logger.debug(
+                f"Pre-computed cached tensors for grid config {grid_config}: "
+                f"pos_embeds={cached['pos_embeds'].shape}, "
+                f"cu_seqlens={cached['cu_seqlens'].shape}"
+            )
 
-        torch.cuda.synchronize()
+            # Warmup run with cached tensors
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                warmup_output = vision_encoder.forward_cudagraph(
+                    pixel_values,
+                    pos_embeds=cached["pos_embeds"],
+                    rotary_pos_emb_cos=cached["rotary_pos_emb_cos"],
+                    rotary_pos_emb_sin=cached["rotary_pos_emb_sin"],
+                    cu_seqlens=cached["cu_seqlens"],
+                    max_seqlen=cached["max_seqlen"],
+                )
+                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
 
-        # Capture the graph
-        graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize()
 
-        # Get a fresh reference to the input buffer for capture
-        input_buffer = self.input_buffers[grid_config]["pixel_values"]
+            # Capture the graph with cached tensors
+            graph = torch.cuda.CUDAGraph()
+            input_buffer = self.input_buffers[grid_config]["pixel_values"]
 
-        with torch.cuda.graph(graph, pool=self.pool):
-            output = vision_encoder(input_buffer, grid_thw=grid_thw)
-            self.output_buffers[grid_config].copy_(output)
+            with torch.cuda.graph(graph, pool=self.pool):
+                output = vision_encoder.forward_cudagraph(
+                    input_buffer,
+                    pos_embeds=cached["pos_embeds"],
+                    rotary_pos_emb_cos=cached["rotary_pos_emb_cos"],
+                    rotary_pos_emb_sin=cached["rotary_pos_emb_sin"],
+                    cu_seqlens=cached["cu_seqlens"],
+                    max_seqlen=cached["max_seqlen"],
+                )
+                self.output_buffers[grid_config].copy_(output)
+        else:
+            # Fallback to original forward (will have CPU gaps)
+            logger.warning(
+                f"Vision encoder does not support forward_cudagraph, "
+                f"using standard forward (will have CPU gaps)"
+            )
+
+            # Warmup run (required before capture)
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                warmup_output = vision_encoder(pixel_values, grid_thw=grid_thw)
+                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+
+            torch.cuda.synchronize()
+
+            # Capture the graph
+            graph = torch.cuda.CUDAGraph()
+            input_buffer = self.input_buffers[grid_config]["pixel_values"]
+
+            with torch.cuda.graph(graph, pool=self.pool):
+                output = vision_encoder(input_buffer, grid_thw=grid_thw)
+                self.output_buffers[grid_config].copy_(output)
 
         self.graphs[grid_config] = graph
         logger.debug(
             f"Captured encoder CUDA graph for grid config {grid_config} "
             f"-> {dummy_inputs['num_output_tokens']} output tokens"
+            f"{' (with cached tensors)' if has_cudagraph_forward else ''}"
         )
 
     @torch.inference_mode()
