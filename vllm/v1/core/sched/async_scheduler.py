@@ -21,15 +21,28 @@ class AsyncScheduler(Scheduler):
             pending_structured_output_tokens |= (
                 request.use_structured_output and request.num_output_placeholders > 0
             )
+            
+            # FIX: Only increment placeholders for single-token decode steps
+            # where we're certain a new token will be generated. This prevents
+            # the race condition where placeholders are incremented before outputs
+            # arrive, causing the scheduler to schedule single-token batches.
+            # See: https://github.com/vllm-project/vllm/issues/XXXXX
+            num_tokens_scheduled = scheduler_output.num_scheduled_tokens[req_id]
             cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+            
+            # Only increment placeholders if:
+            # 1. This is a single-token decode step (not chunked prefill)
+            # 2. The request is past the prefill phase
+            # 3. We scheduled exactly 1 token (+ speculative tokens)
             if (
-                request.num_computed_tokens
+                num_tokens_scheduled == 1 + cur_num_spec_tokens
+                and request.num_computed_tokens >= request.num_prompt_tokens
+                and request.num_computed_tokens
                 == request.num_tokens
                 + request.num_output_placeholders
                 + cur_num_spec_tokens
             ):
-                # The request will generate a new token plus num_spec_tokens
-                # in this scheduling step.
+                # This is a decode step that will generate exactly one new token
                 request.num_output_placeholders += 1 + cur_num_spec_tokens
                 # Add placeholders for the new tokens in spec_token_ids.
                 # We will update the actual spec token ids in the worker process.
