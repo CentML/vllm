@@ -145,6 +145,76 @@ SHOPIFY_TOKEN_BUCKETS_SINGLE = [
     8464,   # All images padded to max
 ]
 
+# =============================================================================
+# OPTIMIZED GRID-ALIGNED TOKEN BUCKETS
+# =============================================================================
+# These buckets are perfect squares (n^2) which align exactly with actual grid
+# token counts. This eliminates any mismatch between bucket size and the tokens
+# produced by the grid configuration.
+#
+# Formula: tokens = (side / merge_size)^2 where side must be even
+# So valid token counts are: 16, 36, 64, 100, 144, 196, 256, 324, 400, 484, 576...
+#
+# Analysis on Shopify dataset (12,754 samples):
+#   - Token range: 63-8161
+#   - P5=4170, P50=6072, P95=8005
+#   - 96% of images have 4000-8200 tokens
+#
+# Comparison with previous presets:
+#   - shopify_coarse (5 buckets): 13.3% padding waste
+#   - shopify_medium (9 buckets): 7.3% padding waste
+#   - shopify_fine (13 buckets): 4.1% padding waste
+#   - optimized (10 buckets): 5.0% padding waste <- better efficiency per bucket
+
+# Optimized buckets for main distribution (4000-8500 tokens, 96% of dataset)
+# 10 buckets with 5.0% padding waste
+SHOPIFY_TOKEN_BUCKETS_OPTIMIZED = [
+    4096,   # 64^2, grid (1,128,128) - covers up to 4096 tokens
+    4489,   # 67^2, grid (1,134,134) - covers 4097-4489
+    4900,   # 70^2, grid (1,140,140) - covers 4490-4900
+    5329,   # 73^2, grid (1,146,146) - covers 4901-5329
+    5776,   # 76^2, grid (1,152,152) - covers 5330-5776
+    6241,   # 79^2, grid (1,158,158) - covers 5777-6241
+    6724,   # 82^2, grid (1,164,164) - covers 6242-6724
+    7225,   # 85^2, grid (1,170,170) - covers 6725-7225
+    7744,   # 88^2, grid (1,176,176) - covers 7226-7744
+    8464,   # 92^2, grid (1,184,184) - covers 7745-8464 (max)
+]
+
+# Full range including small images (adds 6 buckets for <4096 tokens)
+# 16 buckets with 4.2% padding waste
+SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_FULL = [
+    # Small images (<4% of dataset)
+    256,    # 16^2, grid (1,32,32)
+    576,    # 24^2, grid (1,48,48)
+    1024,   # 32^2, grid (1,64,64)
+    1600,   # 40^2, grid (1,80,80)
+    2304,   # 48^2, grid (1,96,96)
+    3136,   # 56^2, grid (1,112,112)
+    # Main distribution (96% of dataset)
+    4096,   # 64^2, grid (1,128,128)
+    4489,   # 67^2, grid (1,134,134)
+    4900,   # 70^2, grid (1,140,140)
+    5329,   # 73^2, grid (1,146,146)
+    5776,   # 76^2, grid (1,152,152)
+    6241,   # 79^2, grid (1,158,158)
+    6724,   # 82^2, grid (1,164,164)
+    7225,   # 85^2, grid (1,170,170)
+    7744,   # 88^2, grid (1,176,176)
+    8464,   # 92^2, grid (1,184,184)
+]
+
+# Compact optimized (6 buckets, ~6.5% padding waste)
+# Good balance between memory usage and padding overhead
+SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_COMPACT = [
+    4096,   # 64^2, grid (1,128,128)
+    5041,   # 71^2, grid (1,142,142)
+    5929,   # 77^2, grid (1,154,154)
+    6724,   # 82^2, grid (1,164,164)
+    7569,   # 87^2, grid (1,174,174)
+    8464,   # 92^2, grid (1,184,184)
+]
+
 
 def token_bucket_to_grid(token_bucket: int, merge_size: int = 2) -> tuple[int, int, int]:
     """
@@ -251,10 +321,15 @@ class EncoderCudaGraphManager:
             # Handle preset names for token buckets
             if isinstance(token_buckets, str):
                 bucket_presets = {
+                    # Legacy presets (non-grid-aligned)
                     "shopify_fine": SHOPIFY_TOKEN_BUCKETS_FINE,
                     "shopify_medium": SHOPIFY_TOKEN_BUCKETS_MEDIUM,
                     "shopify_coarse": SHOPIFY_TOKEN_BUCKETS_COARSE,
                     "shopify_single": SHOPIFY_TOKEN_BUCKETS_SINGLE,
+                    # Optimized grid-aligned presets (recommended)
+                    "optimized": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED,
+                    "optimized_full": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_FULL,
+                    "optimized_compact": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_COMPACT,
                 }
                 if token_buckets in bucket_presets:
                     buckets = bucket_presets[token_buckets]
