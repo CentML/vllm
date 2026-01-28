@@ -712,6 +712,112 @@ class Qwen3_VisionTransformer(nn.Module):
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
 
+    def forward_cudagraph(
+        self,
+        x: torch.Tensor,
+        pos_embeds: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass optimized for CUDA graph capture/replay.
+
+        This method accepts pre-computed position embeddings, rotary embeddings,
+        and cumulative sequence lengths to avoid CPU operations during CUDA graph
+        replay. All tensor arguments must be on the correct device.
+
+        Args:
+            x: Input pixel values [num_patches, patch_channels]
+            pos_embeds: Pre-computed position embeddings [num_patches, hidden_size]
+            rotary_pos_emb_cos: Pre-computed rotary cosine embeddings
+            rotary_pos_emb_sin: Pre-computed rotary sine embeddings
+            cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
+            max_seqlen: Pre-computed max sequence length (scalar tensor on GPU)
+
+        Returns:
+            Vision encoder output tensor
+        """
+        # Patch embedding (GPU operation)
+        hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_states = self.patch_embed(hidden_states)
+
+        # Add pre-computed position embeddings
+        hidden_states = hidden_states + pos_embeds
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        # Run through transformer blocks with pre-computed values
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
+                    hidden_states
+                )
+                deepstack_feature_lists.append(deepstack_feature)
+
+        hidden_states = self.merger(hidden_states)
+        hidden_states = torch.cat(
+            [hidden_states] + deepstack_feature_lists, dim=1
+        )
+        return hidden_states
+
+    def precompute_for_cudagraph(
+        self,
+        grid_thw: list[list[int]],
+    ) -> dict[str, torch.Tensor]:
+        """
+        Pre-compute all grid-dependent tensors for CUDA graph capture.
+
+        This method computes position embeddings, rotary embeddings, and
+        cumulative sequence lengths that are fixed for a given grid configuration.
+        These can be cached and reused during CUDA graph replay.
+
+        Args:
+            grid_thw: List of [T, H, W] for each image
+
+        Returns:
+            Dict containing pre-computed tensors:
+            - pos_embeds: Position embeddings
+            - rotary_pos_emb_cos: Rotary cosine embeddings
+            - rotary_pos_emb_sin: Rotary sine embeddings
+            - cu_seqlens: Cumulative sequence lengths (on GPU)
+            - max_seqlen: Maximum sequence length (scalar tensor on GPU)
+        """
+        # Compute position embeddings
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # Compute rotary embeddings
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
+
+        # Compute cumulative sequence lengths
+        grid_thw_np = np.array(grid_thw, dtype=np.int32)
+        cu_seqlens = np.repeat(
+            grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
+        ).cumsum(axis=0, dtype=np.int32)
+        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+
+        # Compute max sequence length
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+
+        return {
+            "pos_embeds": pos_embeds,
+            "rotary_pos_emb_cos": rotary_pos_emb_cos,
+            "rotary_pos_emb_sin": rotary_pos_emb_sin,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+        }
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
