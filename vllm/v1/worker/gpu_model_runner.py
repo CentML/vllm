@@ -159,6 +159,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -425,6 +426,11 @@ class GPUModelRunner(
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Encoder CUDA graph manager for ViT
+        self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
+        self.encoder_cudagraph_padded_mode: bool = True
+        self._init_encoder_cudagraph_manager()
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -679,6 +685,43 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
+
+    def _init_encoder_cudagraph_manager(self) -> None:
+        """Initialize encoder CUDA graph manager if enabled in config."""
+        if self.compilation_config is None:
+            return
+
+        if not getattr(self.compilation_config, 'cudagraph_mm_encoder', False):
+            return
+
+        bucket_sizes = getattr(
+            self.compilation_config,
+            'encoder_cudagraph_bucket_sizes',
+            None
+        )
+
+        # Check if padded mode is enabled
+        self.encoder_cudagraph_padded_mode = getattr(
+            self.compilation_config,
+            'encoder_cudagraph_padded_mode',
+            True  # Default to padded mode for better CUDA graph utilization
+        )
+
+        self.encoder_cudagraph_manager = EncoderCudaGraphManager(
+            vllm_config=self.vllm_config,
+            device=self.device,
+            dtype=self.dtype,
+            bucket_sizes=bucket_sizes,
+        )
+
+        # Log configuration
+        grid_configs = self.encoder_cudagraph_manager.grid_configs
+        logger.info(
+            "Encoder CUDA graph manager initialized: "
+            f"padded_mode={self.encoder_cudagraph_padded_mode}, "
+            f"num_grids={len(grid_configs)}, "
+            f"grids={grid_configs}"
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -2303,14 +2346,26 @@ class GPUModelRunner(
 
                 curr_group_outputs = curr_group_outputs_lst
             else:
-                # Run the encoder.
-                # `curr_group_outputs` is either of the following:
-                # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                # in case feature_size is fixed across all multimodal items.
-                # 2. A list or tuple (length: num_items) of tensors,
-                # each of shape (feature_size, hidden_size) in case the feature
-                # size is dynamic depending on the input multimodal items.
-                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                # Try to use CUDA graph if available
+                cudagraph_result = None
+                if self.encoder_cudagraph_manager is not None:
+                    cudagraph_result = self._execute_with_encoder_cudagraph(
+                        model, mm_kwargs_group, modality, num_items
+                    )
+
+                if cudagraph_result is not None:
+                    # CUDA graph was used successfully
+                    curr_group_outputs = cudagraph_result
+                else:
+                    # Fall back to eager mode.
+                    # Run the encoder.
+                    # `curr_group_outputs` is either of the following:
+                    # 1. A tensor of shape (num_items, feature_size, hidden_size)
+                    # in case feature_size is fixed across all multimodal items.
+                    # 2. A list or tuple (length: num_items) of tensors,
+                    # each of shape (feature_size, hidden_size) in case the feature
+                    # size is dynamic depending on the input multimodal items.
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -2325,6 +2380,108 @@ class GPUModelRunner(
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
         return encoder_outputs
+
+    def _execute_with_encoder_cudagraph(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+        num_items: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Execute the encoder using CUDA graphs if a matching graph is available.
+
+        Supports two modes:
+        1. Exact match: Only use CUDA graph if grid_thw exactly matches
+        2. Padded mode: Pad inputs to fit the smallest available bucket
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+            num_items: Number of items in the batch
+
+        Returns:
+            List of encoder outputs if CUDA graph was used, None otherwise
+        """
+        if self.encoder_cudagraph_manager is None:
+            return None
+
+        # Only support image/video modalities
+        if modality not in ("image", "video"):
+            return None
+
+        # Extract grid_thw from kwargs
+        grid_thw = mm_kwargs_group.get("image_grid_thw") or mm_kwargs_group.get(
+            "video_grid_thw"
+        )
+        if grid_thw is None:
+            return None
+
+        # Convert to list if tensor
+        if hasattr(grid_thw, "tolist"):
+            grid_thw = grid_thw.tolist()
+
+        # Currently only supports single-image batches for CUDA graph
+        if len(grid_thw) != 1:
+            logger.debug(
+                "Encoder CUDA graph only supports single-image batches, "
+                f"got {len(grid_thw)} images. Using eager mode."
+            )
+            return None
+
+        # Extract pixel_values
+        if modality == "image":
+            pixel_values = mm_kwargs_group.get("pixel_values")
+        else:  # video
+            pixel_values = mm_kwargs_group.get("pixel_values_videos")
+
+        if pixel_values is None:
+            logger.debug("No pixel_values found in kwargs. Using eager mode.")
+            return None
+
+        # Ensure pixel_values is on the correct device
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
+
+        # Get spatial merge size for token calculations
+        spatial_merge_size = getattr(model.visual, 'spatial_merge_size', 2)
+        t, h, w = grid_thw[0]
+        num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+
+        # Try exact match first
+        grid_key = self.encoder_cudagraph_manager.get_graph_for_grid(grid_thw)
+        if grid_key is not None:
+            # Exact match found - try to run
+            output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
+            if output is not None:
+                logger.debug(
+                    f"Encoder CUDA graph exact match for grid {grid_key}, "
+                    f"output: {output.shape}"
+                )
+                return [output[:num_output_tokens]]
+
+        # Try padded execution if enabled
+        if self.encoder_cudagraph_padded_mode:
+            result = self.encoder_cudagraph_manager.run_padded(
+                pixel_values,
+                grid_thw,
+                num_output_tokens,
+                spatial_merge_size,
+            )
+            if result is not None:
+                output, padding_waste = result
+                logger.debug(
+                    f"Encoder CUDA graph padded execution: "
+                    f"{num_output_tokens} tokens, waste={padding_waste}"
+                )
+                return [output]
+
+        # No CUDA graph available
+        logger.debug(
+            f"No encoder CUDA graph for grid {grid_thw[0]} "
+            f"(padded_mode={self.encoder_cudagraph_padded_mode}). Using eager mode."
+        )
+        return None
 
     def _gather_mm_embeddings(
         self,
@@ -4797,6 +4954,11 @@ class GPUModelRunner(
         set_cudagraph_capturing_enabled(True)
         with freeze_gc(), graph_capture(device=self.device):
             start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+
+            # Capture encoder CUDA graphs first (if enabled)
+            if self.encoder_cudagraph_manager is not None:
+                self._capture_encoder_cudagraphs()
+
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
 
@@ -4868,6 +5030,24 @@ class GPUModelRunner(
             scope="local",
         )
         return cuda_graph_size
+
+    def _capture_encoder_cudagraphs(self) -> None:
+        """Capture CUDA graphs for the vision encoder."""
+        if self.encoder_cudagraph_manager is None:
+            return
+
+        model = self.model
+        if not hasattr(model, 'visual') or model.visual is None:
+            logger.warning(
+                "Model does not have a visual encoder, "
+                "skipping encoder CUDA graph capture"
+            )
+            return
+
+        self.encoder_cudagraph_manager.capture(
+            vision_encoder=model.visual,
+            embed_multimodal_fn=model.embed_multimodal,
+        )
 
     def _capture_cudagraphs(
         self,
