@@ -268,6 +268,18 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+
+        # DEBUG: Log initial state
+        logger.debug(
+            "[SCHED_DEBUG] === Schedule step start === "
+            "token_budget=%d, num_running=%d, num_waiting=%d, "
+            "max_num_running_reqs=%d, kv_cache_usage=%.2f%%",
+            token_budget,
+            len(self.running),
+            len(self.waiting),
+            self.max_num_running_reqs,
+            self.kv_cache_manager.usage * 100,
+        )
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -305,19 +317,36 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
+            num_new_tokens_raw = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            num_new_tokens = num_new_tokens_raw
+            limit_reason = "none"
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+                limit_reason = "long_prefill_threshold"
+            if num_new_tokens > token_budget:
+                num_new_tokens = token_budget
+                limit_reason = "token_budget"
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+            max_model_len_limit = self.max_model_len - 1 - request.num_computed_tokens
+            if num_new_tokens > max_model_len_limit:
+                num_new_tokens = max_model_len_limit
+                limit_reason = "max_model_len"
+
+            logger.debug(
+                "[SCHED_DEBUG] Running req %s: raw_tokens=%d, scheduled=%d, "
+                "limit_reason=%s, token_budget=%d, num_computed=%d",
+                request.request_id[:8],
+                num_new_tokens_raw,
+                num_new_tokens,
+                limit_reason,
+                token_budget,
+                request.num_computed_tokens,
             )
 
             # Schedule encoder inputs.
@@ -351,6 +380,13 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                logger.debug(
+                    "[SCHED_DEBUG] Running req %s: SKIPPED (num_new_tokens=0), "
+                    "encoder_budget=%d, has_encoder_inputs=%s",
+                    request.request_id[:8],
+                    encoder_compute_budget,
+                    request.has_encoder_inputs,
+                )
                 req_index += 1
                 continue
 
@@ -402,12 +438,27 @@ class Scheduler(SchedulerInterface):
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
+                    logger.debug(
+                        "[SCHED_DEBUG] Preempted req %s to free KV cache",
+                        preempted_req.request_id[:8],
+                    )
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
+                        logger.debug(
+                            "[SCHED_DEBUG] Running req %s: preempted self, \
+                            no more to preempt",
+                            request.request_id[:8],
+                        )
                         break
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                logger.debug(
+                    "[SCHED_DEBUG] Running req %s: BREAK (KV cache allocation failed "
+                    "after preemption), kv_usage=%.2f%%",
+                    request.request_id[:8],
+                    self.kv_cache_manager.usage * 100,
+                )
                 break
 
             # Schedule the request.
@@ -465,9 +516,23 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        logger.debug(
+            "[SCHED_DEBUG] --- Waiting queue scheduling --- "
+            "preempted=%d, token_budget=%d, num_waiting=%d, "
+            "num_running=%d, max_running=%d",
+            len(preempted_reqs),
+            token_budget,
+            len(self.waiting),
+            len(self.running),
+            self.max_num_running_reqs,
+        )
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    logger.debug(
+                        "[SCHED_DEBUG] BREAK: max_num_running_reqs reached (%d)",
+                        self.max_num_running_reqs,
+                    )
                     break
 
                 request = self.waiting.peek_request()
@@ -565,15 +630,22 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                    logger.debug(
+                        "[SCHED_DEBUG] Waiting req %s: async KV load, num_new_tokens=0",
+                        request.request_id[:8],
+                    )
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    num_new_tokens_raw = request.num_tokens - num_computed_tokens
+                    num_new_tokens = num_new_tokens_raw
+                    limit_reason = "none"
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                        limit_reason = "long_prefill_threshold"
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -583,13 +655,37 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        logger.debug(
+                            "[SCHED_DEBUG] Waiting req %s: \
+                            BREAK (chunked_prefill disabled, "
+                            "need %d tokens but budget=%d)",
+                            request.request_id[:8],
+                            num_new_tokens,
+                            token_budget,
+                        )
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if num_new_tokens > token_budget:
+                        num_new_tokens = token_budget
+                        limit_reason = "token_budget"
                     assert num_new_tokens > 0
+
+                    logger.debug(
+                        "[SCHED_DEBUG] Waiting req %s: raw_tokens=%d, scheduled=%d, "
+                        "limit_reason=%s, token_budget=%d, num_computed=%d, "
+                        "req.num_tokens=%d",
+                        request.request_id[:8],
+                        num_new_tokens_raw,
+                        num_new_tokens,
+                        limit_reason,
+                        token_budget,
+                        num_computed_tokens,
+                        request.num_tokens,
+                    )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
+                        num_new_tokens_before_encoder = num_new_tokens
                         (
                             encoder_inputs_to_schedule,
                             num_new_tokens,
@@ -602,8 +698,22 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
                         )
+                        if num_new_tokens != num_new_tokens_before_encoder:
+                            logger.debug(
+                                "[SCHED_DEBUG] Waiting req %s: encoder limited tokens "
+                                "%d -> %d, encoder_budget=%d",
+                                request.request_id[:8],
+                                num_new_tokens_before_encoder,
+                                num_new_tokens,
+                                encoder_compute_budget,
+                            )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            logger.debug(
+                                "[SCHED_DEBUG] Waiting req %s: \
+                                BREAK (encoder returned 0 tokens)",
+                                request.request_id[:8],
+                            )
                             break
 
                 # Handles an edge case when P/D Disaggregation
@@ -634,6 +744,14 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    logger.debug(
+                        "[SCHED_DEBUG] Waiting req %s: \
+                        BREAK (KV cache allocation failed), "
+                        "kv_usage=%.2f%%, num_new_tokens=%d",
+                        request.request_id[:8],
+                        self.kv_cache_manager.usage * 100,
+                        num_new_tokens,
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -710,6 +828,27 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+
+        # DEBUG: Log final summary
+        logger.debug(
+            "[SCHED_DEBUG] === Schedule step end === "
+            "total_scheduled=%d/%d (%.1f%%), remaining_budget=%d, "
+            "new_reqs=%d, resumed=%d, running_scheduled=%d, preempted=%d, "
+            "final_running=%d, final_waiting=%d, kv_usage=%.2f%%",
+            total_num_scheduled_tokens,
+            self.max_num_scheduled_tokens,
+            100.0 * total_num_scheduled_tokens / self.max_num_scheduled_tokens
+            if self.max_num_scheduled_tokens > 0
+            else 0,
+            token_budget,
+            len(scheduled_new_reqs),
+            len(scheduled_resumed_reqs),
+            len(scheduled_running_reqs),
+            len(preempted_reqs),
+            len(self.running),
+            len(self.waiting),
+            self.kv_cache_manager.usage * 100,
+        )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
