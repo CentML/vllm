@@ -52,6 +52,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             QuickAllReduce,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+        from vllm.distributed.device_communicators.trtllm_all_reduce import (
+            TRTLLMAllReduce,
+        )
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
@@ -65,8 +68,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
+        self.mnnvl_comm: TRTLLMAllReduce | None = None
+
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+
+        # Initialize MNNVL all-reduce for multi-node NVLINK setups
+        # Workspace will be created lazily on first use
+        if use_custom_allreduce and self.world_size > 1:
+            self.mnnvl_comm = TRTLLMAllReduce(
                 group=self.cpu_group,
                 device=self.device,
             )
@@ -136,7 +149,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
                 return out
-        # always try quick reduce first, then custom allreduce,
+        # always try quick reduce first, then mnnvl, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         qr_comm = self.qr_comm
         if (
@@ -145,6 +158,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and qr_comm.should_quick_allreduce(input_)
         ):
             out = qr_comm.quick_all_reduce(input_)
+            assert out is not None
+            return out
+        # Try MNNVL all-reduce for multi-node NVLINK setups
+        mnnvl_comm = self.mnnvl_comm
+        if (
+            mnnvl_comm is not None
+            and not mnnvl_comm.disabled
+            and mnnvl_comm.should_use_mnnvl_ar(input_)
+        ):
+            out = mnnvl_comm.all_reduce(input_)
             assert out is not None
             return out
         ca_comm = self.ca_comm
@@ -270,6 +293,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.mnnvl_comm is not None:
+            self.mnnvl_comm.destroy()
+            self.mnnvl_comm = None
         if self.all2all_manager is not None:
             self.all2all_manager.destroy()
             self.all2all_manager = None
