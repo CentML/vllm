@@ -689,7 +689,15 @@ class SpeculativeConfig:
                 f"{self.disable_by_batch_size=}"
             )
 
-        eagle3_target_supported = ["llama", "qwen", "minicpm", "gpt_oss", "nemotron_h"]
+        eagle3_target_supported = [
+            "llama",
+            "qwen",
+            "minicpm",
+            "gpt_oss",
+            "hunyuan_vl",
+            "hunyuan_v1_dense",
+            "nemotron_h",
+        ]
         if (
             self.method == "eagle3"
             and self.target_model_config
