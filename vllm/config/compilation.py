@@ -446,17 +446,16 @@ class CompilationConfig:
     Experimental feature - use with caution."""
 
     encoder_cudagraph_bucket_sizes: list[int] | None = None
-    """Bucket sizes for encoder CUDA graph capture. Each size represents the
-    number of visual tokens (after spatial merge) to capture a graph for.
-    If None, auto-generates based on common image resolutions:
-    [64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]"""
+    """Square grid side lengths for padded CUDA graph execution. Each size N
+    creates a bucket grid (1, N, N). Inputs with max(H, W) <= N are padded to
+    fit the bucket. Example: [32, 64, 94, 128, 188, 256, 312] captures grids
+    (1, 32, 32), (1, 64, 64), etc. Used with encoder_cudagraph_padded_mode=True."""
 
-    encoder_cudagraph_grid_configs: list[tuple[int, int, int]] | None = None
-    """Grid configurations (T, H, W in patch units) to capture encoder CUDA
-    graphs for. Each tuple represents a specific image dimension configuration.
-    If None, uses default common configurations for Qwen-VL models.
-    Example: [(1, 16, 16), (1, 24, 24), (1, 32, 32)] for 448x448, 672x672,
-    and 896x896 images with patch_size=14 and merge_size=2."""
+    encoder_cudagraph_grid_configs: list[tuple[int, int, int]] | str | None = None
+    """Grid configurations (T, H, W in patch units) for exact-match CUDA graph
+    capture. Can be a list of tuples or a preset name: "default", "custom",
+    "shopify", "shopify_rectangular". The "custom" preset contains top 30 grids
+    from MLPerf dataset (58.9% exact match coverage). If None, uses default."""
 
     encoder_cudagraph_token_buckets: list[int] | str | None = None
     """Token bucket sizes for encoder CUDA graphs with padding support.
@@ -474,8 +473,10 @@ class CompilationConfig:
 
     encoder_cudagraph_padded_mode: bool = True
     """Whether to use padded execution for encoder CUDA graphs.
-    When True, inputs smaller than a captured bucket are padded to fit,
-    enabling higher CUDA graph hit rates at the cost of padding overhead.
+    When True, inputs smaller than a captured bucket are padded to fit.
+    Padded: pixel_values, pos_embeds, rotary_embeds (with zeros).
+    NOT padded: cu_seqlens, max_seqlen (set to actual values so flash
+    attention only processes real tokens). Output is trimmed to actual size.
     When False, only exact grid matches use CUDA graphs."""
 
     # Inductor capture
