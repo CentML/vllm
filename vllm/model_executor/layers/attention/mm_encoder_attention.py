@@ -19,6 +19,15 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
 
 logger = init_logger(__name__)
 
+try:
+    from transformer_engine.common.recipe import DelayedScaling
+    from transformer_engine.pytorch import DotProductAttention, fp8_autocast
+except ImportError:
+    DotProductAttention = None
+    fp8_autocast = None
+    DelayedScaling = None
+    logger.warning("TransformerEngine is not installed.")
+
 
 # --8<-- [start:mm_encoder_attn]
 @CustomOp.register("mm_encoder_attn")
@@ -88,6 +97,23 @@ class MMEncoderAttention(CustomOp):
             get_flash_attn_version() if self.is_flash_attn_backend else None
         )
 
+        # Initialize Transformer Engine FP8 attention if backend is TE
+        self.te_attn_op = None
+        self.te_fp8_recipe = None
+        self.is_te_fp8_backend = (
+            self.attn_backend == AttentionBackendEnum.TE_FP8
+            if hasattr(AttentionBackendEnum, 'TE_FP8')
+            else False
+        )
+        
+        if self.is_te_fp8_backend:
+            if DotProductAttention is None:
+                raise ImportError(
+                    "TransformerEngine is not installed but TE_FP8 backend was selected"
+                )
+            self.te_fp8_recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
+            logger.info_once("Initialized FP8 Transformer Engine for MMEncoderAttention.")
+
         logger.info_once(f"Using {self.attn_backend} for MMEncoderAttention.")
 
     @classmethod
@@ -117,6 +143,25 @@ class MMEncoderAttention(CustomOp):
             value = torch.repeat_interleave(value, num_repeat, dim=2)
 
         return query, key, value
+
+    def _lazy_init_te_attn(
+        self,
+        num_attention_heads: int,
+        kv_channels: int,
+        num_gqa_groups: int | None,
+        attn_mask_type: str,
+        softmax_scale: float | None,
+    ) -> None:
+        """Lazily initialize Transformer Engine attention operator."""
+        if self.te_attn_op is None:
+            self.te_attn_op = DotProductAttention(
+                num_attention_heads,
+                kv_channels,
+                num_gqa_groups=num_gqa_groups,
+                attn_mask_type=attn_mask_type,
+                softmax_scale=softmax_scale,
+                qkv_format="bshd",  # batch, seq, heads, dim
+            )
 
     def _forward_sdpa(
         self,
@@ -185,6 +230,75 @@ class MMEncoderAttention(CustomOp):
         )
         if is_reshaped:
             output = output.reshape(bsz, q_len, -1)
+        return output
+
+    def _forward_te_fp8(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass using Transformer Engine FP8 attention.
+        
+        Input shape:
+        (batch_size x seq_len x hidden_size) or
+        (batch_size x seq_len x num_heads x head_size)
+        
+        Note: TE natively supports GQA, so we don't expand KV heads like other backends.
+        Note: Head dimension is padded to multiple of 16 for optimal performance.
+        """
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+        
+        # Reshape to 4D if needed, but don't expand KV heads for GQA
+        # TE handles GQA natively through num_gqa_groups parameter
+        if is_reshaped:
+            query = query.view(bsz, q_len, self.num_heads, self.head_size)
+            key = key.view(bsz, kv_len, self.num_kv_heads, self.head_size)
+            value = value.view(bsz, kv_len, self.num_kv_heads, self.head_size)
+        
+        # Pad head dimension to multiple of 16 for optimal performance
+        original_head_size = self.head_size
+        padded_head_size = ((self.head_size + 15) // 16) * 16
+        needs_padding = padded_head_size != original_head_size
+        
+        if needs_padding:
+            pad_size = padded_head_size - original_head_size
+            query = torch.nn.functional.pad(query, (0, pad_size))
+            key = torch.nn.functional.pad(key, (0, pad_size))
+            value = torch.nn.functional.pad(value, (0, pad_size))
+        
+        # For vision encoder attention, we typically don't need causal masking
+        attn_mask_type = "no_mask"
+        
+        # Determine GQA groups - TE will handle the GQA logic internally
+        num_gqa_groups = self.num_kv_heads if self.num_kv_heads != self.num_heads else None
+        
+        # Lazy initialization of TE attention operator
+        self._lazy_init_te_attn(
+            num_attention_heads=self.num_heads,
+            kv_channels=padded_head_size,
+            num_gqa_groups=num_gqa_groups,
+            attn_mask_type=attn_mask_type,
+            softmax_scale=self.scale,
+        )
+        
+        # Run attention with FP8 autocasting
+        # TE expects format: (batch, seq_len, num_heads, head_size)
+        with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
+            output = self.te_attn_op(
+                query, key, value, attention_mask=None
+            ).unflatten(-1, (-1, padded_head_size))
+        
+        # Remove padding from output if needed
+        if needs_padding:
+            output = output[..., :original_head_size]
+        
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        
         return output
 
     def _forward_flashinfer(
@@ -274,6 +388,8 @@ class MMEncoderAttention(CustomOp):
             )
         elif self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
             return self._forward_sdpa(query, key, value, cu_seqlens)
+        elif self.is_te_fp8_backend:
+            return self._forward_te_fp8(query, key, value, cu_seqlens)
         else:
             raise ValueError(
                 f"Unsupported multi-modal encoder attention backend for CUDA: "
