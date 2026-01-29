@@ -50,6 +50,7 @@ class EncoderRunner:
         # Encoder CUDA graph manager (optional)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
         self.encoder_cudagraph_padded_mode: bool = True
+        self._encoder_call_count: int = 0
         self._init_encoder_cudagraph_manager()
 
     def _init_encoder_cudagraph_manager(self) -> None:
@@ -235,6 +236,12 @@ class EncoderRunner:
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
+
+        # Log encoder CUDA graph stats
+        self._encoder_call_count += 1
+        if self.encoder_cudagraph_manager is not None:
+            self.encoder_cudagraph_manager.get_stats()
+
         return encoder_outputs
 
     def _execute_with_cudagraph(
