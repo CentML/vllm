@@ -46,9 +46,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Grid configurations for CUDA graph capture (T, H, W in patch units)
-# Top 15 most common grids by frequency (reduced from 30 to save memory)
-# Excludes very large grids (>128) to reduce CUDA graph memory footprint
+# Top 30 most common grids by frequency, sorted by occurrence count
+# With dedicated encoder graph pool, we can capture more grids without
+# competing with decoder CUDA graphs for memory
 CUSTOM_GRID_CONFIGS = [
+    # Top 15 most common (high priority)
     (1, 62, 62),   # Most common
     (1, 94, 94),
     (1, 50, 50),
@@ -64,6 +66,22 @@ CUSTOM_GRID_CONFIGS = [
     (1, 42, 42),
     (1, 24, 24),
     (1, 46, 46),
+    # Additional 15 grids (medium priority)
+    (1, 56, 56),
+    (1, 82, 82),
+    (1, 70, 70),
+    (1, 88, 88),
+    (1, 106, 106),
+    (1, 112, 112),
+    (1, 118, 118),
+    (1, 52, 52),
+    (1, 58, 58),
+    (1, 74, 74),
+    (1, 80, 80),
+    (1, 86, 86),
+    (1, 92, 92),
+    (1, 96, 96),
+    (1, 102, 102),
 ]
 
 
@@ -93,6 +111,7 @@ class EncoderCudaGraphManager:
         dtype: torch.dtype,
         bucket_sizes: list[int] | None = None,
         grid_configs: list[tuple[int, int, int]] | None = None,
+        graph_pool: Any | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -115,7 +134,9 @@ class EncoderCudaGraphManager:
 
         # CUDA graph storage - keyed by (t, h, w) tuple
         self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
-        self.pool = torch.cuda.graph_pool_handle()
+        # Use provided pool or create a dedicated encoder pool
+        # Using a separate pool from decoder allows independent memory management
+        self.pool = graph_pool if graph_pool is not None else torch.cuda.graph_pool_handle()
 
         # Pre-allocated input/output buffers per grid config
         # Key: (t, h, w), Value: {"pixel_values": tensor, "grid_thw": list}
@@ -417,9 +438,13 @@ class EncoderCudaGraphManager:
             logger.warning("Encoder CUDA graphs already captured, skipping")
             return
 
+        # Log initial memory state
+        free_mem_before, total_mem = torch.cuda.mem_get_info(self.device)
+        used_mem_before = total_mem - free_mem_before
         logger.info(
             f"Capturing encoder CUDA graphs for {len(self.grid_configs)} "
-            f"grid configurations"
+            f"grid configurations (GPU memory: {used_mem_before / 1024**3:.2f} GiB used, "
+            f"{free_mem_before / 1024**3:.2f} GiB free)"
         )
 
         # Capture from largest to smallest (more memory efficient)
@@ -451,9 +476,17 @@ class EncoderCudaGraphManager:
                 )
 
         self.captured = True
+
+        # Log final memory state
+        free_mem_after, _ = torch.cuda.mem_get_info(self.device)
+        used_mem_after = total_mem - free_mem_after
+        encoder_graph_mem = used_mem_after - used_mem_before
         logger.info(
             f"Captured {len(self.graphs)} encoder CUDA graphs "
-            f"(configs: {sorted(self.graphs.keys())})"
+            f"(configs: {sorted(self.graphs.keys())}). "
+            f"Encoder graph memory: {encoder_graph_mem / 1024**3:.2f} GiB "
+            f"(GPU: {used_mem_after / 1024**3:.2f} GiB used, "
+            f"{free_mem_after / 1024**3:.2f} GiB free)"
         )
 
     def get_graph_for_grid(
