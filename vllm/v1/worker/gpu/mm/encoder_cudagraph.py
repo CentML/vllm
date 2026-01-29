@@ -209,65 +209,6 @@ class EncoderCudaGraphManager:
         t, h, w = grid_thw[0]
         return (t, h, w)
 
-    def find_best_grid_for_padding(
-        self,
-        grid_thw: list[list[int]],
-        spatial_merge_size: int = 2,
-    ) -> tuple[int, int, int] | None:
-        """
-        Find the smallest captured grid that can accommodate the input with padding.
-
-        For CUDA graph compatibility with variable-size inputs, this finds the
-        smallest captured configuration where:
-        - T_captured >= T_input
-        - H_captured >= H_input
-        - W_captured >= W_input
-
-        Args:
-            grid_thw: Input grid configuration [[T, H, W]]
-            spatial_merge_size: Merge size for spatial dimensions (default 2)
-
-        Returns:
-            The best matching captured grid config, or None if no match found
-        """
-        key = self._grid_to_key(grid_thw)
-        if key is None:
-            return None
-
-        t_in, h_in, w_in = key
-
-        # First check for exact match
-        if key in self.graphs:
-            return key
-
-        # Find smallest captured grid that can accommodate input
-        best_match = None
-        best_waste = float('inf')
-
-        for captured_key in self.graphs.keys():
-            t_cap, h_cap, w_cap = captured_key
-
-            # Check if captured grid can accommodate input
-            if t_cap >= t_in and h_cap >= h_in and w_cap >= w_in:
-                # Calculate waste (padding overhead)
-                input_tokens = self._compute_output_tokens(key, spatial_merge_size)
-                captured_tokens = self._compute_output_tokens(
-                    captured_key, spatial_merge_size
-                )
-                waste = captured_tokens - input_tokens
-
-                if waste < best_waste:
-                    best_waste = waste
-                    best_match = captured_key
-
-        if best_match is not None:
-            logger.debug(
-                f"Found padding-compatible grid: input={key} -> captured={best_match} "
-                f"(waste={best_waste} tokens)"
-            )
-
-        return best_match
-
     def _compute_output_tokens(
         self,
         grid_thw: tuple[int, int, int],
@@ -738,35 +679,3 @@ class EncoderCudaGraphManager:
         return stats
 
 
-def generate_grid_configs_for_resolution_range(
-    min_size: int = 448,
-    max_size: int = 1344,
-    step: int = 224,
-    patch_size: int = 14,
-    temporal_values: list[int] | None = None,
-) -> list[tuple[int, int, int]]:
-    """
-    Generate grid configurations for a range of image resolutions.
-
-    Args:
-        min_size: Minimum image dimension in pixels
-        max_size: Maximum image dimension in pixels
-        step: Step size in pixels
-        patch_size: Patch size of the vision encoder
-        temporal_values: List of temporal dimensions to include (default [1])
-
-    Returns:
-        List of (T, H, W) tuples in patch units
-    """
-    if temporal_values is None:
-        temporal_values = [1]
-
-    configs = []
-    for h_pixels in range(min_size, max_size + 1, step):
-        for w_pixels in range(min_size, max_size + 1, step):
-            h_patches = h_pixels // patch_size
-            w_patches = w_pixels // patch_size
-            for t in temporal_values:
-                configs.append((t, h_patches, w_patches))
-
-    return configs
