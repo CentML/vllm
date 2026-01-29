@@ -45,14 +45,14 @@ def flash_attn_maxseqlen_wrapper(
         cu_seqlens = torch.arange(
             0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
         )
-    # Handle max_seqlen as int (for CUDA graph) or tensor (for eager mode)
-    # Using int avoids .item() call which breaks CUDA graph capture
+    # Handle max_seqlen: can be None, int, or tensor
+    # For CUDA graph capture, use CPU tensor so .item() doesn't trigger GPU sync
     if max_seqlen is None:
         max_seqlen = q_len
     elif isinstance(max_seqlen, int):
         pass  # already an int
     else:
-        max_seqlen = max_seqlen.item()
+        max_seqlen = max_seqlen.item()  # CPU tensor .item() is safe during capture
 
     q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = flash_attn_varlen_func(
@@ -139,14 +139,14 @@ def fa4_flash_attn_maxseqlen_wrapper(
         cu_seqlens = torch.arange(
             0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
         )
-    # Handle max_seqlen as int (for CUDA graph) or tensor (for eager mode)
-    # Using int avoids .item() call which breaks CUDA graph capture
+    # Handle max_seqlen: can be None, int, or tensor
+    # For CUDA graph capture, use CPU tensor so .item() doesn't trigger GPU sync
     if max_seqlen is None:
         max_seqlen_int = q_len
     elif isinstance(max_seqlen, int):
         max_seqlen_int = max_seqlen
     else:
-        max_seqlen_int = max_seqlen.item()
+        max_seqlen_int = max_seqlen.item()  # CPU tensor .item() is safe during capture
 
     q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = fa4_flash_attn_varlen_func(

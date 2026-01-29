@@ -807,11 +807,11 @@ class Qwen3_VisionTransformer(nn.Module):
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
         cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
 
-        # Compute max sequence length as Python int (not tensor)
-        # This is important for CUDA graph capture: .item() must happen BEFORE
-        # capture, not during. Passing as int avoids .item() calls in FA4 wrapper.
-        max_seqlen_tensor = self.compute_attn_mask_seqlen(cu_seqlens)
-        max_seqlen = int(max_seqlen_tensor.item())
+        # Compute max sequence length as CPU scalar tensor
+        # Using CPU tensor is important for CUDA graph capture: .item() on CPU
+        # tensor doesn't trigger GPU sync, so it won't invalidate capture.
+        max_seqlen_gpu = self.compute_attn_mask_seqlen(cu_seqlens)
+        max_seqlen = max_seqlen_gpu.cpu()  # Move to CPU to avoid GPU sync on .item()
 
         return {
             "pos_embeds": pos_embeds,
