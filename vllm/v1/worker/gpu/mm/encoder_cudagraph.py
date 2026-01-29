@@ -37,6 +37,7 @@ from tqdm import tqdm
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -340,16 +341,21 @@ class EncoderCudaGraphManager:
             embed_buffers = self.embedding_buffers[grid_config]
 
             # Warmup run with embedding buffers
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                warmup_output = vision_encoder.forward_cudagraph(
-                    pixel_values,
-                    pos_embeds=embed_buffers["pos_embeds"],
-                    rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
-                    rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
-                    cu_seqlens=embed_buffers["cu_seqlens"],
-                    max_seqlen=embed_buffers["max_seqlen"],
-                )
-                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+            # Use set_forward_context to provide vllm_config for torch.compile
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+            ):
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    warmup_output = vision_encoder.forward_cudagraph(
+                        pixel_values,
+                        pos_embeds=embed_buffers["pos_embeds"],
+                        rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
+                        rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
+                        cu_seqlens=embed_buffers["cu_seqlens"],
+                        max_seqlen=embed_buffers["max_seqlen"],
+                    )
+                    self.output_buffers[grid_config] = torch.empty_like(warmup_output)
 
             torch.cuda.synchronize()
 
@@ -358,16 +364,20 @@ class EncoderCudaGraphManager:
             graph = torch.cuda.CUDAGraph()
             input_buffer = self.input_buffers[grid_config]["pixel_values"]
 
-            with torch.cuda.graph(graph, pool=self.pool):
-                output = vision_encoder.forward_cudagraph(
-                    input_buffer,
-                    pos_embeds=embed_buffers["pos_embeds"],
-                    rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
-                    rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
-                    cu_seqlens=embed_buffers["cu_seqlens"],
-                    max_seqlen=embed_buffers["max_seqlen"],
-                )
-                self.output_buffers[grid_config].copy_(output)
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+            ):
+                with torch.cuda.graph(graph, pool=self.pool):
+                    output = vision_encoder.forward_cudagraph(
+                        input_buffer,
+                        pos_embeds=embed_buffers["pos_embeds"],
+                        rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
+                        rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
+                        cu_seqlens=embed_buffers["cu_seqlens"],
+                        max_seqlen=embed_buffers["max_seqlen"],
+                    )
+                    self.output_buffers[grid_config].copy_(output)
         else:
             # Fallback to original forward (will have CPU gaps)
             logger.warning(
@@ -376,9 +386,13 @@ class EncoderCudaGraphManager:
             )
 
             # Warmup run (required before capture)
-            with torch.cuda.stream(torch.cuda.current_stream()):
-                warmup_output = vision_encoder(pixel_values, grid_thw=grid_thw)
-                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+            ):
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    warmup_output = vision_encoder(pixel_values, grid_thw=grid_thw)
+                    self.output_buffers[grid_config] = torch.empty_like(warmup_output)
 
             torch.cuda.synchronize()
 
@@ -386,9 +400,13 @@ class EncoderCudaGraphManager:
             graph = torch.cuda.CUDAGraph()
             input_buffer = self.input_buffers[grid_config]["pixel_values"]
 
-            with torch.cuda.graph(graph, pool=self.pool):
-                output = vision_encoder(input_buffer, grid_thw=grid_thw)
-                self.output_buffers[grid_config].copy_(output)
+            with set_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+            ):
+                with torch.cuda.graph(graph, pool=self.pool):
+                    output = vision_encoder(input_buffer, grid_thw=grid_thw)
+                    self.output_buffers[grid_config].copy_(output)
 
         self.graphs[grid_config] = graph
         logger.debug(
