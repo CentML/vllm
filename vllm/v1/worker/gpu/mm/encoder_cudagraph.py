@@ -521,7 +521,7 @@ class EncoderCudaGraphManager:
         grid_key = self.get_graph_for_grid(grid_thw)
 
         if grid_key is None:
-            self.cache_misses += 1
+            # Don't count miss here - caller may try run_padded() next
             return None
 
         # Verify input dimensions match
@@ -591,7 +591,7 @@ class EncoderCudaGraphManager:
         # Find the smallest bucket that fits
         bucket_grid = self.find_bucket_for_tokens(num_output_tokens, spatial_merge_size)
         if bucket_grid is None:
-            self.cache_misses += 1
+            # Don't count miss here - caller will count it when falling back to eager
             logger.debug(
                 f"No bucket found for {num_output_tokens} tokens, "
                 f"max available: {max(self._compute_output_tokens(g, spatial_merge_size) for g in self.graphs.keys()) if self.graphs else 0}"
@@ -662,6 +662,14 @@ class EncoderCudaGraphManager:
         )
 
         return trimmed_output, padding_waste
+
+    def count_miss(self) -> None:
+        """Count a cache miss when falling back to eager mode.
+
+        This should be called by the caller when neither run() nor run_padded()
+        succeeded and eager execution is used.
+        """
+        self.cache_misses += 1
 
     def get_stats(self) -> dict[str, Any]:
         """Get and log cache statistics."""
