@@ -713,10 +713,10 @@ class EncoderCudaGraphManager:
         return trimmed_output, padding_waste
 
     def get_stats(self) -> dict[str, Any]:
-        """Get cache statistics."""
+        """Get and log cache statistics."""
         total = self.cache_hits + self.cache_misses + self.eager_fallbacks
         hit_rate = self.cache_hits / total if total > 0 else 0.0
-        return {
+        stats = {
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "eager_fallbacks": self.eager_fallbacks,
@@ -724,6 +724,13 @@ class EncoderCudaGraphManager:
             "num_graphs": len(self.graphs),
             "captured_configs": sorted(self.graphs.keys()),
         }
+        logger.info(
+            f"Encoder CUDA graph stats: "
+            f"hits={self.cache_hits}, misses={self.cache_misses}, "
+            f"eager={self.eager_fallbacks}, hit_rate={hit_rate:.1%}, "
+            f"num_graphs={len(self.graphs)}"
+        )
+        return stats
 
 
 def generate_grid_configs_for_resolution_range(
