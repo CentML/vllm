@@ -707,11 +707,19 @@ class GPUModelRunner(
             True  # Default to padded mode for better CUDA graph utilization
         )
 
+        # Create a dedicated graph pool for encoder CUDA graphs
+        # This keeps encoder and decoder graph memory separate for:
+        # 1. Better memory isolation and predictability
+        # 2. Independent memory management for each subsystem
+        # 3. Easier debugging of memory usage
+        encoder_graph_pool = torch.cuda.graph_pool_handle()
+
         self.encoder_cudagraph_manager = EncoderCudaGraphManager(
             vllm_config=self.vllm_config,
             device=self.device,
             dtype=self.dtype,
             bucket_sizes=bucket_sizes,
+            graph_pool=encoder_graph_pool,
         )
 
         # Log configuration
@@ -720,7 +728,8 @@ class GPUModelRunner(
             "Encoder CUDA graph manager initialized: "
             f"padded_mode={self.encoder_cudagraph_padded_mode}, "
             f"num_grids={len(grid_configs)}, "
-            f"grids={grid_configs}"
+            f"grids={grid_configs}, "
+            f"using dedicated encoder graph pool"
         )
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -4962,12 +4971,32 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
-        with freeze_gc(), graph_capture(device=self.device):
-            start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
-            # Capture encoder CUDA graphs first (if enabled)
-            if self.encoder_cudagraph_manager is not None:
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        start_total_memory = torch.cuda.mem_get_info()[1]
+        logger.info(
+            f"Starting CUDA graph capture: "
+            f"{(start_total_memory - start_free_gpu_memory) / 1024**3:.2f} GiB used, "
+            f"{start_free_gpu_memory / 1024**3:.2f} GiB free"
+        )
+
+        # Capture encoder CUDA graphs first (if enabled)
+        # Encoder uses a dedicated graph pool separate from decoder,
+        # captured outside the decoder's graph_capture context for clean isolation
+        if self.encoder_cudagraph_manager is not None:
+            with freeze_gc():
                 self._capture_encoder_cudagraphs()
+            after_encoder_free = torch.cuda.mem_get_info()[0]
+            encoder_mem = start_free_gpu_memory - after_encoder_free
+            logger.info(
+                f"Encoder CUDA graphs captured: "
+                f"{encoder_mem / 1024**3:.2f} GiB used by encoder graphs, "
+                f"{after_encoder_free / 1024**3:.2f} GiB free"
+            )
+
+        # Capture decoder/LM CUDA graphs in their own context with global pool
+        with freeze_gc(), graph_capture(device=self.device):
+            before_decoder_free = torch.cuda.mem_get_info()[0]
 
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
@@ -5017,6 +5046,19 @@ class GPUModelRunner(
 
             torch.cuda.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            decoder_mem = before_decoder_free - end_free_gpu_memory
+            logger.info(
+                f"Decoder CUDA graphs captured: "
+                f"{decoder_mem / 1024**3:.2f} GiB used by decoder graphs, "
+                f"{end_free_gpu_memory / 1024**3:.2f} GiB free"
+            )
+
+        total_cudagraph_mem = start_free_gpu_memory - end_free_gpu_memory
+        logger.info(
+            f"CUDA graph capture complete: "
+            f"total {total_cudagraph_mem / 1024**3:.2f} GiB for all graphs, "
+            f"{end_free_gpu_memory / 1024**3:.2f} GiB free"
+        )
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
