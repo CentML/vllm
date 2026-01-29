@@ -331,12 +331,13 @@ class EncoderCudaGraphManager:
 
             # Create INPUT BUFFERS for embeddings (for padded mode with runtime computation)
             # These buffers can be updated at runtime before graph replay
+            # Note: max_seqlen is stored as int (not tensor) to avoid .item() during capture
             self.embedding_buffers[grid_config] = {
                 "pos_embeds": cached["pos_embeds"].clone(),
                 "rotary_pos_emb_cos": cached["rotary_pos_emb_cos"].clone(),
                 "rotary_pos_emb_sin": cached["rotary_pos_emb_sin"].clone(),
                 "cu_seqlens": cached["cu_seqlens"].clone(),
-                "max_seqlen": cached["max_seqlen"].clone(),
+                "max_seqlen": cached["max_seqlen"],  # int, not tensor
             }
             embed_buffers = self.embedding_buffers[grid_config]
 
@@ -560,7 +561,7 @@ class EncoderCudaGraphManager:
             embed_buffers["rotary_pos_emb_cos"].copy_(cached["rotary_pos_emb_cos"])
             embed_buffers["rotary_pos_emb_sin"].copy_(cached["rotary_pos_emb_sin"])
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"])
-            embed_buffers["max_seqlen"].copy_(cached["max_seqlen"])
+            embed_buffers["max_seqlen"] = cached["max_seqlen"]  # int, not tensor
 
         # Replay the graph
         self.graphs[grid_key].replay()
@@ -660,7 +661,7 @@ class EncoderCudaGraphManager:
         # cu_seqlens shape is [num_images + 1], for single image it's [2]: [0, num_patches]
         # We copy the actual values so flash attention processes only the real tokens
         embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"])
-        embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"])
+        embed_buffers["max_seqlen"] = actual_embeds["max_seqlen"]  # int, not tensor
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
