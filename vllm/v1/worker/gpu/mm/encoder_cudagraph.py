@@ -290,12 +290,19 @@ class EncoderCudaGraphManager:
         self.input_buffers: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.output_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
 
-        # Cached pre-computed tensors for CUDA graph replay
+        # Cached pre-computed tensors for CUDA graph replay (used for exact match mode)
         # Key: (t, h, w), Value: dict with pos_embeds, rotary embeddings, cu_seqlens, etc.
         self.cached_tensors: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
 
+        # Input buffers for embeddings (used for padded mode with runtime computation)
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin, cu_seqlens buffers
+        self.embedding_buffers: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+
         # Store metadata about captured graphs
         self.captured_metadata: dict[tuple[int, int, int], dict[str, Any]] = {}
+
+        # Reference to vision encoder for runtime embedding computation (set during capture)
+        self.vision_encoder = None
 
         # Track if graphs have been captured
         self.captured = False
@@ -573,12 +580,15 @@ class EncoderCudaGraphManager:
             "patch_input_channels": dummy_inputs["patch_input_channels"],
         }
 
+        # Store vision encoder reference for runtime embedding computation
+        self.vision_encoder = vision_encoder
+
         # Check if vision encoder supports optimized CUDA graph forward
         has_cudagraph_forward = hasattr(vision_encoder, 'forward_cudagraph') and \
                                 hasattr(vision_encoder, 'precompute_for_cudagraph')
 
         if has_cudagraph_forward:
-            # Pre-compute and cache all grid-dependent tensors
+            # Pre-compute tensors for the bucket grid (used for exact match mode)
             cached = vision_encoder.precompute_for_cudagraph(grid_thw)
             self.cached_tensors[grid_config] = cached
             logger.debug(
@@ -587,32 +597,44 @@ class EncoderCudaGraphManager:
                 f"cu_seqlens={cached['cu_seqlens'].shape}"
             )
 
-            # Warmup run with cached tensors
+            # Create INPUT BUFFERS for embeddings (for padded mode with runtime computation)
+            # These buffers can be updated at runtime before graph replay
+            self.embedding_buffers[grid_config] = {
+                "pos_embeds": cached["pos_embeds"].clone(),
+                "rotary_pos_emb_cos": cached["rotary_pos_emb_cos"].clone(),
+                "rotary_pos_emb_sin": cached["rotary_pos_emb_sin"].clone(),
+                "cu_seqlens": cached["cu_seqlens"].clone(),
+                "max_seqlen": cached["max_seqlen"].clone(),
+            }
+            embed_buffers = self.embedding_buffers[grid_config]
+
+            # Warmup run with embedding buffers
             with torch.cuda.stream(torch.cuda.current_stream()):
                 warmup_output = vision_encoder.forward_cudagraph(
                     pixel_values,
-                    pos_embeds=cached["pos_embeds"],
-                    rotary_pos_emb_cos=cached["rotary_pos_emb_cos"],
-                    rotary_pos_emb_sin=cached["rotary_pos_emb_sin"],
-                    cu_seqlens=cached["cu_seqlens"],
-                    max_seqlen=cached["max_seqlen"],
+                    pos_embeds=embed_buffers["pos_embeds"],
+                    rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
+                    rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
+                    cu_seqlens=embed_buffers["cu_seqlens"],
+                    max_seqlen=embed_buffers["max_seqlen"],
                 )
                 self.output_buffers[grid_config] = torch.empty_like(warmup_output)
 
             torch.cuda.synchronize()
 
-            # Capture the graph with cached tensors
+            # Capture the graph with embedding BUFFERS (not constants)
+            # This allows updating embeddings at runtime for padded mode
             graph = torch.cuda.CUDAGraph()
             input_buffer = self.input_buffers[grid_config]["pixel_values"]
 
             with torch.cuda.graph(graph, pool=self.pool):
                 output = vision_encoder.forward_cudagraph(
                     input_buffer,
-                    pos_embeds=cached["pos_embeds"],
-                    rotary_pos_emb_cos=cached["rotary_pos_emb_cos"],
-                    rotary_pos_emb_sin=cached["rotary_pos_emb_sin"],
-                    cu_seqlens=cached["cu_seqlens"],
-                    max_seqlen=cached["max_seqlen"],
+                    pos_embeds=embed_buffers["pos_embeds"],
+                    rotary_pos_emb_cos=embed_buffers["rotary_pos_emb_cos"],
+                    rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
+                    cu_seqlens=embed_buffers["cu_seqlens"],
+                    max_seqlen=embed_buffers["max_seqlen"],
                 )
                 self.output_buffers[grid_config].copy_(output)
         else:
@@ -793,6 +815,16 @@ class EncoderCudaGraphManager:
         # Copy input to the captured buffer
         input_buffer.copy_(pixel_values)
 
+        # For exact match, restore cached embeddings (may have been modified by run_padded)
+        if grid_key in self.embedding_buffers and grid_key in self.cached_tensors:
+            embed_buffers = self.embedding_buffers[grid_key]
+            cached = self.cached_tensors[grid_key]
+            embed_buffers["pos_embeds"].copy_(cached["pos_embeds"])
+            embed_buffers["rotary_pos_emb_cos"].copy_(cached["rotary_pos_emb_cos"])
+            embed_buffers["rotary_pos_emb_sin"].copy_(cached["rotary_pos_emb_sin"])
+            embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"])
+            embed_buffers["max_seqlen"].copy_(cached["max_seqlen"])
+
         # Replay the graph
         self.graphs[grid_key].replay()
 
@@ -809,8 +841,9 @@ class EncoderCudaGraphManager:
         """
         Run the vision encoder with padding to fit a captured bucket.
 
-        This method pads the input to match a captured CUDA graph bucket,
-        executes the graph, and returns the trimmed output.
+        This method computes embeddings for the ACTUAL input grid, pads them
+        to match the bucket size, then replays the CUDA graph. This ensures
+        correct position embeddings while still benefiting from CUDA graphs.
 
         Args:
             pixel_values: Input pixel values [num_patches, patch_channels]
@@ -826,6 +859,11 @@ class EncoderCudaGraphManager:
             logger.debug("Padded mode only supports single-image inputs")
             return None
 
+        # Check if vision encoder is available for embedding computation
+        if self.vision_encoder is None or not hasattr(self.vision_encoder, 'precompute_for_cudagraph'):
+            logger.debug("Vision encoder not available for padded mode")
+            return None
+
         # Find the smallest bucket that fits
         bucket_grid = self.find_bucket_for_tokens(num_output_tokens, spatial_merge_size)
         if bucket_grid is None:
@@ -834,6 +872,11 @@ class EncoderCudaGraphManager:
                 f"No bucket found for {num_output_tokens} tokens, "
                 f"max available: {max(self._compute_output_tokens(g, spatial_merge_size) for g in self.graphs.keys()) if self.graphs else 0}"
             )
+            return None
+
+        # Check if we have embedding buffers for this bucket
+        if bucket_grid not in self.embedding_buffers:
+            logger.debug(f"No embedding buffers for bucket {bucket_grid}")
             return None
 
         bucket_tokens = self._compute_output_tokens(bucket_grid, spatial_merge_size)
@@ -854,13 +897,35 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
-        # Zero the buffer first (for clean padding)
-        input_buffer.zero_()
+        # === KEY FIX: Compute embeddings for ACTUAL grid, then pad ===
+        # This ensures correct position embeddings for the actual input size
+        actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
 
-        # Copy actual input to the beginning of the buffer
+        # Get embedding buffers for the bucket
+        embed_buffers = self.embedding_buffers[bucket_grid]
+
+        # Zero the buffers first (for clean padding)
+        input_buffer.zero_()
+        embed_buffers["pos_embeds"].zero_()
+        embed_buffers["rotary_pos_emb_cos"].zero_()
+        embed_buffers["rotary_pos_emb_sin"].zero_()
+
+        # Copy actual pixel values to the beginning of the buffer
         input_buffer[:num_input_patches].copy_(pixel_values)
 
-        # Replay the graph (uses the bucket's grid_thw for position embeddings)
+        # Copy actual embeddings to the beginning of the buffers (pad with zeros)
+        actual_num_patches = actual_embeds["pos_embeds"].shape[0]
+        embed_buffers["pos_embeds"][:actual_num_patches].copy_(actual_embeds["pos_embeds"])
+        embed_buffers["rotary_pos_emb_cos"][:actual_num_patches].copy_(actual_embeds["rotary_pos_emb_cos"])
+        embed_buffers["rotary_pos_emb_sin"][:actual_num_patches].copy_(actual_embeds["rotary_pos_emb_sin"])
+
+        # Update cu_seqlens and max_seqlen to actual values
+        # cu_seqlens shape is [num_images + 1], for single image it's [2]: [0, num_patches]
+        # We copy the actual values so flash attention processes only the real tokens
+        embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"])
+        embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"])
+
+        # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
 
         # Get output and trim to actual size
