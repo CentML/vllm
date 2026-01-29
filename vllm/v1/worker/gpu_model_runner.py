@@ -2412,9 +2412,9 @@ class GPUModelRunner(
             return None
 
         # Extract grid_thw from kwargs
-        grid_thw = mm_kwargs_group.get("image_grid_thw") or mm_kwargs_group.get(
-            "video_grid_thw"
-        )
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
         if grid_thw is None:
             return None
 

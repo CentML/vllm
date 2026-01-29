@@ -159,9 +159,9 @@ class EncoderRunner:
             return None
 
         # Try to get grid_thw from the kwargs
-        grid_thw = mm_kwargs_group.get("image_grid_thw") or mm_kwargs_group.get(
-            "video_grid_thw"
-        )
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
         if grid_thw is None:
             return None
 
