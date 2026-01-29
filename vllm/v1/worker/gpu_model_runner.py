@@ -2460,19 +2460,16 @@ class GPUModelRunner(
             f"output_tokens={num_output_tokens}"
         )
 
-        # Try exact match first
-        grid_key = self.encoder_cudagraph_manager.get_graph_for_grid(grid_thw)
-        if grid_key is not None:
-            # Exact match found - try to run
-            output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
-            if output is not None:
-                logger.info(
-                    f"ViT CUDA graph EXACT: grid={grid_key}, "
-                    f"output={output.shape}"
-                )
-                return [output[:num_output_tokens]]
+        # Try exact match first via run() - counts hits internally
+        output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
+        if output is not None:
+            logger.info(
+                f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
+                f"output={output.shape}"
+            )
+            return [output[:num_output_tokens]]
 
-        # Try padded execution if enabled
+        # Try padded execution if enabled (run_padded counts hits internally)
         if self.encoder_cudagraph_padded_mode:
             result = self.encoder_cudagraph_manager.run_padded(
                 pixel_values,
@@ -2488,7 +2485,8 @@ class GPUModelRunner(
                 )
                 return [output]
 
-        # No CUDA graph available
+        # No CUDA graph available - count the miss and fall back to eager mode
+        self.encoder_cudagraph_manager.count_miss()
         logger.info(
             f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens} "
             f"(padded_mode={self.encoder_cudagraph_padded_mode})"
