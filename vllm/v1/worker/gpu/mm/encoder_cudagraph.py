@@ -6,16 +6,24 @@ CUDA Graph Manager for Multimodal Encoders (ViT).
 This module provides CUDA graph capture and replay functionality for vision
 encoders to eliminate kernel launch overhead and improve GPU utilization.
 
-Key design principles:
-1. Capture graphs for specific grid_thw configurations (not just token counts)
-2. Only replay when input dimensions exactly match captured configuration
-3. Fall back to eager mode for non-matching inputs
-4. Track statistics for monitoring and optimization
+Two execution modes:
+1. Exact match mode: Replay CUDA graph when input grid_thw exactly matches
+   a captured configuration. No padding overhead.
+2. Padded mode: Pad inputs to fit the smallest captured bucket that can
+   accommodate them. Enables higher CUDA graph utilization at the cost of
+   padding compute overhead.
 
-Limitations:
-- CUDA graphs are only used when input dimensions exactly match captured graphs
-- Variable-size images that don't match any captured configuration use eager mode
-- Multiple images in a batch are processed sequentially through graph replay
+Padded mode details:
+- Padded with zeros: pixel_values, pos_embeds, rotary_pos_emb_cos/sin
+- NOT padded (set to actual values): cu_seqlens, max_seqlen
+- This ensures flash attention only processes real tokens (via cu_seqlens)
+- Output is trimmed to actual size after graph replay
+
+Key design principles:
+1. Capture graphs for specific grid_thw configurations
+2. Support both exact match and padded execution
+3. Fall back to eager mode when no suitable graph is available
+4. Track statistics for monitoring and optimization
 """
 
 from __future__ import annotations
