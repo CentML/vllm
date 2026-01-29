@@ -385,7 +385,7 @@ class Qwen3_VisionTransformer(nn.Module):
 
         from vllm.compilation.backends import set_model_tag
 
-        with set_model_tag("Qwen3_VisionPatchEmbed"):
+        with set_model_tag("Qwen3_VisionPatchEmbed", is_encoder=True):
             self.patch_embed = Qwen3_VisionPatchEmbed(
                 patch_size=self.patch_size,
                 temporal_patch_size=self.temporal_patch_size,
@@ -404,7 +404,7 @@ class Qwen3_VisionTransformer(nn.Module):
             rope_parameters={"partial_rotary_factor": 0.5},
         )
 
-        with set_model_tag("Qwen3_VisionPatchMerger"):
+        with set_model_tag("Qwen3_VisionPatchMerger", is_encoder=True):
             self.merger = Qwen3_VisionPatchMerger(
                 d_model=vision_config.out_hidden_size,
                 context_dim=self.hidden_size,
@@ -415,7 +415,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 prefix=f"{prefix}.merger",
             )
 
-        with set_model_tag("Qwen3_VisionPatchMerger_postshuffle_norm"):
+        with set_model_tag("Qwen3_VisionPatchMerger_postshuffle_norm", is_encoder=True):
             self.deepstack_merger_list = nn.ModuleList(
                 [
                     Qwen3_VisionPatchMerger(
@@ -452,7 +452,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 f"Qwen3-VL does not support {self.attn_backend} backend now."
             )
 
-        with set_model_tag("Qwen3_VisionBlock"):
+        with set_model_tag("Qwen3_VisionBlock", is_encoder=True):
             workspace_buffer = (
                 None
                 if self.attn_backend != AttentionBackendEnum.FLASHINFER
