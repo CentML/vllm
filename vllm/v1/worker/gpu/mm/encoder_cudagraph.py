@@ -46,9 +46,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Grid configurations for CUDA graph capture (T, H, W in patch units)
-# Top 30 most common grids (58.9% exact match coverage)
+# Top 15 most common grids by frequency (reduced from 30 to save memory)
+# Excludes very large grids (>128) to reduce CUDA graph memory footprint
 CUSTOM_GRID_CONFIGS = [
-    (1, 62, 62),
+    (1, 62, 62),   # Most common
     (1, 94, 94),
     (1, 50, 50),
     (1, 32, 32),
@@ -57,27 +58,12 @@ CUSTOM_GRID_CONFIGS = [
     (1, 100, 100),
     (1, 64, 64),
     (1, 38, 38),
-    (1, 188, 188),
     (1, 68, 68),
     (1, 128, 128),
     (1, 44, 44),
-    (1, 250, 250),
-    (1, 256, 256),
     (1, 42, 42),
     (1, 24, 24),
-    (1, 160, 160),
     (1, 46, 46),
-    (1, 80, 80),
-    (1, 112, 112),
-    (1, 16, 16),
-    (1, 56, 56),
-    (1, 208, 312),
-    (1, 188, 252),
-    (1, 156, 156),
-    (1, 40, 40),
-    (1, 252, 188),
-    (1, 120, 120),
-    (1, 218, 218),
 ]
 
 
