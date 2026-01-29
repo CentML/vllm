@@ -20,7 +20,6 @@ Limitations:
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -37,21 +36,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Default grid configurations to capture (T, H, W in patch units)
-# These are common configurations for Qwen-VL models after smart_resize
-# Format: (temporal, height_patches, width_patches)
-DEFAULT_ENCODER_GRID_CONFIGS = [
-    # Common single-frame image configurations (T=1)
-    # After smart_resize with factor=28 (patch=14, merge=2), common sizes:
-    (1, 16, 16),   # ~224x224 -> 64 output tokens
-    (1, 24, 24),   # ~336x336 -> 144 output tokens
-    (1, 32, 32),   # ~448x448 -> 256 output tokens
-    (1, 48, 48),   # ~672x672 -> 576 output tokens
-    (1, 64, 64),   # ~896x896 -> 1024 output tokens
-    (1, 80, 80),   # ~1120x1120 -> 1600 output tokens
-    (1, 96, 96),   # ~1344x1344 -> 2304 output tokens
-]
-
+# Grid configurations for CUDA graph capture (T, H, W in patch units)
+# Top 30 most common grids from MLPerf dataset analysis (58.9% exact match coverage)
 CUSTOM_GRID_CONFIGS = [
     (1, 62, 62),
     (1, 94, 94),
@@ -84,193 +70,6 @@ CUSTOM_GRID_CONFIGS = [
     (1, 120, 120),
     (1, 218, 218),
 ]
-
-# Optimized grid configurations for MLPerf Shopify dataset
-# Based on analysis: 96% of images have 4000-8200 output tokens
-# Using square grids that cover the common token ranges with padding
-SHOPIFY_OPTIMIZED_GRID_CONFIGS = [
-    # Small images (rare, <5% of dataset)
-    (1, 64, 64),    # 1024 tokens - covers up to ~1024 tokens
-    (1, 80, 80),    # 1600 tokens
-    (1, 96, 96),    # 2304 tokens
-    (1, 112, 112),  # 3136 tokens
-    # Main distribution (95% of dataset: 4000-8200 tokens)
-    (1, 128, 128),  # 4096 tokens - covers P10 (4646)
-    (1, 144, 144),  # 5184 tokens - covers ~P25 (5351)
-    (1, 160, 160),  # 6400 tokens - covers ~P50-P75 (6072-6904)
-    (1, 176, 176),  # 7744 tokens - covers ~P90 (7948)
-    (1, 184, 184),  # 8464 tokens - covers max (8161)
-]
-
-# Alternative: Rectangular grids for better aspect ratio coverage
-SHOPIFY_RECTANGULAR_GRID_CONFIGS = [
-    # 4:3 and 3:4 aspect ratios for product images
-    (1, 128, 128),  # 4096 tokens (square)
-    (1, 112, 144),  # 4032 tokens (3:4)
-    (1, 144, 112),  # 4032 tokens (4:3)
-    (1, 144, 144),  # 5184 tokens (square)
-    (1, 128, 160),  # 5120 tokens (4:5)
-    (1, 160, 128),  # 5120 tokens (5:4)
-    (1, 160, 160),  # 6400 tokens (square)
-    (1, 144, 176),  # 6336 tokens (9:11)
-    (1, 176, 144),  # 6336 tokens (11:9)
-    (1, 176, 176),  # 7744 tokens (square)
-    (1, 160, 192),  # 7680 tokens (5:6)
-    (1, 192, 160),  # 7680 tokens (6:5)
-    (1, 184, 184),  # 8464 tokens (square, max)
-]
-
-# Legacy bucket sizes for backward compatibility
-DEFAULT_ENCODER_CUDAGRAPH_BUCKET_SIZES = [
-    64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192
-]
-
-# =============================================================================
-# TOKEN BUCKET PRESETS FOR PADDED CUDA GRAPHS
-# =============================================================================
-# These define output token buckets. Inputs are padded to the smallest bucket
-# that fits, trading padding overhead for CUDA graph utilization.
-#
-# For Shopify dataset analysis:
-#   - P10=4646, P25=5351, P50=6072, P75=6904, P90=7948, Max=8161 tokens
-
-# Fine-grained buckets: More buckets = less padding waste, more GPU memory
-SHOPIFY_TOKEN_BUCKETS_FINE = [
-    1024,   # Small images (<5% of dataset)
-    2048,
-    3072,
-    4096,   # ~P10
-    4608,
-    5120,   # ~P25
-    5632,
-    6144,   # ~P50
-    6656,
-    7168,   # ~P75
-    7680,
-    8192,   # ~P90-P99
-    8464,   # Max coverage
-]
-
-# Medium granularity: Balanced tradeoff
-SHOPIFY_TOKEN_BUCKETS_MEDIUM = [
-    1024,   # Small images
-    2048,
-    3072,
-    4096,   # Covers up to P10
-    5120,   # Covers P10-P25
-    6144,   # Covers P25-P50
-    7168,   # Covers P50-P75
-    8192,   # Covers P75-P99
-    8464,   # Max coverage
-]
-
-# Coarse buckets: Fewer graphs, more padding waste
-SHOPIFY_TOKEN_BUCKETS_COARSE = [
-    2048,   # Small images
-    4096,   # Up to ~P10
-    6144,   # P10-P50
-    8192,   # P50-P99
-    8464,   # Max
-]
-
-# Single bucket: Maximum CUDA graph utilization, maximum padding
-SHOPIFY_TOKEN_BUCKETS_SINGLE = [
-    8464,   # All images padded to max
-]
-
-# =============================================================================
-# OPTIMIZED GRID-ALIGNED TOKEN BUCKETS
-# =============================================================================
-# These buckets are perfect squares (n^2) which align exactly with actual grid
-# token counts. This eliminates any mismatch between bucket size and the tokens
-# produced by the grid configuration.
-#
-# Formula: tokens = (side / merge_size)^2 where side must be even
-# So valid token counts are: 16, 36, 64, 100, 144, 196, 256, 324, 400, 484, 576...
-#
-# Analysis on Shopify dataset (12,754 samples):
-#   - Token range: 63-8161
-#   - P5=4170, P50=6072, P95=8005
-#   - 96% of images have 4000-8200 tokens
-#
-# Comparison with previous presets:
-#   - shopify_coarse (5 buckets): 13.3% padding waste
-#   - shopify_medium (9 buckets): 7.3% padding waste
-#   - shopify_fine (13 buckets): 4.1% padding waste
-#   - optimized (10 buckets): 5.0% padding waste <- better efficiency per bucket
-
-# Optimized buckets for main distribution (4000-8500 tokens, 96% of dataset)
-# 10 buckets with 5.0% padding waste
-SHOPIFY_TOKEN_BUCKETS_OPTIMIZED = [
-    4096,   # 64^2, grid (1,128,128) - covers up to 4096 tokens
-    4489,   # 67^2, grid (1,134,134) - covers 4097-4489
-    4900,   # 70^2, grid (1,140,140) - covers 4490-4900
-    5329,   # 73^2, grid (1,146,146) - covers 4901-5329
-    5776,   # 76^2, grid (1,152,152) - covers 5330-5776
-    6241,   # 79^2, grid (1,158,158) - covers 5777-6241
-    6724,   # 82^2, grid (1,164,164) - covers 6242-6724
-    7225,   # 85^2, grid (1,170,170) - covers 6725-7225
-    7744,   # 88^2, grid (1,176,176) - covers 7226-7744
-    8464,   # 92^2, grid (1,184,184) - covers 7745-8464 (max)
-]
-
-# Full range including small images (adds 6 buckets for <4096 tokens)
-# 16 buckets with 4.2% padding waste
-SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_FULL = [
-    # Small images (<4% of dataset)
-    256,    # 16^2, grid (1,32,32)
-    576,    # 24^2, grid (1,48,48)
-    1024,   # 32^2, grid (1,64,64)
-    1600,   # 40^2, grid (1,80,80)
-    2304,   # 48^2, grid (1,96,96)
-    3136,   # 56^2, grid (1,112,112)
-    # Main distribution (96% of dataset)
-    4096,   # 64^2, grid (1,128,128)
-    4489,   # 67^2, grid (1,134,134)
-    4900,   # 70^2, grid (1,140,140)
-    5329,   # 73^2, grid (1,146,146)
-    5776,   # 76^2, grid (1,152,152)
-    6241,   # 79^2, grid (1,158,158)
-    6724,   # 82^2, grid (1,164,164)
-    7225,   # 85^2, grid (1,170,170)
-    7744,   # 88^2, grid (1,176,176)
-    8464,   # 92^2, grid (1,184,184)
-]
-
-# Compact optimized (6 buckets, ~6.5% padding waste)
-# Good balance between memory usage and padding overhead
-SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_COMPACT = [
-    4096,   # 64^2, grid (1,128,128)
-    5041,   # 71^2, grid (1,142,142)
-    5929,   # 77^2, grid (1,154,154)
-    6724,   # 82^2, grid (1,164,164)
-    7569,   # 87^2, grid (1,174,174)
-    8464,   # 92^2, grid (1,184,184)
-]
-
-
-def token_bucket_to_grid(token_bucket: int, merge_size: int = 2) -> tuple[int, int, int]:
-    """
-    Convert a token bucket size to a square grid configuration.
-
-    Args:
-        token_bucket: Number of output tokens (after spatial merge)
-        merge_size: Spatial merge size (default 2 for Qwen-VL)
-
-    Returns:
-        Grid config (T, H_patches, W_patches)
-    """
-    # For square grid: tokens = (H/merge)^2, so H = merge * sqrt(tokens)
-    side = int(math.ceil(math.sqrt(token_bucket))) * merge_size
-    return (1, side, side)
-
-
-def get_grid_configs_from_token_buckets(
-    token_buckets: list[int],
-    merge_size: int = 2,
-) -> list[tuple[int, int, int]]:
-    """Convert token bucket list to grid configurations."""
-    return [token_bucket_to_grid(t, merge_size) for t in token_buckets]
 
 
 class EncoderCudaGraphManager:
@@ -349,42 +148,7 @@ class EncoderCudaGraphManager:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
         if compilation_config is None:
-            return DEFAULT_ENCODER_GRID_CONFIGS
-
-        # Check for token bucket config first (new preferred way)
-        token_buckets = getattr(
-            compilation_config,
-            'encoder_cudagraph_token_buckets',
-            None
-        )
-        if token_buckets is not None:
-            # Handle preset names for token buckets
-            if isinstance(token_buckets, str):
-                bucket_presets = {
-                    # Legacy presets (non-grid-aligned)
-                    "shopify_fine": SHOPIFY_TOKEN_BUCKETS_FINE,
-                    "shopify_medium": SHOPIFY_TOKEN_BUCKETS_MEDIUM,
-                    "shopify_coarse": SHOPIFY_TOKEN_BUCKETS_COARSE,
-                    "shopify_single": SHOPIFY_TOKEN_BUCKETS_SINGLE,
-                    # Optimized grid-aligned presets (recommended)
-                    "optimized": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED,
-                    "optimized_full": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_FULL,
-                    "optimized_compact": SHOPIFY_TOKEN_BUCKETS_OPTIMIZED_COMPACT,
-                }
-                if token_buckets in bucket_presets:
-                    buckets = bucket_presets[token_buckets]
-                    logger.info(
-                        f"Using token bucket preset '{token_buckets}': {buckets}"
-                    )
-                    return get_grid_configs_from_token_buckets(buckets)
-                else:
-                    logger.warning(
-                        f"Unknown token bucket preset '{token_buckets}', "
-                        f"available: {list(bucket_presets.keys())}"
-                    )
-            elif isinstance(token_buckets, list):
-                logger.info(f"Using custom token buckets: {token_buckets}")
-                return get_grid_configs_from_token_buckets(token_buckets)
+            return CUSTOM_GRID_CONFIGS
 
         # Check for encoder-specific grid config
         grid_configs = getattr(
@@ -393,54 +157,32 @@ class EncoderCudaGraphManager:
             None
         )
         if grid_configs is not None:
-            # Handle preset names
+            # Handle preset name or custom list
             if isinstance(grid_configs, str):
-                if grid_configs == "shopify":
-                    return SHOPIFY_OPTIMIZED_GRID_CONFIGS
-                elif grid_configs == "shopify_rectangular":
-                    return SHOPIFY_RECTANGULAR_GRID_CONFIGS
-                elif grid_configs == "custom":
+                if grid_configs == "custom":
                     return CUSTOM_GRID_CONFIGS
-                elif grid_configs == "default":
-                    return DEFAULT_ENCODER_GRID_CONFIGS
                 else:
                     logger.warning(
                         f"Unknown grid config preset '{grid_configs}', "
-                        "using default"
+                        "using 'custom'"
                     )
-                    return DEFAULT_ENCODER_GRID_CONFIGS
+                    return CUSTOM_GRID_CONFIGS
             return [tuple(cfg) for cfg in grid_configs]
 
-        return DEFAULT_ENCODER_GRID_CONFIGS
+        return CUSTOM_GRID_CONFIGS
 
     def _get_bucket_sizes_from_config(self) -> list[int]:
-        """Get encoder CUDA graph bucket sizes from config or use defaults."""
+        """Get encoder CUDA graph bucket sizes from config."""
         compilation_config = self.vllm_config.compilation_config
         if compilation_config is None:
-            return DEFAULT_ENCODER_CUDAGRAPH_BUCKET_SIZES
+            return []
 
         encoder_sizes = getattr(
             compilation_config,
             'encoder_cudagraph_bucket_sizes',
             None
         )
-        if encoder_sizes is not None:
-            return encoder_sizes
-
-        return DEFAULT_ENCODER_CUDAGRAPH_BUCKET_SIZES
-
-    def get_padded_size(self, num_visual_tokens: int) -> int | None:
-        """
-        Find the smallest bucket size >= num_visual_tokens.
-
-        Returns None if the input is larger than all buckets.
-        Note: This is for backward compatibility. For actual graph lookup,
-        use get_graph_for_grid() instead.
-        """
-        for bucket_size in self.bucket_sizes:
-            if num_visual_tokens <= bucket_size:
-                return bucket_size
-        return None
+        return encoder_sizes if encoder_sizes is not None else []
 
     def _grid_to_key(self, grid_thw: list[list[int]]) -> tuple[int, int, int] | None:
         """
@@ -755,18 +497,6 @@ class EncoderCudaGraphManager:
             f"(configs: {sorted(self.graphs.keys())})"
         )
 
-    def can_use_graph(self, num_visual_tokens: int) -> bool:
-        """
-        Check if a CUDA graph might be available for the given token count.
-
-        Note: This is a heuristic check. Actual graph usage depends on
-        exact grid_thw match via get_graph_for_grid().
-        """
-        if not self.captured:
-            return False
-        padded_size = self.get_padded_size(num_visual_tokens)
-        return padded_size is not None
-
     def get_graph_for_grid(
         self,
         grid_thw: list[list[int]],
@@ -986,39 +716,6 @@ class EncoderCudaGraphManager:
             "num_graphs": len(self.graphs),
             "captured_configs": sorted(self.graphs.keys()),
         }
-
-
-def get_encoder_cudagraph_bucket_sizes(
-    max_visual_tokens: int,
-    min_bucket: int = 64,
-    growth_factor: float = 1.5,
-) -> list[int]:
-    """
-    Generate bucket sizes for encoder CUDA graphs.
-
-    Uses exponential growth to cover the range [min_bucket, max_visual_tokens]
-    with reasonable granularity.
-
-    Args:
-        max_visual_tokens: Maximum number of visual tokens to support
-        min_bucket: Minimum bucket size
-        growth_factor: Multiplier for each successive bucket
-
-    Returns:
-        List of bucket sizes
-    """
-    buckets = []
-    current = min_bucket
-
-    while current <= max_visual_tokens:
-        buckets.append(int(current))
-        current = int(current * growth_factor)
-
-    # Ensure max is included
-    if buckets[-1] < max_visual_tokens:
-        buckets.append(max_visual_tokens)
-
-    return buckets
 
 
 def generate_grid_configs_for_resolution_range(
