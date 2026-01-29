@@ -2379,6 +2379,10 @@ class GPUModelRunner(
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
+        # Log encoder CUDA graph stats periodically
+        if self.encoder_cudagraph_manager is not None:
+            self.encoder_cudagraph_manager.get_stats()
+
         return encoder_outputs
 
     def _execute_with_encoder_cudagraph(
@@ -2462,9 +2466,9 @@ class GPUModelRunner(
             # Exact match found - try to run
             output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
             if output is not None:
-                logger.debug(
-                    f"Encoder CUDA graph exact match for grid {grid_key}, "
-                    f"output: {output.shape}"
+                logger.info(
+                    f"ViT CUDA graph EXACT: grid={grid_key}, "
+                    f"output={output.shape}"
                 )
                 return [output[:num_output_tokens]]
 
@@ -2478,16 +2482,16 @@ class GPUModelRunner(
             )
             if result is not None:
                 output, padding_waste = result
-                logger.debug(
-                    f"Encoder CUDA graph padded execution: "
-                    f"{num_output_tokens} tokens, waste={padding_waste}"
+                logger.info(
+                    f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
+                    f"tokens={num_output_tokens}, waste={padding_waste}"
                 )
                 return [output]
 
         # No CUDA graph available
-        logger.debug(
-            f"No encoder CUDA graph for grid {grid_thw[0]} "
-            f"(padded_mode={self.encoder_cudagraph_padded_mode}). Using eager mode."
+        logger.info(
+            f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens} "
+            f"(padded_mode={self.encoder_cudagraph_padded_mode})"
         )
         return None
 
