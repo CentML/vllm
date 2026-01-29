@@ -252,8 +252,8 @@ class EncoderCudaGraphManager:
         # h, w are in patch units, so num_patches = t * h * w
         num_pixel_patches = t * h * w
 
-        # Create dummy pixel values
-        pixel_values = torch.randn(
+        # Create dummy pixel values (zeros are fine for warmup/capture)
+        pixel_values = torch.zeros(
             num_pixel_patches,
             patch_input_channels,
             dtype=self.dtype,
