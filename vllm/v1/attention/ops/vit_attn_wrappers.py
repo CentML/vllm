@@ -29,7 +29,7 @@ def flash_attn_maxseqlen_wrapper(
     fa_version: int | None,
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    max_seqlen: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     kwargs = {}
     if is_rocm_aiter:
@@ -45,7 +45,14 @@ def flash_attn_maxseqlen_wrapper(
         cu_seqlens = torch.arange(
             0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
         )
-    max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
+    # Handle max_seqlen as int (for CUDA graph) or tensor (for eager mode)
+    # Using int avoids .item() call which breaks CUDA graph capture
+    if max_seqlen is None:
+        max_seqlen = q_len
+    elif isinstance(max_seqlen, int):
+        pass  # already an int
+    else:
+        max_seqlen = max_seqlen.item()
 
     q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = flash_attn_varlen_func(
@@ -117,7 +124,7 @@ def fa4_flash_attn_maxseqlen_wrapper(
     batch_size: int,
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    max_seqlen: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     """FA4 (flash_attn.cute) wrapper for ViT attention.
 
@@ -132,7 +139,14 @@ def fa4_flash_attn_maxseqlen_wrapper(
         cu_seqlens = torch.arange(
             0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
         )
-    max_seqlen_int = q_len if max_seqlen is None else max_seqlen.item()
+    # Handle max_seqlen as int (for CUDA graph) or tensor (for eager mode)
+    # Using int avoids .item() call which breaks CUDA graph capture
+    if max_seqlen is None:
+        max_seqlen_int = q_len
+    elif isinstance(max_seqlen, int):
+        max_seqlen_int = max_seqlen
+    else:
+        max_seqlen_int = max_seqlen.item()
 
     q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
     output = fa4_flash_attn_varlen_func(
