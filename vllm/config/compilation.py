@@ -453,23 +453,8 @@ class CompilationConfig:
 
     encoder_cudagraph_grid_configs: list[tuple[int, int, int]] | str | None = None
     """Grid configurations (T, H, W in patch units) for exact-match CUDA graph
-    capture. Can be a list of tuples or a preset name: "default", "custom",
-    "shopify", "shopify_rectangular". The "custom" preset contains top 30 grids
-    from MLPerf dataset (58.9% exact match coverage). If None, uses default."""
-
-    encoder_cudagraph_token_buckets: list[int] | str | None = None
-    """Token bucket sizes for encoder CUDA graphs with padding support.
-    Instead of requiring exact grid matches, inputs are padded to the smallest
-    bucket that fits. This trades some compute (padding overhead) for higher
-    CUDA graph utilization.
-
-    Can be a list of token counts or a preset name:
-    - "shopify_fine": [1024, 2048, 3072, 4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192, 8464]
-    - "shopify_medium": [1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 8464]
-    - "shopify_coarse": [2048, 4096, 6144, 8192, 8464]
-    - "shopify_single": [8464] (all images padded to max)
-
-    When set, overrides encoder_cudagraph_grid_configs."""
+    capture. Can be a list of tuples or preset "custom" (top 30 most common grids,
+    58.9% exact match coverage). If None, uses "custom" as default."""
 
     encoder_cudagraph_padded_mode: bool = True
     """Whether to use padded execution for encoder CUDA graphs.
