@@ -2447,6 +2447,14 @@ class GPUModelRunner(
         spatial_merge_size = getattr(model.visual, 'spatial_merge_size', 2)
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+        num_input_patches = pixel_values.shape[0]
+
+        # Log the exact size needed for bucket analysis
+        logger.info(
+            f"ViT input: grid_thw=({t}, {h}, {w}), "
+            f"input_patches={num_input_patches}, "
+            f"output_tokens={num_output_tokens}"
+        )
 
         # Try exact match first
         grid_key = self.encoder_cudagraph_manager.get_graph_for_grid(grid_thw)
