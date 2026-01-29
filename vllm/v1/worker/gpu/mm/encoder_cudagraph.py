@@ -448,18 +448,20 @@ class EncoderCudaGraphManager:
                 desc="Capturing encoder CUDA graphs"
             )
 
-        with graph_capture(device=self.device):
-            for grid_config in configs_to_capture:
-                try:
+        # Capture each graph in its own graph_capture context to isolate failures.
+        # If one capture fails, the pool state won't affect subsequent captures.
+        for grid_config in configs_to_capture:
+            try:
+                with graph_capture(device=self.device):
                     self.capture_graph_for_grid(
                         grid_config,
                         vision_encoder,
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to capture encoder CUDA graph for grid config "
-                        f"{grid_config}: {e}. Will use eager mode."
-                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to capture encoder CUDA graph for grid config "
+                    f"{grid_config}: {e}. Will use eager mode."
+                )
 
         self.captured = True
         logger.info(
