@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Grid configurations for CUDA graph capture (T, H, W in patch units)
-# Top 30 most common grids from MLPerf dataset analysis (58.9% exact match coverage)
+# Top 30 most common grids (58.9% exact match coverage)
 CUSTOM_GRID_CONFIGS = [
     (1, 62, 62),
     (1, 94, 94),
