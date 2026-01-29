@@ -300,9 +300,9 @@ class EncoderRunner:
             # Exact match found - try to run
             output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
             if output is not None:
-                logger.debug(
-                    f"Encoder CUDA graph exact match for grid {grid_key}, "
-                    f"output: {output.shape}"
+                logger.info(
+                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
+                    f"tokens={num_output_tokens}"
                 )
                 return [output[:num_output_tokens]]
 
@@ -316,16 +316,15 @@ class EncoderRunner:
             )
             if result is not None:
                 output, padding_waste = result
-                logger.debug(
-                    f"Encoder CUDA graph padded execution: "
-                    f"{num_output_tokens} tokens, waste={padding_waste}"
+                logger.info(
+                    f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
+                    f"tokens={num_output_tokens}, waste={padding_waste}"
                 )
                 return [output]
 
         # No CUDA graph available
-        logger.debug(
-            f"No CUDA graph for grid {grid_thw[0]} "
-            f"(padded_mode={self.encoder_cudagraph_padded_mode}). Using eager mode."
+        logger.info(
+            f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens}"
         )
         return None
 
