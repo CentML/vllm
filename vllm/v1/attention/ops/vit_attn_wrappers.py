@@ -29,7 +29,7 @@ def flash_attn_maxseqlen_wrapper(
     fa_version: int | None,
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    max_seqlen: torch.Tensor | int | None = None,
+    max_seqlen: torch.Tensor | None = None,  # Also accepts int at runtime
 ) -> torch.Tensor:
     kwargs = {}
     if is_rocm_aiter:
@@ -124,7 +124,7 @@ def fa4_flash_attn_maxseqlen_wrapper(
     batch_size: int,
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
-    max_seqlen: torch.Tensor | int | None = None,
+    max_seqlen: torch.Tensor | None = None,  # Also accepts int at runtime
 ) -> torch.Tensor:
     """FA4 (flash_attn.cute) wrapper for ViT attention.
 
