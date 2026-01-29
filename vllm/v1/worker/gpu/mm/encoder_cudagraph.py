@@ -52,6 +52,39 @@ DEFAULT_ENCODER_GRID_CONFIGS = [
     (1, 96, 96),   # ~1344x1344 -> 2304 output tokens
 ]
 
+CUSTOM_GRID_CONFIGS = [
+    (1, 62, 62),
+    (1, 94, 94),
+    (1, 50, 50),
+    (1, 124, 124),
+    (1, 32, 32),
+    (1, 76, 76),
+    (1, 100, 100),
+    (1, 64, 64),
+    (1, 38, 38),
+    (1, 188, 188),
+    (1, 68, 68),
+    (1, 128, 128),
+    (1, 250, 250),
+    (1, 44, 44),
+    (1, 112, 112),
+    (1, 80, 80),
+    (1, 46, 46),
+    (1, 160, 160),
+    (1, 42, 42),
+    (1, 24, 24),
+    (1, 56, 56),
+    (1, 16, 16),
+    (1, 256, 256),
+    (1, 208, 312),
+    (1, 188, 252),
+    (1, 156, 156),
+    (1, 252, 188),
+    (1, 88, 88),
+    (1, 120, 120),
+    (1, 40, 40),
+]
+
 # Optimized grid configurations for MLPerf Shopify dataset
 # Based on analysis: 96% of images have 4000-8200 output tokens
 # Using square grids that cover the common token ranges with padding
@@ -366,6 +399,8 @@ class EncoderCudaGraphManager:
                     return SHOPIFY_OPTIMIZED_GRID_CONFIGS
                 elif grid_configs == "shopify_rectangular":
                     return SHOPIFY_RECTANGULAR_GRID_CONFIGS
+                elif grid_configs == "custom":
+                    return CUSTOM_GRID_CONFIGS
                 elif grid_configs == "default":
                     return DEFAULT_ENCODER_GRID_CONFIGS
                 else:
