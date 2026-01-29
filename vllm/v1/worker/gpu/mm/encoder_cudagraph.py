@@ -111,15 +111,20 @@ class EncoderCudaGraphManager:
         self.device = device
         self.dtype = dtype
 
-        # Get grid configs from config or use defaults
+        # Get grid configs from config or use defaults (for exact match)
         if grid_configs is None:
             grid_configs = self._get_grid_configs_from_config()
-        self.grid_configs = grid_configs
 
-        # Legacy bucket sizes (for backward compatibility with bucket-based API)
+        # Get bucket sizes from config (for padded mode)
         if bucket_sizes is None:
             bucket_sizes = self._get_bucket_sizes_from_config()
-        self.bucket_sizes = sorted(bucket_sizes)
+
+        # Merge: grid_configs (exact match) + bucket_sizes (padded mode square grids)
+        # Bucket sizes create square grids (1, size, size) for padded mode
+        grid_set = set(grid_configs)
+        for size in bucket_sizes:
+            grid_set.add((1, size, size))
+        self.grid_configs = list(grid_set)
 
         # CUDA graph storage - keyed by (t, h, w) tuple
         self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
