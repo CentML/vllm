@@ -499,8 +499,6 @@ ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 ARG FLASHINFER_CUBIN_VERSION=0.5.3
 ARG FLASHINFER_JIT_CACHE_VERSION=0.5.3
 RUN --mount=type=cache,target=/root/.cache/uv \
-    # Upgrade to the latest version of NVIDIA cuDNN for CUDA 13.
-    uv pip install --upgrade --system nvidia-cudnn-cu13 && \
     # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
@@ -585,6 +583,10 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
     uv pip install --system ep_kernels/dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
 
+ # Upgrade to the latest version of NVIDIA cuDNN for CUDA 13.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade --system nvidia-cudnn-cu13
+        
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
 # consistently from the host (see https://github.com/vllm-project/vllm/issues/18859).
