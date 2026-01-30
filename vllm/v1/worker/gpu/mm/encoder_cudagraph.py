@@ -609,18 +609,20 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
-        # Copy input to the captured buffer
-        input_buffer.copy_(pixel_values)
+        # Copy input to the captured buffer (non-blocking for better overlap)
+        input_buffer.copy_(pixel_values, non_blocking=True)
 
         # For exact match, restore cached embeddings (may have been modified by run_padded)
         if grid_key in self.embedding_buffers and grid_key in self.cached_tensors:
             embed_buffers = self.embedding_buffers[grid_key]
             cached = self.cached_tensors[grid_key]
-            embed_buffers["pos_embeds"].copy_(cached["pos_embeds"])
-            embed_buffers["rotary_pos_emb_cos"].copy_(cached["rotary_pos_emb_cos"])
-            embed_buffers["rotary_pos_emb_sin"].copy_(cached["rotary_pos_emb_sin"])
-            embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"])
-            embed_buffers["max_seqlen"].copy_(cached["max_seqlen"])
+            embed_buffers["pos_embeds"].copy_(cached["pos_embeds"], non_blocking=True)
+            embed_buffers["rotary_pos_emb_cos"].copy_(
+                cached["rotary_pos_emb_cos"], non_blocking=True)
+            embed_buffers["rotary_pos_emb_sin"].copy_(
+                cached["rotary_pos_emb_sin"], non_blocking=True)
+            embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
+            embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
 
         # Replay the graph
         self.graphs[grid_key].replay()
@@ -708,19 +710,22 @@ class EncoderCudaGraphManager:
         embed_buffers["rotary_pos_emb_sin"].zero_()
 
         # Copy actual pixel values to the beginning of the buffer
-        input_buffer[:num_input_patches].copy_(pixel_values)
+        input_buffer[:num_input_patches].copy_(pixel_values, non_blocking=True)
 
         # Copy actual embeddings to the beginning of the buffers (pad with zeros)
         actual_num_patches = actual_embeds["pos_embeds"].shape[0]
-        embed_buffers["pos_embeds"][:actual_num_patches].copy_(actual_embeds["pos_embeds"])
-        embed_buffers["rotary_pos_emb_cos"][:actual_num_patches].copy_(actual_embeds["rotary_pos_emb_cos"])
-        embed_buffers["rotary_pos_emb_sin"][:actual_num_patches].copy_(actual_embeds["rotary_pos_emb_sin"])
+        embed_buffers["pos_embeds"][:actual_num_patches].copy_(
+            actual_embeds["pos_embeds"], non_blocking=True)
+        embed_buffers["rotary_pos_emb_cos"][:actual_num_patches].copy_(
+            actual_embeds["rotary_pos_emb_cos"], non_blocking=True)
+        embed_buffers["rotary_pos_emb_sin"][:actual_num_patches].copy_(
+            actual_embeds["rotary_pos_emb_sin"], non_blocking=True)
 
         # Update cu_seqlens and max_seqlen to actual values
         # cu_seqlens shape is [num_images + 1], for single image it's [2]: [0, num_patches]
         # We copy the actual values so flash attention processes only the real tokens
-        embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"])
-        embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"])
+        embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"], non_blocking=True)
+        embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"], non_blocking=True)
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
