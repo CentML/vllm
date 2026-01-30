@@ -2364,25 +2364,58 @@ class GPUModelRunner(
                 curr_group_outputs = curr_group_outputs_lst
             else:
                 # Try to use CUDA graph if available
-                cudagraph_result = None
-                if self.encoder_cudagraph_manager is not None:
-                    cudagraph_result = self._execute_with_encoder_cudagraph(
-                        model, mm_kwargs_group, modality, num_items
-                    )
-
-                if cudagraph_result is not None:
-                    # CUDA graph was used successfully
-                    curr_group_outputs = cudagraph_result
+                # When CUDA graphs are enabled and we have multiple items,
+                # process them one at a time since CUDA graphs only support
+                # single-image batches
+                if (self.encoder_cudagraph_manager is not None
+                    and num_items > 1
+                    and modality in ("image", "video")):
+                    # Process each image individually for CUDA graph support
+                    curr_group_outputs_lst = []
+                    for mm_item in filter(
+                        lambda item: item.modality == modality, mm_kwargs
+                    ):
+                        _, _, single_mm_inputs = next(
+                            group_mm_kwargs_by_modality(
+                                [mm_item],
+                                device=self.device,
+                                pin_memory=self.pin_memory,
+                            )
+                        )
+                        # Try CUDA graph for this single image
+                        single_result = self._execute_with_encoder_cudagraph(
+                            model, single_mm_inputs, modality, 1
+                        )
+                        if single_result is not None:
+                            curr_group_outputs_lst.extend(single_result)
+                        else:
+                            # Fall back to eager for this image
+                            single_output = model.embed_multimodal(
+                                **single_mm_inputs
+                            )
+                            curr_group_outputs_lst.extend(single_output)
+                    curr_group_outputs = curr_group_outputs_lst
                 else:
-                    # Fall back to eager mode.
-                    # Run the encoder.
-                    # `curr_group_outputs` is either of the following:
-                    # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                    # in case feature_size is fixed across all multimodal items.
-                    # 2. A list or tuple (length: num_items) of tensors,
-                    # each of shape (feature_size, hidden_size) in case the feature
-                    # size is dynamic depending on the input multimodal items.
-                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                    # Single item or no CUDA graph manager - try CUDA graph
+                    cudagraph_result = None
+                    if self.encoder_cudagraph_manager is not None:
+                        cudagraph_result = self._execute_with_encoder_cudagraph(
+                            model, mm_kwargs_group, modality, num_items
+                        )
+
+                    if cudagraph_result is not None:
+                        # CUDA graph was used successfully
+                        curr_group_outputs = cudagraph_result
+                    else:
+                        # Fall back to eager mode.
+                        # Run the encoder.
+                        # `curr_group_outputs` is either of the following:
+                        # 1. A tensor of shape (num_items, feature_size, hidden_size)
+                        # in case feature_size is fixed across all multimodal items.
+                        # 2. A list or tuple (length: num_items) of tensors,
+                        # each of shape (feature_size, hidden_size) in case the feature
+                        # size is dynamic depending on the input multimodal items.
+                        curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
