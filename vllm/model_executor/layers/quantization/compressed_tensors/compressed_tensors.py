@@ -970,7 +970,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         type_ = kv_cache_scheme.get("type")
         num_bits = kv_cache_scheme.get("num_bits")
 
-        if type_ != "float" and num_bits != 8:
+        if type_ != "float" or num_bits != 8:
             raise NotImplementedError(
                 "Currently supported kv cache quantization is "
                 "num_bits=8, type=float, however "
@@ -1118,6 +1118,22 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         layer._k_scale = layer.k_scale
         layer._v_scale = layer.v_scale
         layer._q_scale = layer.q_scale
+
+        # Adjust scales for fp8 fnuz if needed.
+        if current_platform.is_fp8_fnuz():
+            layer._k_scale.mul_(2)
+            layer._v_scale.mul_(2)
+            layer._q_scale.mul_(2)
+
+        def _scale_to_float(scale: torch.Tensor) -> float:
+            if scale.numel() == 1:
+                return scale.item()
+            # Per-head scales are not used by backends requiring *_scale_float.
+            return scale.reshape(-1)[0].item()
+
+        layer._k_scale_float = _scale_to_float(layer._k_scale)
+        layer._v_scale_float = _scale_to_float(layer._v_scale)
+        layer._q_scale_float = _scale_to_float(layer._q_scale)
 
         # Discard all placeholders.
         del layer.k_scale
