@@ -2404,22 +2404,31 @@ class GPUModelRunner(
                                 patch_offset:patch_offset + num_patches]
                             patch_offset += num_patches
 
-                            # Build single-image kwargs
-                            single_mm_inputs = {
+                            # Build single-image kwargs for CUDA graph (list format)
+                            single_mm_inputs_for_cudagraph = {
                                 pixel_key: single_pixel_values,
                                 grid_key: [grid_thw],
                             }
 
                             # Try CUDA graph for this single image
                             single_result = self._execute_with_encoder_cudagraph(
-                                model, single_mm_inputs, modality, 1
+                                model, single_mm_inputs_for_cudagraph, modality, 1
                             )
                             if single_result is not None:
                                 curr_group_outputs_lst.extend(single_result)
                             else:
                                 # Fall back to eager for this image
+                                # Model expects grid_thw as tensor, not list
+                                single_mm_inputs_for_eager = {
+                                    pixel_key: single_pixel_values,
+                                    grid_key: torch.tensor(
+                                        [grid_thw],
+                                        dtype=torch.int64,
+                                        device=self.device,
+                                    ),
+                                }
                                 single_output = model.embed_multimodal(
-                                    **single_mm_inputs
+                                    **single_mm_inputs_for_eager
                                 )
                                 curr_group_outputs_lst.extend(single_output)
 
