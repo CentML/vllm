@@ -2532,8 +2532,9 @@ class GPUModelRunner(
             self.encoder_cudagraph_manager.count_miss()
             return None
 
-        # Ensure pixel_values is on the correct device
-        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
+        # Ensure pixel_values is on the correct device and contiguous
+        # Contiguity is important for CUDA graph replay to avoid memory issues
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype).contiguous()
 
         # Get spatial merge size for token calculations
         spatial_merge_size = getattr(model.visual, 'spatial_merge_size', 2)

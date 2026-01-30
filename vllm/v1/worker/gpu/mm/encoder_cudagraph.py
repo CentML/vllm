@@ -607,7 +607,28 @@ class EncoderCudaGraphManager:
             self.eager_fallbacks += 1
             return None
 
+        # Verify device and dtype match
+        if pixel_values.device != input_buffer.device:
+            logger.warning(
+                f"Device mismatch: expected {input_buffer.device}, "
+                f"got {pixel_values.device}. Falling back to eager mode."
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        if pixel_values.dtype != input_buffer.dtype:
+            logger.warning(
+                f"Dtype mismatch: expected {input_buffer.dtype}, "
+                f"got {pixel_values.dtype}. Falling back to eager mode."
+            )
+            self.eager_fallbacks += 1
+            return None
+
         self.cache_hits += 1
+
+        # Ensure contiguous memory layout for safe copy
+        if not pixel_values.is_contiguous():
+            pixel_values = pixel_values.contiguous()
 
         # Copy input to the captured buffer (non-blocking for better overlap)
         input_buffer.copy_(pixel_values, non_blocking=True)
@@ -693,6 +714,27 @@ class EncoderCudaGraphManager:
             )
             self.eager_fallbacks += 1
             return None
+
+        # Verify device and dtype match
+        if pixel_values.device != input_buffer.device:
+            logger.warning(
+                f"Device mismatch: expected {input_buffer.device}, "
+                f"got {pixel_values.device}. Falling back to eager mode."
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        if pixel_values.dtype != input_buffer.dtype:
+            logger.warning(
+                f"Dtype mismatch: expected {input_buffer.dtype}, "
+                f"got {pixel_values.dtype}. Falling back to eager mode."
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        # Ensure contiguous memory layout for safe copy
+        if not pixel_values.is_contiguous():
+            pixel_values = pixel_values.contiguous()
 
         self.cache_hits += 1
 
