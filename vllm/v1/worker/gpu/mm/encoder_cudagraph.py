@@ -791,6 +791,13 @@ class EncoderCudaGraphManager:
                 f"bucket_patches={bucket_input_patches}"
             )
 
+        # Synchronize before replay to ensure precompute_for_cudagraph() and all
+        # non-blocking copies have completed. This is necessary because we're
+        # running fresh GPU operations (precompute) before replaying the graph,
+        # unlike run() which only copies from pre-existing cached tensors.
+        # Without this sync, rapid back-to-back calls can cause memory corruption.
+        torch.cuda.current_stream().synchronize()
+
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
 
