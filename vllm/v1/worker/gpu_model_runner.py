@@ -2417,8 +2417,11 @@ class GPUModelRunner(
                             }
 
                             # Try CUDA graph for this single image
+                            # Skip padded mode to avoid segfaults with rapid
+                            # back-to-back graph replays during one-by-one processing
                             single_result = self._execute_with_encoder_cudagraph(
-                                model, single_mm_inputs_for_cudagraph, modality, 1
+                                model, single_mm_inputs_for_cudagraph, modality, 1,
+                                skip_padded_mode=True,
                             )
                             if single_result is not None:
                                 curr_group_outputs_lst.extend(single_result)
@@ -2490,6 +2493,7 @@ class GPUModelRunner(
         mm_kwargs_group: dict,
         modality: str,
         num_items: int,
+        skip_padded_mode: bool = False,
     ) -> list[torch.Tensor] | None:
         """
         Execute the encoder using CUDA graphs if a matching graph is available.
@@ -2503,6 +2507,8 @@ class GPUModelRunner(
             mm_kwargs_group: Batched multimodal kwargs
             modality: The modality type ("image" or "video")
             num_items: Number of items in the batch
+            skip_padded_mode: If True, skip padded mode even if enabled.
+                Used during one-by-one processing to avoid segfaults.
 
         Returns:
             List of encoder outputs if CUDA graph was used, None otherwise
@@ -2575,7 +2581,8 @@ class GPUModelRunner(
             return [output[:num_output_tokens]]
 
         # Try padded execution if enabled (run_padded counts hits internally)
-        if self.encoder_cudagraph_padded_mode:
+        # Skip padded mode during one-by-one processing to avoid segfaults
+        if self.encoder_cudagraph_padded_mode and not skip_padded_mode:
             result = self.encoder_cudagraph_manager.run_padded(
                 pixel_values,
                 grid_thw,
