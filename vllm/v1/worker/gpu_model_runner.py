@@ -2426,14 +2426,13 @@ class GPUModelRunner(
                                 curr_group_outputs_lst.extend(single_result)
                             else:
                                 # Fall back to eager for this image
-                                # Model expects grid_thw as tensor, not list
+                                # Model expects grid_thw as CPU tensor (it calls .numpy())
                                 single_mm_inputs_for_eager = {
                                     pixel_key: single_pixel_values,
                                     grid_key: torch.tensor(
                                         [grid_thw],
                                         dtype=torch.int64,
-                                        device=self.device,
-                                    ),
+                                    ),  # Keep on CPU
                                 }
                                 single_output = model.embed_multimodal(
                                     **single_mm_inputs_for_eager
