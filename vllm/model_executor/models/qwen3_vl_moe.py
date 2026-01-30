@@ -177,6 +177,14 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             "_k_scale",
             ".v_scale",
             "_v_scale",
+            ".q_scale",
+            "_q_scale",
+            ".k_zero_point",
+            "_k_zero_point",
+            ".v_zero_point",
+            "_v_zero_point",
+            ".q_zero_point",
+            "_q_zero_point",
             ".weight_scale",
             "_weight_scale",
             ".input_scale",
@@ -209,17 +217,17 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra parameters for GPTQ/modelopt models.
-                if name.endswith(ignore_suffixes) and name not in params_dict:
-                    continue
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
-                if name.endswith("scale"):
-                    # Remapping the name of FP8 kv-scale.
+                # Remapping the name of FP8 kv-scale and zero_point.
+                if "scale" in name or "zero_point" in name:
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
+                # Skip loading extra parameters for GPTQ/modelopt models.
+                if name.endswith(ignore_suffixes) and name not in params_dict:
+                    continue
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -270,6 +278,13 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                                 num_experts,
                             )
                     else:
+                        # Remapping the name of FP8 kv-scale and zero_point.
+                        if "scale" in name_mapped or "zero_point" in name_mapped:
+                            name_mapped = maybe_remap_kv_scale_name(
+                                name_mapped, params_dict
+                            )
+                            if name_mapped is None:
+                                continue
                         # Skip loading extra parameters for GPTQ/modelopt models
                         if (
                             name_mapped.endswith(ignore_suffixes)
@@ -300,26 +315,17 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                         # However it's not mapped locally to this rank
                         # So we simply skip it
                         continue
-                    # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(ignore_suffixes) and name not in params_dict:
-                        continue
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name, self):
                         continue
-                    # Remapping the name of FP8 kv-scale.
-                    if name.endswith("kv_scale"):
-                        remapped_kv_scale_name = name.replace(
-                            ".kv_scale", ".attn.kv_scale"
-                        )
-                        if remapped_kv_scale_name not in params_dict:
-                            logger.warning_once(
-                                "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",  # noqa: E501
-                                name,
-                                remapped_kv_scale_name,
-                            )
+                    # Remapping the name of FP8 kv-scale and zero_point.
+                    if "scale" in name or "zero_point" in name:
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None:
                             continue
-                        else:
-                            name = remapped_kv_scale_name
+                    # Skip loading extra parameters for GPTQ/modelopt models.
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
