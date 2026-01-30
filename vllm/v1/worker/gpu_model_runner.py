@@ -429,6 +429,7 @@ class GPUModelRunner(
         # Encoder CUDA graph manager for ViT
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
         self.encoder_cudagraph_padded_mode: bool = True
+        self.encoder_cudagraph_verbose: bool = False
         self._init_encoder_cudagraph_manager()
 
         self.use_aux_hidden_state_outputs = False
@@ -705,6 +706,13 @@ class GPUModelRunner(
             self.compilation_config,
             'encoder_cudagraph_padded_mode',
             True  # Default to padded mode for better CUDA graph utilization
+        )
+
+        # Check if verbose logging is enabled
+        self.encoder_cudagraph_verbose = getattr(
+            self.compilation_config,
+            'encoder_cudagraph_verbose',
+            False  # Default to quiet mode
         )
 
         # Create a dedicated graph pool for encoder CUDA graphs
@@ -2388,9 +2396,11 @@ class GPUModelRunner(
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
-        # Log encoder CUDA graph stats periodically
+        # Log encoder CUDA graph stats periodically (verbose only)
         if self.encoder_cudagraph_manager is not None:
-            self.encoder_cudagraph_manager.get_stats()
+            self.encoder_cudagraph_manager.get_stats(
+                verbose=self.encoder_cudagraph_verbose
+            )
 
         return encoder_outputs
 
@@ -2462,20 +2472,22 @@ class GPUModelRunner(
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
         num_input_patches = pixel_values.shape[0]
 
-        # Log the exact size needed for bucket analysis
-        logger.info(
-            f"ViT input: grid_thw=({t}, {h}, {w}), "
-            f"input_patches={num_input_patches}, "
-            f"output_tokens={num_output_tokens}"
-        )
+        # Log the exact size needed for bucket analysis (verbose only)
+        if self.encoder_cudagraph_verbose:
+            logger.info(
+                f"ViT input: grid_thw=({t}, {h}, {w}), "
+                f"input_patches={num_input_patches}, "
+                f"output_tokens={num_output_tokens}"
+            )
 
         # Try exact match first via run() - counts hits internally
         output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
         if output is not None:
-            logger.info(
-                f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
-                f"output={output.shape}"
-            )
+            if self.encoder_cudagraph_verbose:
+                logger.info(
+                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
+                    f"output={output.shape}"
+                )
             return [output[:num_output_tokens]]
 
         # Try padded execution if enabled (run_padded counts hits internally)
@@ -2488,18 +2500,20 @@ class GPUModelRunner(
             )
             if result is not None:
                 output, padding_waste = result
-                logger.info(
-                    f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
-                    f"tokens={num_output_tokens}, waste={padding_waste}"
-                )
+                if self.encoder_cudagraph_verbose:
+                    logger.info(
+                        f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
+                        f"tokens={num_output_tokens}, waste={padding_waste}"
+                    )
                 return [output]
 
         # No CUDA graph available - count the miss and fall back to eager mode
         self.encoder_cudagraph_manager.count_miss()
-        logger.info(
-            f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens} "
-            f"(padded_mode={self.encoder_cudagraph_padded_mode})"
-        )
+        if self.encoder_cudagraph_verbose:
+            logger.info(
+                f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens} "
+                f"(padded_mode={self.encoder_cudagraph_padded_mode})"
+            )
         return None
 
     def _gather_mm_embeddings(
