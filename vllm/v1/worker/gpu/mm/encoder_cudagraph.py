@@ -648,8 +648,16 @@ class EncoderCudaGraphManager:
         # Sync before replay to ensure all copies are complete (debug)
         torch.cuda.synchronize()
 
+        # Debug: log before replay to identify crash pattern
+        logger.info(
+            f"DEBUG run(): About to replay graph for grid_key={grid_key}, "
+            f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
+        )
+
         # Replay the graph
         self.graphs[grid_key].replay()
+
+        logger.info(f"DEBUG run(): Replay completed for grid_key={grid_key}")
 
         # Return a clone of the output to avoid issues with buffer reuse
         return self.output_buffers[grid_key].clone()
@@ -775,8 +783,17 @@ class EncoderCudaGraphManager:
         # Sync before replay to ensure all copies are complete (debug)
         torch.cuda.synchronize()
 
+        # Debug: log before replay to identify crash pattern
+        logger.info(
+            f"DEBUG run_padded(): About to replay graph for bucket_grid={bucket_grid}, "
+            f"actual_grid={grid_thw[0]}, input_patches={num_input_patches}, "
+            f"bucket_patches={bucket_input_patches}"
+        )
+
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
+
+        logger.info(f"DEBUG run_padded(): Replay completed for bucket_grid={bucket_grid}")
 
         # Get output and trim to actual size
         full_output = self.output_buffers[bucket_grid]
