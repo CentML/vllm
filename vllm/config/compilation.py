@@ -474,6 +474,12 @@ class CompilationConfig:
     Set lower (e.g., 128, 188, 218) on memory-constrained systems.
     Default 256 captures all grids in CUSTOM_GRID_CONFIGS."""
 
+    encoder_cudagraph_verbose: bool = False
+    """Enable verbose logging for encoder CUDA graph execution.
+    When True, logs each ViT input size and CUDA graph hit/miss/padded status.
+    Useful for debugging and analyzing CUDA graph utilization.
+    When False, only logs summary stats at the end of execution."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition

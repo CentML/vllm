@@ -745,8 +745,12 @@ class EncoderCudaGraphManager:
         """
         self.cache_misses += 1
 
-    def get_stats(self) -> dict[str, Any]:
-        """Get and log cache statistics."""
+    def get_stats(self, verbose: bool = True) -> dict[str, Any]:
+        """Get and optionally log cache statistics.
+
+        Args:
+            verbose: If True, log stats to INFO level. If False, only return stats dict.
+        """
         total = self.cache_hits + self.cache_misses + self.eager_fallbacks
         hit_rate = self.cache_hits / total if total > 0 else 0.0
         stats = {
@@ -757,12 +761,13 @@ class EncoderCudaGraphManager:
             "num_graphs": len(self.graphs),
             "captured_configs": sorted(self.graphs.keys()),
         }
-        logger.info(
-            f"Encoder CUDA graph stats: "
-            f"hits={self.cache_hits}, misses={self.cache_misses}, "
-            f"eager={self.eager_fallbacks}, hit_rate={hit_rate:.1%}, "
-            f"num_graphs={len(self.graphs)}"
-        )
+        if verbose:
+            logger.info(
+                f"Encoder CUDA graph stats: "
+                f"hits={self.cache_hits}, misses={self.cache_misses}, "
+                f"eager={self.eager_fallbacks}, hit_rate={hit_rate:.1%}, "
+                f"num_graphs={len(self.graphs)}"
+            )
         return stats
 
 
