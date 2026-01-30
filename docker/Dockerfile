@@ -598,8 +598,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system flashinfer-cubin==${FLASHINFER_CUBIN_VERSION} && \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_JIT_CACHE_VERSION} \
     --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') && \
-    rm -rf /tmp/flashinfer && \
-    flashinfer show-config
+    rm -rf /tmp/flashinfer
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
