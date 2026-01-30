@@ -128,7 +128,27 @@ class EncoderCudaGraphManager:
         grid_set = set(grid_configs)
         for size in bucket_sizes:
             grid_set.add((1, size, size))
-        self.grid_configs = list(grid_set)
+
+        # Filter out grids that are too large to capture efficiently
+        # Large grids (e.g., 256x256+) consume massive memory (~14+ GiB each)
+        # and are better served by eager mode or padded execution
+        max_grid_size = self._get_max_grid_size_from_config()
+        filtered_grids = []
+        skipped_grids = []
+        for grid in grid_set:
+            t, h, w = grid
+            if h <= max_grid_size and w <= max_grid_size:
+                filtered_grids.append(grid)
+            else:
+                skipped_grids.append(grid)
+
+        if skipped_grids:
+            logger.info(
+                f"Skipping {len(skipped_grids)} grids exceeding max_grid_size={max_grid_size}: "
+                f"{sorted(skipped_grids, key=lambda x: x[1]*x[2], reverse=True)[:5]}..."
+            )
+
+        self.grid_configs = filtered_grids
 
         # CUDA graph storage - keyed by (t, h, w) tuple
         self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
@@ -202,6 +222,28 @@ class EncoderCudaGraphManager:
             None
         )
         return encoder_sizes if encoder_sizes is not None else []
+
+    def _get_max_grid_size_from_config(self) -> int:
+        """Get maximum grid size for encoder CUDA graph capture.
+
+        Large grids (e.g., 256x256+) consume massive GPU memory per graph:
+        - 128x128: ~3.5 GiB
+        - 188x188: ~7.7 GiB
+        - 256x256: ~14 GiB
+        - 512x512: ~57 GiB
+
+        Default is 128 to allow capturing ~15-20 useful grids on typical hardware.
+        """
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config is None:
+            return 128  # Conservative default
+
+        max_size = getattr(
+            compilation_config,
+            'encoder_cudagraph_max_grid_size',
+            128  # Default: max 128x128 grids
+        )
+        return max_size
 
     def _grid_to_key(self, grid_thw: list[list[int]]) -> tuple[int, int, int] | None:
         """
@@ -445,11 +487,12 @@ class EncoderCudaGraphManager:
             f"{free_mem_before / 1024**3:.2f} GiB free)"
         )
 
-        # Capture from largest to smallest (more memory efficient)
+        # Capture from smallest to largest so that common smaller grids are
+        # captured first. If we run out of memory, only large grids will fail.
         configs_to_capture = sorted(
             self.grid_configs,
             key=lambda x: x[0] * x[1] * x[2],
-            reverse=True
+            reverse=False  # Smallest first
         )
 
         if is_global_first_rank():
