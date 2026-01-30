@@ -180,7 +180,6 @@ class EncoderCudaGraphManager:
 
         # Statistics
         self.cache_hits = 0
-        self.cache_misses = 0
         self.eager_fallbacks = 0
 
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
@@ -738,12 +737,12 @@ class EncoderCudaGraphManager:
         return trimmed_output, padding_waste
 
     def count_miss(self) -> None:
-        """Count a cache miss when falling back to eager mode.
+        """Count when falling back to eager mode.
 
         This should be called by the caller when neither run() nor run_padded()
         succeeded and eager execution is used.
         """
-        self.cache_misses += 1
+        self.eager_fallbacks += 1
 
     def get_stats(self, verbose: bool = True) -> dict[str, Any]:
         """Get and optionally log cache statistics.
@@ -751,11 +750,10 @@ class EncoderCudaGraphManager:
         Args:
             verbose: If True, log stats to INFO level. If False, only return stats dict.
         """
-        total = self.cache_hits + self.cache_misses + self.eager_fallbacks
+        total = self.cache_hits + self.eager_fallbacks
         hit_rate = self.cache_hits / total if total > 0 else 0.0
         stats = {
             "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
             "eager_fallbacks": self.eager_fallbacks,
             "hit_rate": hit_rate,
             "num_graphs": len(self.graphs),
@@ -764,9 +762,8 @@ class EncoderCudaGraphManager:
         if verbose:
             logger.info(
                 f"Encoder CUDA graph stats: "
-                f"hits={self.cache_hits}, misses={self.cache_misses}, "
-                f"eager={self.eager_fallbacks}, hit_rate={hit_rate:.1%}, "
-                f"num_graphs={len(self.graphs)}"
+                f"hits={self.cache_hits}, eager={self.eager_fallbacks}, "
+                f"hit_rate={hit_rate:.1%}, num_graphs={len(self.graphs)}"
             )
         return stats
 
