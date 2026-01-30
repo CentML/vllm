@@ -2395,7 +2395,15 @@ class GPUModelRunner(
 
                         # Calculate patch boundaries for slicing
                         patch_offset = 0
-                        for grid_thw in grid_thw_list:
+                        logger.info(
+                            f"DEBUG: Processing {len(grid_thw_list)} images "
+                            f"one-at-a-time, grids={grid_thw_list}"
+                        )
+                        for img_idx, grid_thw in enumerate(grid_thw_list):
+                            logger.info(
+                                f"DEBUG: Processing image {img_idx+1}/{len(grid_thw_list)}, "
+                                f"grid={grid_thw}"
+                            )
                             t, h, w = grid_thw
                             num_patches = t * h * w
 
