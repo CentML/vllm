@@ -2472,6 +2472,7 @@ class GPUModelRunner(
         if grid_thw is None:
             grid_thw = mm_kwargs_group.get("video_grid_thw")
         if grid_thw is None:
+            self.encoder_cudagraph_manager.count_miss()
             return None
 
         # Convert to list if tensor
@@ -2484,6 +2485,7 @@ class GPUModelRunner(
                 "Encoder CUDA graph only supports single-image batches, "
                 f"got {len(grid_thw)} images. Using eager mode."
             )
+            self.encoder_cudagraph_manager.count_miss()
             return None
 
         # Extract pixel_values
@@ -2494,6 +2496,7 @@ class GPUModelRunner(
 
         if pixel_values is None:
             logger.debug("No pixel_values found in kwargs. Using eager mode.")
+            self.encoder_cudagraph_manager.count_miss()
             return None
 
         # Ensure pixel_values is on the correct device
