@@ -2367,9 +2367,15 @@ class GPUModelRunner(
                 # When CUDA graphs are enabled and we have multiple items,
                 # process them one at a time since CUDA graphs only support
                 # single-image batches
+                # Set VLLM_DISABLE_ENCODER_ONEBYONE=1 to disable one-at-a-time
+                # processing for debugging
+                import os
+                disable_onebyone = os.environ.get(
+                    "VLLM_DISABLE_ENCODER_ONEBYONE", "0") == "1"
                 if (self.encoder_cudagraph_manager is not None
                     and num_items > 1
-                    and modality in ("image", "video")):
+                    and modality in ("image", "video")
+                    and not disable_onebyone):
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
@@ -2448,6 +2454,9 @@ class GPUModelRunner(
                     # Single item or no CUDA graph manager - try CUDA graph
                     cudagraph_result = None
                     if self.encoder_cudagraph_manager is not None:
+                        logger.info(
+                            f"DEBUG: Processing single item, modality={modality}"
+                        )
                         cudagraph_result = self._execute_with_encoder_cudagraph(
                             model, mm_kwargs_group, modality, num_items
                         )
