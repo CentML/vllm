@@ -42,6 +42,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     """
 
     FLASH_ATTN = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+    # FA4 (Cute-DSL) - this tag is only used for ViT (MM encoder) attention.
+    # NOTE: This backend does not implement the KV-cache attention path and
+    # should not be used with `--attention-config.backend`.
+    FLASH_ATTN_CUTE = "flash_attn.cute"
     FLASH_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )

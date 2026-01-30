@@ -110,6 +110,85 @@ def vit_flash_attn_wrapper(
     )
 
 
+def fa4_flash_attn_maxseqlen_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FA4 (flash_attn.cute) wrapper for ViT attention.
+
+    flash_attn.cute returns (out, lse); we only return out.
+    """
+    from vllm.v1.attention.backends.fa4_utils import (
+        flash_attn_varlen_func as fa4_flash_attn_varlen_func,
+    )
+
+    q_len = q.size(1)
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
+        )
+    max_seqlen_int = q_len if max_seqlen is None else max_seqlen.item()
+
+    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    output = fa4_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen_int,
+        max_seqlen_k=max_seqlen_int,
+        softmax_scale=scale,
+        causal=False,
+    )
+    context_layer = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+    return context_layer
+
+
+def fa4_flash_attn_maxseqlen_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="fa4_flash_attn_maxseqlen_wrapper",
+    op_func=fa4_flash_attn_maxseqlen_wrapper,
+    fake_impl=fa4_flash_attn_maxseqlen_wrapper_fake,
+)
+
+
+def vit_fa4_flash_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.fa4_flash_attn_maxseqlen_wrapper(
+        q,
+        k,
+        v,
+        batch_size,
+        scale,
+        cu_seqlens,
+        max_seqlen,
+    )
+
+
 def apply_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -183,3 +262,88 @@ def vit_torch_sdpa_wrapper(
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.torch_sdpa_wrapper(q, k, v, scale, cu_seqlens)
+
+
+def flashinfer_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+
+    is_reshaped = q.dim() == 4
+
+    if is_reshaped:
+        reshape_batch_size = q.shape[0]
+        q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+
+    assert len(cu_seqlens) % 3 == 0, "cu_seqlens must be divisible by 3"
+    cu_seqlength = len(cu_seqlens) // 3
+    batch_offsets_qk = cu_seqlens[:cu_seqlength].view(-1, 1, 1, 1)
+    batch_offsets_v = cu_seqlens[cu_seqlength : cu_seqlength * 2].view(-1, 1, 1, 1)
+    batch_offsets_o = cu_seqlens[cu_seqlength * 2 :].view(-1, 1, 1, 1)
+    sequence_lengths = sequence_lengths.view(-1, 1, 1, 1)
+    max_seqlen = max_seqlen.item()
+
+    output, _ = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        scale,
+        workspace_buffer,
+        max_token_per_sequence=max_seqlen,
+        max_sequence_kv=max_seqlen,
+        actual_seq_lens_q=sequence_lengths,
+        actual_seq_lens_kv=sequence_lengths,
+        causal=False,
+        return_lse=False,
+        batch_offsets_q=batch_offsets_qk,
+        batch_offsets_k=batch_offsets_qk,
+        batch_offsets_v=batch_offsets_v,
+        batch_offsets_o=batch_offsets_o,
+    )
+
+    if is_reshaped:
+        output = einops.rearrange(output, "(b s) h d -> b s h d", b=reshape_batch_size)
+
+    return output
+
+
+def vit_flashinfer_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="flashinfer_wrapper",
+    op_func=flashinfer_wrapper,
+    fake_impl=vit_flashinfer_wrapper_fake,
+)
+
+
+def vit_flashinfer_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.flashinfer_wrapper(
+        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen, sequence_lengths
+    )
