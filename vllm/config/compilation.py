@@ -464,6 +464,16 @@ class CompilationConfig:
     attention only processes real tokens). Output is trimmed to actual size.
     When False, only exact grid matches use CUDA graphs."""
 
+    encoder_cudagraph_max_grid_size: int = 256
+    """Maximum grid dimension (H or W) for encoder CUDA graph capture.
+    Grids with H > max or W > max are skipped to limit GPU memory usage.
+    Memory scales roughly with H*W:
+    - 128x128: ~0.8 GiB
+    - 188x188: ~1.7 GiB
+    - 256x256: ~3.2 GiB
+    Set lower (e.g., 128, 188, 218) on memory-constrained systems.
+    Default 256 captures all grids in CUSTOM_GRID_CONFIGS."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
