@@ -499,6 +499,8 @@ ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
 ARG FLASHINFER_CUBIN_VERSION=0.5.3
 ARG FLASHINFER_JIT_CACHE_VERSION=0.5.3
 RUN --mount=type=cache,target=/root/.cache/uv \
+    # Upgrade to the latest version of NVIDIA cuDNN for CUDA 13.
+    uv pip install --upgrade --system nvidia-cudnn-cu13 && \
     # Clone and build FlashInfer
     git clone --recursive -b ${FLASHINFER_BRANCH} ${FLASHINFER_REPO} /tmp/flashinfer && \
     cd /tmp/flashinfer && \
