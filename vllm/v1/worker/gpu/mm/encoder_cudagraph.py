@@ -645,6 +645,9 @@ class EncoderCudaGraphManager:
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
             embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
 
+        # Sync before replay to ensure all copies are complete (debug)
+        torch.cuda.synchronize()
+
         # Replay the graph
         self.graphs[grid_key].replay()
 
@@ -768,6 +771,9 @@ class EncoderCudaGraphManager:
         # We copy the actual values so flash attention processes only the real tokens
         embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"], non_blocking=True)
         embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"], non_blocking=True)
+
+        # Sync before replay to ensure all copies are complete (debug)
+        torch.cuda.synchronize()
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
