@@ -110,10 +110,12 @@ class EncoderCudaGraphManager:
         bucket_sizes: list[int] | None = None,
         grid_configs: list[tuple[int, int, int]] | None = None,
         graph_pool: Any | None = None,
+        verbose: bool = False,
     ):
         self.vllm_config = vllm_config
         self.device = device
         self.dtype = dtype
+        self.verbose = verbose
 
         # Get grid configs from config or use defaults (for exact match)
         if grid_configs is None:
@@ -652,19 +654,14 @@ class EncoderCudaGraphManager:
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=False)
             embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=False)
 
-        # Sync before replay to ensure all copies are complete (debug)
-        torch.cuda.synchronize()
-
-        # Debug: log before replay to identify crash pattern
-        logger.info(
-            f"DEBUG run(): About to replay graph for grid_key={grid_key}, "
-            f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
-        )
+        if self.verbose:
+            logger.info(
+                f"run(): grid_key={grid_key}, "
+                f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
+            )
 
         # Replay the graph
         self.graphs[grid_key].replay()
-
-        logger.info(f"DEBUG run(): Replay completed for grid_key={grid_key}")
 
         # Return a clone of the output to avoid issues with buffer reuse
         return self.output_buffers[grid_key].clone()
@@ -787,20 +784,15 @@ class EncoderCudaGraphManager:
         embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"], non_blocking=False)
         embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"], non_blocking=False)
 
-        # Sync before replay to ensure all copies are complete (debug)
-        torch.cuda.synchronize()
-
-        # Debug: log before replay to identify crash pattern
-        logger.info(
-            f"DEBUG run_padded(): About to replay graph for bucket_grid={bucket_grid}, "
-            f"actual_grid={grid_thw[0]}, input_patches={num_input_patches}, "
-            f"bucket_patches={bucket_input_patches}"
-        )
+        if self.verbose:
+            logger.info(
+                f"run_padded(): bucket_grid={bucket_grid}, "
+                f"actual_grid={grid_thw[0]}, input_patches={num_input_patches}, "
+                f"bucket_patches={bucket_input_patches}"
+            )
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
-
-        logger.info(f"DEBUG run_padded(): Replay completed for bucket_grid={bucket_grid}")
 
         # Get output and trim to actual size
         full_output = self.output_buffers[bucket_grid]
