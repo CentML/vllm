@@ -2371,30 +2371,63 @@ class GPUModelRunner(
                     and num_items > 1
                     and modality in ("image", "video")):
                     # Process each image individually for CUDA graph support
+                    # Extract batched data and slice per-image to avoid
+                    # re-calling group_mm_kwargs_by_modality overhead
                     curr_group_outputs_lst = []
-                    for mm_item in filter(
-                        lambda item: item.modality == modality, mm_kwargs
-                    ):
-                        _, _, single_mm_inputs = next(
-                            group_mm_kwargs_by_modality(
-                                [mm_item],
-                                device=self.device,
-                                pin_memory=self.pin_memory,
+
+                    # Get batched pixel_values and grid_thw
+                    if modality == "image":
+                        batched_pixel_values = mm_kwargs_group.get("pixel_values")
+                        grid_thw_list = mm_kwargs_group.get("image_grid_thw")
+                        grid_key = "image_grid_thw"
+                        pixel_key = "pixel_values"
+                    else:  # video
+                        batched_pixel_values = mm_kwargs_group.get(
+                            "pixel_values_videos")
+                        grid_thw_list = mm_kwargs_group.get("video_grid_thw")
+                        grid_key = "video_grid_thw"
+                        pixel_key = "pixel_values_videos"
+
+                    if batched_pixel_values is not None and grid_thw_list is not None:
+                        # Convert grid_thw to list if tensor
+                        if hasattr(grid_thw_list, "tolist"):
+                            grid_thw_list = grid_thw_list.tolist()
+
+                        # Calculate patch boundaries for slicing
+                        patch_offset = 0
+                        for grid_thw in grid_thw_list:
+                            t, h, w = grid_thw
+                            num_patches = t * h * w
+
+                            # Slice pixel_values for this image
+                            single_pixel_values = batched_pixel_values[
+                                patch_offset:patch_offset + num_patches]
+                            patch_offset += num_patches
+
+                            # Build single-image kwargs
+                            single_mm_inputs = {
+                                pixel_key: single_pixel_values,
+                                grid_key: [grid_thw],
+                            }
+
+                            # Try CUDA graph for this single image
+                            single_result = self._execute_with_encoder_cudagraph(
+                                model, single_mm_inputs, modality, 1
                             )
-                        )
-                        # Try CUDA graph for this single image
-                        single_result = self._execute_with_encoder_cudagraph(
-                            model, single_mm_inputs, modality, 1
-                        )
-                        if single_result is not None:
-                            curr_group_outputs_lst.extend(single_result)
-                        else:
-                            # Fall back to eager for this image
-                            single_output = model.embed_multimodal(
-                                **single_mm_inputs
-                            )
-                            curr_group_outputs_lst.extend(single_output)
-                    curr_group_outputs = curr_group_outputs_lst
+                            if single_result is not None:
+                                curr_group_outputs_lst.extend(single_result)
+                            else:
+                                # Fall back to eager for this image
+                                single_output = model.embed_multimodal(
+                                    **single_mm_inputs
+                                )
+                                curr_group_outputs_lst.extend(single_output)
+
+                        curr_group_outputs = curr_group_outputs_lst
+                    else:
+                        # Fallback to eager if data extraction fails
+                        curr_group_outputs = model.embed_multimodal(
+                            **mm_kwargs_group)
                 else:
                     # Single item or no CUDA graph manager - try CUDA graph
                     cudagraph_result = None
