@@ -154,7 +154,13 @@ class EncoderCudaGraphManager:
         self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         # Use provided pool or create a dedicated encoder pool
         # Using a separate pool from decoder allows independent memory management
-        self.pool = graph_pool if graph_pool is not None else torch.cuda.graph_pool_handle()
+        # Set VLLM_ENCODER_NO_POOL=1 to disable shared pool (debug for segfault)
+        import os
+        if os.environ.get("VLLM_ENCODER_NO_POOL", "0") == "1":
+            self.pool = None  # Each graph uses private memory
+            logger.info("Encoder CUDA graphs: using private pools (no shared pool)")
+        else:
+            self.pool = graph_pool if graph_pool is not None else torch.cuda.graph_pool_handle()
 
         # Pre-allocated input/output buffers per grid config
         # Key: (t, h, w), Value: {"pixel_values": tensor, "grid_thw": list}
