@@ -637,6 +637,11 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
+        # Sync before modifying buffers: ensure any previous graph replay
+        # (from a prior call) has completed. Without this, we could modify
+        # buffers while a previous replay is still reading them.
+        torch.cuda.synchronize()
+
         # Ensure contiguous memory layout for safe copy
         if not pixel_values.is_contiguous():
             pixel_values = pixel_values.contiguous()
@@ -661,6 +666,11 @@ class EncoderCudaGraphManager:
                 f"run(): grid_key={grid_key}, "
                 f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
             )
+
+        # Sync before replay: graph was captured on a separate stream, but buffer
+        # modifications (copy) happen on the default stream. Without sync,
+        # replay may start before copies complete.
+        torch.cuda.synchronize()
 
         # Replay the graph
         self.graphs[grid_key].replay()
