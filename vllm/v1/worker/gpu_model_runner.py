@@ -2417,11 +2417,8 @@ class GPUModelRunner(
                             }
 
                             # Try CUDA graph for this single image
-                            # Skip padded mode to avoid segfaults with rapid
-                            # back-to-back graph replays during one-by-one processing
                             single_result = self._execute_with_encoder_cudagraph(
                                 model, single_mm_inputs_for_cudagraph, modality, 1,
-                                skip_padded_mode=True,
                             )
                             if single_result is not None:
                                 curr_group_outputs_lst.extend(single_result)
