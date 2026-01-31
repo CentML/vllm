@@ -755,6 +755,11 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
+        # Sync before modifying buffers: ensure any previous graph replay
+        # (from a prior call) has completed. Without this, we could zero/modify
+        # buffers while a previous replay is still reading them.
+        torch.cuda.synchronize()
+
         # === KEY FIX: Compute embeddings for ACTUAL grid, then pad ===
         # This ensures correct position embeddings for the actual input size
         actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
