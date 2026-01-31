@@ -793,6 +793,11 @@ class EncoderCudaGraphManager:
                 f"bucket_patches={bucket_input_patches}"
             )
 
+        # Sync before replay: graph was captured on a separate stream, but buffer
+        # modifications (zero, copy) happen on the default stream. Without sync,
+        # replay may start before copies complete, reading zeros/partial data.
+        torch.cuda.synchronize()
+
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
 
