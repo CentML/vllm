@@ -456,7 +456,9 @@ class Qwen3_VisionTransformer(nn.Module):
             workspace_buffer = (
                 None
                 if self.attn_backend != AttentionBackendEnum.FLASHINFER
-                else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+                else torch.zeros(
+                    128 * 1024 * 1024, dtype=torch.uint8, device=self.device
+                )
             )
 
             self.blocks = nn.ModuleList(
@@ -766,9 +768,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 deepstack_feature_lists.append(deepstack_feature)
 
         hidden_states = self.merger(hidden_states)
-        hidden_states = torch.cat(
-            [hidden_states] + deepstack_feature_lists, dim=1
-        )
+        hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
         return hidden_states
 
     def precompute_for_cudagraph(
