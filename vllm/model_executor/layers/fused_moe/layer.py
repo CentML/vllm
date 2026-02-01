@@ -2139,6 +2139,7 @@ class FusedMoE(CustomOp):
         ]
 
     def extra_repr(self) -> str:
+        return ""
         s = (
             f"global_num_experts={self.global_num_experts}, "
             f"local_num_experts={self.local_num_experts}, "
