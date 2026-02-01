@@ -1561,14 +1561,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 x_quant, x_scale = mxfp8_quantize(x, False)  # to mxfp8
                 x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
+                if layer.w13_weight_shuffled.shape[1] != layer.intermediate_size_per_partition:
+                    gemm1_w = torch.nn.functional.pad(
+                        layer.w13_weight_shuffled, 
+                        (0, 0, 0, layer.intermediate_size_per_partition - layer.w13_weight_shuffled.shape[1]), 
+                        "constant", 0
+                    ).contiguous()
+                    gemm2_w = torch.nn.functional.pad(
+                        layer.w2_weight_shuffled, 
+                        (0, layer.intermediate_size_per_partition - layer.w2_weight_shuffled.shape[2], 0, 0), 
+                        "constant", 0
+                    ).contiguous()
+                else:
+                    gemm1_w = layer.w13_weight_shuffled
+                    gemm2_w = layer.w2_weight_shuffled
                 flashinfer_output = trtllm_mxfp8_block_scale_moe(
                     routing_logits=router_logits,
                     routing_bias=e_score_correction_bias,
                     hidden_states=x_quant,
                     hidden_states_scale=x_scale,
-                    gemm1_weights=layer.w13_weight_shuffled,
+                    gemm1_weights=gemm1_w,
                     gemm1_weights_scale=layer.w13_scales_shuffled,
-                    gemm2_weights=layer.w2_weight_shuffled,
+                    gemm2_weights=gemm2_w,
                     gemm2_weights_scale=layer.w2_scales_shuffled,
                     num_experts=layer.global_num_experts,
                     top_k=layer.top_k,
