@@ -62,23 +62,21 @@ class EncoderRunner:
         if compilation_config is None:
             return
 
-        if not getattr(compilation_config, 'cudagraph_mm_encoder', False):
+        if not getattr(compilation_config, "cudagraph_mm_encoder", False):
             return
 
         # Import here to avoid circular imports
         from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 
         bucket_sizes = getattr(
-            compilation_config,
-            'encoder_cudagraph_bucket_sizes',
-            None
+            compilation_config, "encoder_cudagraph_bucket_sizes", None
         )
 
         # Check if padded mode is enabled
         self.encoder_cudagraph_padded_mode = getattr(
             compilation_config,
-            'encoder_cudagraph_padded_mode',
-            True  # Default to padded mode for better CUDA graph utilization
+            "encoder_cudagraph_padded_mode",
+            True,  # Default to padded mode for better CUDA graph utilization
         )
 
         self.encoder_cudagraph_manager = EncoderCudaGraphManager(
@@ -109,7 +107,7 @@ class EncoderRunner:
         if self.encoder_cudagraph_manager is None:
             return
 
-        if not hasattr(model, 'visual') or model.visual is None:
+        if not hasattr(model, "visual") or model.visual is None:
             logger.warning(
                 "Model does not have a visual encoder, "
                 "skipping encoder CUDA graph capture"
@@ -297,7 +295,7 @@ class EncoderRunner:
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
 
         # Get spatial merge size for token calculations
-        spatial_merge_size = getattr(model.visual, 'spatial_merge_size', 2)
+        spatial_merge_size = getattr(model.visual, "spatial_merge_size", 2)
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
 
@@ -330,9 +328,7 @@ class EncoderRunner:
                 return [output]
 
         # No CUDA graph available
-        logger.info(
-            f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens}"
-        )
+        logger.info(f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens}")
         return None
 
     def gather_mm_embeddings(
