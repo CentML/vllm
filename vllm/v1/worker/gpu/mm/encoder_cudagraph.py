@@ -682,6 +682,11 @@ class EncoderCudaGraphManager:
         self.graphs[grid_key].replay()
         print(f"[EXACT] replay done", file=sys.stderr, flush=True)
 
+        # Sync after replay: ensure graph execution completes before we read output
+        # (replay is on capture stream, clone is on default stream)
+        torch.cuda.synchronize()
+        print(f"[EXACT] post-replay sync done", file=sys.stderr, flush=True)
+
         # Return a clone of the output to avoid issues with buffer reuse
         return self.output_buffers[grid_key].clone()
 
@@ -833,6 +838,11 @@ class EncoderCudaGraphManager:
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
         print(f"[PADDED] replay done", file=sys.stderr, flush=True)
+
+        # Sync after replay: ensure graph execution completes before we read output
+        # (replay is on capture stream, clone is on default stream)
+        torch.cuda.synchronize()
+        print(f"[PADDED] post-replay sync done", file=sys.stderr, flush=True)
 
         # Get output and trim to actual size
         full_output = self.output_buffers[bucket_grid]
