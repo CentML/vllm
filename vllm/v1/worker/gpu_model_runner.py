@@ -155,11 +155,11 @@ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -693,34 +693,32 @@ class GPUModelRunner(
         if self.compilation_config is None:
             return
 
-        if not getattr(self.compilation_config, 'cudagraph_mm_encoder', False):
+        if not getattr(self.compilation_config, "cudagraph_mm_encoder", False):
             return
 
         bucket_sizes = getattr(
-            self.compilation_config,
-            'encoder_cudagraph_bucket_sizes',
-            None
+            self.compilation_config, "encoder_cudagraph_bucket_sizes", None
         )
 
         # Check if padded mode is enabled
         self.encoder_cudagraph_padded_mode = getattr(
             self.compilation_config,
-            'encoder_cudagraph_padded_mode',
-            True  # Default to padded mode for better CUDA graph utilization
+            "encoder_cudagraph_padded_mode",
+            True,  # Default to padded mode for better CUDA graph utilization
         )
 
         # Check if verbose logging is enabled
         self.encoder_cudagraph_verbose = getattr(
             self.compilation_config,
-            'encoder_cudagraph_verbose',
-            False  # Default to quiet mode
+            "encoder_cudagraph_verbose",
+            False,  # Default to quiet mode
         )
 
         # Check if one-by-one processing is enabled for multi-image batches
         self.encoder_cudagraph_one_by_one = getattr(
             self.compilation_config,
-            'encoder_cudagraph_one_by_one',
-            True  # Default to one-by-one for higher CUDA graph hit rate
+            "encoder_cudagraph_one_by_one",
+            True,  # Default to one-by-one for higher CUDA graph hit rate
         )
 
         # Create a dedicated graph pool for encoder CUDA graphs
@@ -2378,10 +2376,12 @@ class GPUModelRunner(
                 # process them one at a time since CUDA graphs only support
                 # single-image batches. This can be disabled via config if
                 # the sync overhead outweighs the CUDA graph benefits.
-                if (self.encoder_cudagraph_manager is not None
+                if (
+                    self.encoder_cudagraph_manager is not None
                     and self.encoder_cudagraph_one_by_one
                     and num_items > 1
-                    and modality in ("image", "video")):
+                    and modality in ("image", "video")
+                ):
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
@@ -2395,7 +2395,8 @@ class GPUModelRunner(
                         pixel_key = "pixel_values"
                     else:  # video
                         batched_pixel_values = mm_kwargs_group.get(
-                            "pixel_values_videos")
+                            "pixel_values_videos"
+                        )
                         grid_thw_list = mm_kwargs_group.get("video_grid_thw")
                         grid_key = "video_grid_thw"
                         pixel_key = "pixel_values_videos"
@@ -2418,7 +2419,8 @@ class GPUModelRunner(
 
                             # Slice pixel_values for this image
                             single_pixel_values = batched_pixel_values[
-                                patch_offset:patch_offset + num_patches]
+                                patch_offset : patch_offset + num_patches
+                            ]
                             patch_offset += num_patches
 
                             # Build single-image kwargs for CUDA graph (list format)
@@ -2429,7 +2431,10 @@ class GPUModelRunner(
 
                             # Try CUDA graph for this single image
                             single_result = self._execute_with_encoder_cudagraph(
-                                model, single_mm_inputs_for_cudagraph, modality, 1,
+                                model,
+                                single_mm_inputs_for_cudagraph,
+                                modality,
+                                1,
                             )
                             if single_result is not None:
                                 curr_group_outputs_lst.extend(single_result)
@@ -2451,8 +2456,7 @@ class GPUModelRunner(
                         curr_group_outputs = curr_group_outputs_lst
                     else:
                         # Fallback to eager if data extraction fails
-                        curr_group_outputs = model.embed_multimodal(
-                            **mm_kwargs_group)
+                        curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
                 else:
                     # Single item or no CUDA graph manager - try CUDA graph
                     cudagraph_result = None
@@ -2562,10 +2566,12 @@ class GPUModelRunner(
 
         # Ensure pixel_values is on the correct device and contiguous
         # Contiguity is important for CUDA graph replay to avoid memory issues
-        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype).contiguous()
+        pixel_values = pixel_values.to(
+            device=self.device, dtype=self.dtype
+        ).contiguous()
 
         # Get spatial merge size for token calculations
-        spatial_merge_size = getattr(model.visual, 'spatial_merge_size', 2)
+        spatial_merge_size = getattr(model.visual, "spatial_merge_size", 2)
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
         num_input_patches = pixel_values.shape[0]
@@ -2583,8 +2589,7 @@ class GPUModelRunner(
         if output is not None:
             if self.encoder_cudagraph_verbose:
                 logger.info(
-                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
-                    f"output={output.shape}"
+                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), output={output.shape}"
                 )
             return [output[:num_output_tokens]]
 
@@ -5202,7 +5207,7 @@ class GPUModelRunner(
             return
 
         model = self.model
-        if not hasattr(model, 'visual') or model.visual is None:
+        if not hasattr(model, "visual") or model.visual is None:
             logger.warning(
                 "Model does not have a visual encoder, "
                 "skipping encoder CUDA graph capture"
