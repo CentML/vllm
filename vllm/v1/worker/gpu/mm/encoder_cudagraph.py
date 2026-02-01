@@ -640,16 +640,13 @@ class EncoderCudaGraphManager:
         # Sync before modifying buffers: ensure any previous graph replay
         # (from a prior call) has completed. Without this, we could modify
         # buffers while a previous replay is still reading them.
-        print(f"[EXACT] sync before modify, grid={grid_key}", file=sys.stderr, flush=True)
         torch.cuda.synchronize()
-        print(f"[EXACT] sync done", file=sys.stderr, flush=True)
 
         # Ensure contiguous memory layout for safe copy
         if not pixel_values.is_contiguous():
             pixel_values = pixel_values.contiguous()
 
         # Copy input to the captured buffer (non-blocking for better overlap)
-        print(f"[EXACT] copying buffers", file=sys.stderr, flush=True)
         input_buffer.copy_(pixel_values, non_blocking=True)
 
         # For exact match, restore cached embeddings (may have been modified by run_padded)
@@ -663,7 +660,6 @@ class EncoderCudaGraphManager:
                 cached["rotary_pos_emb_sin"], non_blocking=True)
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
             embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
-        print(f"[EXACT] copying done", file=sys.stderr, flush=True)
 
         if self.verbose:
             logger.info(
@@ -674,18 +670,14 @@ class EncoderCudaGraphManager:
         # Sync before replay: graph was captured on a separate stream, but buffer
         # modifications (copy) happen on the default stream. Without sync,
         # replay may start before copies complete.
-        print(f"[EXACT] sync before replay", file=sys.stderr, flush=True)
         torch.cuda.synchronize()
-        print(f"[EXACT] sync done, about to replay", file=sys.stderr, flush=True)
 
         # Replay the graph
         self.graphs[grid_key].replay()
-        print(f"[EXACT] replay done", file=sys.stderr, flush=True)
 
         # Sync after replay: ensure graph execution completes before we read output
         # (replay is on capture stream, clone is on default stream)
         torch.cuda.synchronize()
-        print(f"[EXACT] post-replay sync done", file=sys.stderr, flush=True)
 
         # Return a clone of the output to avoid issues with buffer reuse
         return self.output_buffers[grid_key].clone()
@@ -780,29 +772,22 @@ class EncoderCudaGraphManager:
         # Sync before modifying buffers: ensure any previous graph replay
         # (from a prior call) has completed. Without this, we could zero/modify
         # buffers while a previous replay is still reading them.
-        print(f"[PADDED] sync before modify, bucket={bucket_grid}", file=sys.stderr, flush=True)
         torch.cuda.synchronize()
-        print(f"[PADDED] sync done", file=sys.stderr, flush=True)
 
-        # === KEY FIX: Compute embeddings for ACTUAL grid, then pad ===
-        # This ensures correct position embeddings for the actual input size
-        print(f"[PADDED] precompute start", file=sys.stderr, flush=True)
+        # Compute embeddings for ACTUAL grid, then pad to bucket size.
+        # This ensures correct position embeddings for the actual input size.
         actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
-        print(f"[PADDED] precompute done", file=sys.stderr, flush=True)
 
         # Get embedding buffers for the bucket
         embed_buffers = self.embedding_buffers[bucket_grid]
 
         # Zero the buffers first (for clean padding)
-        print(f"[PADDED] zeroing buffers", file=sys.stderr, flush=True)
         input_buffer.zero_()
         embed_buffers["pos_embeds"].zero_()
         embed_buffers["rotary_pos_emb_cos"].zero_()
         embed_buffers["rotary_pos_emb_sin"].zero_()
-        print(f"[PADDED] zeroing done", file=sys.stderr, flush=True)
 
         # Copy actual pixel values to the beginning of the buffer
-        print(f"[PADDED] copying buffers", file=sys.stderr, flush=True)
         input_buffer[:num_input_patches].copy_(pixel_values, non_blocking=True)
 
         # Copy actual embeddings to the beginning of the buffers (pad with zeros)
@@ -819,7 +804,6 @@ class EncoderCudaGraphManager:
         # We copy the actual values so flash attention processes only the real tokens
         embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"], non_blocking=True)
         embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"], non_blocking=True)
-        print(f"[PADDED] copying done", file=sys.stderr, flush=True)
 
         if self.verbose:
             logger.info(
@@ -831,18 +815,14 @@ class EncoderCudaGraphManager:
         # Sync before replay: graph was captured on a separate stream, but buffer
         # modifications (zero, copy) happen on the default stream. Without sync,
         # replay may start before copies complete, reading zeros/partial data.
-        print(f"[PADDED] sync before replay", file=sys.stderr, flush=True)
         torch.cuda.synchronize()
-        print(f"[PADDED] sync done, about to replay", file=sys.stderr, flush=True)
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
-        print(f"[PADDED] replay done", file=sys.stderr, flush=True)
 
         # Sync after replay: ensure graph execution completes before we read output
         # (replay is on capture stream, clone is on default stream)
         torch.cuda.synchronize()
-        print(f"[PADDED] post-replay sync done", file=sys.stderr, flush=True)
 
         # Get output and trim to actual size
         full_output = self.output_buffers[bucket_grid]
