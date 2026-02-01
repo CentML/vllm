@@ -191,6 +191,12 @@ class EncoderCudaGraphManager:
         self.cache_hits = 0
         self.eager_fallbacks = 0
 
+        # CUDA event for lightweight synchronization
+        # Instead of torch.cuda.synchronize() which waits for ALL GPU work,
+        # we use an event to track only the last replay completion.
+        # This allows better overlap between encoder and other GPU work.
+        self.replay_done_event: torch.cuda.Event | None = None
+
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
@@ -637,10 +643,11 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
-        # Sync before modifying buffers: ensure any previous graph replay
-        # (from a prior call) has completed. Without this, we could modify
-        # buffers while a previous replay is still reading them.
-        torch.cuda.synchronize()
+        # Wait for any previous graph replay to complete before modifying buffers.
+        # Using event.synchronize() is lighter than torch.cuda.synchronize()
+        # which waits for ALL GPU work across all streams.
+        if self.replay_done_event is not None:
+            self.replay_done_event.synchronize()
 
         # Ensure contiguous memory layout for safe copy
         if not pixel_values.is_contiguous():
@@ -667,17 +674,25 @@ class EncoderCudaGraphManager:
                 f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
             )
 
-        # Sync before replay: graph was captured on a separate stream, but buffer
-        # modifications (copy) happen on the default stream. Without sync,
-        # replay may start before copies complete.
-        torch.cuda.synchronize()
+        # Sync current stream before replay: graph was captured on a separate stream,
+        # but buffer copies happen on the default stream. We need copies to complete
+        # before replay reads from those buffers.
+        # Using current_stream().synchronize() is lighter than torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
 
         # Replay the graph
         self.graphs[grid_key].replay()
 
-        # Sync after replay: ensure graph execution completes before we read output
-        # (replay is on capture stream, clone is on default stream)
-        torch.cuda.synchronize()
+        # Record event after replay for lightweight sync in next call.
+        # Create event lazily on first use.
+        if self.replay_done_event is None:
+            self.replay_done_event = torch.cuda.Event()
+        self.replay_done_event.record()
+
+        # Sync to ensure output is ready before clone.
+        # TODO: Could eliminate this if we return a view and defer sync to caller,
+        # but that would require careful handling of buffer reuse.
+        self.replay_done_event.synchronize()
 
         # Return a clone of the output to avoid issues with buffer reuse
         return self.output_buffers[grid_key].clone()
@@ -769,10 +784,10 @@ class EncoderCudaGraphManager:
 
         self.cache_hits += 1
 
-        # Sync before modifying buffers: ensure any previous graph replay
-        # (from a prior call) has completed. Without this, we could zero/modify
-        # buffers while a previous replay is still reading them.
-        torch.cuda.synchronize()
+        # Wait for any previous graph replay to complete before modifying buffers.
+        # Using event.synchronize() is lighter than torch.cuda.synchronize()
+        if self.replay_done_event is not None:
+            self.replay_done_event.synchronize()
 
         # Compute embeddings for ACTUAL grid, then pad to bucket size.
         # This ensures correct position embeddings for the actual input size.
@@ -812,17 +827,21 @@ class EncoderCudaGraphManager:
                 f"bucket_patches={bucket_input_patches}"
             )
 
-        # Sync before replay: graph was captured on a separate stream, but buffer
-        # modifications (zero, copy) happen on the default stream. Without sync,
-        # replay may start before copies complete, reading zeros/partial data.
-        torch.cuda.synchronize()
+        # Sync current stream before replay: graph was captured on a separate stream,
+        # but buffer modifications (zero, copy) happen on the default stream.
+        # Using current_stream().synchronize() is lighter than torch.cuda.synchronize()
+        torch.cuda.current_stream().synchronize()
 
         # Replay the graph with updated embedding buffers
         self.graphs[bucket_grid].replay()
 
-        # Sync after replay: ensure graph execution completes before we read output
-        # (replay is on capture stream, clone is on default stream)
-        torch.cuda.synchronize()
+        # Record event after replay for lightweight sync in next call.
+        if self.replay_done_event is None:
+            self.replay_done_event = torch.cuda.Event()
+        self.replay_done_event.record()
+
+        # Sync to ensure output is ready before clone.
+        self.replay_done_event.synchronize()
 
         # Get output and trim to actual size
         full_output = self.output_buffers[bucket_grid]
