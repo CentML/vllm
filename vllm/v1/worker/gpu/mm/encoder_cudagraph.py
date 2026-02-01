@@ -41,7 +41,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.model_executor.models.interfaces import SupportsMultiModal
+    pass
 
 logger = init_logger(__name__)
 
@@ -53,28 +53,25 @@ logger = init_logger(__name__)
 # Grids larger than max_grid_size (default 96) should use padded mode or eager.
 CUSTOM_GRID_CONFIGS = [
     # === Tier 1: Very small grids (<=32) ===
-    (1, 16, 16),   # 256 patches
-    (1, 24, 24),   # 576 patches
-    (1, 32, 32),   # 1024 patches
-
+    (1, 16, 16),  # 256 patches
+    (1, 24, 24),  # 576 patches
+    (1, 32, 32),  # 1024 patches
     # === Tier 2: Small grids (33-50) ===
-    (1, 38, 38),   # 1444 patches
-    (1, 40, 40),   # 1600 patches
-    (1, 42, 42),   # 1764 patches
-    (1, 44, 44),   # 1936 patches
-    (1, 46, 46),   # 2116 patches
-    (1, 50, 50),   # 2500 patches
-
+    (1, 38, 38),  # 1444 patches
+    (1, 40, 40),  # 1600 patches
+    (1, 42, 42),  # 1764 patches
+    (1, 44, 44),  # 1936 patches
+    (1, 46, 46),  # 2116 patches
+    (1, 50, 50),  # 2500 patches
     # === Tier 3: Medium-small grids (51-70) ===
-    (1, 56, 56),   # 3136 patches
-    (1, 62, 62),   # 3844 patches
-    (1, 64, 64),   # 4096 patches
-    (1, 68, 68),   # 4624 patches
-
+    (1, 56, 56),  # 3136 patches
+    (1, 62, 62),  # 3844 patches
+    (1, 64, 64),  # 4096 patches
+    (1, 68, 68),  # 4624 patches
     # === Tier 4: Medium grids (71-96) ===
-    (1, 76, 76),   # 5776 patches
-    (1, 80, 80),   # 6400 patches
-    (1, 94, 94),   # 8836 patches
+    (1, 76, 76),  # 5776 patches
+    (1, 80, 80),  # 6400 patches
+    (1, 94, 94),  # 8836 patches
 ]
 
 # Default bucket sizes for padded mode (creates square grids)
@@ -147,7 +144,7 @@ class EncoderCudaGraphManager:
         if skipped_grids:
             logger.info(
                 f"Skipping {len(skipped_grids)} grids exceeding max_grid_size={max_grid_size}: "
-                f"{sorted(skipped_grids, key=lambda x: x[1]*x[2], reverse=True)[:5]}..."
+                f"{sorted(skipped_grids, key=lambda x: x[1] * x[2], reverse=True)[:5]}..."
             )
 
         self.grid_configs = filtered_grids
@@ -159,8 +156,11 @@ class EncoderCudaGraphManager:
         # Set VLLM_ENCODER_SHARED_POOL=1 to use shared pool (saves memory but
         # may cause issues with rapid replays)
         import os
+
         if os.environ.get("VLLM_ENCODER_SHARED_POOL", "0") == "1":
-            self.pool = graph_pool if graph_pool is not None else torch.cuda.graph_pool_handle()
+            self.pool = (
+                graph_pool if graph_pool is not None else torch.cuda.graph_pool_handle()
+            )
             logger.info("Encoder CUDA graphs: using shared pool")
         else:
             self.pool = None  # Each graph uses private memory (default)
@@ -205,9 +205,7 @@ class EncoderCudaGraphManager:
 
         # Check for encoder-specific grid config
         grid_configs = getattr(
-            compilation_config,
-            'encoder_cudagraph_grid_configs',
-            None
+            compilation_config, "encoder_cudagraph_grid_configs", None
         )
         if grid_configs is not None:
             # Handle preset name or custom list
@@ -216,8 +214,7 @@ class EncoderCudaGraphManager:
                     return CUSTOM_GRID_CONFIGS
                 else:
                     logger.warning(
-                        f"Unknown grid config preset '{grid_configs}', "
-                        "using 'custom'"
+                        f"Unknown grid config preset '{grid_configs}', using 'custom'"
                     )
                     return CUSTOM_GRID_CONFIGS
             return [tuple(cfg) for cfg in grid_configs]
@@ -235,11 +232,11 @@ class EncoderCudaGraphManager:
             return DEFAULT_PADDED_BUCKET_SIZES
 
         encoder_sizes = getattr(
-            compilation_config,
-            'encoder_cudagraph_bucket_sizes',
-            None
+            compilation_config, "encoder_cudagraph_bucket_sizes", None
         )
-        return encoder_sizes if encoder_sizes is not None else DEFAULT_PADDED_BUCKET_SIZES
+        return (
+            encoder_sizes if encoder_sizes is not None else DEFAULT_PADDED_BUCKET_SIZES
+        )
 
     def _get_max_grid_size_from_config(self) -> int:
         """Get maximum grid size for encoder CUDA graph capture.
@@ -256,8 +253,8 @@ class EncoderCudaGraphManager:
 
         max_size = getattr(
             compilation_config,
-            'encoder_cudagraph_max_grid_size',
-            96  # Default: max 96x96 grids for exact match
+            "encoder_cudagraph_max_grid_size",
+            96,  # Default: max 96x96 grids for exact match
         )
         return max_size
 
@@ -327,9 +324,7 @@ class EncoderCudaGraphManager:
         grid_thw = [[t, h, w]]
 
         # Calculate output tokens
-        output_tokens = self._compute_output_tokens(
-            grid_config, spatial_merge_size
-        )
+        output_tokens = self._compute_output_tokens(grid_config, spatial_merge_size)
 
         return {
             "pixel_values": pixel_values,
@@ -379,8 +374,9 @@ class EncoderCudaGraphManager:
         self.vision_encoder = vision_encoder
 
         # Check if vision encoder supports optimized CUDA graph forward
-        has_cudagraph_forward = hasattr(vision_encoder, 'forward_cudagraph') and \
-                                hasattr(vision_encoder, 'precompute_for_cudagraph')
+        has_cudagraph_forward = hasattr(
+            vision_encoder, "forward_cudagraph"
+        ) and hasattr(vision_encoder, "precompute_for_cudagraph")
 
         if has_cudagraph_forward:
             # Pre-compute tensors for the bucket grid (used for exact match mode)
@@ -444,8 +440,8 @@ class EncoderCudaGraphManager:
         else:
             # Fallback to original forward (will have CPU gaps)
             logger.warning(
-                f"Vision encoder does not support forward_cudagraph, "
-                f"using standard forward (will have CPU gaps)"
+                "Vision encoder does not support forward_cudagraph, "
+                "using standard forward (will have CPU gaps)"
             )
 
             # Warmup run (required before capture)
@@ -508,13 +504,12 @@ class EncoderCudaGraphManager:
         configs_to_capture = sorted(
             self.grid_configs,
             key=lambda x: x[0] * x[1] * x[2],
-            reverse=False  # Smallest first
+            reverse=False,  # Smallest first
         )
 
         if is_global_first_rank():
             configs_to_capture = tqdm(
-                configs_to_capture,
-                desc="Capturing encoder CUDA graphs"
+                configs_to_capture, desc="Capturing encoder CUDA graphs"
             )
 
         # Capture each graph in its own graph_capture context to isolate failures.
@@ -583,7 +578,7 @@ class EncoderCudaGraphManager:
             Grid config (T, H, W) of the best bucket, or None if too large
         """
         best_grid = None
-        best_bucket_tokens = float('inf')
+        best_bucket_tokens = float("inf")
 
         for grid_key in self.graphs.keys():
             bucket_tokens = self._compute_output_tokens(grid_key, spatial_merge_size)
@@ -662,9 +657,11 @@ class EncoderCudaGraphManager:
             cached = self.cached_tensors[grid_key]
             embed_buffers["pos_embeds"].copy_(cached["pos_embeds"], non_blocking=True)
             embed_buffers["rotary_pos_emb_cos"].copy_(
-                cached["rotary_pos_emb_cos"], non_blocking=True)
+                cached["rotary_pos_emb_cos"], non_blocking=True
+            )
             embed_buffers["rotary_pos_emb_sin"].copy_(
-                cached["rotary_pos_emb_sin"], non_blocking=True)
+                cached["rotary_pos_emb_sin"], non_blocking=True
+            )
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
             embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
 
@@ -726,7 +723,9 @@ class EncoderCudaGraphManager:
             return None
 
         # Check if vision encoder is available for embedding computation
-        if self.vision_encoder is None or not hasattr(self.vision_encoder, 'precompute_for_cudagraph'):
+        if self.vision_encoder is None or not hasattr(
+            self.vision_encoder, "precompute_for_cudagraph"
+        ):
             logger.debug("Vision encoder not available for padded mode")
             return None
 
@@ -808,17 +807,24 @@ class EncoderCudaGraphManager:
         # Copy actual embeddings to the beginning of the buffers (pad with zeros)
         actual_num_patches = actual_embeds["pos_embeds"].shape[0]
         embed_buffers["pos_embeds"][:actual_num_patches].copy_(
-            actual_embeds["pos_embeds"], non_blocking=True)
+            actual_embeds["pos_embeds"], non_blocking=True
+        )
         embed_buffers["rotary_pos_emb_cos"][:actual_num_patches].copy_(
-            actual_embeds["rotary_pos_emb_cos"], non_blocking=True)
+            actual_embeds["rotary_pos_emb_cos"], non_blocking=True
+        )
         embed_buffers["rotary_pos_emb_sin"][:actual_num_patches].copy_(
-            actual_embeds["rotary_pos_emb_sin"], non_blocking=True)
+            actual_embeds["rotary_pos_emb_sin"], non_blocking=True
+        )
 
         # Update cu_seqlens and max_seqlen to actual values
         # cu_seqlens shape is [num_images + 1], for single image it's [2]: [0, num_patches]
         # We copy the actual values so flash attention processes only the real tokens
-        embed_buffers["cu_seqlens"].copy_(actual_embeds["cu_seqlens"], non_blocking=True)
-        embed_buffers["max_seqlen"].copy_(actual_embeds["max_seqlen"], non_blocking=True)
+        embed_buffers["cu_seqlens"].copy_(
+            actual_embeds["cu_seqlens"], non_blocking=True
+        )
+        embed_buffers["max_seqlen"].copy_(
+            actual_embeds["max_seqlen"], non_blocking=True
+        )
 
         if self.verbose:
             logger.info(
@@ -850,7 +856,7 @@ class EncoderCudaGraphManager:
         if self.verbose:
             logger.debug(
                 f"Padded execution: {num_output_tokens} -> {bucket_tokens} tokens "
-                f"(waste: {padding_waste}, {padding_waste/bucket_tokens*100:.1f}%)"
+                f"(waste: {padding_waste}, {padding_waste / bucket_tokens * 100:.1f}%)"
             )
 
         return trimmed_output, padding_waste
@@ -885,5 +891,3 @@ class EncoderCudaGraphManager:
                 f"hit_rate={hit_rate:.1%}, num_graphs={len(self.graphs)}"
             )
         return stats
-
-
