@@ -480,6 +480,15 @@ class CompilationConfig:
     Useful for debugging and analyzing CUDA graph utilization.
     When False, only logs summary stats at the end of execution."""
 
+    encoder_cudagraph_one_by_one: bool = True
+    """Enable one-by-one image processing for multi-image batches.
+    When True (default), multi-image batches are processed individually to
+    maximize CUDA graph hit rate.
+    When False, multi-image batches are processed together in eager mode,
+    which may be faster when CUDA graph overhead (sync, memory) outweighs
+    the kernel launch savings.
+    Set to False if you observe throughput regression with encoder CUDA graphs."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
