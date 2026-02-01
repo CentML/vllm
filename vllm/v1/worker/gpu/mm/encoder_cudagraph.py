@@ -847,10 +847,11 @@ class EncoderCudaGraphManager:
         full_output = self.output_buffers[bucket_grid]
         trimmed_output = full_output[:num_output_tokens].clone()
 
-        logger.debug(
-            f"Padded execution: {num_output_tokens} -> {bucket_tokens} tokens "
-            f"(waste: {padding_waste}, {padding_waste/bucket_tokens*100:.1f}%)"
-        )
+        if self.verbose:
+            logger.debug(
+                f"Padded execution: {num_output_tokens} -> {bucket_tokens} tokens "
+                f"(waste: {padding_waste}, {padding_waste/bucket_tokens*100:.1f}%)"
+            )
 
         return trimmed_output, padding_waste
 
