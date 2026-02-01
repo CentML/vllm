@@ -320,7 +320,7 @@ class EncoderCudaGraphManager:
             device=self.device,
         )
 
-        # Grid THW for this configuration
+        # Grid (temporal, height, width) for this configuration
         grid_thw = [[t, h, w]]
 
         # Calculate output tokens
