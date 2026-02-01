@@ -90,9 +90,10 @@ class EncoderRunner:
         grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
             "Encoder CUDA graph manager initialized: "
-            f"padded_mode={self.encoder_cudagraph_padded_mode}, "
-            f"num_grids={len(grid_configs)}, "
-            f"grids={grid_configs}"
+            "padded_mode=%s, num_grids=%d, grids=%s",
+            self.encoder_cudagraph_padded_mode,
+            len(grid_configs),
+            grid_configs,
         )
 
     def capture_encoder_cudagraphs(
@@ -277,7 +278,8 @@ class EncoderRunner:
         if len(grid_thw) != 1:
             logger.debug(
                 "CUDA graph only supports single-image batches, "
-                f"got {len(grid_thw)} images. Using eager mode."
+                "got %d images. Using eager mode.",
+                len(grid_thw),
             )
             return None
 
@@ -306,8 +308,11 @@ class EncoderRunner:
             output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
             if output is not None:
                 logger.info(
-                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), "
-                    f"tokens={num_output_tokens}"
+                    "ViT CUDA graph EXACT: grid=(%d, %d, %d), tokens=%d",
+                    t,
+                    h,
+                    w,
+                    num_output_tokens,
                 )
                 return [output[:num_output_tokens]]
 
@@ -322,13 +327,19 @@ class EncoderRunner:
             if result is not None:
                 output, padding_waste = result
                 logger.info(
-                    f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
-                    f"tokens={num_output_tokens}, waste={padding_waste}"
+                    "ViT CUDA graph PADDED: grid=(%d, %d, %d), tokens=%d, waste=%d",
+                    t,
+                    h,
+                    w,
+                    num_output_tokens,
+                    padding_waste,
                 )
                 return [output]
 
         # No CUDA graph available
-        logger.info(f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens}")
+        logger.info(
+            "ViT EAGER: grid=(%d, %d, %d), tokens=%d", t, h, w, num_output_tokens
+        )
         return None
 
     def gather_mm_embeddings(

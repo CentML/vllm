@@ -142,9 +142,14 @@ class EncoderCudaGraphManager:
                 skipped_grids.append(grid)
 
         if skipped_grids:
+            top_skipped = sorted(
+                skipped_grids, key=lambda x: x[1] * x[2], reverse=True
+            )[:5]
             logger.info(
-                f"Skipping {len(skipped_grids)} grids exceeding max_grid_size={max_grid_size}: "
-                f"{sorted(skipped_grids, key=lambda x: x[1] * x[2], reverse=True)[:5]}..."
+                "Skipping %d grids exceeding max_grid_size=%d: %s...",
+                len(skipped_grids),
+                max_grid_size,
+                top_skipped,
             )
 
         self.grid_configs = filtered_grids
@@ -170,18 +175,18 @@ class EncoderCudaGraphManager:
         self.input_buffers: dict[tuple[int, int, int], dict[str, Any]] = {}
         self.output_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
 
-        # Cached pre-computed tensors for CUDA graph replay (used for exact match mode)
-        # Key: (t, h, w), Value: dict with pos_embeds, rotary embeddings, cu_seqlens, etc.
+        # Cached pre-computed tensors for CUDA graph replay (exact match mode)
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary embeddings, etc.
         self.cached_tensors: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
 
-        # Input buffers for embeddings (used for padded mode with runtime computation)
-        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin, cu_seqlens buffers
+        # Input buffers for embeddings (padded mode with runtime computation)
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos/sin, cu_seqlens
         self.embedding_buffers: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
 
         # Store metadata about captured graphs
         self.captured_metadata: dict[tuple[int, int, int], dict[str, Any]] = {}
 
-        # Reference to vision encoder for runtime embedding computation (set during capture)
+        # Vision encoder reference for runtime embedding computation (set at capture)
         self.vision_encoder = None
 
         # Track if graphs have been captured
@@ -214,7 +219,8 @@ class EncoderCudaGraphManager:
                     return CUSTOM_GRID_CONFIGS
                 else:
                     logger.warning(
-                        f"Unknown grid config preset '{grid_configs}', using 'custom'"
+                        "Unknown grid config preset '%s', using 'custom'",
+                        grid_configs,
                     )
                     return CUSTOM_GRID_CONFIGS
             return [tuple(cfg) for cfg in grid_configs]
@@ -350,7 +356,7 @@ class EncoderCudaGraphManager:
             grid_config: Tuple of (T, H, W) in patch units
             vision_encoder: The vision encoder module
         """
-        logger.debug(f"Capturing encoder CUDA graph for grid config {grid_config}")
+        logger.debug("Capturing encoder CUDA graph for grid config %s", grid_config)
 
         # Prepare dummy inputs
         dummy_inputs = self._prepare_dummy_inputs_for_grid(grid_config, vision_encoder)
@@ -383,12 +389,14 @@ class EncoderCudaGraphManager:
             cached = vision_encoder.precompute_for_cudagraph(grid_thw)
             self.cached_tensors[grid_config] = cached
             logger.debug(
-                f"Pre-computed cached tensors for grid config {grid_config}: "
-                f"pos_embeds={cached['pos_embeds'].shape}, "
-                f"cu_seqlens={cached['cu_seqlens'].shape}"
+                "Pre-computed cached tensors for grid config %s: "
+                "pos_embeds=%s, cu_seqlens=%s",
+                grid_config,
+                cached["pos_embeds"].shape,
+                cached["cu_seqlens"].shape,
             )
 
-            # Create INPUT BUFFERS for embeddings (for padded mode with runtime computation)
+            # Create INPUT BUFFERS for embeddings (padded mode runtime computation)
             # These buffers can be updated at runtime before graph replay
             # Note: max_seqlen is a CPU scalar tensor to avoid GPU sync on .item()
             self.embedding_buffers[grid_config] = {
@@ -467,10 +475,12 @@ class EncoderCudaGraphManager:
                 self.output_buffers[grid_config].copy_(output)
 
         self.graphs[grid_config] = graph
+        cached_suffix = " (with cached tensors)" if has_cudagraph_forward else ""
         logger.debug(
-            f"Captured encoder CUDA graph for grid config {grid_config} "
-            f"-> {dummy_inputs['num_output_tokens']} output tokens"
-            f"{' (with cached tensors)' if has_cudagraph_forward else ''}"
+            "Captured encoder CUDA graph for grid config %s -> %d output tokens%s",
+            grid_config,
+            dummy_inputs["num_output_tokens"],
+            cached_suffix,
         )
 
     @torch.inference_mode()
@@ -484,7 +494,7 @@ class EncoderCudaGraphManager:
 
         Args:
             vision_encoder: The vision encoder module (e.g., Qwen3_VisionTransformer)
-            embed_multimodal_fn: The model's embed_multimodal method (unused but kept for API)
+            embed_multimodal_fn: The model's embed_multimodal method (unused)
         """
         if self.captured:
             logger.warning("Encoder CUDA graphs already captured, skipping")
@@ -494,9 +504,11 @@ class EncoderCudaGraphManager:
         free_mem_before, total_mem = torch.cuda.mem_get_info(self.device)
         used_mem_before = total_mem - free_mem_before
         logger.info(
-            f"Capturing encoder CUDA graphs for {len(self.grid_configs)} "
-            f"grid configurations (GPU memory: {used_mem_before / 1024**3:.2f} GiB used, "
-            f"{free_mem_before / 1024**3:.2f} GiB free)"
+            "Capturing encoder CUDA graphs for %d grid configurations "
+            "(GPU memory: %.2f GiB used, %.2f GiB free)",
+            len(self.grid_configs),
+            used_mem_before / 1024**3,
+            free_mem_before / 1024**3,
         )
 
         # Capture from smallest to largest so that common smaller grids are
@@ -523,8 +535,10 @@ class EncoderCudaGraphManager:
                     )
             except Exception as e:
                 logger.warning(
-                    f"Failed to capture encoder CUDA graph for grid config "
-                    f"{grid_config}: {e}. Will use eager mode."
+                    "Failed to capture encoder CUDA graph for grid config "
+                    "%s: %s. Will use eager mode.",
+                    grid_config,
+                    e,
                 )
 
         self.captured = True
@@ -534,11 +548,13 @@ class EncoderCudaGraphManager:
         used_mem_after = total_mem - free_mem_after
         encoder_graph_mem = used_mem_after - used_mem_before
         logger.info(
-            f"Captured {len(self.graphs)} encoder CUDA graphs "
-            f"(configs: {sorted(self.graphs.keys())}). "
-            f"Encoder graph memory: {encoder_graph_mem / 1024**3:.2f} GiB "
-            f"(GPU: {used_mem_after / 1024**3:.2f} GiB used, "
-            f"{free_mem_after / 1024**3:.2f} GiB free)"
+            "Captured %d encoder CUDA graphs (configs: %s). "
+            "Encoder graph memory: %.2f GiB (GPU: %.2f GiB used, %.2f GiB free)",
+            len(self.graphs),
+            sorted(self.graphs.keys()),
+            encoder_graph_mem / 1024**3,
+            used_mem_after / 1024**3,
+            free_mem_after / 1024**3,
         )
 
     def get_graph_for_grid(
@@ -580,7 +596,7 @@ class EncoderCudaGraphManager:
         best_grid = None
         best_bucket_tokens = float("inf")
 
-        for grid_key in self.graphs.keys():
+        for grid_key in self.graphs:
             bucket_tokens = self._compute_output_tokens(grid_key, spatial_merge_size)
             if bucket_tokens >= num_tokens and bucket_tokens < best_bucket_tokens:
                 best_bucket_tokens = bucket_tokens
@@ -613,8 +629,10 @@ class EncoderCudaGraphManager:
         input_buffer = self.input_buffers[grid_key]["pixel_values"]
         if pixel_values.shape != input_buffer.shape:
             logger.warning(
-                f"Pixel values shape mismatch: expected {input_buffer.shape}, "
-                f"got {pixel_values.shape}. Falling back to eager mode."
+                "Pixel values shape mismatch: expected %s, got %s. "
+                "Falling back to eager mode.",
+                input_buffer.shape,
+                pixel_values.shape,
             )
             self.eager_fallbacks += 1
             return None
@@ -622,16 +640,18 @@ class EncoderCudaGraphManager:
         # Verify device and dtype match
         if pixel_values.device != input_buffer.device:
             logger.warning(
-                f"Device mismatch: expected {input_buffer.device}, "
-                f"got {pixel_values.device}. Falling back to eager mode."
+                "Device mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.device,
+                pixel_values.device,
             )
             self.eager_fallbacks += 1
             return None
 
         if pixel_values.dtype != input_buffer.dtype:
             logger.warning(
-                f"Dtype mismatch: expected {input_buffer.dtype}, "
-                f"got {pixel_values.dtype}. Falling back to eager mode."
+                "Dtype mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.dtype,
+                pixel_values.dtype,
             )
             self.eager_fallbacks += 1
             return None
@@ -651,7 +671,7 @@ class EncoderCudaGraphManager:
         # Copy input to the captured buffer (non-blocking for better overlap)
         input_buffer.copy_(pixel_values, non_blocking=True)
 
-        # For exact match, restore cached embeddings (may have been modified by run_padded)
+        # For exact match, restore cached embeddings (may have been modified)
         if grid_key in self.embedding_buffers and grid_key in self.cached_tensors:
             embed_buffers = self.embedding_buffers[grid_key]
             cached = self.cached_tensors[grid_key]
@@ -667,8 +687,10 @@ class EncoderCudaGraphManager:
 
         if self.verbose:
             logger.info(
-                f"run(): grid_key={grid_key}, "
-                f"input_shape={pixel_values.shape}, buffer_shape={input_buffer.shape}"
+                "run(): grid_key=%s, input_shape=%s, buffer_shape=%s",
+                grid_key,
+                pixel_values.shape,
+                input_buffer.shape,
             )
 
         # Sync current stream before replay: graph was captured on a separate stream,
@@ -733,15 +755,24 @@ class EncoderCudaGraphManager:
         bucket_grid = self.find_bucket_for_tokens(num_output_tokens, spatial_merge_size)
         if bucket_grid is None:
             # Don't count miss here - caller will count it when falling back to eager
+            max_available = (
+                max(
+                    self._compute_output_tokens(g, spatial_merge_size)
+                    for g in self.graphs
+                )
+                if self.graphs
+                else 0
+            )
             logger.debug(
-                f"No bucket found for {num_output_tokens} tokens, "
-                f"max available: {max(self._compute_output_tokens(g, spatial_merge_size) for g in self.graphs.keys()) if self.graphs else 0}"
+                "No bucket found for %d tokens, max available: %d",
+                num_output_tokens,
+                max_available,
             )
             return None
 
         # Check if we have embedding buffers for this bucket
         if bucket_grid not in self.embedding_buffers:
-            logger.debug(f"No embedding buffers for bucket {bucket_grid}")
+            logger.debug("No embedding buffers for bucket %s", bucket_grid)
             return None
 
         bucket_tokens = self._compute_output_tokens(bucket_grid, spatial_merge_size)
@@ -754,8 +785,10 @@ class EncoderCudaGraphManager:
 
         if num_input_patches > bucket_input_patches:
             logger.warning(
-                f"Input patches ({num_input_patches}) exceed bucket capacity "
-                f"({bucket_input_patches}). This shouldn't happen."
+                "Input patches (%d) exceed bucket capacity (%d). "
+                "This shouldn't happen.",
+                num_input_patches,
+                bucket_input_patches,
             )
             self.eager_fallbacks += 1
             return None
@@ -763,16 +796,18 @@ class EncoderCudaGraphManager:
         # Verify device and dtype match
         if pixel_values.device != input_buffer.device:
             logger.warning(
-                f"Device mismatch: expected {input_buffer.device}, "
-                f"got {pixel_values.device}. Falling back to eager mode."
+                "Device mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.device,
+                pixel_values.device,
             )
             self.eager_fallbacks += 1
             return None
 
         if pixel_values.dtype != input_buffer.dtype:
             logger.warning(
-                f"Dtype mismatch: expected {input_buffer.dtype}, "
-                f"got {pixel_values.dtype}. Falling back to eager mode."
+                "Dtype mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.dtype,
+                pixel_values.dtype,
             )
             self.eager_fallbacks += 1
             return None
@@ -817,8 +852,8 @@ class EncoderCudaGraphManager:
         )
 
         # Update cu_seqlens and max_seqlen to actual values
-        # cu_seqlens shape is [num_images + 1], for single image it's [2]: [0, num_patches]
-        # We copy the actual values so flash attention processes only the real tokens
+        # cu_seqlens shape is [num_images + 1], for single image: [0, num_patches]
+        # We copy actual values so flash attention processes only the real tokens
         embed_buffers["cu_seqlens"].copy_(
             actual_embeds["cu_seqlens"], non_blocking=True
         )
@@ -828,9 +863,12 @@ class EncoderCudaGraphManager:
 
         if self.verbose:
             logger.info(
-                f"run_padded(): bucket_grid={bucket_grid}, "
-                f"actual_grid={grid_thw[0]}, input_patches={num_input_patches}, "
-                f"bucket_patches={bucket_input_patches}"
+                "run_padded(): bucket_grid=%s, actual_grid=%s, "
+                "input_patches=%d, bucket_patches=%d",
+                bucket_grid,
+                grid_thw[0],
+                num_input_patches,
+                bucket_input_patches,
             )
 
         # Sync current stream before replay: graph was captured on a separate stream,
@@ -855,8 +893,11 @@ class EncoderCudaGraphManager:
 
         if self.verbose:
             logger.debug(
-                f"Padded execution: {num_output_tokens} -> {bucket_tokens} tokens "
-                f"(waste: {padding_waste}, {padding_waste / bucket_tokens * 100:.1f}%)"
+                "Padded execution: %d -> %d tokens (waste: %d, %.1f%%)",
+                num_output_tokens,
+                bucket_tokens,
+                padding_waste,
+                padding_waste / bucket_tokens * 100,
             )
 
         return trimmed_output, padding_waste
@@ -886,8 +927,11 @@ class EncoderCudaGraphManager:
         }
         if verbose:
             logger.info(
-                f"Encoder CUDA graph stats: "
-                f"hits={self.cache_hits}, eager={self.eager_fallbacks}, "
-                f"hit_rate={hit_rate:.1%}, num_graphs={len(self.graphs)}"
+                "Encoder CUDA graph stats: hits=%d, eager=%d, "
+                "hit_rate=%.1f%%, num_graphs=%d",
+                self.cache_hits,
+                self.eager_fallbacks,
+                hit_rate * 100,
+                len(self.graphs),
             )
         return stats

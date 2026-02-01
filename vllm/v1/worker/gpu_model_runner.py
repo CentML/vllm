@@ -741,11 +741,12 @@ class GPUModelRunner(
         grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
             "Encoder CUDA graph manager initialized: "
-            f"padded_mode={self.encoder_cudagraph_padded_mode}, "
-            f"one_by_one={self.encoder_cudagraph_one_by_one}, "
-            f"num_grids={len(grid_configs)}, "
-            f"grids={grid_configs}, "
-            f"using dedicated encoder graph pool"
+            "padded_mode=%s, one_by_one=%s, num_grids=%d, grids=%s, "
+            "using dedicated encoder graph pool",
+            self.encoder_cudagraph_padded_mode,
+            self.encoder_cudagraph_one_by_one,
+            len(grid_configs),
+            grid_configs,
         )
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -781,7 +782,7 @@ class GPUModelRunner(
 
         attn_layers = self.compilation_config.static_forward_context
         for name, module in attn_layers.items():
-            if isinstance(module, (Attention, MLAAttention)):
+            if isinstance(module, Attention | MLAAttention):
                 # TODO: Generally, scale is 1.0 if user uses on-the-fly fp8
                 # kvcache quant. However, to get better accuracy, compression
                 # frameworks like llm-compressors allow users to tune the
@@ -2410,8 +2411,9 @@ class GPUModelRunner(
                         patch_offset = 0
                         if self.encoder_cudagraph_verbose:
                             logger.info(
-                                f"Processing {len(grid_thw_list)} images "
-                                f"one-at-a-time, grids={grid_thw_list}"
+                                "Processing %d images one-at-a-time, grids=%s",
+                                len(grid_thw_list),
+                                grid_thw_list,
                             )
                         for img_idx, grid_thw in enumerate(grid_thw_list):
                             t, h, w = grid_thw
@@ -2440,7 +2442,7 @@ class GPUModelRunner(
                                 curr_group_outputs_lst.extend(single_result)
                             else:
                                 # Fall back to eager for this image
-                                # Model expects grid_thw as CPU tensor (it calls .numpy())
+                                # Model expects grid_thw as CPU tensor (.numpy())
                                 single_mm_inputs_for_eager = {
                                     pixel_key: single_pixel_values,
                                     grid_key: torch.tensor(
@@ -2548,7 +2550,8 @@ class GPUModelRunner(
         if len(grid_thw) != 1:
             logger.debug(
                 "Encoder CUDA graph only supports single-image batches, "
-                f"got {len(grid_thw)} images. Using eager mode."
+                "got %d images. Using eager mode.",
+                len(grid_thw),
             )
             self.encoder_cudagraph_manager.count_miss()
             return None
@@ -2579,9 +2582,12 @@ class GPUModelRunner(
         # Log the exact size needed for bucket analysis (verbose only)
         if self.encoder_cudagraph_verbose:
             logger.info(
-                f"ViT input: grid_thw=({t}, {h}, {w}), "
-                f"input_patches={num_input_patches}, "
-                f"output_tokens={num_output_tokens}"
+                "ViT input: grid_thw=(%d, %d, %d), input_patches=%d, output_tokens=%d",
+                t,
+                h,
+                w,
+                num_input_patches,
+                num_output_tokens,
             )
 
         # Try exact match first via run() - counts hits internally
@@ -2589,7 +2595,11 @@ class GPUModelRunner(
         if output is not None:
             if self.encoder_cudagraph_verbose:
                 logger.info(
-                    f"ViT CUDA graph EXACT: grid=({t}, {h}, {w}), output={output.shape}"
+                    "ViT CUDA graph EXACT: grid=(%d, %d, %d), output=%s",
+                    t,
+                    h,
+                    w,
+                    output.shape,
                 )
             return [output[:num_output_tokens]]
 
@@ -2606,8 +2616,12 @@ class GPUModelRunner(
                 output, padding_waste = result
                 if self.encoder_cudagraph_verbose:
                     logger.info(
-                        f"ViT CUDA graph PADDED: grid=({t}, {h}, {w}), "
-                        f"tokens={num_output_tokens}, waste={padding_waste}"
+                        "ViT CUDA graph PADDED: grid=(%d, %d, %d), tokens=%d, waste=%d",
+                        t,
+                        h,
+                        w,
+                        num_output_tokens,
+                        padding_waste,
                     )
                 return [output]
 
@@ -2615,8 +2629,12 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager.count_miss()
         if self.encoder_cudagraph_verbose:
             logger.info(
-                f"ViT EAGER: grid=({t}, {h}, {w}), tokens={num_output_tokens} "
-                f"(padded_mode={self.encoder_cudagraph_padded_mode})"
+                "ViT EAGER: grid=(%d, %d, %d), tokens=%d (padded_mode=%s)",
+                t,
+                h,
+                w,
+                num_output_tokens,
+                self.encoder_cudagraph_padded_mode,
             )
         return None
 
@@ -2725,7 +2743,7 @@ class GPUModelRunner(
 
     def get_model(self) -> nn.Module:
         # get raw model out of the cudagraph wrapper.
-        if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
+        if isinstance(self.model, CUDAGraphWrapper | UBatchWrapper):
             return self.model.unwrap()
         return self.model
 
@@ -4288,7 +4306,7 @@ class GPUModelRunner(
             return None
 
         layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
-        if layer_ids and isinstance(layer_ids, (list, tuple)):
+        if layer_ids and isinstance(layer_ids, list | tuple):
             return tuple(layer_ids)
 
         return None
@@ -5093,9 +5111,9 @@ class GPUModelRunner(
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
         start_total_memory = torch.cuda.mem_get_info()[1]
         logger.info(
-            f"Starting CUDA graph capture: "
-            f"{(start_total_memory - start_free_gpu_memory) / 1024**3:.2f} GiB used, "
-            f"{start_free_gpu_memory / 1024**3:.2f} GiB free"
+            "Starting CUDA graph capture: %.2f GiB used, %.2f GiB free",
+            (start_total_memory - start_free_gpu_memory) / 1024**3,
+            start_free_gpu_memory / 1024**3,
         )
 
         # Capture encoder CUDA graphs first (if enabled)
@@ -5107,9 +5125,10 @@ class GPUModelRunner(
             after_encoder_free = torch.cuda.mem_get_info()[0]
             encoder_mem = start_free_gpu_memory - after_encoder_free
             logger.info(
-                f"Encoder CUDA graphs captured: "
-                f"{encoder_mem / 1024**3:.2f} GiB used by encoder graphs, "
-                f"{after_encoder_free / 1024**3:.2f} GiB free"
+                "Encoder CUDA graphs captured: %.2f GiB used by encoder graphs, "
+                "%.2f GiB free",
+                encoder_mem / 1024**3,
+                after_encoder_free / 1024**3,
             )
 
         # Capture decoder/LM CUDA graphs in their own context with global pool
@@ -5166,16 +5185,17 @@ class GPUModelRunner(
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
             decoder_mem = before_decoder_free - end_free_gpu_memory
             logger.info(
-                f"Decoder CUDA graphs captured: "
-                f"{decoder_mem / 1024**3:.2f} GiB used by decoder graphs, "
-                f"{end_free_gpu_memory / 1024**3:.2f} GiB free"
+                "Decoder CUDA graphs captured: %.2f GiB used by decoder graphs, "
+                "%.2f GiB free",
+                decoder_mem / 1024**3,
+                end_free_gpu_memory / 1024**3,
             )
 
         total_cudagraph_mem = start_free_gpu_memory - end_free_gpu_memory
         logger.info(
-            f"CUDA graph capture complete: "
-            f"total {total_cudagraph_mem / 1024**3:.2f} GiB for all graphs, "
-            f"{end_free_gpu_memory / 1024**3:.2f} GiB free"
+            "CUDA graph capture complete: total %.2f GiB for all graphs, %.2f GiB free",
+            total_cudagraph_mem / 1024**3,
+            end_free_gpu_memory / 1024**3,
         )
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
