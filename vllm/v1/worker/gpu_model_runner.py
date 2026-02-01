@@ -2404,7 +2404,7 @@ class GPUModelRunner(
 
                     if batched_pixel_values is not None and grid_thw_list is not None:
                         # Convert grid_thw to list if tensor
-                        if hasattr(grid_thw_list, "tolist"):
+                        if isinstance(grid_thw_list, torch.Tensor):
                             grid_thw_list = grid_thw_list.tolist()
 
                         # Calculate patch boundaries for slicing
