@@ -430,6 +430,7 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
         self.encoder_cudagraph_padded_mode: bool = True
         self.encoder_cudagraph_verbose: bool = False
+        self.encoder_cudagraph_one_by_one: bool = True
         self._init_encoder_cudagraph_manager()
 
         self.use_aux_hidden_state_outputs = False
@@ -715,6 +716,13 @@ class GPUModelRunner(
             False  # Default to quiet mode
         )
 
+        # Check if one-by-one processing is enabled for multi-image batches
+        self.encoder_cudagraph_one_by_one = getattr(
+            self.compilation_config,
+            'encoder_cudagraph_one_by_one',
+            True  # Default to one-by-one for higher CUDA graph hit rate
+        )
+
         # Create a dedicated graph pool for encoder CUDA graphs
         # This keeps encoder and decoder graph memory separate for:
         # 1. Better memory isolation and predictability
@@ -736,6 +744,7 @@ class GPUModelRunner(
         logger.info(
             "Encoder CUDA graph manager initialized: "
             f"padded_mode={self.encoder_cudagraph_padded_mode}, "
+            f"one_by_one={self.encoder_cudagraph_one_by_one}, "
             f"num_grids={len(grid_configs)}, "
             f"grids={grid_configs}, "
             f"using dedicated encoder graph pool"
@@ -2367,8 +2376,10 @@ class GPUModelRunner(
                 # Try to use CUDA graph if available
                 # When CUDA graphs are enabled and we have multiple items,
                 # process them one at a time since CUDA graphs only support
-                # single-image batches
+                # single-image batches. This can be disabled via config if
+                # the sync overhead outweighs the CUDA graph benefits.
                 if (self.encoder_cudagraph_manager is not None
+                    and self.encoder_cudagraph_one_by_one
                     and num_items > 1
                     and modality in ("image", "video")):
                     # Process each image individually for CUDA graph support
