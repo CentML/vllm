@@ -153,10 +153,15 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
+        # Get cos_sin_cache and is_neox_style for fused RoPE + KV cache kernel
+        cos_sin_cache = None
+        is_neox_style = True
         if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            is_neox_style = getattr(self.rotary_emb, "is_neox_style", True)
+            # RoPE will be applied in-place by the fused kernel in mla_attention
+            # concat_and_cache_mla_rope_fused applies RoPE to q_pe and k_pe
+            # and writes k to cache in a single kernel
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -170,6 +175,9 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q,
             kv_c_normed,
             k_pe,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            is_neox_style=is_neox_style,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
         )
 

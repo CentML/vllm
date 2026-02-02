@@ -231,6 +231,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer, has_nvidia_artifactory
 from vllm.utils.math_utils import cdiv, round_down
+
+# FlashInfer fused RoPE + FP8 quantization functions
+_flashinfer_rope_available = False
+try:
+    from flashinfer.rope import (
+        rope_quantize_fp8,
+        rope_quantize_fp8_append_paged_kv_cache,
+    )
+    _flashinfer_rope_available = True
+except ImportError:
+    pass
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
@@ -425,6 +436,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        cos_sin_cache: torch.Tensor | None = None,
+        is_neox_style: bool = True,
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
@@ -445,12 +459,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_pe,
                     self_kv_cache,
                     attn_metadata,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox_style=is_neox_style,
                     output=output,
                 )
                 return output
             else:
                 return self.forward_impl(
-                    q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+                    q, kv_c_normed, k_pe, self_kv_cache, attn_metadata,
+                    positions=positions, cos_sin_cache=cos_sin_cache,
+                    is_neox_style=is_neox_style
                 )
         else:
             if self.attn_backend.accept_output_buffer:
@@ -475,9 +494,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self,
         q: torch.Tensor,
         k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
+        k_pe: torch.Tensor,  # value in unified attn (raw, without RoPE for fused path)
         kv_cache: torch.Tensor,
         attn_metadata: "MLACommonMetadata",
+        positions: torch.Tensor | None = None,
+        cos_sin_cache: torch.Tensor | None = None,
+        is_neox_style: bool = True,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
@@ -539,15 +561,38 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
         # write the latent and rope to kv cache
+        # Use fused kernel that applies RoPE + writes to cache in one kernel
         if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                k_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=self._k_scale,
-            )
+            if cos_sin_cache is not None and positions is not None:
+                # Use fused RoPE + KV cache write kernel
+                # This applies RoPE to q_pe and k_pe in-place, then writes k to cache
+                # Extract q_pe portion for RoPE application (in-place modification)
+                q_pe = q[..., self.qk_nope_head_dim:]
+                
+                # cos_sin_cache should match q_pe dtype (kernel requirement)
+                # The rotary embedding already has cos_sin_cache in correct dtype
+                ops.concat_and_cache_mla_rope_fused(
+                    positions[:num_actual_toks],
+                    q_pe,  # [num_tokens, num_heads, rot_dim] - modified in place
+                    k_pe.squeeze(1),  # [num_tokens, rot_dim] - modified in place
+                    k_c_normed,  # [num_tokens, kv_lora_rank]
+                    cos_sin_cache,
+                    is_neox_style,
+                    attn_metadata.slot_mapping.flatten(),
+                    kv_cache,
+                    self.kv_cache_dtype,
+                    self._k_scale,
+                )
+            else:
+                # Fallback: RoPE should have been applied earlier
+                ops.concat_and_cache_mla(
+                    k_c_normed,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
 
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
