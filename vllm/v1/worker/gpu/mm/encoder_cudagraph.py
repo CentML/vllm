@@ -202,6 +202,21 @@ class EncoderCudaGraphManager:
         # This allows better overlap between encoder and other GPU work.
         self.replay_done_event: torch.cuda.Event | None = None
 
+        # Single-GPU optimization: when TP=1, PP=1, DP=1, we can capture graphs
+        # on the current stream instead of a separate stream. This eliminates
+        # the need for stream synchronization before replay.
+        parallel_config = vllm_config.parallel_config
+        self.is_single_gpu = (
+            parallel_config.tensor_parallel_size == 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+        )
+        if self.is_single_gpu:
+            logger.info(
+                "Encoder CUDA graphs: single-GPU mode enabled "
+                "(TP=1, PP=1, DP=1), using optimized sync scheme"
+            )
+
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
@@ -527,15 +542,24 @@ class EncoderCudaGraphManager:
                 configs_to_capture, desc="Capturing encoder CUDA graphs"
             )
 
-        # Capture each graph in its own graph_capture context to isolate failures.
-        # If one capture fails, the pool state won't affect subsequent captures.
+        # Capture each graph. For single-GPU mode, capture directly on current stream
+        # to avoid stream synchronization overhead at replay time.
+        # For multi-GPU mode, use graph_capture() context to coordinate with TP/PP.
         for grid_config in configs_to_capture:
             try:
-                with graph_capture(device=self.device):
+                if self.is_single_gpu:
+                    # Single-GPU: capture on current stream (no separate stream)
                     self.capture_graph_for_grid(
                         grid_config,
                         vision_encoder,
                     )
+                else:
+                    # Multi-GPU: use graph_capture() for TP/PP coordination
+                    with graph_capture(device=self.device):
+                        self.capture_graph_for_grid(
+                            grid_config,
+                            vision_encoder,
+                        )
             except Exception as e:
                 logger.warning(
                     "Failed to capture encoder CUDA graph for grid config "
@@ -662,9 +686,10 @@ class EncoderCudaGraphManager:
         self.cache_hits += 1
 
         # Wait for any previous graph replay to complete before modifying buffers.
-        # Using event.synchronize() is lighter than torch.cuda.synchronize()
-        # which waits for ALL GPU work across all streams.
-        if self.replay_done_event is not None:
+        # For single-GPU mode, this is not needed because everything is on the same
+        # stream and CUDA guarantees ordering. For multi-GPU mode, we need this
+        # because the graph runs on a different stream.
+        if not self.is_single_gpu and self.replay_done_event is not None:
             self.replay_done_event.synchronize()
 
         # Ensure contiguous memory layout for safe copy
@@ -699,28 +724,30 @@ class EncoderCudaGraphManager:
                 input_buffer.shape,
             )
 
-        # Sync current stream before replay: graph was captured on a separate stream,
-        # but buffer copies happen on the default stream. We need copies to complete
-        # before replay reads from those buffers.
-        # Using current_stream().synchronize() is lighter than torch.cuda.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if self.is_single_gpu:
+            # Single-GPU optimized path: graph was captured on current stream,
+            # so buffer copies and replay are on the same stream - no sync needed.
+            # Return view directly; caller must use output before next run() call.
+            self.graphs[grid_key].replay()
+            return self.output_buffers[grid_key]
+        else:
+            # Multi-GPU path: graph was captured on a separate stream.
+            # Sync current stream before replay to ensure buffer copies complete.
+            torch.cuda.current_stream().synchronize()
 
-        # Replay the graph
-        self.graphs[grid_key].replay()
+            # Replay the graph
+            self.graphs[grid_key].replay()
 
-        # Record event after replay for lightweight sync in next call.
-        # Create event lazily on first use.
-        if self.replay_done_event is None:
-            self.replay_done_event = torch.cuda.Event()
-        self.replay_done_event.record()
+            # Record event after replay for lightweight sync in next call.
+            if self.replay_done_event is None:
+                self.replay_done_event = torch.cuda.Event()
+            self.replay_done_event.record()
 
-        # Sync to ensure output is ready before clone.
-        # TODO: Could eliminate this if we return a view and defer sync to caller,
-        # but that would require careful handling of buffer reuse.
-        self.replay_done_event.synchronize()
+            # Sync to ensure output is ready before clone.
+            self.replay_done_event.synchronize()
 
-        # Return a clone of the output to avoid issues with buffer reuse
-        return self.output_buffers[grid_key].clone()
+            # Return a clone of the output to avoid issues with buffer reuse
+            return self.output_buffers[grid_key].clone()
 
     def run_padded(
         self,
@@ -825,8 +852,9 @@ class EncoderCudaGraphManager:
         self.cache_hits += 1
 
         # Wait for any previous graph replay to complete before modifying buffers.
-        # Using event.synchronize() is lighter than torch.cuda.synchronize()
-        if self.replay_done_event is not None:
+        # For single-GPU mode, this is not needed because everything is on the same
+        # stream and CUDA guarantees ordering.
+        if not self.is_single_gpu and self.replay_done_event is not None:
             self.replay_done_event.synchronize()
 
         # Compute embeddings for ACTUAL grid, then pad to bucket size.
@@ -880,25 +908,32 @@ class EncoderCudaGraphManager:
                 bucket_input_patches,
             )
 
-        # Sync current stream before replay: graph was captured on a separate stream,
-        # but buffer modifications (zero, copy) happen on the default stream.
-        # Using current_stream().synchronize() is lighter than torch.cuda.synchronize()
-        torch.cuda.current_stream().synchronize()
+        if self.is_single_gpu:
+            # Single-GPU optimized path: graph was captured on current stream,
+            # so buffer modifications and replay are on the same stream - no sync needed.
+            # Return view directly; caller must use output before next run() call.
+            self.graphs[bucket_grid].replay()
+            full_output = self.output_buffers[bucket_grid]
+            trimmed_output = full_output[:num_output_tokens]
+        else:
+            # Multi-GPU path: graph was captured on a separate stream.
+            # Sync current stream before replay to ensure buffer modifications complete.
+            torch.cuda.current_stream().synchronize()
 
-        # Replay the graph with updated embedding buffers
-        self.graphs[bucket_grid].replay()
+            # Replay the graph with updated embedding buffers
+            self.graphs[bucket_grid].replay()
 
-        # Record event after replay for lightweight sync in next call.
-        if self.replay_done_event is None:
-            self.replay_done_event = torch.cuda.Event()
-        self.replay_done_event.record()
+            # Record event after replay for lightweight sync in next call.
+            if self.replay_done_event is None:
+                self.replay_done_event = torch.cuda.Event()
+            self.replay_done_event.record()
 
-        # Sync to ensure output is ready before clone.
-        self.replay_done_event.synchronize()
+            # Sync to ensure output is ready before clone.
+            self.replay_done_event.synchronize()
 
-        # Get output and trim to actual size
-        full_output = self.output_buffers[bucket_grid]
-        trimmed_output = full_output[:num_output_tokens].clone()
+            # Get output and trim to actual size
+            full_output = self.output_buffers[bucket_grid]
+            trimmed_output = full_output[:num_output_tokens].clone()
 
         if self.verbose:
             logger.debug(
