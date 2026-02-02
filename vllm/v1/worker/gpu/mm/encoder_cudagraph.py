@@ -217,6 +217,10 @@ class EncoderCudaGraphManager:
                 "(TP=1, PP=1, DP=1), using optimized sync scheme"
             )
 
+        # Track which grids have had their embedding buffers modified by run_padded().
+        # This allows run() to skip restoring cached tensors when not needed.
+        self.modified_grids: set[tuple[int, int, int]] = set()
+
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
@@ -699,8 +703,9 @@ class EncoderCudaGraphManager:
         # Copy input to the captured buffer (non-blocking for better overlap)
         input_buffer.copy_(pixel_values, non_blocking=True)
 
-        # For exact match, restore cached embeddings (may have been modified)
-        if grid_key in self.embedding_buffers and grid_key in self.cached_tensors:
+        # For exact match, restore cached embeddings only if modified by run_padded().
+        # This avoids 6 unnecessary tensor copies when only using exact-match mode.
+        if grid_key in self.modified_grids:
             embed_buffers = self.embedding_buffers[grid_key]
             cached = self.cached_tensors[grid_key]
             embed_buffers["pos_embeds"].copy_(cached["pos_embeds"], non_blocking=True)
@@ -715,6 +720,7 @@ class EncoderCudaGraphManager:
             embed_buffers["sequence_lengths"].copy_(
                 cached["sequence_lengths"], non_blocking=True
             )
+            self.modified_grids.discard(grid_key)
 
         if self.verbose:
             logger.info(
@@ -897,6 +903,9 @@ class EncoderCudaGraphManager:
         embed_buffers["sequence_lengths"].copy_(
             actual_embeds["sequence_lengths"], non_blocking=True
         )
+
+        # Mark this grid as modified so run() knows to restore cached tensors
+        self.modified_grids.add(bucket_grid)
 
         if self.verbose:
             logger.info(
