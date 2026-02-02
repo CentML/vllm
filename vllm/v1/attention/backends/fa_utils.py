@@ -22,7 +22,9 @@ elif current_platform.is_xpu():
 
 elif current_platform.is_rocm():
     try:
-        from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]  # noqa: F401
+        from flash_attn import (
+            flash_attn_varlen_func,  # type: ignore[no-redef]  # noqa: F401
+        )
     except ImportError:
 
         def flash_attn_varlen_func(*args, **kwargs):  # type: ignore[misc]
