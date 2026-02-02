@@ -405,6 +405,7 @@ class EncoderCudaGraphManager:
                 "rotary_pos_emb_sin": cached["rotary_pos_emb_sin"].clone(),
                 "cu_seqlens": cached["cu_seqlens"].clone(),
                 "max_seqlen": cached["max_seqlen"].clone(),
+                "sequence_lengths": cached["sequence_lengths"].clone(),
             }
             embed_buffers = self.embedding_buffers[grid_config]
 
@@ -421,6 +422,7 @@ class EncoderCudaGraphManager:
                     rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
                     cu_seqlens=embed_buffers["cu_seqlens"],
                     max_seqlen=embed_buffers["max_seqlen"],
+                    sequence_lengths=embed_buffers["sequence_lengths"],
                 )
                 self.output_buffers[grid_config] = torch.empty_like(warmup_output)
 
@@ -443,6 +445,7 @@ class EncoderCudaGraphManager:
                     rotary_pos_emb_sin=embed_buffers["rotary_pos_emb_sin"],
                     cu_seqlens=embed_buffers["cu_seqlens"],
                     max_seqlen=embed_buffers["max_seqlen"],
+                    sequence_lengths=embed_buffers["sequence_lengths"],
                 )
                 self.output_buffers[grid_config].copy_(output)
         else:
@@ -684,6 +687,9 @@ class EncoderCudaGraphManager:
             )
             embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
             embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
+            embed_buffers["sequence_lengths"].copy_(
+                cached["sequence_lengths"], non_blocking=True
+            )
 
         if self.verbose:
             logger.info(
@@ -859,6 +865,9 @@ class EncoderCudaGraphManager:
         )
         embed_buffers["max_seqlen"].copy_(
             actual_embeds["max_seqlen"], non_blocking=True
+        )
+        embed_buffers["sequence_lengths"].copy_(
+            actual_embeds["sequence_lengths"], non_blocking=True
         )
 
         if self.verbose:

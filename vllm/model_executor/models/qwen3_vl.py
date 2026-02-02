@@ -722,6 +722,7 @@ class Qwen3_VisionTransformer(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
+        sequence_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """
         Forward pass optimized for CUDA graph capture/replay.
@@ -737,6 +738,7 @@ class Qwen3_VisionTransformer(nn.Module):
             rotary_pos_emb_sin: Pre-computed rotary sine embeddings
             cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
             max_seqlen: Pre-computed max sequence length (scalar tensor on GPU)
+            sequence_lengths: Pre-computed sequence lengths (for FlashInfer CuDNN)
 
         Returns:
             Vision encoder output tensor
@@ -759,6 +761,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
@@ -813,12 +816,18 @@ class Qwen3_VisionTransformer(nn.Module):
         max_seqlen_gpu = self.compute_attn_mask_seqlen(cu_seqlens)
         max_seqlen = max_seqlen_gpu.cpu()  # Move to CPU to avoid GPU sync on .item()
 
+        # Compute sequence_lengths (individual sequence lengths from cu_seqlens)
+        # This is used by FlashInfer CuDNN backend
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
+
         return {
             "pos_embeds": pos_embeds,
             "rotary_pos_emb_cos": rotary_pos_emb_cos,
             "rotary_pos_emb_sin": rotary_pos_emb_sin,
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
+            "sequence_lengths": sequence_lengths,
         }
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
