@@ -2574,7 +2574,8 @@ class GPUModelRunner(
         ).contiguous()
 
         # Get spatial merge size for token calculations
-        spatial_merge_size = getattr(model.visual, "spatial_merge_size", 2)
+        visual = getattr(model, "visual", None)
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
         num_input_patches = pixel_values.shape[0]

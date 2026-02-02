@@ -224,7 +224,7 @@ class EncoderRunner:
                 curr_group_outputs = cudagraph_result
             else:
                 # Fall back to eager mode
-                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                curr_group_outputs = list(model.embed_multimodal(**mm_kwargs_group))
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -297,7 +297,8 @@ class EncoderRunner:
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
 
         # Get spatial merge size for token calculations
-        spatial_merge_size = getattr(model.visual, "spatial_merge_size", 2)
+        visual = getattr(model, "visual", None)
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
 
