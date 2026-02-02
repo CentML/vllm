@@ -1250,11 +1250,6 @@ class VllmConfig:
                 ):
                     computed_compile_ranges_split_points.append(x)
 
-        # (hack) Add a large number to the compile ranges split points to ensure that
-        # the last range is always included for vit models.
-        INT_MAX = 2**63 - 1
-        computed_compile_ranges_split_points.append(INT_MAX)
-
         compilation_config.compile_ranges_split_points = sorted(
             computed_compile_ranges_split_points
         )

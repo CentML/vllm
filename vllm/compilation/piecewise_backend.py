@@ -61,6 +61,10 @@ class PiecewiseBackend:
             # to set the upper bound of the compile ranges
             max_int32 = 2**31 - 1
             last_compile_range = self.compile_ranges[-1]
+            assert (
+                last_compile_range.end
+                == vllm_config.scheduler_config.max_num_batched_tokens
+            )
             self.compile_ranges[-1] = Range(
                 start=last_compile_range.start, end=max_int32
             )
