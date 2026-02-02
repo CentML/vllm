@@ -480,6 +480,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_pe,
                     output,
                     self.layer_name,
+                    positions,  # positional arg for custom op
+                    cos_sin_cache,  # positional arg for custom op
+                    is_neox_style,  # positional arg for custom op
                 )
                 return output
             else:
@@ -488,6 +491,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     kv_c_normed,
                     k_pe,
                     self.layer_name,
+                    positions,  # positional arg for custom op
+                    cos_sin_cache,  # positional arg for custom op
+                    is_neox_style,  # positional arg for custom op
                 )
 
     def forward_impl(
@@ -883,9 +889,17 @@ def unified_mla_attention(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     layer_name: str,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+    is_neox_style: bool = True,
 ) -> torch.Tensor:
     attn_metadata, layer, kv_cache = get_attention_context(layer_name)
-    output = layer.forward_impl(q, kv_c_normed, k_pe, kv_cache, attn_metadata)
+    output = layer.forward_impl(
+        q, kv_c_normed, k_pe, kv_cache, attn_metadata,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        is_neox_style=is_neox_style,
+    )
 
     return output
 
@@ -895,6 +909,9 @@ def unified_mla_attention_fake(
     kv_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     layer_name: str,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+    is_neox_style: bool = True,
 ) -> torch.Tensor:
     return torch.empty_like(q).contiguous()
 
@@ -915,6 +932,9 @@ def unified_mla_attention_with_output(
     k_pe: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+    is_neox_style: bool = True,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> None:
@@ -925,6 +945,9 @@ def unified_mla_attention_with_output(
         k_pe,
         kv_cache,
         attn_metadata,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        is_neox_style=is_neox_style,
         output=output,
         output_scale=output_scale,
         output_block_scale=output_block_scale,
@@ -937,6 +960,9 @@ def unified_mla_attention_with_output_fake(
     k_pe: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    positions: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
+    is_neox_style: bool = True,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> None:
