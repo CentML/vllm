@@ -17,15 +17,15 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops
 
     reshape_and_cache_flash = ipex_ops.reshape_and_cache_flash
-    flash_attn_varlen_func = ipex_ops.flash_attn_varlen_func
+    flash_attn_varlen_func = ipex_ops.flash_attn_varlen_func  # type: ignore[assignment]
     get_scheduler_metadata = ipex_ops.get_scheduler_metadata
 
 elif current_platform.is_rocm():
     try:
-        from flash_attn import flash_attn_varlen_func  # noqa: F401
+        from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]  # noqa: F401
     except ImportError:
 
-        def flash_attn_varlen_func(*args, **kwargs):
+        def flash_attn_varlen_func(*args, **kwargs):  # type: ignore[misc]
             raise ImportError(
                 "ROCm platform requires upstream flash-attn "
                 "to be installed. Please install flash-attn first."
