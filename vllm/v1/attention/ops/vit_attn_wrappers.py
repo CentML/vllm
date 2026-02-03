@@ -320,6 +320,7 @@ def flashinfer_wrapper(
         batch_offsets_k=batch_offsets_qk,
         batch_offsets_v=batch_offsets_v,
         batch_offsets_o=batch_offsets_o,
+        is_cuda_graph_compatible=True,
     )
 
     if is_reshaped:
@@ -338,7 +339,7 @@ def vit_flashinfer_wrapper_fake(
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(q)
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
 
 
 direct_register_custom_op(

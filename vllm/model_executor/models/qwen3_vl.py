@@ -220,6 +220,7 @@ class Qwen3_VisionMLP(nn.Module):
         "rotary_pos_emb_cos": 0,
         "rotary_pos_emb_sin": 0,
         "max_seqlen": 0,
+        "sequence_lengths": 0,  # Batch dimension is dynamic
     },
     mark_unbacked_dims={"max_seqlen": 0},
     enable_if=should_torch_compile_mm_vit,
@@ -808,18 +809,30 @@ class Qwen3_VisionTransformer(nn.Module):
             grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
         ).cumsum(axis=0, dtype=np.int32)
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            sequence_lengths = self.add_padding_to_fi_seqlens(
+                sequence_lengths, len(sequence_lengths), 0
+            )
+            cu_seqlens = self.compute_flashinfer_cu_seqlens(
+                cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
         cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+        sequence_lengths = torch.from_numpy(sequence_lengths).to(
+            self.device, non_blocking=True
+        )
 
         # Compute max sequence length as CPU scalar tensor
         # Using CPU tensor is important for CUDA graph capture: .item() on CPU
         # tensor doesn't trigger GPU sync, so it won't invalidate capture.
-        max_seqlen_gpu = self.compute_attn_mask_seqlen(cu_seqlens)
+        max_seqlen_gpu = (
+            torch.tensor(128 * 1024, device=self.device)
+            # setting to 128k to avoid cudnn recompilation
+            # TODO: use the real max_seqlen once cudnn compilation is optimized
+            if self.attn_backend == AttentionBackendEnum.FLASHINFER
+            else self.compute_attn_mask_seqlen(cu_seqlens)
+        )
         max_seqlen = max_seqlen_gpu.cpu()  # Move to CPU to avoid GPU sync on .item()
-
-        # Compute sequence_lengths (individual sequence lengths from cu_seqlens)
-        # This is used by FlashInfer CuDNN backend
-        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
 
         return {
             "pos_embeds": pos_embeds,
