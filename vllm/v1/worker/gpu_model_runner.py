@@ -693,6 +693,28 @@ class GPUModelRunner(
         if self.compilation_config is None:
             return
 
+        # Check if piecewise encoder cudagraph mode is enabled
+        # In piecewise mode, torch.compile handles graph splitting at attention ops,
+        # so we don't need the full EncoderCudaGraphManager
+        encoder_cudagraph_piecewise = getattr(
+            self.compilation_config, "encoder_cudagraph_piecewise", False
+        )
+        if encoder_cudagraph_piecewise:
+            compile_mm_encoder = getattr(
+                self.compilation_config, "compile_mm_encoder", False
+            )
+            if not compile_mm_encoder:
+                logger.warning(
+                    "encoder_cudagraph_piecewise=True requires compile_mm_encoder=True. "
+                    "Piecewise encoder cudagraph will not be effective."
+                )
+            else:
+                logger.info(
+                    "Piecewise encoder CUDA graph mode enabled. "
+                    "torch.compile will handle graph splitting at attention ops."
+                )
+            return
+
         if not getattr(self.compilation_config, "cudagraph_mm_encoder", False):
             return
 
