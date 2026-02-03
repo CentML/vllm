@@ -499,6 +499,16 @@ class CompilationConfig:
     processing when batch sizes vary.
     Requires compile_mm_encoder=True. Mutually exclusive with cudagraph_mm_encoder."""
 
+    encoder_cudagraph_capture_sizes: list[int] | None = None
+    """CUDA graph capture sizes (token counts) for encoder piecewise mode.
+    These are the total token counts at which CUDA graphs are captured.
+    For Qwen3-VL with spatial_merge_size=2:
+    - (1, 32, 32) grid → 1024 patches → 256 output tokens
+    - (1, 64, 64) grid → 4096 patches → 1024 output tokens
+    - (1, 94, 94) grid → 8836 patches → 2209 output tokens
+    Example: [256, 512, 1024, 2048, 4096, 8192, 16384]
+    If None, encoder piecewise mode will use compile_ranges only (no cudagraph)."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
