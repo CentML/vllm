@@ -2662,6 +2662,181 @@ class GPUModelRunner(
             )
         return None
 
+    def _find_nearest_encoder_capture_size(
+        self, num_tokens: int
+    ) -> int | None:
+        """Find the smallest capture size >= num_tokens for piecewise mode.
+
+        Args:
+            num_tokens: The actual number of output tokens
+
+        Returns:
+            The nearest capture size, or None if no suitable size found
+        """
+        if self.compilation_config is None:
+            return None
+
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return None
+
+        # Find smallest size >= num_tokens
+        for size in sorted(capture_sizes):
+            if size >= num_tokens:
+                return size
+
+        # num_tokens exceeds all capture sizes
+        return None
+
+    def _execute_encoder_piecewise_padded(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+    ) -> list[torch.Tensor] | None:
+        """Execute encoder with padding for piecewise cudagraph mode.
+
+        Pads inputs to the nearest capture size so that the compiled encoder
+        can use cudagraph. Trims output to actual size after execution.
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+
+        Returns:
+            List of encoder outputs if padding was applied, None otherwise
+        """
+        # Only support image/video modalities
+        if modality not in ("image", "video"):
+            return None
+
+        # Extract grid_thw and pixel_values
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        pixel_key = "pixel_values"
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
+            pixel_key = "pixel_values_videos"
+        if grid_thw is None:
+            return None
+
+        pixel_values = mm_kwargs_group.get(pixel_key)
+        if pixel_values is None:
+            return None
+
+        # Convert to list if tensor
+        if hasattr(grid_thw, "tolist"):
+            grid_thw_list = grid_thw.tolist()
+        else:
+            grid_thw_list = list(grid_thw)
+
+        # Get spatial merge size from model
+        visual = getattr(model, "visual", None)
+        if visual is None:
+            return None
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        # Calculate actual output tokens
+        actual_num_patches = sum(t * h * w for t, h, w in grid_thw_list)
+        actual_output_tokens = actual_num_patches // (spatial_merge_size ** 2)
+
+        # Find nearest capture size
+        capture_size = self._find_nearest_encoder_capture_size(actual_output_tokens)
+        if capture_size is None:
+            # No suitable capture size, fall back to non-padded execution
+            return None
+
+        if capture_size == actual_output_tokens:
+            # Exact match, no padding needed
+            return None
+
+        # Calculate padding needed
+        padding_tokens = capture_size - actual_output_tokens
+        padding_patches = padding_tokens * (spatial_merge_size ** 2)
+
+        # Pad pixel_values with zeros
+        # pixel_values shape: [num_patches, patch_channels]
+        num_input_patches = pixel_values.shape[0]
+        padded_num_patches = num_input_patches + padding_patches
+
+        padded_pixel_values = torch.zeros(
+            (padded_num_patches, pixel_values.shape[1]),
+            dtype=pixel_values.dtype,
+            device=pixel_values.device,
+        )
+        padded_pixel_values[:num_input_patches] = pixel_values
+
+        # Extend the last image's grid to include padding patches
+        # This ensures cu_seqlens is computed correctly
+        padded_grid_thw = [list(g) for g in grid_thw_list]
+        if len(padded_grid_thw) > 0:
+            # Add padding to the last image's H dimension
+            # We need to add padding_patches to the last image
+            last_t, last_h, last_w = padded_grid_thw[-1]
+            # Calculate new dimensions that accommodate padding
+            last_patches = last_t * last_h * last_w
+            new_last_patches = last_patches + padding_patches
+            # Keep T and W the same, adjust H
+            new_last_h = new_last_patches // (last_t * last_w)
+            if new_last_h * last_t * last_w != new_last_patches:
+                # Can't evenly divide, adjust W instead
+                new_last_w = new_last_patches // (last_t * last_h)
+                if new_last_w * last_t * last_h != new_last_patches:
+                    # Use square-ish dimensions
+                    import math
+                    total = new_last_patches // last_t
+                    new_last_h = int(math.ceil(math.sqrt(total)))
+                    new_last_w = int(math.ceil(total / new_last_h))
+                    # Adjust padding to match
+                    actual_new_patches = last_t * new_last_h * new_last_w
+                    if actual_new_patches != new_last_patches:
+                        # Recalculate padded pixel values
+                        extra_padding = actual_new_patches - last_patches
+                        padded_num_patches = num_input_patches + extra_padding
+                        padded_pixel_values = torch.zeros(
+                            (padded_num_patches, pixel_values.shape[1]),
+                            dtype=pixel_values.dtype,
+                            device=pixel_values.device,
+                        )
+                        padded_pixel_values[:num_input_patches] = pixel_values
+                else:
+                    new_last_h = last_h
+            else:
+                new_last_w = last_w
+            padded_grid_thw[-1] = [last_t, new_last_h, new_last_w]
+
+        # Create padded kwargs
+        padded_kwargs = dict(mm_kwargs_group)
+        padded_kwargs[pixel_key] = padded_pixel_values
+        if modality == "image":
+            padded_kwargs["image_grid_thw"] = padded_grid_thw
+        else:
+            padded_kwargs["video_grid_thw"] = padded_grid_thw
+
+        # Execute encoder with padded inputs
+        padded_outputs = model.embed_multimodal(**padded_kwargs)
+
+        # Trim outputs to actual size
+        trimmed_outputs = []
+        for output in padded_outputs:
+            if isinstance(output, torch.Tensor):
+                trimmed_outputs.append(output[:actual_output_tokens])
+            else:
+                trimmed_outputs.append(output)
+
+        if self.encoder_cudagraph_verbose:
+            logger.info(
+                "Piecewise padded execution: actual_tokens=%d, "
+                "capture_size=%d, padding=%d",
+                actual_output_tokens,
+                capture_size,
+                capture_size - actual_output_tokens,
+            )
+
+        return trimmed_outputs
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
