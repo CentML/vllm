@@ -290,7 +290,7 @@ def apply_rope_with_cos_sin_cache(
         x: Input tensor [..., rotary_dim]
         cos_sin_cache: Cache tensor [max_seq_len, rotary_dim]
         positions: Position indices [batch_size]
-        is_neox_style: Use NeoX-style RoPE (default True)
+        is_neox_style: Use NeoX-style RoPE (True) or GPT-J style (False)
 
     Returns:
         Rotated tensor with same shape as input
@@ -305,22 +305,21 @@ def apply_rope_with_cos_sin_cache(
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-    rotary_dim = cos_sin_cache.shape[-1] // 2
-    x1 = x[..., :rotary_dim]
-    x2 = x[..., rotary_dim:]
-
     if is_neox_style:
         # NeoX-style: first half and second half
-        rotated = torch.cat([
-            x1 * cos - x2 * sin,
-            x1 * sin + x2 * cos,
-        ], dim=-1)
+        rotary_dim = x.shape[-1] // 2
+        x1 = x[..., :rotary_dim]
+        x2 = x[..., rotary_dim:]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        rotated = torch.cat([o1, o2], dim=-1)
     else:
-        # GPT-J style: interleaved
-        rotated = torch.cat([
-            x1 * cos - x2 * sin,
-            x1 * sin + x2 * cos,
-        ], dim=-1)
+        # GPT-J style: interleaved (even/odd positions)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        rotated = torch.stack([o1, o2], dim=-1).flatten(-2)
 
     return rotated.to(x.dtype)
 
