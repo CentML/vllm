@@ -716,6 +716,10 @@ class VllmBackend:
         if self.compilation_config.use_inductor_graph_partition:
             # Let Inductor decide partitioning; avoid FX-level pre-splitting.
             fx_split_ops: list[str] = []
+        elif self.is_encoder:
+            # For encoder compilation, use encoder-specific splitting ops
+            # to enable piecewise cudagraph (attention in eager, rest in graph)
+            fx_split_ops = self.compilation_config.get_encoder_splitting_ops()
         else:
             fx_split_ops = self.compilation_config.splitting_ops or []
 

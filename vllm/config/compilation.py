@@ -673,6 +673,15 @@ class CompilationConfig:
         "vllm::sparse_attn_indexer",
     ]
 
+    # Encoder (ViT) attention ops; used for piecewise cudagraphs on encoders
+    # These ops depend on batch structure (cu_seqlens), so they must be
+    # excluded from cudagraph capture to allow batching multiple images.
+    _encoder_attention_ops: ClassVar[list[str]] = [
+        "vllm::flash_attn_maxseqlen_wrapper",
+        "vllm::fa4_flash_attn_maxseqlen_wrapper",
+        "vllm::flashinfer_wrapper",
+    ]
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
@@ -1073,6 +1082,15 @@ class CompilationConfig:
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in self._attention_ops
         )
+
+    def get_encoder_splitting_ops(self) -> list[str]:
+        """Get splitting ops for encoder (ViT) compilation.
+
+        For piecewise cudagraph on encoders, we split at attention ops
+        so that non-attention ops (norm, MLP) can be captured in cudagraphs
+        while attention runs in eager mode with batched images.
+        """
+        return list(self._encoder_attention_ops)
 
     def is_attention_compiled_piecewise(self) -> bool:
         if not self.splitting_ops_contain_attention():
