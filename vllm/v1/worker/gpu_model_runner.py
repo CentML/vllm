@@ -2503,6 +2503,11 @@ class GPUModelRunner(
                                 "encoder_cudagraph_piecewise",
                                 False,
                             )
+                            and getattr(
+                                self.compilation_config,
+                                "encoder_cudagraph_padded_mode",
+                                True,
+                            )
                         ):
                             piecewise_result = (
                                 self._execute_encoder_piecewise_padded(
