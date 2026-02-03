@@ -780,6 +780,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            kv_cache_usage=self.kv_cache_manager.usage,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

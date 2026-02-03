@@ -238,6 +238,9 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # KV cache usage (0.0 to 1.0)
+    kv_cache_usage: float = 0.0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

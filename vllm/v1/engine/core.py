@@ -358,7 +358,9 @@ class EngineCore:
                     str(iteration_details.num_generation_requests),
                     " generation requests, ",
                     str(iteration_details.num_generation_tokens),
-                    " generation tokens, iteration elapsed time: ",
+                    " generation tokens, KV cache usage: ",
+                    format(iteration_details.kv_cache_usage * 100, ".2f"),
+                    "%, iteration elapsed time: ",
                     format((time.monotonic() - before) * 1000, ".2f"),
                     " ms",
                 ]
