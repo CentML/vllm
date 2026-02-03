@@ -339,7 +339,7 @@ def vit_flashinfer_wrapper_fake(
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(q, memory_format=torch.contiguous_format)
+    return torch.empty_like(q)
 
 
 direct_register_custom_op(
