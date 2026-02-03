@@ -686,9 +686,11 @@ class Qwen2VisionTransformer(nn.Module):
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
             grid_thw = np.array(grid_thw, dtype=np.int32)
+        elif isinstance(grid_thw, np.ndarray):
+            grid_thw_list = grid_thw.tolist()
         else:
             grid_thw_list = grid_thw.tolist()
-            grid_thw = grid_thw.numpy()
+            grid_thw = grid_thw.cpu().numpy()
 
         # compute position embedding
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)

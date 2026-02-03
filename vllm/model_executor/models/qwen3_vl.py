@@ -660,9 +660,11 @@ class Qwen3_VisionTransformer(nn.Module):
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
             grid_thw = np.array(grid_thw, dtype=np.int32)
+        elif isinstance(grid_thw, np.ndarray):
+            grid_thw_list = grid_thw.tolist()
         else:
             grid_thw_list = grid_thw.tolist()
-            grid_thw = grid_thw.numpy()
+            grid_thw = grid_thw.cpu().numpy()
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
         hidden_states = hidden_states + pos_embeds
