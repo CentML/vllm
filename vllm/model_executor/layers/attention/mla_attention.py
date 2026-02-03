@@ -264,6 +264,20 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+@functools.lru_cache(maxsize=1)
+def has_flashinfer_rope_quantize_fp8() -> bool:
+    """Check if FlashInfer has rope_quantize_fp8 API available.
+
+    This function is cached since we only need to check once.
+    Returns True if the API is available, False otherwise.
+    """
+    try:
+        from flashinfer.rope import rope_quantize_fp8
+        return True
+    except ImportError:
+        return False
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -420,12 +434,27 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             compile_native=True,
         )
 
+        # Determine if FlashInfer fused RoPE+quant kernels should be used for Q path
+        # Auto-enabled when: FP8 cache dtype + FlashInfer API available
+        self._use_flashinfer_fused_q_rope = (
+            self.kv_cache_dtype.startswith("fp8")
+            and has_flashinfer_rope_quantize_fp8()
+        )
+        if self._use_flashinfer_fused_q_rope:
+            logger.info_once(
+                "Using FlashInfer fused RoPE+quant kernels for MLA Q decode path"
+            )
+
     def forward(
         self,
         q: torch.Tensor,
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        positions: torch.Tensor | None = None,
+        cos_sin_cache: torch.Tensor | None = None,
+        is_neox_style: bool = True,
+        q_pe_unrotated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -446,11 +475,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self_kv_cache,
                     attn_metadata,
                     output=output,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox_style=is_neox_style,
+                    q_pe_unrotated=q_pe_unrotated,
                 )
                 return output
             else:
                 return self.forward_impl(
-                    q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    self_kv_cache,
+                    attn_metadata,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox_style=is_neox_style,
+                    q_pe_unrotated=q_pe_unrotated,
                 )
         else:
             if self.attn_backend.accept_output_buffer:
@@ -481,6 +522,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        cos_sin_cache: torch.Tensor | None = None,
+        is_neox_style: bool = True,
+        q_pe_unrotated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -522,6 +567,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
+        # Slice optional parameters for fused kernel path
+        if q_pe_unrotated is not None:
+            q_pe_unrotated = q_pe_unrotated[:num_actual_toks, ...]
+        if positions is not None:
+            positions = positions[:num_actual_toks, ...]
+
         assert (
             attn_metadata.num_decodes is not None
             and attn_metadata.num_prefills is not None
@@ -533,6 +584,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         num_decode_tokens = attn_metadata.num_decode_tokens
 
         decode_q = q[:num_decode_tokens]
+
+        # Slice q_pe_unrotated and positions for decode tokens (for fused kernel)
+        decode_q_pe_unrotated = None
+        decode_positions = None
+        if q_pe_unrotated is not None:
+            decode_q_pe_unrotated = q_pe_unrotated[:num_decode_tokens]
+        if positions is not None:
+            decode_positions = positions[:num_decode_tokens]
 
         prefill_q = q[num_decode_tokens:]
         prefill_k_pe = k_pe[num_decode_tokens:]
@@ -631,9 +690,74 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if fp8_attention:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
+
+                # Use FlashInfer fused RoPE+quant kernel when available
+                if (
+                    self._use_flashinfer_fused_q_rope
+                    and decode_q_pe_unrotated is not None
+                    and decode_positions is not None
+                    and cos_sin_cache is not None
+                ):
+                    from flashinfer.rope import rope_quantize_fp8
+
+                    # Get unrotated q_pe for decode tokens, matching mqa_q_pe shape
+                    # decode_q_pe_unrotated is [B, N, R], same as mqa_q_pe
+                    mqa_q_pe_unrotated = decode_q_pe_unrotated
+
+                    # Handle q_pad_num_heads if needed
+                    if self.q_pad_num_heads is not None:
+                        B, N, R = mqa_q_pe_unrotated.shape
+                        mqa_pe_unrotated_padded = mqa_q_pe_unrotated.new_empty(
+                            (B, self.q_pad_num_heads, R)
+                        )
+                        mqa_pe_unrotated_padded.resize_((B, N, R))
+                        mqa_pe_unrotated_padded.copy_(mqa_q_pe_unrotated)
+                        mqa_q_pe_unrotated = mqa_pe_unrotated_padded
+
+                    # Create dummy K tensors (required by API but output ignored)
+                    # k_rope is required, k_nope is optional but we pass a dummy
+                    B = mqa_q_pe_unrotated.shape[0]
+                    dummy_k_rope = torch.zeros(
+                        B, self.qk_rope_head_dim,
+                        device=mqa_q_pe_unrotated.device,
+                        dtype=mqa_q_pe_unrotated.dtype,
+                    )
+                    dummy_k_nope = torch.zeros(
+                        B, self.kv_lora_rank,
+                        device=mqa_q_pe_unrotated.device,
+                        dtype=mqa_q_pe_unrotated.dtype,
+                    )
+
+                    # Get the scale as a float value
+                    q_scale_float = self._q_scale.item() if isinstance(
+                        self._q_scale, torch.Tensor
+                    ) else self._q_scale
+
+                    # Ensure cos_sin_cache is float32 (required by FlashInfer)
+                    if cos_sin_cache.dtype != torch.float32:
+                        cos_sin_cache = cos_sin_cache.to(torch.float32)
+
+                    # Fused RoPE + Quant for Q only (K outputs ignored)
+                    q_rope_fp8, k_rope_fp8, q_nope_fp8, k_nope_fp8 = rope_quantize_fp8(
+                        q_rope=mqa_q_pe_unrotated,  # [B, N, R] - UNROTATED
+                        k_rope=dummy_k_rope,        # [B, R] - dummy, output ignored
+                        q_nope=mqa_ql_nope,         # [B, N, Lkv] - from BMM
+                        k_nope=dummy_k_nope,        # [B, Lkv] - dummy, output ignored
+                        cos_sin_cache=cos_sin_cache,
+                        pos_ids=decode_positions,
+                        is_neox=is_neox_style,
+                        quantize_dtype=current_platform.fp8_dtype(),
+                        quant_scale_q=q_scale_float,
+                        quant_scale_kv=1.0,  # Unused (K ignored)
+                    )
+                    # K outputs discarded - K already in cache via standard path
+                    # Concatenate FP8 results: [q_nope, q_rope]
+                    mqa_q = torch.cat([q_nope_fp8, q_rope_fp8], dim=-1)
+                else:
+                    # Fallback to existing path
+                    mqa_q = self._decode_concat_quant_fp8_op(
+                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                    )
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
