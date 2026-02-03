@@ -2494,15 +2494,39 @@ class GPUModelRunner(
                         # CUDA graph was used successfully
                         curr_group_outputs = cudagraph_result
                     else:
-                        # Fall back to eager mode.
-                        # Run the encoder.
-                        # `curr_group_outputs` is either of the following:
-                        # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                        # in case feature_size is fixed across all multimodal items.
-                        # 2. A list or tuple (length: num_items) of tensors,
-                        # each of shape (feature_size, hidden_size) in case the feature
-                        # size is dynamic depending on the input multimodal items.
-                        curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                        # Try piecewise padded execution if enabled
+                        piecewise_result = None
+                        if (
+                            self.compilation_config is not None
+                            and getattr(
+                                self.compilation_config,
+                                "encoder_cudagraph_piecewise",
+                                False,
+                            )
+                        ):
+                            piecewise_result = (
+                                self._execute_encoder_piecewise_padded(
+                                    model, mm_kwargs_group, modality
+                                )
+                            )
+
+                        if piecewise_result is not None:
+                            curr_group_outputs = piecewise_result
+                        else:
+                            # Fall back to non-padded execution.
+                            # Run the encoder.
+                            # `curr_group_outputs` is either of the following:
+                            # 1. A tensor of shape
+                            #    (num_items, feature_size, hidden_size)
+                            #    in case feature_size is fixed across all
+                            #    multimodal items.
+                            # 2. A list or tuple (length: num_items) of tensors,
+                            #    each of shape (feature_size, hidden_size) in
+                            #    case the feature size is dynamic depending on
+                            #    the input multimodal items.
+                            curr_group_outputs = model.embed_multimodal(
+                                **mm_kwargs_group
+                            )
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
