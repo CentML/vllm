@@ -705,8 +705,9 @@ class GPUModelRunner(
             )
             if not compile_mm_encoder:
                 logger.warning(
-                    "encoder_cudagraph_piecewise=True requires compile_mm_encoder=True. "
-                    "Piecewise encoder cudagraph will not be effective."
+                    "encoder_cudagraph_piecewise=True requires "
+                    "compile_mm_encoder=True. Piecewise encoder cudagraph "
+                    "will not be effective."
                 )
             else:
                 logger.info(
