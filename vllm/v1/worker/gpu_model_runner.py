@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import math
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -2793,45 +2794,27 @@ class GPUModelRunner(
         )
         padded_pixel_values[:num_input_patches] = pixel_values
 
-        # Extend the last image's grid to include padding patches
-        # This ensures cu_seqlens is computed correctly
+        # Add a dummy image entry for padding patches (don't modify existing grids)
+        # This preserves position embeddings for real images
         padded_grid_thw = [list(g) for g in grid_thw_list]
-        if len(padded_grid_thw) > 0:
-            # Add padding to the last image's H dimension
-            # We need to add padding_patches to the last image
-            last_t, last_h, last_w = padded_grid_thw[-1]
-            # Calculate new dimensions that accommodate padding
-            last_patches = last_t * last_h * last_w
-            new_last_patches = last_patches + padding_patches
-            # Keep T and W the same, adjust H
-            new_last_h = new_last_patches // (last_t * last_w)
-            if new_last_h * last_t * last_w != new_last_patches:
-                # Can't evenly divide, adjust W instead
-                new_last_w = new_last_patches // (last_t * last_h)
-                if new_last_w * last_t * last_h != new_last_patches:
-                    # Use square-ish dimensions
-                    import math
-
-                    total = new_last_patches // last_t
-                    new_last_h = int(math.ceil(math.sqrt(total)))
-                    new_last_w = int(math.ceil(total / new_last_h))
-                    # Adjust padding to match
-                    actual_new_patches = last_t * new_last_h * new_last_w
-                    if actual_new_patches != new_last_patches:
-                        # Recalculate padded pixel values
-                        extra_padding = actual_new_patches - last_patches
-                        padded_num_patches = num_input_patches + extra_padding
-                        padded_pixel_values = torch.zeros(
-                            (padded_num_patches, pixel_values.shape[1]),
-                            dtype=pixel_values.dtype,
-                            device=pixel_values.device,
-                        )
-                        padded_pixel_values[:num_input_patches] = pixel_values
-                else:
-                    new_last_h = last_h
-            else:
-                new_last_w = last_w
-            padded_grid_thw[-1] = [last_t, new_last_h, new_last_w]
+        if padding_patches > 0:
+            # Create a square-ish dummy grid for padding patches
+            dummy_side = int(math.ceil(math.sqrt(padding_patches)))
+            # Ensure it's even (required by spatial_merge_size=2)
+            if dummy_side % 2 != 0:
+                dummy_side += 1
+            actual_dummy_patches = dummy_side * dummy_side
+            # Update padding to match actual dummy grid
+            if actual_dummy_patches != padding_patches:
+                padded_num_patches = num_input_patches + actual_dummy_patches
+                padded_pixel_values = torch.zeros(
+                    (padded_num_patches, pixel_values.shape[1]),
+                    dtype=pixel_values.dtype,
+                    device=pixel_values.device,
+                )
+                padded_pixel_values[:num_input_patches] = pixel_values
+            # Add dummy image entry: T=1, H=dummy_side, W=dummy_side
+            padded_grid_thw.append([1, dummy_side, dummy_side])
 
         # Create padded kwargs
         padded_kwargs = dict(mm_kwargs_group)
@@ -2848,24 +2831,20 @@ class GPUModelRunner(
         # Execute encoder with padded inputs
         padded_outputs = model.embed_multimodal(**padded_kwargs)
 
-        # Trim outputs to actual size
-        trimmed_outputs = []
-        for output in padded_outputs:
-            if isinstance(output, torch.Tensor):
-                trimmed_outputs.append(output[:actual_output_tokens])
-            else:
-                trimmed_outputs.append(output)
+        # Return only real image outputs (exclude dummy image at the end)
+        num_real_images = len(grid_thw_list)
+        real_outputs = list(padded_outputs[:num_real_images])
 
         if self.encoder_cudagraph_verbose:
             logger.info(
                 "Piecewise padded execution: actual_tokens=%d, "
-                "capture_size=%d, padding=%d",
+                "capture_size=%d, num_real_images=%d",
                 actual_output_tokens,
                 capture_size,
-                capture_size - actual_output_tokens,
+                num_real_images,
             )
 
-        return trimmed_outputs
+        return real_outputs
 
     def _gather_mm_embeddings(
         self,
