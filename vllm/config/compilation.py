@@ -489,6 +489,16 @@ class CompilationConfig:
     the kernel launch savings.
     Set to False if you observe throughput regression with encoder CUDA graphs."""
 
+    encoder_cudagraph_piecewise: bool = False
+    """Enable piecewise CUDA graph mode for encoder (ViT).
+    When True, torch.compile splits the encoder graph at attention ops, so:
+    - Non-attention ops (norm, MLP, patch_embed, merger) are captured in CUDA graphs
+    - Attention ops run in eager mode with original batch structure
+    This allows batching multiple images together while still benefiting from
+    CUDA graphs for the non-attention parts. More efficient than one-by-one
+    processing when batch sizes vary.
+    Requires compile_mm_encoder=True. Mutually exclusive with cudagraph_mm_encoder."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
