@@ -919,7 +919,7 @@ class EncoderCudaGraphManager:
 
         if self.is_single_gpu:
             # Single-GPU optimized path: graph was captured on current stream,
-            # so buffer modifications and replay are on the same stream - no sync needed.
+            # so buffer modifications and replay are on same stream - no sync needed.
             # Return view directly; caller must use output before next run() call.
             self.graphs[bucket_grid].replay()
             full_output = self.output_buffers[bucket_grid]
