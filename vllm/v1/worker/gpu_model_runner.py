@@ -2836,10 +2836,14 @@ class GPUModelRunner(
         # Create padded kwargs
         padded_kwargs = dict(mm_kwargs_group)
         padded_kwargs[pixel_key] = padded_pixel_values
+        # Convert padded_grid_thw to tensor (model expects tensor, not list)
+        padded_grid_thw_tensor = torch.tensor(
+            padded_grid_thw, dtype=torch.int32, device=pixel_values.device
+        )
         if modality == "image":
-            padded_kwargs["image_grid_thw"] = padded_grid_thw
+            padded_kwargs["image_grid_thw"] = padded_grid_thw_tensor
         else:
-            padded_kwargs["video_grid_thw"] = padded_grid_thw
+            padded_kwargs["video_grid_thw"] = padded_grid_thw_tensor
 
         # Execute encoder with padded inputs
         padded_outputs = model.embed_multimodal(**padded_kwargs)
