@@ -72,8 +72,15 @@ class PiecewiseBackend:
         log_string = f"PiecewiseBackend: compile_ranges: {self.compile_ranges}"
         logger.debug_once(log_string)
 
-        self.compile_sizes = self.compilation_config.compile_sizes
-        log_string = f"PiecewiseBackend: compile_sizes: {self.compile_sizes}"
+        # Use encoder-specific capture sizes for encoder compilation
+        if self.is_encoder_compilation:
+            self.compile_sizes = self.compilation_config.encoder_cudagraph_capture_sizes
+        else:
+            self.compile_sizes = self.compilation_config.compile_sizes
+        log_string = (
+            f"PiecewiseBackend: compile_sizes: {self.compile_sizes} "
+            f"(is_encoder={self.is_encoder_compilation})"
+        )
         logger.debug_once(log_string)
 
         self.sym_shape_indices = sym_shape_indices
