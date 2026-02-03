@@ -278,6 +278,53 @@ def has_flashinfer_rope_quantize_fp8() -> bool:
         return False
 
 
+def apply_rope_with_cos_sin_cache(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox_style: bool = True,
+) -> torch.Tensor:
+    """Apply RoPE to tensor using cos_sin_cache.
+
+    Args:
+        x: Input tensor [..., rotary_dim]
+        cos_sin_cache: Cache tensor [max_seq_len, rotary_dim]
+        positions: Position indices [batch_size]
+        is_neox_style: Use NeoX-style RoPE (default True)
+
+    Returns:
+        Rotated tensor with same shape as input
+    """
+    # Get cos and sin for positions
+    cos_sin = cos_sin_cache[positions]  # [B, rotary_dim]
+    cos, sin = cos_sin.chunk(2, dim=-1)  # Each [B, rotary_dim/2]
+
+    # Add dimensions for broadcasting to match x shape
+    # x shape: [..., rotary_dim], cos/sin shape after: [B, 1, ..., rotary_dim/2]
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+    rotary_dim = cos_sin_cache.shape[-1] // 2
+    x1 = x[..., :rotary_dim]
+    x2 = x[..., rotary_dim:]
+
+    if is_neox_style:
+        # NeoX-style: first half and second half
+        rotated = torch.cat([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos,
+        ], dim=-1)
+    else:
+        # GPT-J style: interleaved
+        rotated = torch.cat([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos,
+        ], dim=-1)
+
+    return rotated.to(x.dtype)
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -454,7 +501,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor | None = None,
         cos_sin_cache: torch.Tensor | None = None,
         is_neox_style: bool = True,
-        q_pe_unrotated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -478,7 +524,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     is_neox_style=is_neox_style,
-                    q_pe_unrotated=q_pe_unrotated,
                 )
                 return output
             else:
@@ -491,7 +536,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     is_neox_style=is_neox_style,
-                    q_pe_unrotated=q_pe_unrotated,
                 )
         else:
             if self.attn_backend.accept_output_buffer:
@@ -514,9 +558,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
     def forward_impl(
         self,
-        q: torch.Tensor,
+        q: torch.Tensor,  # q is UNROTATED; RoPE is applied in this method as needed
         k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
+        k_pe: torch.Tensor,  # value in unified attn (already has RoPE applied)
         kv_cache: torch.Tensor,
         attn_metadata: "MLACommonMetadata",
         output: torch.Tensor | None = None,
@@ -525,7 +569,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         positions: torch.Tensor | None = None,
         cos_sin_cache: torch.Tensor | None = None,
         is_neox_style: bool = True,
-        q_pe_unrotated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
@@ -567,9 +610,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        # Slice optional parameters for fused kernel path
-        if q_pe_unrotated is not None:
-            q_pe_unrotated = q_pe_unrotated[:num_actual_toks, ...]
+        # Slice positions for fused kernel path
         if positions is not None:
             positions = positions[:num_actual_toks, ...]
 
@@ -585,11 +626,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         decode_q = q[:num_decode_tokens]
 
-        # Slice q_pe_unrotated and positions for decode tokens (for fused kernel)
-        decode_q_pe_unrotated = None
+        # Slice positions for decode tokens (for fused kernel)
         decode_positions = None
-        if q_pe_unrotated is not None:
-            decode_q_pe_unrotated = q_pe_unrotated[:num_decode_tokens]
         if positions is not None:
             decode_positions = positions[:num_decode_tokens]
 
@@ -615,6 +653,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
 
         if has_prefill and not is_sparse_impl:
+            # Apply RoPE to prefill_q's rope portion (q is unrotated from wrapper)
+            if cos_sin_cache is not None and positions is not None:
+                prefill_positions = positions[num_decode_tokens:]
+                prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
+                prefill_q_pe_rotated = apply_rope_with_cos_sin_cache(
+                    prefill_q_pe,
+                    cos_sin_cache,
+                    prefill_positions,
+                    is_neox_style,
+                )
+                # Create rotated prefill_q by concatenating nope and rotated rope
+                prefill_q = torch.cat([
+                    prefill_q[..., :self.qk_nope_head_dim],
+                    prefill_q_pe_rotated,
+                ], dim=-1)
+
             self.impl.forward_mha(
                 prefill_q,
                 prefill_k_c_normed,
@@ -692,40 +746,29 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
 
                 # Use FlashInfer fused RoPE+quant kernel when available
+                # mqa_q_pe is UNROTATED (RoPE not applied in wrapper)
                 if (
                     self._use_flashinfer_fused_q_rope
-                    and decode_q_pe_unrotated is not None
                     and decode_positions is not None
                     and cos_sin_cache is not None
                 ):
                     from flashinfer.rope import rope_quantize_fp8
 
-                    # Get unrotated q_pe for decode tokens, matching mqa_q_pe shape
-                    # decode_q_pe_unrotated is [B, N, R], same as mqa_q_pe
-                    mqa_q_pe_unrotated = decode_q_pe_unrotated
-
-                    # Handle q_pad_num_heads if needed
-                    if self.q_pad_num_heads is not None:
-                        B, N, R = mqa_q_pe_unrotated.shape
-                        mqa_pe_unrotated_padded = mqa_q_pe_unrotated.new_empty(
-                            (B, self.q_pad_num_heads, R)
-                        )
-                        mqa_pe_unrotated_padded.resize_((B, N, R))
-                        mqa_pe_unrotated_padded.copy_(mqa_q_pe_unrotated)
-                        mqa_q_pe_unrotated = mqa_pe_unrotated_padded
+                    # mqa_q_pe is already unrotated [B, N, R]
+                    # (RoPE is applied by the fused kernel)
 
                     # Create dummy K tensors (required by API but output ignored)
-                    # k_rope is required, k_nope is optional but we pass a dummy
-                    B = mqa_q_pe_unrotated.shape[0]
-                    dummy_k_rope = torch.zeros(
+                    # Use torch.empty since K outputs are discarded
+                    B = mqa_q_pe.shape[0]
+                    dummy_k_rope = torch.empty(
                         B, self.qk_rope_head_dim,
-                        device=mqa_q_pe_unrotated.device,
-                        dtype=mqa_q_pe_unrotated.dtype,
+                        device=mqa_q_pe.device,
+                        dtype=mqa_q_pe.dtype,
                     )
-                    dummy_k_nope = torch.zeros(
+                    dummy_k_nope = torch.empty(
                         B, self.kv_lora_rank,
-                        device=mqa_q_pe_unrotated.device,
-                        dtype=mqa_q_pe_unrotated.dtype,
+                        device=mqa_q_pe.device,
+                        dtype=mqa_q_pe.dtype,
                     )
 
                     # Get the scale as a float value
@@ -734,16 +777,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     ) else self._q_scale
 
                     # Ensure cos_sin_cache is float32 (required by FlashInfer)
+                    cos_sin_cache_f32 = cos_sin_cache
                     if cos_sin_cache.dtype != torch.float32:
-                        cos_sin_cache = cos_sin_cache.to(torch.float32)
+                        cos_sin_cache_f32 = cos_sin_cache.to(torch.float32)
 
                     # Fused RoPE + Quant for Q only (K outputs ignored)
                     q_rope_fp8, k_rope_fp8, q_nope_fp8, k_nope_fp8 = rope_quantize_fp8(
-                        q_rope=mqa_q_pe_unrotated,  # [B, N, R] - UNROTATED
+                        q_rope=mqa_q_pe,            # [B, N, R] - UNROTATED
                         k_rope=dummy_k_rope,        # [B, R] - dummy, output ignored
                         q_nope=mqa_ql_nope,         # [B, N, Lkv] - from BMM
                         k_nope=dummy_k_nope,        # [B, Lkv] - dummy, output ignored
-                        cos_sin_cache=cos_sin_cache,
+                        cos_sin_cache=cos_sin_cache_f32,
                         pos_ids=decode_positions,
                         is_neox=is_neox_style,
                         quantize_dtype=current_platform.fp8_dtype(),
@@ -754,12 +798,34 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # Concatenate FP8 results: [q_nope, q_rope]
                     mqa_q = torch.cat([q_nope_fp8, q_rope_fp8], dim=-1)
                 else:
-                    # Fallback to existing path
+                    # Fallback path: Apply RoPE to mqa_q_pe then concat+quant
+                    # mqa_q_pe is unrotated, need to apply RoPE first
+                    if cos_sin_cache is not None and decode_positions is not None:
+                        mqa_q_pe_rotated = apply_rope_with_cos_sin_cache(
+                            mqa_q_pe,
+                            cos_sin_cache,
+                            decode_positions,
+                            is_neox_style,
+                        )
+                    else:
+                        # No RoPE params available, use as-is (shouldn't happen)
+                        mqa_q_pe_rotated = mqa_q_pe
+
                     mqa_q = self._decode_concat_quant_fp8_op(
-                        mqa_ql_nope, mqa_q_pe, self._q_scale
+                        mqa_ql_nope, mqa_q_pe_rotated, self._q_scale
                     )
             else:
-                mqa_q = (mqa_ql_nope, mqa_q_pe)
+                # Non-FP8 path: Apply RoPE to mqa_q_pe
+                if cos_sin_cache is not None and decode_positions is not None:
+                    mqa_q_pe_rotated = apply_rope_with_cos_sin_cache(
+                        mqa_q_pe,
+                        cos_sin_cache,
+                        decode_positions,
+                        is_neox_style,
+                    )
+                else:
+                    mqa_q_pe_rotated = mqa_q_pe
+                mqa_q = (mqa_ql_nope, mqa_q_pe_rotated)
             if self.impl.dcp_world_size > 1:
                 assert not fp8_attention, "DCP not support fp8 kvcache now."
                 # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)

@@ -153,19 +153,18 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        # Save unrotated q_pe for potential fused RoPE+quant kernel
-        # This is cloned before RoPE is applied in-place
-        q_pe_unrotated = q[..., self.qk_nope_head_dim :].clone()
-
         # Get cos_sin_cache and is_neox_style for fused kernel
+        # Only apply RoPE to k_pe here; q RoPE is handled in attention layer
+        # This avoids cloning q_pe for the fused kernel path
         cos_sin_cache = None
         is_neox_style = True
         if self.rotary_emb is not None:
             cos_sin_cache = self.rotary_emb.cos_sin_cache
             is_neox_style = getattr(self.rotary_emb, "is_neox_style", True)
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            # Apply RoPE only to k_pe
+            # Pass k_pe as both query and key (some RoPE impls require key!=None)
+            # Use only the key output (second return value)
+            _, k_pe = self.rotary_emb(positions, k_pe, k_pe)
 
         if self.indexer and self.is_sparse:
             _topk_indices = self.indexer(
@@ -176,14 +175,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q *= llama_4_scaling
 
         attn_out = self.mla_attn(
-            q,
+            q,  # q is unrotated; attention layer will apply RoPE as needed
             kv_c_normed,
             k_pe,
             output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
             positions=positions,
             cos_sin_cache=cos_sin_cache,
             is_neox_style=is_neox_style,
-            q_pe_unrotated=q_pe_unrotated,
         )
 
         return self.o_proj(attn_out)[0]
