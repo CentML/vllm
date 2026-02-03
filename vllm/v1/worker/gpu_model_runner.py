@@ -2509,10 +2509,8 @@ class GPUModelRunner(
                                 True,
                             )
                         ):
-                            piecewise_result = (
-                                self._execute_encoder_piecewise_padded(
-                                    model, mm_kwargs_group, modality
-                                )
+                            piecewise_result = self._execute_encoder_piecewise_padded(
+                                model, mm_kwargs_group, modality
                             )
 
                         if piecewise_result is not None:
@@ -2691,9 +2689,7 @@ class GPUModelRunner(
             )
         return None
 
-    def _find_nearest_encoder_capture_size(
-        self, num_tokens: int
-    ) -> int | None:
+    def _find_nearest_encoder_capture_size(self, num_tokens: int) -> int | None:
         """Find the smallest capture size >= num_tokens for piecewise mode.
 
         Args:
@@ -2769,7 +2765,7 @@ class GPUModelRunner(
 
         # Calculate actual output tokens
         actual_num_patches = sum(t * h * w for t, h, w in grid_thw_list)
-        actual_output_tokens = actual_num_patches // (spatial_merge_size ** 2)
+        actual_output_tokens = actual_num_patches // (spatial_merge_size**2)
 
         # Find nearest capture size
         capture_size = self._find_nearest_encoder_capture_size(actual_output_tokens)
@@ -2783,7 +2779,7 @@ class GPUModelRunner(
 
         # Calculate padding needed
         padding_tokens = capture_size - actual_output_tokens
-        padding_patches = padding_tokens * (spatial_merge_size ** 2)
+        padding_patches = padding_tokens * (spatial_merge_size**2)
 
         # Pad pixel_values with zeros
         # pixel_values shape: [num_patches, patch_channels]
@@ -2815,6 +2811,7 @@ class GPUModelRunner(
                 if new_last_w * last_t * last_h != new_last_patches:
                     # Use square-ish dimensions
                     import math
+
                     total = new_last_patches // last_t
                     new_last_h = int(math.ceil(math.sqrt(total)))
                     new_last_w = int(math.ceil(total / new_last_h))
