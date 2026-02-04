@@ -489,6 +489,14 @@ class CompilationConfig:
     the kernel launch savings.
     Set to False if you observe throughput regression with encoder CUDA graphs."""
 
+    encoder_cudagraph_batch_sizes: list[int] | None = None
+    """Batch sizes for grouped batched CUDA graph capture.
+    When set (e.g., [4]), captures graphs for processing multiple images
+    together. Images are grouped by similar grid sizes and padded to the
+    largest grid in each group. Single graph replay for the whole group.
+    Example: [4] captures batch_size=4 graphs only (1-3 images use eager).
+    Default None uses legacy one-by-one mode (batch_size=1 per image)."""
+
     encoder_cudagraph_piecewise: bool = False
     """Enable piecewise CUDA graph mode for encoder (ViT).
     When True, torch.compile splits the encoder graph at attention ops, so:
