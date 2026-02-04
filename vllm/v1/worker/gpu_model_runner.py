@@ -755,6 +755,13 @@ class GPUModelRunner(
             True,  # Default to one-by-one for higher CUDA graph hit rate
         )
 
+        # Get batch sizes for grouped batched mode
+        self.encoder_cudagraph_batch_sizes = getattr(
+            self.compilation_config,
+            "encoder_cudagraph_batch_sizes",
+            None,  # Default None means legacy mode (batch_size=1 only)
+        )
+
         # Create a dedicated graph pool for encoder CUDA graphs
         # This keeps encoder and decoder graph memory separate for:
         # 1. Better memory isolation and predictability
@@ -2407,16 +2414,58 @@ class GPUModelRunner(
                 curr_group_outputs = curr_group_outputs_lst
             else:
                 # Try to use CUDA graph if available
-                # When CUDA graphs are enabled and we have multiple items,
-                # process them one at a time since CUDA graphs only support
-                # single-image batches. This can be disabled via config if
-                # the sync overhead outweighs the CUDA graph benefits.
+                # First try grouped batched mode if configured (batch_size > 1)
+                # Then fall back to one-by-one mode
+                grouped_batched_result = None
                 if (
+                    self.encoder_cudagraph_manager is not None
+                    and self.encoder_cudagraph_batch_sizes is not None
+                    and num_items > 1
+                    and modality in ("image", "video")
+                ):
+                    # Try grouped batched mode
+                    if modality == "image":
+                        batched_pixel_values = mm_kwargs_group.get("pixel_values")
+                        grid_thw_list = mm_kwargs_group.get("image_grid_thw")
+                    else:  # video
+                        batched_pixel_values = mm_kwargs_group.get(
+                            "pixel_values_videos"
+                        )
+                        grid_thw_list = mm_kwargs_group.get("video_grid_thw")
+
+                    if batched_pixel_values is not None and grid_thw_list is not None:
+                        if isinstance(grid_thw_list, torch.Tensor):
+                            grid_thw_list = grid_thw_list.tolist()
+
+                        # Find largest batch size that fits
+                        target_batch_size = max(
+                            bs for bs in self.encoder_cudagraph_batch_sizes
+                            if bs <= num_items
+                        ) if any(bs <= num_items for bs in self.encoder_cudagraph_batch_sizes) else None
+
+                        if target_batch_size is not None and target_batch_size > 1:
+                            if self.encoder_cudagraph_verbose:
+                                logger.info(
+                                    "Trying grouped batch: %d images, target_bs=%d",
+                                    num_items, target_batch_size
+                                )
+                            grouped_batched_result = self._execute_grouped_batched_encoder(
+                                model,
+                                batched_pixel_values,
+                                grid_thw_list,
+                                modality,
+                                target_batch_size,
+                            )
+
+                if grouped_batched_result is not None:
+                    curr_group_outputs = grouped_batched_result
+                elif (
                     self.encoder_cudagraph_manager is not None
                     and self.encoder_cudagraph_one_by_one
                     and num_items > 1
                     and modality in ("image", "video")
                 ):
+                    # Fall back to one-by-one processing
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
@@ -2714,6 +2763,143 @@ class GPUModelRunner(
                 self.encoder_cudagraph_padded_mode,
             )
         return None
+
+    def _execute_grouped_batched_encoder(
+        self,
+        model: "SupportsMultiModal",
+        batched_pixel_values: torch.Tensor,
+        grid_thw_list: list[list[int]],
+        modality: str,
+        target_batch_size: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Execute encoder using grouped batched CUDA graphs.
+
+        Groups images by grid size, pads to largest in group, and uses
+        batched CUDA graph for groups of target_batch_size.
+
+        Args:
+            model: The multimodal model
+            batched_pixel_values: Concatenated pixel values for all images
+            grid_thw_list: List of [T, H, W] for each image
+            modality: "image" or "video"
+            target_batch_size: Target batch size for grouping (e.g., 4)
+
+        Returns:
+            List of output tensors, or None if batched mode not available
+        """
+        if self.encoder_cudagraph_manager is None:
+            return None
+
+        num_images = len(grid_thw_list)
+        if num_images < target_batch_size:
+            # Not enough images for a full batch, fall back to eager
+            return None
+
+        # Get spatial merge size for output token calculation
+        visual = getattr(model, "visual", None)
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        # Sort images by grid size (patch count) for efficient grouping
+        # Keep track of original indices for reordering output
+        indexed_grids = [(i, grid, grid[0] * grid[1] * grid[2])
+                         for i, grid in enumerate(grid_thw_list)]
+        sorted_grids = sorted(indexed_grids, key=lambda x: x[2])
+
+        # Calculate patch offsets for slicing
+        patch_offsets = [0]
+        for grid in grid_thw_list:
+            t, h, w = grid
+            patch_offsets.append(patch_offsets[-1] + t * h * w)
+
+        outputs = [None] * num_images
+        processed = 0
+
+        # Process full batches
+        while processed + target_batch_size <= num_images:
+            # Get the next batch of images (sorted by size)
+            batch_indices = [sorted_grids[processed + i][0]
+                             for i in range(target_batch_size)]
+            batch_grids = [grid_thw_list[i] for i in batch_indices]
+
+            # Find the largest grid in this batch (for padding)
+            max_patches = max(g[0] * g[1] * g[2] for g in batch_grids)
+            max_grid = None
+            for g in batch_grids:
+                if g[0] * g[1] * g[2] == max_patches:
+                    max_grid = g
+                    break
+
+            # Check if we have a graph for this batch_size and grid
+            graph_key = self.encoder_cudagraph_manager.get_graph_for_grid(
+                [max_grid] * target_batch_size, batch_size=target_batch_size
+            )
+            if graph_key is None:
+                # No graph for this configuration, skip to eager
+                processed += target_batch_size
+                continue
+
+            # Pad all images in batch to max_grid size
+            padded_pixels_list = []
+            for idx in batch_indices:
+                start = patch_offsets[idx]
+                end = patch_offsets[idx + 1]
+                img_pixels = batched_pixel_values[start:end]
+
+                actual_patches = img_pixels.shape[0]
+                if actual_patches < max_patches:
+                    # Pad with zeros
+                    padding = torch.zeros(
+                        max_patches - actual_patches,
+                        img_pixels.shape[1],
+                        dtype=img_pixels.dtype,
+                        device=img_pixels.device,
+                    )
+                    img_pixels = torch.cat([img_pixels, padding], dim=0)
+                padded_pixels_list.append(img_pixels)
+
+            # Concatenate for batched execution
+            batched_input = torch.cat(padded_pixels_list, dim=0)
+
+            # Run batched CUDA graph
+            result = self.encoder_cudagraph_manager.run_batched(
+                batched_input,
+                [max_grid] * target_batch_size,
+                batch_size=target_batch_size,
+            )
+
+            if result is not None:
+                # Split output by image and trim to actual size
+                output_tokens_per_image = (
+                    max_grid[0]
+                    * (max_grid[1] // spatial_merge_size)
+                    * (max_grid[2] // spatial_merge_size)
+                )
+                for i, idx in enumerate(batch_indices):
+                    actual_grid = grid_thw_list[idx]
+                    actual_tokens = (
+                        actual_grid[0]
+                        * (actual_grid[1] // spatial_merge_size)
+                        * (actual_grid[2] // spatial_merge_size)
+                    )
+                    start = i * output_tokens_per_image
+                    # Trim to actual output size
+                    outputs[idx] = result[start:start + actual_tokens].clone()
+
+                if self.encoder_cudagraph_verbose:
+                    logger.info(
+                        "Grouped batch: batch_size=%d, max_grid=%s, processed=%d",
+                        target_batch_size, max_grid, target_batch_size
+                    )
+
+            processed += target_batch_size
+
+        # Check if all images were processed
+        if any(o is None for o in outputs):
+            # Some images not processed, fall back to full eager
+            return None
+
+        return outputs
 
     def _find_nearest_encoder_capture_size(self, num_tokens: int) -> int | None:
         """Find the smallest capture size >= num_tokens for piecewise mode.
