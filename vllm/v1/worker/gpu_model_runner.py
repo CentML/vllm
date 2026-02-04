@@ -3155,6 +3155,106 @@ class GPUModelRunner(
         run_forward(warmup_size)
         torch.cuda.empty_cache()
 
+    def _capture_encoder_piecewise_cudagraphs(self) -> None:
+        """Capture encoder piecewise CUDA graphs for all capture sizes.
+
+        Called during capture_model() when cudagraph capturing is enabled.
+        This triggers CUDAGraphWrapper to capture graphs for each size.
+        """
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return
+
+        model = self.model
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "forward_piecewise"):
+            return
+
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+        merge_size_sq = spatial_merge_size ** 2
+
+        # Convert capture_sizes to patches, largest first
+        capture_sizes_patches = sorted(
+            [size * merge_size_sq for size in capture_sizes],
+            reverse=True
+        )
+
+        logger.info(
+            "Capturing encoder piecewise CUDA graphs for %d sizes",
+            len(capture_sizes_patches)
+        )
+
+        for num_patches in capture_sizes_patches:
+            # Create dummy inputs
+            patch_embed = getattr(visual, "patch_embed", None)
+            if patch_embed is not None:
+                temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
+                patch_size = getattr(patch_embed, "patch_size", 14)
+                proj = getattr(patch_embed, "proj", None)
+                raw_in_channels = getattr(proj, "in_channels", 3) if proj else 3
+                input_channels = (raw_in_channels * temporal_patch_size
+                                  * patch_size * patch_size)
+            else:
+                input_channels = 3 * 2 * 14 * 14
+
+            pixel_values = torch.zeros(
+                (num_patches, input_channels),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            hidden_size = getattr(visual, "hidden_size",
+                                 getattr(visual, "embed_dim", 1152))
+            pos_embeds = torch.zeros(
+                (num_patches, hidden_size),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
+            rotary_cos = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+            rotary_sin = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            cu_seqlens = torch.tensor(
+                [0, num_patches], dtype=torch.int32, device=self.device
+            )
+            max_seqlen = torch.tensor(num_patches, device=self.device)
+            sequence_lengths = torch.tensor(
+                [num_patches], dtype=torch.int32, device=self.device
+            )
+
+            # Call with PIECEWISE mode to trigger CUDAGraphWrapper capture
+            batch_desc = BatchDescriptor(num_tokens=num_patches)
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                batch_descriptor=batch_desc,
+            ):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+            torch.cuda.empty_cache()
+
+        logger.info("Encoder piecewise CUDA graph capture complete")
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
@@ -5647,6 +5747,11 @@ class GPUModelRunner(
                 encoder_mem / 1024**3,
                 after_encoder_free / 1024**3,
             )
+
+        # Capture encoder piecewise CUDA graphs (if enabled)
+        if getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
+            with freeze_gc():
+                self._capture_encoder_piecewise_cudagraphs()
 
         # Capture decoder/LM CUDA graphs in their own context with global pool
         with freeze_gc(), graph_capture(device=self.device):
