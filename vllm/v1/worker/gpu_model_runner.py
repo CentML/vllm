@@ -3233,7 +3233,21 @@ class GPUModelRunner(
                 [num_patches], dtype=torch.int32, device=self.device
             )
 
-            # Call with PIECEWISE mode to trigger CUDAGraphWrapper capture
+            # Two-pass capture like LM:
+            # Pass 1: NONE mode - triggers torch.compile without CUDA graph capture
+            with set_forward_context(None, self.vllm_config):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+            # Pass 2: PIECEWISE mode - triggers CUDAGraphWrapper capture
+            # (compilation already done in pass 1)
             batch_desc = BatchDescriptor(num_tokens=num_patches)
             with set_forward_context(
                 None,
