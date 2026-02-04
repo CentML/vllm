@@ -662,11 +662,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     prefill_positions,
                     is_neox_style,
                 )
-                # Create rotated prefill_q by concatenating nope and rotated rope
-                prefill_q = torch.cat([
-                    prefill_q[..., :self.qk_nope_head_dim],
-                    prefill_q_pe_rotated,
-                ], dim=-1)
+                # Modify q_pe slice in-place, avoiding torch.cat
+                prefill_q[..., self.qk_nope_head_dim:] = prefill_q_pe_rotated
 
             self.impl.forward_mha(
                 prefill_q,
