@@ -624,6 +624,9 @@ def set_functorch_config() -> None:
     # (e.g., Conv3d in vision encoders) that don't produce AOT artifacts.
     # This matches what InductorAdaptor does with context manager.
     torch._functorch.config.enable_autograd_cache = False
+    # Disable fx_graph_cache to avoid assertion errors during cache save
+    # for graphs that don't produce AOT autograd artifacts.
+    torch._inductor.config.fx_graph_cache = False
 
 
 class EagerAdaptor(CompilerInterface):
