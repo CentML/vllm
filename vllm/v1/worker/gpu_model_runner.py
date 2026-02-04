@@ -694,6 +694,13 @@ class GPUModelRunner(
         if self.compilation_config is None:
             return
 
+        # Always check verbose logging first (applies to all modes)
+        self.encoder_cudagraph_verbose = getattr(
+            self.compilation_config,
+            "encoder_cudagraph_verbose",
+            False,
+        )
+
         # Check if piecewise encoder cudagraph mode is enabled
         # In piecewise mode, torch.compile handles graph splitting at attention ops,
         # so we don't need the full EncoderCudaGraphManager
