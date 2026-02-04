@@ -2902,34 +2902,35 @@ class GPUModelRunner(
         buffers = self._piecewise_buffers.get(capture_size)
         if buffers is None:
             # Lazily allocate buffers on first use for this capture_size
-            # Using torch.empty avoids the zeros kernel
+            # Using torch.zeros ensures padding region is valid (not garbage)
+            # The zeros kernel only runs once per capture_size, not per call
             buffers = {
-                "pixel_values": torch.empty(
+                "pixel_values": torch.zeros(
                     (padded_num_patches, pixel_values.shape[1]),
                     dtype=visual.dtype,
                     device=pixel_values.device,
                 ),
-                "pos_embeds": torch.empty(
+                "pos_embeds": torch.zeros(
                     (padded_num_patches, pos_embeds.shape[1]),
                     dtype=pos_embeds.dtype,
                     device=pos_embeds.device,
                 ),
-                "rotary_cos": torch.empty(
+                "rotary_cos": torch.zeros(
                     (padded_num_patches, rotary_pos_emb_cos.shape[1]),
                     dtype=rotary_pos_emb_cos.dtype,
                     device=rotary_pos_emb_cos.device,
                 ),
-                "rotary_sin": torch.empty(
+                "rotary_sin": torch.zeros(
                     (padded_num_patches, rotary_pos_emb_sin.shape[1]),
                     dtype=rotary_pos_emb_sin.dtype,
                     device=rotary_pos_emb_sin.device,
                 ),
                 # Pre-allocate cu_seqlens with max possible entries
                 # (assuming max ~1000 images per batch is more than enough)
-                "cu_seqlens": torch.empty(
+                "cu_seqlens": torch.zeros(
                     (1001,), dtype=cu_seqlens.dtype, device=cu_seqlens.device
                 ),
-                "sequence_lengths": torch.empty(
+                "sequence_lengths": torch.zeros(
                     (1000,), dtype=sequence_lengths.dtype,
                     device=sequence_lengths.device
                 ),
