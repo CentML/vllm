@@ -3029,15 +3029,13 @@ class GPUModelRunner(
         return real_outputs
 
     def warmup_encoder_piecewise(self) -> None:
-        """Warmup encoder piecewise compilation using compile_ranges.
+        """Warmup and capture encoder piecewise compilation.
 
-        This mimics LM warmup approach:
-        1. Warmup with sizes in compile_ranges (NOT exact capture_sizes)
-        2. This triggers compilation with fake tensors (is_exact_size=False)
-        3. Exact capture_sizes compile lazily during actual execution
+        This mimics LM's two-phase approach:
+        1. Warmup phase: Compile ranges with fake tensors (is_exact_size=False)
+        2. Capture phase: Compile all exact capture_sizes upfront (is_exact_size=True)
 
-        This avoids PyTorch AOT autograd cache issues that occur when
-        compiling simple graphs (like patch_embed) with real tensors.
+        This ensures no compilation happens during execution.
         """
         if not getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
             return
@@ -3057,47 +3055,14 @@ class GPUModelRunner(
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
         merge_size_sq = spatial_merge_size ** 2
 
-        # Convert capture_sizes to patches for comparison
-        capture_sizes_patches = set(size * merge_size_sq for size in capture_sizes)
-
-        # For encoder warmup, we want to use a size that:
-        # 1. Is NOT in capture_sizes (so is_exact_size=False, uses fake tensors)
-        # 2. Is reasonable for memory (not using LM's large compile_range.end)
-        # 3. Is within the valid compile_range
-        #
-        # Strategy: Use max(capture_sizes) + 1 (in output tokens) as warmup size
-        # This ensures we compile the range without OOM from huge sizes
-        max_capture_size = max(capture_sizes)  # In output tokens
-        warmup_size_tokens = max_capture_size + 1  # Slightly larger, not exact match
-        warmup_size = warmup_size_tokens * merge_size_sq  # Convert to patches
-
-        warmup_sizes = []
-        if warmup_size not in capture_sizes_patches:
-            warmup_sizes.append(warmup_size)
-        else:
-            # Try max - 1 if max + 1 happens to be a capture_size
-            warmup_size_tokens = max_capture_size - 1
-            if warmup_size_tokens > 0:
-                warmup_size = warmup_size_tokens * merge_size_sq
-                if warmup_size not in capture_sizes_patches:
-                    warmup_sizes.append(warmup_size)
-
-        if not warmup_sizes:
-            logger.info(
-                "Encoder piecewise warmup: no suitable warmup sizes found, "
-                "compilation will happen lazily during execution"
-            )
-            return
-
-        logger.info(
-            "Warming up encoder piecewise with %d compile_range sizes "
-            "(exact capture_sizes will compile lazily): %s",
-            len(warmup_sizes), [s // merge_size_sq for s in warmup_sizes]
+        # Convert capture_sizes to patches
+        capture_sizes_patches = sorted(
+            [size * merge_size_sq for size in capture_sizes],
+            reverse=True  # Largest first like LM
         )
 
-        for num_patches in sorted(warmup_sizes, reverse=True):
-            # Create dummy inputs matching the expected shapes
-            # pixel_values: [num_patches, C] where C = in_chans * temporal * H * W
+        # Helper to create dummy inputs for a given num_patches
+        def create_dummy_inputs(num_patches: int):
             patch_embed = getattr(visual, "patch_embed", None)
             if patch_embed is not None:
                 temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
@@ -3107,7 +3072,8 @@ class GPUModelRunner(
                     raw_in_channels = getattr(proj, "in_channels", 3)
                 else:
                     raw_in_channels = 3
-                input_channels = raw_in_channels * temporal_patch_size * patch_size * patch_size
+                input_channels = (raw_in_channels * temporal_patch_size
+                                  * patch_size * patch_size)
             else:
                 input_channels = 3 * 2 * 14 * 14
 
@@ -3146,13 +3112,13 @@ class GPUModelRunner(
                 [num_patches], dtype=torch.int32, device=self.device
             )
 
-            logger.info(
-                "Warming up encoder piecewise: patches=%d (tokens=%d)",
-                num_patches, num_patches // merge_size_sq
-            )
+            return (pixel_values, pos_embeds, rotary_cos, rotary_sin,
+                    cu_seqlens, max_seqlen, sequence_lengths)
 
-            # Call forward_piecewise to trigger compilation with fake tensors
-            # (is_exact_size=False because size is NOT in capture_sizes)
+        def run_forward(num_patches: int):
+            (pixel_values, pos_embeds, rotary_cos, rotary_sin,
+             cu_seqlens, max_seqlen, sequence_lengths) = create_dummy_inputs(num_patches)
+
             with set_forward_context(None, self.vllm_config):
                 _ = visual.forward_piecewise(
                     x=pixel_values,
@@ -3164,12 +3130,54 @@ class GPUModelRunner(
                     sequence_lengths=sequence_lengths,
                 )
 
-            # Clear CUDA cache after each warmup to free intermediate memory
+        # ============================================================
+        # Phase 1: Warmup compile_ranges with fake tensors
+        # ============================================================
+        # Use a size that's NOT in capture_sizes to trigger range compilation
+        # with fake tensors (is_exact_size=False)
+        max_capture_size = max(capture_sizes)  # In output tokens
+        warmup_size_tokens = max_capture_size + 1
+        warmup_size = warmup_size_tokens * merge_size_sq
+
+        # Make sure warmup_size is not an exact capture_size
+        capture_sizes_patches_set = set(capture_sizes_patches)
+        if warmup_size in capture_sizes_patches_set:
+            warmup_size_tokens = max_capture_size + 2
+            warmup_size = warmup_size_tokens * merge_size_sq
+
+        logger.info(
+            "Phase 1: Warming up encoder piecewise compile_ranges "
+            "with patches=%d (tokens=%d)",
+            warmup_size, warmup_size_tokens
+        )
+
+        run_forward(warmup_size)
+        torch.cuda.empty_cache()
+
+        logger.info("Phase 1 complete: compile_ranges warmed up")
+
+        # ============================================================
+        # Phase 2: Capture all exact sizes upfront (like LM capture_model)
+        # ============================================================
+        logger.info(
+            "Phase 2: Capturing encoder piecewise for %d exact sizes: %s",
+            len(capture_sizes_patches),
+            [s // merge_size_sq for s in capture_sizes_patches]
+        )
+
+        for i, num_patches in enumerate(capture_sizes_patches):
+            num_tokens = num_patches // merge_size_sq
+            logger.info(
+                "Capturing encoder piecewise %d/%d: patches=%d (tokens=%d)",
+                i + 1, len(capture_sizes_patches), num_patches, num_tokens
+            )
+
+            run_forward(num_patches)
             torch.cuda.empty_cache()
 
         logger.info(
-            "Encoder piecewise warmup complete. Compile_ranges warmed up, "
-            "exact capture_sizes (%d) will compile on first use.",
+            "Encoder piecewise warmup and capture complete. "
+            "All %d capture_sizes compiled upfront.",
             len(capture_sizes)
         )
 
