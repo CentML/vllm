@@ -84,7 +84,7 @@ class PiecewiseBackend:
                 logger.debug_once(
                     "PiecewiseBackend: converted encoder capture sizes from "
                     "output tokens %s to input patches %s (merge_size²=%d)",
-                    encoder_capture_sizes, self.compile_sizes, merge_size_sq
+                    tuple(encoder_capture_sizes), tuple(self.compile_sizes), merge_size_sq
                 )
             else:
                 self.compile_sizes = None
