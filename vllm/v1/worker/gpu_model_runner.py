@@ -3060,29 +3060,26 @@ class GPUModelRunner(
         # Convert capture_sizes to patches for comparison
         capture_sizes_patches = set(size * merge_size_sq for size in capture_sizes)
 
-        # Get compile_ranges and find warmup sizes that are NOT exact capture_sizes
-        # This ensures we use fake tensors (is_exact_size=False) during compilation
-        compile_ranges = self.compilation_config.get_compile_ranges()
-        warmup_sizes = []
-        for compile_range in compile_ranges:
-            # Use the end of each compile_range for warmup
-            # (similar to LM warmup approach)
-            warmup_size = compile_range.end * merge_size_sq  # Convert to patches
-            if warmup_size not in capture_sizes_patches:
-                warmup_sizes.append(warmup_size)
+        # For encoder warmup, we want to use a size that:
+        # 1. Is NOT in capture_sizes (so is_exact_size=False, uses fake tensors)
+        # 2. Is reasonable for memory (not using LM's large compile_range.end)
+        # 3. Is within the valid compile_range
+        #
+        # Strategy: Use max(capture_sizes) + 1 (in output tokens) as warmup size
+        # This ensures we compile the range without OOM from huge sizes
+        max_capture_size = max(capture_sizes)  # In output tokens
+        warmup_size_tokens = max_capture_size + 1  # Slightly larger, not exact match
+        warmup_size = warmup_size_tokens * merge_size_sq  # Convert to patches
 
-        # If all compile_range ends are capture_sizes, use a size slightly off
-        if not warmup_sizes and compile_ranges:
-            # Use a size that's in the largest compile_range but not a capture_size
-            largest_range = compile_ranges[-1]
-            # Try the middle of the range
-            warmup_size = ((largest_range.start + largest_range.end) // 2) * merge_size_sq
-            if warmup_size not in capture_sizes_patches:
-                warmup_sizes.append(warmup_size)
-            else:
-                # Use range.end - 1 if possible
-                warmup_size = (largest_range.end - 1) * merge_size_sq
-                if warmup_size > 0 and warmup_size not in capture_sizes_patches:
+        warmup_sizes = []
+        if warmup_size not in capture_sizes_patches:
+            warmup_sizes.append(warmup_size)
+        else:
+            # Try max - 1 if max + 1 happens to be a capture_size
+            warmup_size_tokens = max_capture_size - 1
+            if warmup_size_tokens > 0:
+                warmup_size = warmup_size_tokens * merge_size_sq
+                if warmup_size not in capture_sizes_patches:
                     warmup_sizes.append(warmup_size)
 
         if not warmup_sizes:
