@@ -3062,20 +3062,27 @@ class GPUModelRunner(
             num_patches = capture_size * merge_size_sq
 
             # Create dummy inputs matching the expected shapes
-            # pixel_values: [num_patches, patch_channels]
-            patch_channels = getattr(visual, "patch_embed", None)
-            if patch_channels is not None:
-                in_channels = getattr(patch_channels, "in_channels",
-                                     getattr(patch_channels, "proj", None))
-                if in_channels is not None and hasattr(in_channels, "in_channels"):
-                    in_channels = in_channels.in_channels
+            # pixel_values: [num_patches, C] where C = in_chans * temporal * H * W
+            # For Qwen3-VL: C = 3 * 2 * 14 * 14 = 1176
+            patch_embed = getattr(visual, "patch_embed", None)
+            if patch_embed is not None:
+                # Get the actual dimensions from patch_embed
+                temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
+                patch_size = getattr(patch_embed, "patch_size", 14)
+                # in_channels is typically 3 (RGB)
+                proj = getattr(patch_embed, "proj", None)
+                if proj is not None:
+                    raw_in_channels = getattr(proj, "in_channels", 3)
                 else:
-                    in_channels = 3 * 14 * 14  # Default for Qwen3-VL
+                    raw_in_channels = 3
+                # Total input channels = in_chans * temporal * patch_h * patch_w
+                input_channels = raw_in_channels * temporal_patch_size * patch_size * patch_size
             else:
-                in_channels = 3 * 14 * 14
+                # Default for Qwen3-VL: 3 * 2 * 14 * 14 = 1176
+                input_channels = 3 * 2 * 14 * 14
 
             pixel_values = torch.zeros(
-                (num_patches, in_channels),
+                (num_patches, input_channels),
                 dtype=visual.dtype,
                 device=self.device,
             )
