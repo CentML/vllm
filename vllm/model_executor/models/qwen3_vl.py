@@ -874,7 +874,7 @@ class Qwen3_VisionTransformer(nn.Module):
             rotary_pos_emb_cos: Pre-computed rotary cosine embeddings
             rotary_pos_emb_sin: Pre-computed rotary sine embeddings
             cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
-            max_seqlen: Pre-computed max sequence length (scalar tensor on GPU)
+            max_seqlen: Pre-computed max sequence length (scalar tensor, can be CPU)
             sequence_lengths: Pre-computed sequence lengths (for FlashInfer CuDNN)
 
         Returns:
@@ -883,6 +883,10 @@ class Qwen3_VisionTransformer(nn.Module):
         # Patch embedding (GPU operation)
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         hidden_states = self.patch_embed(hidden_states)
+
+        # Ensure max_seqlen is on GPU for attention kernels
+        if max_seqlen.device.type == "cpu":
+            max_seqlen = max_seqlen.to(self.device, non_blocking=True)
 
         # Add pre-computed position embeddings
         hidden_states = hidden_states + pos_embeds
