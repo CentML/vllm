@@ -2497,7 +2497,7 @@ class GPUModelRunner(
                     else:
                         # Try piecewise padded execution if enabled
                         piecewise_result = None
-                        if (
+                        piecewise_enabled = (
                             self.compilation_config is not None
                             and getattr(
                                 self.compilation_config,
@@ -2509,7 +2509,22 @@ class GPUModelRunner(
                                 "encoder_cudagraph_padded_mode",
                                 True,
                             )
-                        ):
+                        )
+
+                        if self.encoder_cudagraph_verbose:
+                            logger.info(
+                                "ViT: cudagraph_result=None, piecewise_enabled=%s "
+                                "(piecewise=%s, padded_mode=%s)",
+                                piecewise_enabled,
+                                getattr(self.compilation_config,
+                                        "encoder_cudagraph_piecewise", False)
+                                if self.compilation_config else None,
+                                getattr(self.compilation_config,
+                                        "encoder_cudagraph_padded_mode", True)
+                                if self.compilation_config else None,
+                            )
+
+                        if piecewise_enabled:
                             piecewise_result = self._execute_encoder_piecewise_padded(
                                 model, mm_kwargs_group, modality
                             )
@@ -2716,6 +2731,66 @@ class GPUModelRunner(
         # num_tokens exceeds all capture sizes
         return None
 
+    # Class-level counters for piecewise padded mode statistics
+    _piecewise_stats: dict = {}
+
+    @classmethod
+    def _init_piecewise_stats(cls):
+        if not cls._piecewise_stats:
+            cls._piecewise_stats = {
+                "calls": 0,
+                "executions": 0,
+                "total_actual_tokens": 0,
+                "total_padded_tokens": 0,
+                "capture_size_hits": {},  # capture_size -> count
+                "fallback_reasons": {},   # reason -> count
+            }
+
+    def _record_piecewise_fallback(self, reason: str):
+        self._init_piecewise_stats()
+        self._piecewise_stats["calls"] += 1
+        self._piecewise_stats["fallback_reasons"][reason] = (
+            self._piecewise_stats["fallback_reasons"].get(reason, 0) + 1
+        )
+        if self.encoder_cudagraph_verbose:
+            logger.info("ViT PIECEWISE fallback: %s", reason)
+
+    @classmethod
+    def _record_piecewise_execution(cls, actual_tokens: int, capture_size: int):
+        cls._init_piecewise_stats()
+        cls._piecewise_stats["calls"] += 1
+        cls._piecewise_stats["executions"] += 1
+        cls._piecewise_stats["total_actual_tokens"] += actual_tokens
+        cls._piecewise_stats["total_padded_tokens"] += capture_size
+        cls._piecewise_stats["capture_size_hits"][capture_size] = (
+            cls._piecewise_stats["capture_size_hits"].get(capture_size, 0) + 1
+        )
+
+    @classmethod
+    def get_piecewise_stats_summary(cls) -> str:
+        cls._init_piecewise_stats()
+        stats = cls._piecewise_stats
+        if stats["calls"] == 0:
+            return "Piecewise padded: no calls"
+
+        total_actual = stats["total_actual_tokens"]
+        total_padded = stats["total_padded_tokens"]
+        waste_pct = (
+            (total_padded - total_actual) / total_padded * 100
+            if total_padded > 0 else 0
+        )
+
+        lines = [
+            f"Piecewise padded stats:",
+            f"  Calls: {stats['calls']}, Executions: {stats['executions']}",
+            f"  Total actual tokens: {total_actual}",
+            f"  Total padded tokens: {total_padded}",
+            f"  Padding waste: {waste_pct:.1f}%",
+            f"  Capture size hits: {stats['capture_size_hits']}",
+            f"  Fallback reasons: {stats['fallback_reasons']}",
+        ]
+        return "\n".join(lines)
+
     def _execute_encoder_piecewise_padded(
         self,
         model: "SupportsMultiModal",
@@ -2740,8 +2815,13 @@ class GPUModelRunner(
         Returns:
             List of encoder outputs if padding was applied, None otherwise
         """
+        if self.encoder_cudagraph_verbose:
+            logger.info("ViT PIECEWISE: _execute_encoder_piecewise_padded called, "
+                        "modality=%s", modality)
+
         # Only support image/video modalities
         if modality not in ("image", "video"):
+            self._record_piecewise_fallback(f"unsupported_modality:{modality}")
             return None
 
         # Extract grid_thw and pixel_values
@@ -2751,10 +2831,12 @@ class GPUModelRunner(
             grid_thw = mm_kwargs_group.get("video_grid_thw")
             pixel_key = "pixel_values_videos"
         if grid_thw is None:
+            self._record_piecewise_fallback("no_grid_thw")
             return None
 
         pixel_values = mm_kwargs_group.get(pixel_key)
         if pixel_values is None:
+            self._record_piecewise_fallback("no_pixel_values")
             return None
 
         # Convert to list if tensor
@@ -2766,10 +2848,12 @@ class GPUModelRunner(
         # Get visual encoder and check for forward_piecewise support
         visual = getattr(model, "visual", None)
         if visual is None:
+            self._record_piecewise_fallback("no_visual_encoder")
             return None
 
         # Check if forward_piecewise is available
         if not hasattr(visual, "forward_piecewise"):
+            self._record_piecewise_fallback("no_forward_piecewise_method")
             return None
 
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
@@ -2781,7 +2865,9 @@ class GPUModelRunner(
         # Find nearest capture size
         capture_size = self._find_nearest_encoder_capture_size(actual_output_tokens)
         if capture_size is None:
-            # No suitable capture size, fall back to non-padded execution
+            self._record_piecewise_fallback(
+                f"no_capture_size_for_{actual_output_tokens}_tokens"
+            )
             return None
 
         # Calculate padding needed
@@ -2879,15 +2965,25 @@ class GPUModelRunner(
         sizes = [t * h * w // merge_size_sq for t, h, w in grid_thw_list]
         real_outputs = list(encoder_output[:actual_output_tokens].split(sizes))
 
+        # Record statistics
+        self._record_piecewise_execution(actual_output_tokens, capture_size)
+
         if self.encoder_cudagraph_verbose:
+            waste_pct = padding_output_tokens / capture_size * 100
             logger.info(
-                "Piecewise padded execution: actual_tokens=%d, "
-                "capture_size=%d, padding=%d, num_images=%d",
+                "ViT PIECEWISE PADDED: actual_tokens=%d, capture_size=%d, "
+                "padding=%d (%.1f%% waste), num_images=%d, grids=%s",
                 actual_output_tokens,
                 capture_size,
                 padding_output_tokens,
+                waste_pct,
                 len(grid_thw_list),
+                grid_thw_list,
             )
+            # Periodically log overall stats
+            stats = self._piecewise_stats
+            if stats["executions"] % 100 == 0:
+                logger.info(self.get_piecewise_stats_summary())
 
         return real_outputs
 
