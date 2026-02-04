@@ -2724,8 +2724,13 @@ class GPUModelRunner(
     ) -> list[torch.Tensor] | None:
         """Execute encoder with padding for piecewise cudagraph mode.
 
-        Pads inputs to the nearest capture size so that the compiled encoder
-        can use cudagraph. Trims output to actual size after execution.
+        Pre-computes embeddings outside the compiled graph, pads all tensors
+        to the nearest capture size, then calls forward_piecewise. This allows
+        cudagraph capture at fixed sizes while handling variable batch sizes.
+
+        The key insight is that position embeddings depend on grid dimensions
+        and must be computed OUTSIDE the compiled graph. By pre-computing them
+        and padding, we can achieve cudagraph hits for the compiled regions.
 
         Args:
             model: The multimodal model
@@ -2758,13 +2763,18 @@ class GPUModelRunner(
         else:
             grid_thw_list = list(grid_thw)
 
-        # Get spatial merge size from model
+        # Get visual encoder and check for forward_piecewise support
         visual = getattr(model, "visual", None)
         if visual is None:
             return None
+
+        # Check if forward_piecewise is available
+        if not hasattr(visual, "forward_piecewise"):
+            return None
+
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
 
-        # Calculate actual output tokens
+        # Calculate actual tokens
         actual_num_patches = sum(t * h * w for t, h, w in grid_thw_list)
         actual_output_tokens = actual_num_patches // (spatial_merge_size**2)
 
@@ -2774,19 +2784,25 @@ class GPUModelRunner(
             # No suitable capture size, fall back to non-padded execution
             return None
 
-        if capture_size == actual_output_tokens:
-            # Exact match, no padding needed
-            return None
-
         # Calculate padding needed
-        padding_tokens = capture_size - actual_output_tokens
-        padding_patches = padding_tokens * (spatial_merge_size**2)
+        padding_output_tokens = capture_size - actual_output_tokens
+        padding_patches = padding_output_tokens * (spatial_merge_size**2)
 
-        # Pad pixel_values with zeros
-        # pixel_values shape: [num_patches, patch_channels]
+        # Pre-compute embeddings for real images (OUTSIDE compiled graph)
+        # This is the key to making piecewise padding work
+        precomputed = visual.precompute_for_cudagraph(grid_thw_list)
+        pos_embeds = precomputed["pos_embeds"]
+        rotary_pos_emb_cos = precomputed["rotary_pos_emb_cos"]
+        rotary_pos_emb_sin = precomputed["rotary_pos_emb_sin"]
+        cu_seqlens = precomputed["cu_seqlens"]
+        max_seqlen = precomputed["max_seqlen"]
+        sequence_lengths = precomputed["sequence_lengths"]
+
+        # Pad all tensors to capture_size
         num_input_patches = pixel_values.shape[0]
         padded_num_patches = num_input_patches + padding_patches
 
+        # Pad pixel_values
         padded_pixel_values = torch.zeros(
             (padded_num_patches, pixel_values.shape[1]),
             dtype=pixel_values.dtype,
@@ -2794,54 +2810,83 @@ class GPUModelRunner(
         )
         padded_pixel_values[:num_input_patches] = pixel_values
 
-        # Add a dummy image entry for padding patches (don't modify existing grids)
-        # This preserves position embeddings for real images
-        padded_grid_thw = [list(g) for g in grid_thw_list]
-        if padding_patches > 0:
-            # Create a square-ish dummy grid for padding patches
-            dummy_side = int(math.ceil(math.sqrt(padding_patches)))
-            # Ensure it's even (required by spatial_merge_size=2)
-            if dummy_side % 2 != 0:
-                dummy_side += 1
-            actual_dummy_patches = dummy_side * dummy_side
-            # Update padding to match actual dummy grid
-            if actual_dummy_patches != padding_patches:
-                padded_num_patches = num_input_patches + actual_dummy_patches
-                padded_pixel_values = torch.zeros(
-                    (padded_num_patches, pixel_values.shape[1]),
-                    dtype=pixel_values.dtype,
-                    device=pixel_values.device,
-                )
-                padded_pixel_values[:num_input_patches] = pixel_values
-            # Add dummy image entry: T=1, H=dummy_side, W=dummy_side
-            padded_grid_thw.append([1, dummy_side, dummy_side])
-
-        # Create padded kwargs
-        padded_kwargs = dict(mm_kwargs_group)
-        padded_kwargs[pixel_key] = padded_pixel_values
-        # Use CPU tensor (has .ndim for model, accepted by tensor schema)
-        padded_grid_thw_tensor = torch.tensor(
-            padded_grid_thw, dtype=torch.int32, device="cpu"
+        # Pad position embeddings
+        padded_pos_embeds = torch.zeros(
+            (padded_num_patches, pos_embeds.shape[1]),
+            dtype=pos_embeds.dtype,
+            device=pos_embeds.device,
         )
-        if modality == "image":
-            padded_kwargs["image_grid_thw"] = padded_grid_thw_tensor
+        padded_pos_embeds[:num_input_patches] = pos_embeds
+
+        # Pad rotary embeddings
+        padded_rotary_cos = torch.zeros(
+            (padded_num_patches, rotary_pos_emb_cos.shape[1]),
+            dtype=rotary_pos_emb_cos.dtype,
+            device=rotary_pos_emb_cos.device,
+        )
+        padded_rotary_cos[:num_input_patches] = rotary_pos_emb_cos
+
+        padded_rotary_sin = torch.zeros(
+            (padded_num_patches, rotary_pos_emb_sin.shape[1]),
+            dtype=rotary_pos_emb_sin.dtype,
+            device=rotary_pos_emb_sin.device,
+        )
+        padded_rotary_sin[:num_input_patches] = rotary_pos_emb_sin
+
+        # Update cu_seqlens to include padding as a separate sequence
+        # Original cu_seqlens ends at actual_num_patches
+        # Add padding patches as one sequence at the end
+        if padding_patches > 0:
+            # Append padding sequence boundary
+            padding_end = cu_seqlens[-1] + padding_patches
+            padded_cu_seqlens = torch.cat([
+                cu_seqlens,
+                torch.tensor([padding_end], dtype=cu_seqlens.dtype,
+                             device=cu_seqlens.device)
+            ])
+            # Add padding sequence length
+            padded_sequence_lengths = torch.cat([
+                sequence_lengths,
+                torch.tensor([padding_patches], dtype=sequence_lengths.dtype,
+                             device=sequence_lengths.device)
+            ])
         else:
-            padded_kwargs["video_grid_thw"] = padded_grid_thw_tensor
+            padded_cu_seqlens = cu_seqlens
+            padded_sequence_lengths = sequence_lengths
 
-        # Execute encoder with padded inputs
-        padded_outputs = model.embed_multimodal(**padded_kwargs)
+        # Update max_seqlen if padding sequence is larger
+        if padding_patches > max_seqlen.item():
+            max_seqlen = torch.tensor(padding_patches, dtype=max_seqlen.dtype,
+                                      device=max_seqlen.device)
 
-        # Return only real image outputs (exclude dummy image at the end)
-        num_real_images = len(grid_thw_list)
-        real_outputs = list(padded_outputs[:num_real_images])
+        # Convert pixel_values to visual encoder dtype
+        padded_pixel_values = padded_pixel_values.type(visual.dtype)
+
+        # Call forward_piecewise directly with pre-computed and padded tensors
+        with set_forward_context(None, self.vllm_config):
+            encoder_output = visual.forward_piecewise(
+                x=padded_pixel_values,
+                pos_embeds=padded_pos_embeds,
+                rotary_pos_emb_cos=padded_rotary_cos,
+                rotary_pos_emb_sin=padded_rotary_sin,
+                cu_seqlens=padded_cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=padded_sequence_lengths,
+            )
+
+        # Split output by actual token counts for each image (exclude padding)
+        merge_size_sq = spatial_merge_size ** 2
+        sizes = [t * h * w // merge_size_sq for t, h, w in grid_thw_list]
+        real_outputs = list(encoder_output[:actual_output_tokens].split(sizes))
 
         if self.encoder_cudagraph_verbose:
             logger.info(
                 "Piecewise padded execution: actual_tokens=%d, "
-                "capture_size=%d, num_real_images=%d",
+                "capture_size=%d, padding=%d, num_images=%d",
                 actual_output_tokens,
                 capture_size,
-                num_real_images,
+                padding_output_tokens,
+                len(grid_thw_list),
             )
 
         return real_outputs
