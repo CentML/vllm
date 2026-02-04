@@ -413,7 +413,7 @@ def tensor_data(tensor: torch.Tensor) -> memoryview:
     Returns:
         A memoryview of the tensor data as uint8.
     """
-    return tensor.flatten().contiguous().view(torch.uint8).numpy().data
+    return tensor.cpu().flatten().contiguous().view(torch.uint8).numpy().data
 
 
 @dataclass
