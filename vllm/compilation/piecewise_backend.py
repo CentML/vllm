@@ -221,6 +221,24 @@ class PiecewiseBackend:
 
     def __call__(self, *args: Any) -> Any:
         runtime_shape = args[self.sym_shape_indices[0]]
+
+        # Debug logging for encoder to understand shape mismatch
+        if self.is_encoder_compilation:
+            arg_shapes = []
+            for i, a in enumerate(args[:5]):  # First 5 args
+                if hasattr(a, 'shape'):
+                    arg_shapes.append(f"arg[{i}].shape={tuple(a.shape)}")
+                else:
+                    arg_shapes.append(f"arg[{i}]={type(a).__name__}")
+            logger.info(
+                "PIECEWISE ENCODER __call__: runtime_shape=%s, "
+                "sym_shape_indices=%s, compile_sizes=%s, %s",
+                runtime_shape,
+                self.sym_shape_indices,
+                self.compile_sizes,
+                ", ".join(arg_shapes),
+            )
+
         range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
