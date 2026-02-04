@@ -432,6 +432,9 @@ class GPUModelRunner(
         self.encoder_cudagraph_padded_mode: bool = True
         self.encoder_cudagraph_verbose: bool = False
         self.encoder_cudagraph_one_by_one: bool = True
+        # Pre-allocated buffers for piecewise padded mode (lazily initialized)
+        # Key: capture_size (output tokens), Value: dict of buffers
+        self._piecewise_buffers: dict[int, dict[str, torch.Tensor]] = {}
         self._init_encoder_cudagraph_manager()
 
         self.use_aux_hidden_state_outputs = False
@@ -2880,6 +2883,7 @@ class GPUModelRunner(
         # Calculate padding needed
         padding_output_tokens = capture_size - actual_output_tokens
         padding_patches = padding_output_tokens * (spatial_merge_size**2)
+        padded_num_patches = capture_size * (spatial_merge_size**2)
 
         # Pre-compute embeddings for real images (OUTSIDE compiled graph)
         # This is the key to making piecewise padding work
@@ -2891,69 +2895,91 @@ class GPUModelRunner(
         max_seqlen = precomputed["max_seqlen"]
         sequence_lengths = precomputed["sequence_lengths"]
 
-        # Pad all tensors to capture_size
         num_input_patches = pixel_values.shape[0]
-        padded_num_patches = num_input_patches + padding_patches
 
-        # Pad pixel_values
-        padded_pixel_values = torch.zeros(
-            (padded_num_patches, pixel_values.shape[1]),
-            dtype=pixel_values.dtype,
-            device=pixel_values.device,
-        )
-        padded_pixel_values[:num_input_patches] = pixel_values
+        # Get or create pre-allocated buffers for this capture_size
+        # This avoids allocation and zeros kernels on every call
+        buffers = self._piecewise_buffers.get(capture_size)
+        if buffers is None:
+            # Lazily allocate buffers on first use for this capture_size
+            # Using torch.empty avoids the zeros kernel
+            buffers = {
+                "pixel_values": torch.empty(
+                    (padded_num_patches, pixel_values.shape[1]),
+                    dtype=visual.dtype,
+                    device=pixel_values.device,
+                ),
+                "pos_embeds": torch.empty(
+                    (padded_num_patches, pos_embeds.shape[1]),
+                    dtype=pos_embeds.dtype,
+                    device=pos_embeds.device,
+                ),
+                "rotary_cos": torch.empty(
+                    (padded_num_patches, rotary_pos_emb_cos.shape[1]),
+                    dtype=rotary_pos_emb_cos.dtype,
+                    device=rotary_pos_emb_cos.device,
+                ),
+                "rotary_sin": torch.empty(
+                    (padded_num_patches, rotary_pos_emb_sin.shape[1]),
+                    dtype=rotary_pos_emb_sin.dtype,
+                    device=rotary_pos_emb_sin.device,
+                ),
+                # Pre-allocate cu_seqlens with max possible entries
+                # (assuming max ~1000 images per batch is more than enough)
+                "cu_seqlens": torch.empty(
+                    (1001,), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+                ),
+                "sequence_lengths": torch.empty(
+                    (1000,), dtype=sequence_lengths.dtype,
+                    device=sequence_lengths.device
+                ),
+            }
+            self._piecewise_buffers[capture_size] = buffers
+            if self.encoder_cudagraph_verbose:
+                logger.info(
+                    "ViT PIECEWISE: Allocated buffers for capture_size=%d "
+                    "(patches=%d)",
+                    capture_size, padded_num_patches
+                )
 
-        # Pad position embeddings
-        padded_pos_embeds = torch.zeros(
-            (padded_num_patches, pos_embeds.shape[1]),
-            dtype=pos_embeds.dtype,
-            device=pos_embeds.device,
-        )
-        padded_pos_embeds[:num_input_patches] = pos_embeds
+        # Copy data into pre-allocated buffers (no allocation, no zeros kernel)
+        padded_pixel_values = buffers["pixel_values"]
+        padded_pixel_values[:num_input_patches].copy_(
+            pixel_values.type(visual.dtype))
 
-        # Pad rotary embeddings
-        padded_rotary_cos = torch.zeros(
-            (padded_num_patches, rotary_pos_emb_cos.shape[1]),
-            dtype=rotary_pos_emb_cos.dtype,
-            device=rotary_pos_emb_cos.device,
-        )
-        padded_rotary_cos[:num_input_patches] = rotary_pos_emb_cos
+        padded_pos_embeds = buffers["pos_embeds"]
+        padded_pos_embeds[:num_input_patches].copy_(pos_embeds)
 
-        padded_rotary_sin = torch.zeros(
-            (padded_num_patches, rotary_pos_emb_sin.shape[1]),
-            dtype=rotary_pos_emb_sin.dtype,
-            device=rotary_pos_emb_sin.device,
-        )
-        padded_rotary_sin[:num_input_patches] = rotary_pos_emb_sin
+        padded_rotary_cos = buffers["rotary_cos"]
+        padded_rotary_cos[:num_input_patches].copy_(rotary_pos_emb_cos)
+
+        padded_rotary_sin = buffers["rotary_sin"]
+        padded_rotary_sin[:num_input_patches].copy_(rotary_pos_emb_sin)
 
         # Update cu_seqlens to include padding as a separate sequence
-        # Original cu_seqlens ends at actual_num_patches
-        # Add padding patches as one sequence at the end
+        num_seqs = cu_seqlens.shape[0]
+        padded_cu_seqlens = buffers["cu_seqlens"]
+        padded_cu_seqlens[:num_seqs].copy_(cu_seqlens)
         if padding_patches > 0:
-            # Append padding sequence boundary
-            padding_end = cu_seqlens[-1] + padding_patches
-            padded_cu_seqlens = torch.cat([
-                cu_seqlens,
-                torch.tensor([padding_end], dtype=cu_seqlens.dtype,
-                             device=cu_seqlens.device)
-            ])
-            # Add padding sequence length
-            padded_sequence_lengths = torch.cat([
-                sequence_lengths,
-                torch.tensor([padding_patches], dtype=sequence_lengths.dtype,
-                             device=sequence_lengths.device)
-            ])
-        else:
-            padded_cu_seqlens = cu_seqlens
-            padded_sequence_lengths = sequence_lengths
+            # Add padding sequence boundary
+            padded_cu_seqlens[num_seqs] = cu_seqlens[-1] + padding_patches
+            num_seqs += 1
+
+        num_seq_lens = sequence_lengths.shape[0]
+        padded_sequence_lengths = buffers["sequence_lengths"]
+        padded_sequence_lengths[:num_seq_lens].copy_(sequence_lengths)
+        if padding_patches > 0:
+            padded_sequence_lengths[num_seq_lens] = padding_patches
+            num_seq_lens += 1
+
+        # Slice to actual size needed
+        padded_cu_seqlens = padded_cu_seqlens[:num_seqs]
+        padded_sequence_lengths = padded_sequence_lengths[:num_seq_lens]
 
         # Update max_seqlen if padding sequence is larger
         if padding_patches > max_seqlen.item():
             max_seqlen = torch.tensor(padding_patches, dtype=max_seqlen.dtype,
                                       device=max_seqlen.device)
-
-        # Convert pixel_values to visual encoder dtype
-        padded_pixel_values = padded_pixel_values.type(visual.dtype)
 
         # Call forward_piecewise directly with pre-computed and padded tensors
         with set_forward_context(None, self.vllm_config):
