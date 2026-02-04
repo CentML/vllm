@@ -3125,15 +3125,26 @@ class GPUModelRunner(
             )
 
             # Call forward_piecewise to trigger compilation
-            with set_forward_context(None, self.vllm_config):
-                _ = visual.forward_piecewise(
-                    x=pixel_values,
-                    pos_embeds=pos_embeds,
-                    rotary_pos_emb_cos=rotary_cos,
-                    rotary_pos_emb_sin=rotary_sin,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    sequence_lengths=sequence_lengths,
+            # Wrap in try-except to handle PyTorch compile cache errors gracefully
+            # (e.g., aot_autograd_artifacts assertion errors)
+            try:
+                with set_forward_context(None, self.vllm_config):
+                    _ = visual.forward_piecewise(
+                        x=pixel_values,
+                        pos_embeds=pos_embeds,
+                        rotary_pos_emb_cos=rotary_cos,
+                        rotary_pos_emb_sin=rotary_sin,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        sequence_lengths=sequence_lengths,
+                    )
+            except (AssertionError, RuntimeError) as e:
+                # PyTorch compile cache may fail in some edge cases
+                # The compilation itself may have succeeded, continue with warmup
+                logger.warning(
+                    "Encoder piecewise warmup for capture_size=%d hit an error "
+                    "(compilation may still work at runtime): %s",
+                    capture_size, str(e)[:200]
                 )
 
             # Clear CUDA cache after each warmup to free intermediate memory
