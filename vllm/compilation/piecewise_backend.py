@@ -266,7 +266,7 @@ class PiecewiseBackend:
 
         # Log replay (capture is logged inside _maybe_compile_for_range_entry)
         if not is_capture:
-            logger.debug(
+            logger.info(
                 "PIECEWISE REPLAY: graph_index=%d/%d, shape=%d, range=%s, "
                 "is_exact_size=%s, is_encoder=%s",
                 self.piecewise_compile_index,
