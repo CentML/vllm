@@ -88,7 +88,8 @@ class ImageMediaIO(MediaIO[Image.Image]):
         return MediaWithBytes(self._convert_image_mode(image), data)
 
     def load_nvimgcodec_image(self, data: bytes) -> MediaWithBytes[torch.Tensor]:
-        decoded = _get_decoder().decode(data)
+        code_stream = nvimgcodec.CodeStream(data)
+        decoded = _get_decoder().decode(code_stream)
 
         device = "cuda:0"
         tensor = torch.as_tensor(decoded, device=device)
