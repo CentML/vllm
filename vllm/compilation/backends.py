@@ -556,6 +556,12 @@ class VllmBackend:
         # only at compile time.
         self.inductor_config = deepcopy(self.compilation_config.inductor_compile_config)
 
+        # Disable cache for encoder compilation to avoid assertion errors
+        # with simple graphs (e.g., Conv3d) that don't produce AOT artifacts.
+        # This skips the save in InductorStandaloneAdaptor.compile().
+        if self.is_encoder:
+            self.inductor_config["force_disable_caches"] = True
+
         # `torch.compile` is JIT compiled, so we don't need to
         # do anything here
 
