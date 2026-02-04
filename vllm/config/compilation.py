@@ -509,6 +509,12 @@ class CompilationConfig:
     Example: [256, 512, 1024, 2048, 4096, 8192, 16384]
     If None, encoder piecewise mode will use compile_ranges only (no cudagraph)."""
 
+    encoder_spatial_merge_size: int = 2
+    """Spatial merge size for vision encoder (e.g., 2 for Qwen3-VL).
+    This converts encoder_cudagraph_capture_sizes (output tokens) to input patches.
+    Input patches = output tokens * spatial_merge_size².
+    Default is 2, which is common for Qwen-VL family models."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition

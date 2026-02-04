@@ -74,7 +74,20 @@ class PiecewiseBackend:
 
         # Use encoder-specific capture sizes for encoder compilation
         if self.is_encoder_compilation:
-            self.compile_sizes = self.compilation_config.encoder_cudagraph_capture_sizes
+            encoder_capture_sizes = self.compilation_config.encoder_cudagraph_capture_sizes
+            if encoder_capture_sizes is not None:
+                # Convert from output tokens to input patches
+                # encoder_cudagraph_capture_sizes is specified in output tokens
+                # but runtime_shape (from sym_shape_indices) is in input patches
+                merge_size_sq = self.compilation_config.encoder_spatial_merge_size ** 2
+                self.compile_sizes = [size * merge_size_sq for size in encoder_capture_sizes]
+                logger.debug_once(
+                    "PiecewiseBackend: converted encoder capture sizes from "
+                    "output tokens %s to input patches %s (merge_size²=%d)",
+                    encoder_capture_sizes, self.compile_sizes, merge_size_sq
+                )
+            else:
+                self.compile_sizes = None
         else:
             self.compile_sizes = self.compilation_config.compile_sizes
         log_string = (
