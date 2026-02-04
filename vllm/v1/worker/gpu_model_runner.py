@@ -3028,6 +3028,112 @@ class GPUModelRunner(
 
         return real_outputs
 
+    def warmup_encoder_piecewise(self) -> None:
+        """Pre-capture all encoder piecewise cudagraph sizes.
+
+        This should be called during model warmup to compile all capture sizes
+        upfront, avoiding compilation latency during actual execution.
+        """
+        if not getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
+            return
+
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return
+
+        # Get visual encoder
+        model = self.model
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "forward_piecewise"):
+            return
+
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+        merge_size_sq = spatial_merge_size ** 2
+
+        logger.info(
+            "Warming up encoder piecewise for %d capture sizes: %s",
+            len(capture_sizes), capture_sizes
+        )
+
+        for capture_size in sorted(capture_sizes):
+            # Convert output tokens to input patches
+            num_patches = capture_size * merge_size_sq
+
+            # Create dummy inputs matching the expected shapes
+            # pixel_values: [num_patches, patch_channels]
+            patch_channels = getattr(visual, "patch_embed", None)
+            if patch_channels is not None:
+                in_channels = getattr(patch_channels, "in_channels",
+                                     getattr(patch_channels, "proj", None))
+                if in_channels is not None and hasattr(in_channels, "in_channels"):
+                    in_channels = in_channels.in_channels
+                else:
+                    in_channels = 3 * 14 * 14  # Default for Qwen3-VL
+            else:
+                in_channels = 3 * 14 * 14
+
+            pixel_values = torch.zeros(
+                (num_patches, in_channels),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            # Get hidden size from visual encoder
+            hidden_size = getattr(visual, "hidden_size",
+                                 getattr(visual, "embed_dim", 1152))
+
+            pos_embeds = torch.zeros(
+                (num_patches, hidden_size),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            # Rotary embeddings - get actual dim from model
+            rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
+            rotary_cos = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+            rotary_sin = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            # cu_seqlens for single "image" covering all patches
+            cu_seqlens = torch.tensor(
+                [0, num_patches], dtype=torch.int32, device=self.device
+            )
+            max_seqlen = torch.tensor(num_patches, device=self.device)
+            sequence_lengths = torch.tensor(
+                [num_patches], dtype=torch.int32, device=self.device
+            )
+
+            logger.info(
+                "Warming up encoder piecewise: capture_size=%d (patches=%d)",
+                capture_size, num_patches
+            )
+
+            # Call forward_piecewise to trigger compilation
+            with set_forward_context(None, self.vllm_config):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+            # Clear CUDA cache after each warmup to free intermediate memory
+            torch.cuda.empty_cache()
+
+        logger.info("Encoder piecewise warmup complete for %d sizes", len(capture_sizes))
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",

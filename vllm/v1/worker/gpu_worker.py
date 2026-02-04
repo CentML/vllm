@@ -446,6 +446,12 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        # Warmup encoder piecewise cudagraph if enabled
+        # This pre-captures all encoder capture sizes to avoid compilation
+        # latency during actual execution
+        if hasattr(self.model_runner, "warmup_encoder_piecewise"):
+            self.model_runner.warmup_encoder_piecewise()
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
