@@ -845,6 +845,72 @@ class Qwen3_VisionTransformer(nn.Module):
             "sequence_lengths": sequence_lengths,
         }
 
+    def forward_piecewise(
+        self,
+        x: torch.Tensor,
+        pos_embeds: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass optimized for piecewise CUDA graph mode with batched images.
+
+        This method accepts pre-computed position embeddings, rotary embeddings,
+        and cumulative sequence lengths. Unlike forward_cudagraph which processes
+        one image at a time, this method handles batched images with padding for
+        piecewise cudagraph optimization.
+
+        The key difference from the regular forward() is that all grid-dependent
+        computations (position embeddings, rotary embeddings, cu_seqlens) are
+        pre-computed outside the compiled graph, allowing padding to be applied
+        to match cudagraph capture sizes.
+
+        Args:
+            x: Input pixel values [num_patches, patch_channels]
+            pos_embeds: Pre-computed position embeddings [num_patches, hidden_size]
+            rotary_pos_emb_cos: Pre-computed rotary cosine embeddings
+            rotary_pos_emb_sin: Pre-computed rotary sine embeddings
+            cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
+            max_seqlen: Pre-computed max sequence length (scalar tensor on GPU)
+            sequence_lengths: Pre-computed sequence lengths (for FlashInfer CuDNN)
+
+        Returns:
+            Vision encoder output tensor [num_output_tokens, hidden_size]
+        """
+        # Patch embedding (GPU operation)
+        hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_states = self.patch_embed(hidden_states)
+
+        # Add pre-computed position embeddings
+        hidden_states = hidden_states + pos_embeds
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        # Run through transformer blocks with pre-computed values
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
+                    hidden_states
+                )
+                deepstack_feature_lists.append(deepstack_feature)
+
+        hidden_states = self.merger(hidden_states)
+        hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
+        return hidden_states
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
