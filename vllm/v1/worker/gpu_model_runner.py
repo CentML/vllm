@@ -3029,10 +3029,15 @@ class GPUModelRunner(
         return real_outputs
 
     def warmup_encoder_piecewise(self) -> None:
-        """Pre-capture all encoder piecewise cudagraph sizes.
+        """Warmup encoder piecewise compilation using compile_ranges.
 
-        This should be called during model warmup to compile all capture sizes
-        upfront, avoiding compilation latency during actual execution.
+        This mimics LM warmup approach:
+        1. Warmup with sizes in compile_ranges (NOT exact capture_sizes)
+        2. This triggers compilation with fake tensors (is_exact_size=False)
+        3. Exact capture_sizes compile lazily during actual execution
+
+        This avoids PyTorch AOT autograd cache issues that occur when
+        compiling simple graphs (like patch_embed) with real tensors.
         """
         if not getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
             return
@@ -3052,33 +3057,61 @@ class GPUModelRunner(
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
         merge_size_sq = spatial_merge_size ** 2
 
+        # Convert capture_sizes to patches for comparison
+        capture_sizes_patches = set(size * merge_size_sq for size in capture_sizes)
+
+        # Get compile_ranges and find warmup sizes that are NOT exact capture_sizes
+        # This ensures we use fake tensors (is_exact_size=False) during compilation
+        compile_ranges = self.compilation_config.get_compile_ranges()
+        warmup_sizes = []
+        for compile_range in compile_ranges:
+            # Use the end of each compile_range for warmup
+            # (similar to LM warmup approach)
+            warmup_size = compile_range.end * merge_size_sq  # Convert to patches
+            if warmup_size not in capture_sizes_patches:
+                warmup_sizes.append(warmup_size)
+
+        # If all compile_range ends are capture_sizes, use a size slightly off
+        if not warmup_sizes and compile_ranges:
+            # Use a size that's in the largest compile_range but not a capture_size
+            largest_range = compile_ranges[-1]
+            # Try the middle of the range
+            warmup_size = ((largest_range.start + largest_range.end) // 2) * merge_size_sq
+            if warmup_size not in capture_sizes_patches:
+                warmup_sizes.append(warmup_size)
+            else:
+                # Use range.end - 1 if possible
+                warmup_size = (largest_range.end - 1) * merge_size_sq
+                if warmup_size > 0 and warmup_size not in capture_sizes_patches:
+                    warmup_sizes.append(warmup_size)
+
+        if not warmup_sizes:
+            logger.info(
+                "Encoder piecewise warmup: no suitable warmup sizes found, "
+                "compilation will happen lazily during execution"
+            )
+            return
+
         logger.info(
-            "Warming up encoder piecewise for %d capture sizes: %s",
-            len(capture_sizes), capture_sizes
+            "Warming up encoder piecewise with %d compile_range sizes "
+            "(exact capture_sizes will compile lazily): %s",
+            len(warmup_sizes), [s // merge_size_sq for s in warmup_sizes]
         )
 
-        for capture_size in sorted(capture_sizes):
-            # Convert output tokens to input patches
-            num_patches = capture_size * merge_size_sq
-
+        for num_patches in sorted(warmup_sizes, reverse=True):
             # Create dummy inputs matching the expected shapes
             # pixel_values: [num_patches, C] where C = in_chans * temporal * H * W
-            # For Qwen3-VL: C = 3 * 2 * 14 * 14 = 1176
             patch_embed = getattr(visual, "patch_embed", None)
             if patch_embed is not None:
-                # Get the actual dimensions from patch_embed
                 temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
                 patch_size = getattr(patch_embed, "patch_size", 14)
-                # in_channels is typically 3 (RGB)
                 proj = getattr(patch_embed, "proj", None)
                 if proj is not None:
                     raw_in_channels = getattr(proj, "in_channels", 3)
                 else:
                     raw_in_channels = 3
-                # Total input channels = in_chans * temporal * patch_h * patch_w
                 input_channels = raw_in_channels * temporal_patch_size * patch_size * patch_size
             else:
-                # Default for Qwen3-VL: 3 * 2 * 14 * 14 = 1176
                 input_channels = 3 * 2 * 14 * 14
 
             pixel_values = torch.zeros(
@@ -3087,7 +3120,6 @@ class GPUModelRunner(
                 device=self.device,
             )
 
-            # Get hidden size from visual encoder
             hidden_size = getattr(visual, "hidden_size",
                                  getattr(visual, "embed_dim", 1152))
 
@@ -3097,7 +3129,6 @@ class GPUModelRunner(
                 device=self.device,
             )
 
-            # Rotary embeddings - get actual dim from model
             rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
             rotary_cos = torch.zeros(
                 (num_patches, rotary_dim),
@@ -3110,7 +3141,6 @@ class GPUModelRunner(
                 device=self.device,
             )
 
-            # cu_seqlens for single "image" covering all patches
             cu_seqlens = torch.tensor(
                 [0, num_patches], dtype=torch.int32, device=self.device
             )
@@ -3120,37 +3150,31 @@ class GPUModelRunner(
             )
 
             logger.info(
-                "Warming up encoder piecewise: capture_size=%d (patches=%d)",
-                capture_size, num_patches
+                "Warming up encoder piecewise: patches=%d (tokens=%d)",
+                num_patches, num_patches // merge_size_sq
             )
 
-            # Call forward_piecewise to trigger compilation
-            # Wrap in try-except to handle PyTorch compile cache errors gracefully
-            # (e.g., aot_autograd_artifacts assertion errors)
-            try:
-                with set_forward_context(None, self.vllm_config):
-                    _ = visual.forward_piecewise(
-                        x=pixel_values,
-                        pos_embeds=pos_embeds,
-                        rotary_pos_emb_cos=rotary_cos,
-                        rotary_pos_emb_sin=rotary_sin,
-                        cu_seqlens=cu_seqlens,
-                        max_seqlen=max_seqlen,
-                        sequence_lengths=sequence_lengths,
-                    )
-            except (AssertionError, RuntimeError) as e:
-                # PyTorch compile cache may fail in some edge cases
-                # The compilation itself may have succeeded, continue with warmup
-                logger.warning(
-                    "Encoder piecewise warmup for capture_size=%d hit an error "
-                    "(compilation may still work at runtime): %s",
-                    capture_size, str(e)[:200]
+            # Call forward_piecewise to trigger compilation with fake tensors
+            # (is_exact_size=False because size is NOT in capture_sizes)
+            with set_forward_context(None, self.vllm_config):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
                 )
 
             # Clear CUDA cache after each warmup to free intermediate memory
             torch.cuda.empty_cache()
 
-        logger.info("Encoder piecewise warmup complete for %d sizes", len(capture_sizes))
+        logger.info(
+            "Encoder piecewise warmup complete. Compile_ranges warmed up, "
+            "exact capture_sizes (%d) will compile on first use.",
+            len(capture_sizes)
+        )
 
     def _gather_mm_embeddings(
         self,
