@@ -2970,20 +2970,27 @@ class GPUModelRunner(
 
         if self.encoder_cudagraph_verbose:
             waste_pct = padding_output_tokens / capture_size * 100
+            stats = self._piecewise_stats
+            total_waste_pct = (
+                (stats["total_padded_tokens"] - stats["total_actual_tokens"])
+                / stats["total_padded_tokens"] * 100
+                if stats["total_padded_tokens"] > 0 else 0
+            )
             logger.info(
-                "ViT PIECEWISE PADDED: actual_tokens=%d, capture_size=%d, "
-                "padding=%d (%.1f%% waste), num_images=%d, grids=%s",
+                "ViT PIECEWISE PADDED: actual=%d, capture_size=%d, "
+                "padding=%d (%.1f%%), num_images=%d | "
+                "cumulative: executions=%d, total_actual=%d, total_padded=%d, "
+                "waste=%.1f%%",
                 actual_output_tokens,
                 capture_size,
                 padding_output_tokens,
                 waste_pct,
                 len(grid_thw_list),
-                grid_thw_list,
+                stats["executions"],
+                stats["total_actual_tokens"],
+                stats["total_padded_tokens"],
+                total_waste_pct,
             )
-            # Periodically log overall stats
-            stats = self._piecewise_stats
-            if stats["executions"] % 100 == 0:
-                logger.info(self.get_piecewise_stats_summary())
 
         return real_outputs
 
