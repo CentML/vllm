@@ -177,7 +177,6 @@ class MMEncoderAttention(CustomOp):
 
     def _lazy_init_te_attn(
         self,
-        batch_size: int,
         num_attention_heads: int,
         kv_channels: int,
         num_gqa_groups: int | None,
@@ -186,8 +185,8 @@ class MMEncoderAttention(CustomOp):
         qkv_format: str = "bshd",
     ) -> None:
         """Lazily initialize Transformer Engine attention operator."""
-        if batch_size not in self.te_attn_op:
-            self.te_attn_op[batch_size] = DotProductAttention(
+        if self.te_attn_op is None:
+            self.te_attn_op = DotProductAttention(
                 num_attention_heads,
                 kv_channels,
                 num_gqa_groups=num_gqa_groups,
@@ -322,7 +321,6 @@ class MMEncoderAttention(CustomOp):
         
         # Lazy initialization of TE attention operator
         self._lazy_init_te_attn(
-            batch_size=bsz,
             num_attention_heads=self.num_heads,
             kv_channels=padded_head_size,
             num_gqa_groups=num_gqa_groups,
@@ -334,7 +332,7 @@ class MMEncoderAttention(CustomOp):
         max_seqlen = TE_FIXED_MAX_SEQLEN
 
         with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
-            output = self.te_attn_op[bsz](
+            output = self.te_attn_op(
                 query,
                 key,
                 value,
