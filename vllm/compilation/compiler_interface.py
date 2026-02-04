@@ -620,6 +620,10 @@ def set_inductor_config(config: dict[str, Any], compile_range: Range) -> None:
 
 def set_functorch_config() -> None:
     torch._functorch.config.bundled_autograd_cache = False
+    # Disable AOT autograd cache to avoid assertion errors with simple graphs
+    # (e.g., Conv3d in vision encoders) that don't produce AOT artifacts.
+    # This matches what InductorAdaptor does with context manager.
+    torch._functorch.config.enable_autograd_cache = False
 
 
 class EagerAdaptor(CompilerInterface):
