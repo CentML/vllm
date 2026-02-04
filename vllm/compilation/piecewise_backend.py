@@ -164,15 +164,6 @@ class PiecewiseBackend:
             self.to_be_compiled_ranges.remove(range_entry.compile_range)
 
             is_exact_size = range_entry.compile_range.is_single_size()
-            logger.info(
-                "PIECEWISE CAPTURE: graph_index=%d/%d, range=%s, "
-                "is_exact_size=%s, is_encoder=%s",
-                self.piecewise_compile_index,
-                self.total_piecewise_compiles,
-                range_entry.compile_range,
-                is_exact_size,
-                self.is_encoder_compilation,
-            )
 
             # args are real arguments
             # fakify for range, real args for concrete size.
@@ -241,23 +232,6 @@ class PiecewiseBackend:
             f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
         )
 
-        # Log capture vs replay
-        is_capture = not range_entry.compiled
-        is_exact_size = range_entry.compile_range.is_single_size()
-
         self._maybe_compile_for_range_entry(range_entry, args)  # type: ignore[arg-type]
-
-        # Log replay (capture is logged inside _maybe_compile_for_range_entry)
-        if not is_capture:
-            logger.info(
-                "PIECEWISE REPLAY: graph_index=%d/%d, shape=%d, range=%s, "
-                "is_exact_size=%s, is_encoder=%s",
-                self.piecewise_compile_index,
-                self.total_piecewise_compiles,
-                runtime_shape,
-                range_entry.compile_range,
-                is_exact_size,
-                self.is_encoder_compilation,
-            )
 
         return range_entry.runnable(*args)  # type: ignore[union-attr]

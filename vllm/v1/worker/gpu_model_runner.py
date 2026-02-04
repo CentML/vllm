@@ -3145,24 +3145,8 @@ class GPUModelRunner(
             warmup_size_tokens = max_capture_size + 2
             warmup_size = warmup_size_tokens * merge_size_sq
 
-        logger.info(
-            "Phase 1: Warming up encoder piecewise compile_ranges "
-            "with patches=%d (tokens=%d)",
-            warmup_size, warmup_size_tokens
-        )
-
         run_forward(warmup_size)
         torch.cuda.empty_cache()
-
-        logger.info(
-            "Encoder piecewise warmup complete. Compile_ranges warmed up, "
-            "exact capture_sizes (%d) will compile lazily during execution.",
-            len(capture_sizes)
-        )
-        # NOTE: We skip upfront capture of exact sizes because encoder's simple
-        # graphs (e.g., patch_embed with Conv3d only) don't produce AOT autograd
-        # artifacts, causing cache assertion errors. Exact sizes compile lazily
-        # during execution instead.
 
     def _gather_mm_embeddings(
         self,
