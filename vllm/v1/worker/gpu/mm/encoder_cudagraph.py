@@ -114,6 +114,9 @@ class EncoderCudaGraphManager:
         self.dtype = dtype
         self.verbose = verbose
 
+        # Get batch sizes from config (for grouped batched mode)
+        self.batch_sizes = self._get_batch_sizes_from_config()
+
         # Get grid configs from config or use defaults (for exact match)
         if grid_configs is None:
             grid_configs = self._get_grid_configs_from_config()
@@ -154,8 +157,9 @@ class EncoderCudaGraphManager:
 
         self.grid_configs = filtered_grids
 
-        # CUDA graph storage - keyed by (t, h, w) tuple
-        self.graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
+        # CUDA graph storage - keyed by (batch_size, t, h, w) tuple
+        # For legacy mode (batch_sizes=None), key is (1, t, h, w)
+        self.graphs: dict[tuple[int, int, int, int], torch.cuda.CUDAGraph] = {}
         # Use private pools by default to avoid segfaults with rapid back-to-back
         # graph replays during one-by-one multi-image processing.
         # Set VLLM_ENCODER_SHARED_POOL=1 to use shared pool (saves memory but
@@ -170,21 +174,21 @@ class EncoderCudaGraphManager:
         else:
             self.pool = None  # Each graph uses private memory (default)
 
-        # Pre-allocated input/output buffers per grid config
-        # Key: (t, h, w), Value: {"pixel_values": tensor, "grid_thw": list}
-        self.input_buffers: dict[tuple[int, int, int], dict[str, Any]] = {}
-        self.output_buffers: dict[tuple[int, int, int], torch.Tensor] = {}
+        # Pre-allocated input/output buffers per graph config
+        # Key: (batch_size, t, h, w), Value: {"pixel_values": tensor, "grid_thw": list}
+        self.input_buffers: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+        self.output_buffers: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
         # Cached pre-computed tensors for CUDA graph replay (exact match mode)
-        # Key: (t, h, w), Value: dict with pos_embeds, rotary embeddings, etc.
-        self.cached_tensors: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary embeddings, etc.
+        self.cached_tensors: dict[tuple[int, int, int, int], dict[str, torch.Tensor]] = {}
 
         # Input buffers for embeddings (padded mode with runtime computation)
-        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos/sin, cu_seqlens
-        self.embedding_buffers: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary_cos/sin, cu_seqlens
+        self.embedding_buffers: dict[tuple[int, int, int, int], dict[str, torch.Tensor]] = {}
 
         # Store metadata about captured graphs
-        self.captured_metadata: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self.captured_metadata: dict[tuple[int, int, int, int], dict[str, Any]] = {}
 
         # Vision encoder reference for runtime embedding computation (set at capture)
         self.vision_encoder = None
@@ -283,6 +287,26 @@ class EncoderCudaGraphManager:
         )
         return max_size
 
+    def _get_batch_sizes_from_config(self) -> list[int]:
+        """Get batch sizes for grouped batched CUDA graph capture.
+
+        When set (e.g., [4]), captures graphs for processing multiple images
+        together with the same grid size. Images are grouped by grid size and
+        padded to the largest in each group.
+
+        Default is [1] for legacy one-by-one mode.
+        """
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config is None:
+            return [1]
+
+        batch_sizes = getattr(
+            compilation_config, "encoder_cudagraph_batch_sizes", None
+        )
+        if batch_sizes is None:
+            return [1]  # Legacy mode: batch_size=1 only
+        return sorted(batch_sizes)
+
     def _grid_to_key(self, grid_thw: list[list[int]]) -> tuple[int, int, int] | None:
         """
         Convert a grid_thw list to a hashable key.
@@ -309,6 +333,7 @@ class EncoderCudaGraphManager:
         self,
         grid_config: tuple[int, int, int],
         vision_encoder: nn.Module,
+        batch_size: int = 1,
     ) -> dict[str, Any]:
         """
         Prepare dummy inputs for CUDA graph capture with a specific grid config.
@@ -316,6 +341,7 @@ class EncoderCudaGraphManager:
         Args:
             grid_config: Tuple of (T, H, W) in patch units
             vision_encoder: The vision encoder module
+            batch_size: Number of images in the batch (all same grid)
 
         Returns:
             Dict with pixel_values, grid_thw, and metadata
@@ -333,39 +359,47 @@ class EncoderCudaGraphManager:
             temporal_patch_size * patch_size * patch_size * in_channels
         )
 
-        # Calculate number of pixel patches (before patch embedding)
+        # Calculate number of pixel patches per image
         # h, w are in patch units, so num_patches = t * h * w
-        num_pixel_patches = t * h * w
+        num_pixel_patches_per_image = t * h * w
+        total_pixel_patches = num_pixel_patches_per_image * batch_size
 
-        # Create dummy pixel values (zeros are fine for warmup/capture)
+        # Create dummy pixel values for batch (zeros are fine for warmup/capture)
         pixel_values = torch.zeros(
-            num_pixel_patches,
+            total_pixel_patches,
             patch_input_channels,
             dtype=self.dtype,
             device=self.device,
         )
 
-        # Grid (temporal, height, width) for this configuration
-        grid_thw = [[t, h, w]]
+        # Grid (temporal, height, width) for each image in batch
+        grid_thw = [[t, h, w]] * batch_size
 
-        # Calculate output tokens
-        output_tokens = self._compute_output_tokens(grid_config, spatial_merge_size)
+        # Calculate output tokens per image and total
+        output_tokens_per_image = self._compute_output_tokens(
+            grid_config, spatial_merge_size
+        )
+        total_output_tokens = output_tokens_per_image * batch_size
 
         return {
             "pixel_values": pixel_values,
             "grid_thw": grid_thw,
-            "num_output_tokens": output_tokens,
-            "num_pixel_patches": num_pixel_patches,
+            "num_output_tokens": total_output_tokens,
+            "num_output_tokens_per_image": output_tokens_per_image,
+            "num_pixel_patches": total_pixel_patches,
+            "num_pixel_patches_per_image": num_pixel_patches_per_image,
             "patch_input_channels": patch_input_channels,
+            "batch_size": batch_size,
         }
 
     def capture_graph_for_grid(
         self,
         grid_config: tuple[int, int, int],
         vision_encoder: nn.Module,
+        batch_size: int = 1,
     ) -> None:
         """
-        Capture a CUDA graph for the given grid configuration.
+        Capture a CUDA graph for the given grid configuration and batch size.
 
         This method pre-computes and caches all grid-dependent tensors
         (position embeddings, rotary embeddings, cu_seqlens) to eliminate
@@ -374,25 +408,36 @@ class EncoderCudaGraphManager:
         Args:
             grid_config: Tuple of (T, H, W) in patch units
             vision_encoder: The vision encoder module
+            batch_size: Number of images with same grid (default 1)
         """
-        logger.debug("Capturing encoder CUDA graph for grid config %s", grid_config)
+        t, h, w = grid_config
+        graph_key = (batch_size, t, h, w)
+        logger.debug(
+            "Capturing encoder CUDA graph for key %s (batch_size=%d, grid=%s)",
+            graph_key, batch_size, grid_config
+        )
 
-        # Prepare dummy inputs
-        dummy_inputs = self._prepare_dummy_inputs_for_grid(grid_config, vision_encoder)
+        # Prepare dummy inputs for batch
+        dummy_inputs = self._prepare_dummy_inputs_for_grid(
+            grid_config, vision_encoder, batch_size
+        )
         pixel_values = dummy_inputs["pixel_values"]
         grid_thw = dummy_inputs["grid_thw"]
 
-        # Store input buffer reference
-        self.input_buffers[grid_config] = {
+        # Store input buffer reference with new key format
+        self.input_buffers[graph_key] = {
             "pixel_values": pixel_values.clone(),
             "grid_thw": grid_thw,
         }
 
         # Store metadata
-        self.captured_metadata[grid_config] = {
+        self.captured_metadata[graph_key] = {
             "num_output_tokens": dummy_inputs["num_output_tokens"],
+            "num_output_tokens_per_image": dummy_inputs["num_output_tokens_per_image"],
             "num_pixel_patches": dummy_inputs["num_pixel_patches"],
+            "num_pixel_patches_per_image": dummy_inputs["num_pixel_patches_per_image"],
             "patch_input_channels": dummy_inputs["patch_input_channels"],
+            "batch_size": batch_size,
         }
 
         # Store vision encoder reference for runtime embedding computation
@@ -404,13 +449,13 @@ class EncoderCudaGraphManager:
         ) and hasattr(vision_encoder, "precompute_for_cudagraph")
 
         if has_cudagraph_forward:
-            # Pre-compute tensors for the bucket grid (used for exact match mode)
+            # Pre-compute tensors for the batched grid (used for exact match mode)
             cached = vision_encoder.precompute_for_cudagraph(grid_thw)
-            self.cached_tensors[grid_config] = cached
+            self.cached_tensors[graph_key] = cached
             logger.debug(
-                "Pre-computed cached tensors for grid config %s: "
+                "Pre-computed cached tensors for key %s: "
                 "pos_embeds=%s, cu_seqlens=%s",
-                grid_config,
+                graph_key,
                 cached["pos_embeds"].shape,
                 cached["cu_seqlens"].shape,
             )
@@ -418,7 +463,7 @@ class EncoderCudaGraphManager:
             # Create INPUT BUFFERS for embeddings (padded mode runtime computation)
             # These buffers can be updated at runtime before graph replay
             # Note: max_seqlen is a CPU scalar tensor to avoid GPU sync on .item()
-            self.embedding_buffers[grid_config] = {
+            self.embedding_buffers[graph_key] = {
                 "pos_embeds": cached["pos_embeds"].clone(),
                 "rotary_pos_emb_cos": cached["rotary_pos_emb_cos"].clone(),
                 "rotary_pos_emb_sin": cached["rotary_pos_emb_sin"].clone(),
@@ -426,7 +471,7 @@ class EncoderCudaGraphManager:
                 "max_seqlen": cached["max_seqlen"].clone(),
                 "sequence_lengths": cached["sequence_lengths"].clone(),
             }
-            embed_buffers = self.embedding_buffers[grid_config]
+            embed_buffers = self.embedding_buffers[graph_key]
 
             # Warmup run with embedding buffers
             # Use set_forward_context to provide vllm_config for torch.compile
@@ -443,12 +488,12 @@ class EncoderCudaGraphManager:
                     max_seqlen=embed_buffers["max_seqlen"],
                     sequence_lengths=embed_buffers["sequence_lengths"],
                 )
-                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+                self.output_buffers[graph_key] = torch.empty_like(warmup_output)
 
             # Capture the graph with embedding BUFFERS (not constants)
             # This allows updating embeddings at runtime for padded mode
             graph = torch.cuda.CUDAGraph()
-            input_buffer = self.input_buffers[grid_config]["pixel_values"]
+            input_buffer = self.input_buffers[graph_key]["pixel_values"]
 
             with (
                 set_forward_context(
@@ -466,7 +511,7 @@ class EncoderCudaGraphManager:
                     max_seqlen=embed_buffers["max_seqlen"],
                     sequence_lengths=embed_buffers["sequence_lengths"],
                 )
-                self.output_buffers[grid_config].copy_(output)
+                self.output_buffers[graph_key].copy_(output)
         else:
             # Fallback to original forward (will have CPU gaps)
             logger.warning(
@@ -480,11 +525,11 @@ class EncoderCudaGraphManager:
                 vllm_config=self.vllm_config,
             ):
                 warmup_output = vision_encoder(pixel_values, grid_thw=grid_thw)
-                self.output_buffers[grid_config] = torch.empty_like(warmup_output)
+                self.output_buffers[graph_key] = torch.empty_like(warmup_output)
 
             # Capture the graph
             graph = torch.cuda.CUDAGraph()
-            input_buffer = self.input_buffers[grid_config]["pixel_values"]
+            input_buffer = self.input_buffers[graph_key]["pixel_values"]
 
             with (
                 set_forward_context(
@@ -494,13 +539,13 @@ class EncoderCudaGraphManager:
                 torch.cuda.graph(graph, self.pool),
             ):
                 output = vision_encoder(input_buffer, grid_thw=grid_thw)
-                self.output_buffers[grid_config].copy_(output)
+                self.output_buffers[graph_key].copy_(output)
 
-        self.graphs[grid_config] = graph
+        self.graphs[graph_key] = graph
         cached_suffix = " (with cached tensors)" if has_cudagraph_forward else ""
         logger.debug(
-            "Captured encoder CUDA graph for grid config %s -> %d output tokens%s",
-            grid_config,
+            "Captured encoder CUDA graph for key %s -> %d output tokens%s",
+            graph_key,
             dummy_inputs["num_output_tokens"],
             cached_suffix,
         )
@@ -512,7 +557,7 @@ class EncoderCudaGraphManager:
         embed_multimodal_fn: Callable,
     ) -> None:
         """
-        Capture CUDA graphs for all configured grid configurations.
+        Capture CUDA graphs for all configured grid and batch size combinations.
 
         Args:
             vision_encoder: The vision encoder module (e.g., Qwen3_VisionTransformer)
@@ -522,12 +567,21 @@ class EncoderCudaGraphManager:
             logger.warning("Encoder CUDA graphs already captured, skipping")
             return
 
+        # Build list of (batch_size, grid_config) combinations to capture
+        capture_combinations = []
+        for batch_size in self.batch_sizes:
+            for grid_config in self.grid_configs:
+                capture_combinations.append((batch_size, grid_config))
+
         # Log initial memory state
         free_mem_before, total_mem = torch.cuda.mem_get_info(self.device)
         used_mem_before = total_mem - free_mem_before
         logger.info(
-            "Capturing encoder CUDA graphs for %d grid configurations "
+            "Capturing encoder CUDA graphs for %d combinations "
+            "(batch_sizes=%s, grids=%d) "
             "(GPU memory: %.2f GiB used, %.2f GiB free)",
+            len(capture_combinations),
+            self.batch_sizes,
             len(self.grid_configs),
             used_mem_before / 1024**3,
             free_mem_before / 1024**3,
@@ -535,27 +589,28 @@ class EncoderCudaGraphManager:
 
         # Capture from smallest to largest so that common smaller grids are
         # captured first. If we run out of memory, only large grids will fail.
-        configs_to_capture = sorted(
-            self.grid_configs,
-            key=lambda x: x[0] * x[1] * x[2],
+        capture_combinations = sorted(
+            capture_combinations,
+            key=lambda x: x[0] * x[1][0] * x[1][1] * x[1][2],  # batch * t * h * w
             reverse=False,  # Smallest first
         )
 
         if is_global_first_rank():
-            configs_to_capture = tqdm(
-                configs_to_capture, desc="Capturing encoder CUDA graphs"
+            capture_combinations = tqdm(
+                capture_combinations, desc="Capturing encoder CUDA graphs"
             )
 
         # Capture each graph. For single-GPU mode, capture directly on current stream
         # to avoid stream synchronization overhead at replay time.
         # For multi-GPU mode, use graph_capture() context to coordinate with TP/PP.
-        for grid_config in configs_to_capture:
+        for batch_size, grid_config in capture_combinations:
             try:
                 if self.is_single_gpu:
                     # Single-GPU: capture on current stream (no separate stream)
                     self.capture_graph_for_grid(
                         grid_config,
                         vision_encoder,
+                        batch_size=batch_size,
                     )
                 else:
                     # Multi-GPU: use graph_capture() for TP/PP coordination
@@ -563,11 +618,13 @@ class EncoderCudaGraphManager:
                         self.capture_graph_for_grid(
                             grid_config,
                             vision_encoder,
+                            batch_size=batch_size,
                         )
             except Exception as e:
                 logger.warning(
-                    "Failed to capture encoder CUDA graph for grid config "
-                    "%s: %s. Will use eager mode.",
+                    "Failed to capture encoder CUDA graph for "
+                    "batch_size=%d, grid=%s: %s. Will use eager mode.",
+                    batch_size,
                     grid_config,
                     e,
                 )
@@ -591,26 +648,34 @@ class EncoderCudaGraphManager:
     def get_graph_for_grid(
         self,
         grid_thw: list[list[int]],
-    ) -> tuple[int, int, int] | None:
+        batch_size: int = 1,
+    ) -> tuple[int, int, int, int] | None:
         """
-        Check if a CUDA graph is available for the given grid configuration.
+        Check if a CUDA graph is available for the given grid and batch size.
 
         Args:
-            grid_thw: List of [T, H, W] for each image
+            grid_thw: List of [T, H, W] for each image (must all be same grid)
+            batch_size: Number of images (default 1 for legacy mode)
 
         Returns:
-            The grid config key if a matching graph exists, None otherwise
+            The graph key (batch_size, t, h, w) if matching graph exists, None otherwise
         """
-        key = self._grid_to_key(grid_thw)
-        if key is None:
+        if len(grid_thw) < 1:
             return None
+        # All images must have the same grid for batched mode
+        t, h, w = grid_thw[0]
+        for grid in grid_thw[1:]:
+            if grid != [t, h, w]:
+                return None  # Mixed grids not supported
+        key = (batch_size, t, h, w)
         return key if key in self.graphs else None
 
     def find_bucket_for_tokens(
         self,
         num_tokens: int,
         spatial_merge_size: int = 2,
-    ) -> tuple[int, int, int] | None:
+        batch_size: int = 1,
+    ) -> tuple[int, int, int, int] | None:
         """
         Find the smallest captured grid that can fit the given token count.
 
@@ -618,46 +683,53 @@ class EncoderCudaGraphManager:
         are padded to match the bucket size.
 
         Args:
-            num_tokens: Number of output tokens needed
+            num_tokens: Number of output tokens needed (per image)
             spatial_merge_size: Merge size (default 2)
+            batch_size: Required batch size (default 1)
 
         Returns:
-            Grid config (T, H, W) of the best bucket, or None if too large
+            Graph key (batch_size, T, H, W) of the best bucket, or None if too large
         """
-        best_grid = None
+        best_key = None
         best_bucket_tokens = float("inf")
 
-        for grid_key in self.graphs:
-            bucket_tokens = self._compute_output_tokens(grid_key, spatial_merge_size)
+        for graph_key in self.graphs:
+            key_batch_size, t, h, w = graph_key
+            if key_batch_size != batch_size:
+                continue  # Skip graphs with wrong batch size
+            grid = (t, h, w)
+            bucket_tokens = self._compute_output_tokens(grid, spatial_merge_size)
             if bucket_tokens >= num_tokens and bucket_tokens < best_bucket_tokens:
                 best_bucket_tokens = bucket_tokens
-                best_grid = grid_key
+                best_key = graph_key
 
-        return best_grid
+        return best_key
 
     def run(
         self,
         pixel_values: torch.Tensor,
         grid_thw: list[list[int]],
+        batch_size: int = 1,
     ) -> torch.Tensor | None:
         """
         Run the vision encoder using a captured CUDA graph if available.
 
         Args:
             pixel_values: Input pixel values [num_patches, patch_channels]
-            grid_thw: List of [T, H, W] for each image
+            grid_thw: List of [T, H, W] for each image (all must be same grid)
+            batch_size: Number of images in batch (default 1 for legacy mode)
 
         Returns:
             Vision encoder output tensor if graph was used, None if no matching graph
         """
-        grid_key = self.get_graph_for_grid(grid_thw)
+        graph_key = self.get_graph_for_grid(grid_thw, batch_size=batch_size)
 
-        if grid_key is None:
+        if graph_key is None:
             # Don't count miss here - caller may try run_padded() next
             return None
 
         # Verify input dimensions match
-        input_buffer = self.input_buffers[grid_key]["pixel_values"]
+        input_buffer = self.input_buffers[graph_key]["pixel_values"]
         if pixel_values.shape != input_buffer.shape:
             logger.warning(
                 "Pixel values shape mismatch: expected %s, got %s. "
@@ -705,9 +777,9 @@ class EncoderCudaGraphManager:
 
         # For exact match, restore cached embeddings only if modified by run_padded().
         # This avoids 6 unnecessary tensor copies when only using exact-match mode.
-        if grid_key in self.modified_grids:
-            embed_buffers = self.embedding_buffers[grid_key]
-            cached = self.cached_tensors[grid_key]
+        if graph_key in self.modified_grids:
+            embed_buffers = self.embedding_buffers[graph_key]
+            cached = self.cached_tensors[graph_key]
             embed_buffers["pos_embeds"].copy_(cached["pos_embeds"], non_blocking=True)
             embed_buffers["rotary_pos_emb_cos"].copy_(
                 cached["rotary_pos_emb_cos"], non_blocking=True
@@ -720,12 +792,12 @@ class EncoderCudaGraphManager:
             embed_buffers["sequence_lengths"].copy_(
                 cached["sequence_lengths"], non_blocking=True
             )
-            self.modified_grids.discard(grid_key)
+            self.modified_grids.discard(graph_key)
 
         if self.verbose:
             logger.info(
-                "run(): grid_key=%s, input_shape=%s, buffer_shape=%s",
-                grid_key,
+                "run(): graph_key=%s, input_shape=%s, buffer_shape=%s",
+                graph_key,
                 pixel_values.shape,
                 input_buffer.shape,
             )
@@ -734,15 +806,15 @@ class EncoderCudaGraphManager:
             # Single-GPU optimized path: graph was captured on current stream,
             # so buffer copies and replay are on the same stream - no sync needed.
             # Return view directly; caller must use output before next run() call.
-            self.graphs[grid_key].replay()
-            return self.output_buffers[grid_key]
+            self.graphs[graph_key].replay()
+            return self.output_buffers[graph_key]
         else:
             # Multi-GPU path: graph was captured on a separate stream.
             # Sync current stream before replay to ensure buffer copies complete.
             torch.cuda.current_stream().synchronize()
 
             # Replay the graph
-            self.graphs[grid_key].replay()
+            self.graphs[graph_key].replay()
 
             # Record event after replay for lightweight sync in next call.
             if self.replay_done_event is None:
@@ -753,7 +825,7 @@ class EncoderCudaGraphManager:
             self.replay_done_event.synchronize()
 
             # Return a clone of the output to avoid issues with buffer reuse
-            return self.output_buffers[grid_key].clone()
+            return self.output_buffers[graph_key].clone()
 
     def run_padded(
         self,
@@ -790,14 +862,17 @@ class EncoderCudaGraphManager:
             logger.debug("Vision encoder not available for padded mode")
             return None
 
-        # Find the smallest bucket that fits
-        bucket_grid = self.find_bucket_for_tokens(num_output_tokens, spatial_merge_size)
-        if bucket_grid is None:
+        # Find the smallest bucket that fits (for batch_size=1)
+        graph_key = self.find_bucket_for_tokens(
+            num_output_tokens, spatial_merge_size, batch_size=1
+        )
+        if graph_key is None:
             # Don't count miss here - caller will count it when falling back to eager
             max_available = (
                 max(
-                    self._compute_output_tokens(g, spatial_merge_size)
-                    for g in self.graphs
+                    self._compute_output_tokens((t, h, w), spatial_merge_size)
+                    for (bs, t, h, w) in self.graphs
+                    if bs == 1  # Only consider batch_size=1 graphs
                 )
                 if self.graphs
                 else 0
@@ -810,15 +885,17 @@ class EncoderCudaGraphManager:
             return None
 
         # Check if we have embedding buffers for this bucket
-        if bucket_grid not in self.embedding_buffers:
-            logger.debug("No embedding buffers for bucket %s", bucket_grid)
+        if graph_key not in self.embedding_buffers:
+            logger.debug("No embedding buffers for bucket %s", graph_key)
             return None
 
-        bucket_tokens = self._compute_output_tokens(bucket_grid, spatial_merge_size)
+        # Extract grid from graph_key for _compute_output_tokens
+        _, t, h, w = graph_key
+        bucket_tokens = self._compute_output_tokens((t, h, w), spatial_merge_size)
         padding_waste = bucket_tokens - num_output_tokens
 
         # Get the input buffer for this bucket
-        input_buffer = self.input_buffers[bucket_grid]["pixel_values"]
+        input_buffer = self.input_buffers[graph_key]["pixel_values"]
         num_input_patches = pixel_values.shape[0]
         bucket_input_patches = input_buffer.shape[0]
 
@@ -868,7 +945,7 @@ class EncoderCudaGraphManager:
         actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
 
         # Get embedding buffers for the bucket
-        embed_buffers = self.embedding_buffers[bucket_grid]
+        embed_buffers = self.embedding_buffers[graph_key]
 
         # Zero the buffers first (for clean padding)
         input_buffer.zero_()
@@ -905,13 +982,13 @@ class EncoderCudaGraphManager:
         )
 
         # Mark this grid as modified so run() knows to restore cached tensors
-        self.modified_grids.add(bucket_grid)
+        self.modified_grids.add(graph_key)
 
         if self.verbose:
             logger.info(
-                "run_padded(): bucket_grid=%s, actual_grid=%s, "
+                "run_padded(): graph_key=%s, actual_grid=%s, "
                 "input_patches=%d, bucket_patches=%d",
-                bucket_grid,
+                graph_key,
                 grid_thw[0],
                 num_input_patches,
                 bucket_input_patches,
@@ -921,8 +998,8 @@ class EncoderCudaGraphManager:
             # Single-GPU optimized path: graph was captured on current stream,
             # so buffer modifications and replay are on same stream - no sync needed.
             # Return view directly; caller must use output before next run() call.
-            self.graphs[bucket_grid].replay()
-            full_output = self.output_buffers[bucket_grid]
+            self.graphs[graph_key].replay()
+            full_output = self.output_buffers[graph_key]
             trimmed_output = full_output[:num_output_tokens]
         else:
             # Multi-GPU path: graph was captured on a separate stream.
@@ -930,7 +1007,7 @@ class EncoderCudaGraphManager:
             torch.cuda.current_stream().synchronize()
 
             # Replay the graph with updated embedding buffers
-            self.graphs[bucket_grid].replay()
+            self.graphs[graph_key].replay()
 
             # Record event after replay for lightweight sync in next call.
             if self.replay_done_event is None:
@@ -941,7 +1018,7 @@ class EncoderCudaGraphManager:
             self.replay_done_event.synchronize()
 
             # Get output and trim to actual size
-            full_output = self.output_buffers[bucket_grid]
+            full_output = self.output_buffers[graph_key]
             trimmed_output = full_output[:num_output_tokens].clone()
 
         if self.verbose:
@@ -954,6 +1031,130 @@ class EncoderCudaGraphManager:
             )
 
         return trimmed_output, padding_waste
+
+    def run_batched(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: list[list[int]],
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        """
+        Run the vision encoder for a batch of images with the same grid size.
+
+        This is used for grouped batching where multiple images are processed
+        together with a single CUDA graph replay.
+
+        Args:
+            pixel_values: Concatenated pixel values [total_patches, patch_channels]
+            grid_thw: List of [T, H, W] for each image (all must be same grid)
+            batch_size: Number of images in the batch
+
+        Returns:
+            Concatenated output tensor for all images, or None if no matching graph
+        """
+        if len(grid_thw) != batch_size:
+            logger.warning(
+                "grid_thw length (%d) doesn't match batch_size (%d)",
+                len(grid_thw), batch_size
+            )
+            return None
+
+        # All images must have the same grid
+        if len(grid_thw) < 1:
+            return None
+        base_grid = grid_thw[0]
+        for grid in grid_thw[1:]:
+            if grid != base_grid:
+                logger.warning(
+                    "run_batched requires all images to have same grid, "
+                    "got %s and %s", base_grid, grid
+                )
+                return None
+
+        # Look up the graph for this batch_size and grid
+        graph_key = self.get_graph_for_grid(grid_thw, batch_size=batch_size)
+        if graph_key is None:
+            return None
+
+        # Verify input dimensions match
+        input_buffer = self.input_buffers[graph_key]["pixel_values"]
+        if pixel_values.shape != input_buffer.shape:
+            logger.warning(
+                "Pixel values shape mismatch: expected %s, got %s. "
+                "Falling back to eager mode.",
+                input_buffer.shape,
+                pixel_values.shape,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        # Verify device and dtype match
+        if pixel_values.device != input_buffer.device:
+            logger.warning(
+                "Device mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.device,
+                pixel_values.device,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        if pixel_values.dtype != input_buffer.dtype:
+            logger.warning(
+                "Dtype mismatch: expected %s, got %s. Falling back to eager mode.",
+                input_buffer.dtype,
+                pixel_values.dtype,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        self.cache_hits += 1
+
+        # Wait for any previous graph replay to complete before modifying buffers.
+        if not self.is_single_gpu and self.replay_done_event is not None:
+            self.replay_done_event.synchronize()
+
+        # Ensure contiguous memory layout for safe copy
+        if not pixel_values.is_contiguous():
+            pixel_values = pixel_values.contiguous()
+
+        # Copy input to the captured buffer
+        input_buffer.copy_(pixel_values, non_blocking=True)
+
+        # For batched exact match, restore cached embeddings if modified
+        if graph_key in self.modified_grids:
+            embed_buffers = self.embedding_buffers[graph_key]
+            cached = self.cached_tensors[graph_key]
+            embed_buffers["pos_embeds"].copy_(cached["pos_embeds"], non_blocking=True)
+            embed_buffers["rotary_pos_emb_cos"].copy_(
+                cached["rotary_pos_emb_cos"], non_blocking=True
+            )
+            embed_buffers["rotary_pos_emb_sin"].copy_(
+                cached["rotary_pos_emb_sin"], non_blocking=True
+            )
+            embed_buffers["cu_seqlens"].copy_(cached["cu_seqlens"], non_blocking=True)
+            embed_buffers["max_seqlen"].copy_(cached["max_seqlen"], non_blocking=True)
+            embed_buffers["sequence_lengths"].copy_(
+                cached["sequence_lengths"], non_blocking=True
+            )
+            self.modified_grids.discard(graph_key)
+
+        if self.verbose:
+            logger.info(
+                "run_batched(): graph_key=%s, batch_size=%d, input_shape=%s",
+                graph_key, batch_size, pixel_values.shape,
+            )
+
+        if self.is_single_gpu:
+            self.graphs[graph_key].replay()
+            return self.output_buffers[graph_key]
+        else:
+            torch.cuda.current_stream().synchronize()
+            self.graphs[graph_key].replay()
+            if self.replay_done_event is None:
+                self.replay_done_event = torch.cuda.Event()
+            self.replay_done_event.record()
+            self.replay_done_event.synchronize()
+            return self.output_buffers[graph_key].clone()
 
     def count_miss(self) -> None:
         """Count when falling back to eager mode.
