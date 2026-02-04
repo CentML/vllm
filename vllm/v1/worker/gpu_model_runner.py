@@ -2983,7 +2983,14 @@ class GPUModelRunner(
                                       device=max_seqlen.device)
 
         # Call forward_piecewise directly with pre-computed and padded tensors
-        with set_forward_context(None, self.vllm_config):
+        # Enable CUDA graph capture/replay by setting the proper forward context
+        batch_desc = BatchDescriptor(num_tokens=padded_num_patches)
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=batch_desc,
+        ):
             encoder_output = visual.forward_piecewise(
                 x=padded_pixel_values,
                 pos_embeds=padded_pos_embeds,
