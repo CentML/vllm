@@ -1111,7 +1111,8 @@ class EncoderCudaGraphManager:
             self.eager_fallbacks += 1
             return None
 
-        self.cache_hits += 1
+        # Count images processed, not replay count (for accurate hit rate)
+        self.cache_hits += batch_size
 
         # Wait for any previous graph replay to complete before modifying buffers.
         if not self.is_single_gpu and self.replay_done_event is not None:
@@ -1255,7 +1256,8 @@ class EncoderCudaGraphManager:
         if not pixel_values.is_contiguous():
             pixel_values = pixel_values.contiguous()
 
-        self.cache_hits += 1
+        # Count images processed, not replay count (for accurate hit rate)
+        self.cache_hits += batch_size
 
         # Wait for any previous graph replay to complete
         if not self.is_single_gpu and self.replay_done_event is not None:
