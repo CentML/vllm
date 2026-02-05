@@ -830,10 +830,27 @@ class EncoderCudaGraphManager:
             except Exception as e:
                 logger.debug("Failed to pre-warm grid %s: %s", grid, e)
 
+        # Calculate embedding cache memory consumption
+        cache_memory_bytes = self._compute_embedding_cache_memory()
         logger.info(
-            "Embedding cache warmed: %d grids total",
+            "Embedding cache warmed: %d grids total, memory: %.2f MiB",
             len(self.grid_embedding_cache),
+            cache_memory_bytes / (1024 * 1024),
         )
+
+    def _compute_embedding_cache_memory(self) -> int:
+        """
+        Compute the total GPU memory consumption of the embedding cache.
+
+        Returns:
+            Total memory in bytes used by all cached embeddings.
+        """
+        total_bytes = 0
+        for grid, cached in self.grid_embedding_cache.items():
+            for key, tensor in cached.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_bytes += tensor.numel() * tensor.element_size()
+        return total_bytes
 
     def get_graph_for_grid(
         self,
