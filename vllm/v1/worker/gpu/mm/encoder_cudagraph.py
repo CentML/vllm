@@ -1156,6 +1156,198 @@ class EncoderCudaGraphManager:
             self.replay_done_event.synchronize()
             return self.output_buffers[graph_key].clone()
 
+    def run_batched_contiguous(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw_list: list[list[int]],
+        graph_key: tuple[int, int, int, int],
+        spatial_merge_size: int = 2,
+    ) -> torch.Tensor | None:
+        """
+        Run batched CUDA graph with contiguous packing and end padding.
+
+        This method packs images contiguously in the buffer (no interleaved padding),
+        computes actual cu_seqlens at runtime, and pads only at the end. This ensures
+        flash attention reads correct data for each sequence.
+
+        Memory layout:
+            Buffer: [img0][img1][img2][img3][PADDING at end]
+            cu_seqlens: [0, size0, size0+size1, ..., total_actual]
+
+        Flash attention uses cu_seqlens to process only actual tokens; padding at
+        the end is outside all sequence boundaries and is ignored.
+
+        Args:
+            pixel_values: Contiguously packed pixel values (no padding between images)
+            grid_thw_list: List of [T, H, W] for each image (can be different grids)
+            graph_key: The bucket graph key (batch_size, t, h, w) to use
+            spatial_merge_size: Spatial merge size (default 2)
+
+        Returns:
+            Full output tensor from the bucket, or None if failed.
+            Caller should use cu_seqlens to extract per-image outputs.
+        """
+        if graph_key not in self.graphs:
+            logger.debug("No graph for key %s", graph_key)
+            return None
+
+        batch_size = graph_key[0]
+        if len(grid_thw_list) != batch_size:
+            logger.warning(
+                "grid_thw_list length (%d) doesn't match graph batch_size (%d)",
+                len(grid_thw_list), batch_size
+            )
+            return None
+
+        # Check if vision encoder is available for embedding computation
+        if self.vision_encoder is None or not hasattr(
+            self.vision_encoder, "precompute_for_cudagraph"
+        ):
+            logger.debug("Vision encoder not available for batched contiguous mode")
+            return None
+
+        # Check if we have embedding buffers for this bucket
+        if graph_key not in self.embedding_buffers:
+            logger.debug("No embedding buffers for bucket %s", graph_key)
+            return None
+
+        # Get the input buffer for this bucket
+        input_buffer = self.input_buffers[graph_key]["pixel_values"]
+        actual_input_patches = pixel_values.shape[0]
+        bucket_input_patches = input_buffer.shape[0]
+
+        if actual_input_patches > bucket_input_patches:
+            logger.warning(
+                "Input patches (%d) exceed bucket capacity (%d).",
+                actual_input_patches, bucket_input_patches,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        # Verify device and dtype match
+        if pixel_values.device != input_buffer.device:
+            logger.warning(
+                "Device mismatch: expected %s, got %s.",
+                input_buffer.device, pixel_values.device,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        if pixel_values.dtype != input_buffer.dtype:
+            logger.warning(
+                "Dtype mismatch: expected %s, got %s.",
+                input_buffer.dtype, pixel_values.dtype,
+            )
+            self.eager_fallbacks += 1
+            return None
+
+        # Ensure contiguous memory layout
+        if not pixel_values.is_contiguous():
+            pixel_values = pixel_values.contiguous()
+
+        self.cache_hits += 1
+
+        # Wait for any previous graph replay to complete
+        if not self.is_single_gpu and self.replay_done_event is not None:
+            self.replay_done_event.synchronize()
+
+        # Get embedding buffers for the bucket
+        embed_buffers = self.embedding_buffers[graph_key]
+
+        # Zero the buffers first (for clean padding at end)
+        input_buffer.zero_()
+        embed_buffers["pos_embeds"].zero_()
+        embed_buffers["rotary_pos_emb_cos"].zero_()
+        embed_buffers["rotary_pos_emb_sin"].zero_()
+
+        # Copy actual pixel values to the beginning of the buffer (contiguous)
+        input_buffer[:actual_input_patches].copy_(pixel_values, non_blocking=True)
+
+        # Compute embeddings for each actual grid and pack contiguously
+        # Also build cu_seqlens from actual cumulative sizes
+        pos_embeds_list = []
+        rotary_cos_list = []
+        rotary_sin_list = []
+        sequence_lengths = []
+
+        for grid in grid_thw_list:
+            # Compute embeddings for this actual grid
+            actual_embeds = self.vision_encoder.precompute_for_cudagraph([grid])
+            pos_embeds_list.append(actual_embeds["pos_embeds"])
+            rotary_cos_list.append(actual_embeds["rotary_pos_emb_cos"])
+            rotary_sin_list.append(actual_embeds["rotary_pos_emb_sin"])
+            # Output tokens for this image
+            t, h, w = grid
+            output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            sequence_lengths.append(output_tokens)
+
+        # Concatenate embeddings (contiguous packing)
+        packed_pos_embeds = torch.cat(pos_embeds_list, dim=0)
+        packed_rotary_cos = torch.cat(rotary_cos_list, dim=0)
+        packed_rotary_sin = torch.cat(rotary_sin_list, dim=0)
+
+        # Copy packed embeddings to buffer (padding remains zero at end)
+        actual_output_tokens = packed_pos_embeds.shape[0]
+        embed_buffers["pos_embeds"][:actual_output_tokens].copy_(
+            packed_pos_embeds, non_blocking=True
+        )
+        embed_buffers["rotary_pos_emb_cos"][:actual_output_tokens].copy_(
+            packed_rotary_cos, non_blocking=True
+        )
+        embed_buffers["rotary_pos_emb_sin"][:actual_output_tokens].copy_(
+            packed_rotary_sin, non_blocking=True
+        )
+
+        # Build cu_seqlens from actual cumulative sizes
+        # cu_seqlens = [0, size0, size0+size1, ..., total]
+        cu_seqlens_list = [0]
+        for length in sequence_lengths:
+            cu_seqlens_list.append(cu_seqlens_list[-1] + length)
+
+        cu_seqlens_tensor = torch.tensor(
+            cu_seqlens_list, dtype=torch.int32, device=self.device
+        )
+        max_seqlen = max(sequence_lengths)
+        max_seqlen_tensor = torch.tensor(
+            max_seqlen, dtype=torch.int32, device="cpu"
+        )
+        sequence_lengths_tensor = torch.tensor(
+            sequence_lengths, dtype=torch.int32, device=self.device
+        )
+
+        # Update cu_seqlens buffer - need to handle size mismatch
+        # The captured buffer may be larger, so we update only the actual part
+        embed_buffers["cu_seqlens"][:len(cu_seqlens_list)].copy_(
+            cu_seqlens_tensor, non_blocking=True
+        )
+        embed_buffers["max_seqlen"].copy_(max_seqlen_tensor, non_blocking=True)
+        embed_buffers["sequence_lengths"][:batch_size].copy_(
+            sequence_lengths_tensor, non_blocking=True
+        )
+
+        # Mark this grid as modified so run() knows to restore cached tensors
+        self.modified_grids.add(graph_key)
+
+        if self.verbose:
+            logger.info(
+                "run_batched_contiguous(): graph_key=%s, grids=%s, "
+                "actual_patches=%d, bucket_patches=%d, cu_seqlens=%s",
+                graph_key, grid_thw_list, actual_input_patches,
+                bucket_input_patches, cu_seqlens_list,
+            )
+
+        if self.is_single_gpu:
+            self.graphs[graph_key].replay()
+            return self.output_buffers[graph_key]
+        else:
+            torch.cuda.current_stream().synchronize()
+            self.graphs[graph_key].replay()
+            if self.replay_done_event is None:
+                self.replay_done_event = torch.cuda.Event()
+            self.replay_done_event.record()
+            self.replay_done_event.synchronize()
+            return self.output_buffers[graph_key].clone()
+
     def count_miss(self) -> None:
         """Count when falling back to eager mode.
 
