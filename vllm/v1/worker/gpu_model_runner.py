@@ -2894,15 +2894,57 @@ class GPUModelRunner(
         num_remainder = num_images - num_grouped
 
         if self.encoder_cudagraph_verbose:
+            # Pre-compute padding waste estimate for logging
+            total_actual_tokens = sum(x[2] for x in sorted_grids)
+            total_bucket_tokens = 0
+            waste_per_batch = []
+
+            # Assert for mypy (already checked at function start)
+            assert self.encoder_cudagraph_manager is not None
+            temp_idx = 0
+            while temp_idx + target_batch_size <= num_images:
+                batch_grids = [
+                    grid_thw_list[sorted_grids[temp_idx + i][0]]
+                    for i in range(target_batch_size)
+                ]
+                max_tokens = max(compute_output_tokens(g) for g in batch_grids)
+                actual_tokens = sum(compute_output_tokens(g) for g in batch_grids)
+
+                # Find bucket for this batch
+                graph_key = self.encoder_cudagraph_manager.find_bucket_for_tokens(
+                    max_tokens, spatial_merge_size, batch_size=target_batch_size
+                )
+                if graph_key is not None:
+                    _, t, h, w = graph_key
+                    bucket_tokens = (
+                        t * (h // spatial_merge_size) * (w // spatial_merge_size)
+                    )
+                    # Bucket capacity * batch_size vs sum of actual tokens
+                    batch_bucket_total = bucket_tokens * target_batch_size
+                    batch_waste = batch_bucket_total - actual_tokens
+                    total_bucket_tokens += batch_bucket_total
+                    waste_per_batch.append(batch_waste)
+                temp_idx += target_batch_size
+
+            total_waste = sum(waste_per_batch) if waste_per_batch else 0
+            waste_pct = (
+                (total_waste / total_bucket_tokens * 100)
+                if total_bucket_tokens > 0
+                else 0.0
+            )
+
             logger.info(
                 "Processing %d images: %d in %d group(s) of %d, "
-                "%d remainder (eager), grids=%s",
+                "%d remainder (eager), grids=%s, "
+                "padding_waste=%d tokens (%.1f%%)",
                 num_images,
                 num_grouped,
                 num_full_batches,
                 target_batch_size,
                 num_remainder,
                 grid_thw_list,
+                total_waste,
+                waste_pct,
             )
 
         outputs = [None] * num_images
