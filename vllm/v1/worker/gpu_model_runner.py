@@ -2477,7 +2477,10 @@ class GPUModelRunner(
 
                 if all_complete:
                     # All images processed by grouped batch
-                    curr_group_outputs = grouped_batched_result
+                    # all_complete ensures no None entries
+                    curr_group_outputs = cast(
+                        list[torch.Tensor], grouped_batched_result
+                    )
                 elif (
                     self.encoder_cudagraph_manager is not None
                     and self.encoder_cudagraph_one_by_one
@@ -2488,12 +2491,16 @@ class GPUModelRunner(
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
+                    # Note: list may contain None for unprocessed images;
+                    # these will be filled in by one-by-one processing below
                     if has_partial_results and grouped_batched_result is not None:
-                        curr_group_outputs_lst: list[torch.Tensor | None] = list(
-                            grouped_batched_result
+                        curr_group_outputs_lst = cast(
+                            list[torch.Tensor], list(grouped_batched_result)
                         )
                     else:
-                        curr_group_outputs_lst = [None] * num_items
+                        curr_group_outputs_lst = cast(
+                            list[torch.Tensor], [None] * num_items
+                        )
 
                     # Get batched pixel_values and grid_thw
                     if modality == "image":
