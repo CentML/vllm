@@ -433,6 +433,10 @@ class Qwen3_VisionTransformer(nn.Module):
                 ]
             )
 
+        # Per-grid embedding cache for eager mode optimization
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin
+        self._embedding_cache: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
+
         attn_backend_override = (
             multimodal_config.mm_encoder_attn_backend if multimodal_config else None
         )
@@ -649,6 +653,59 @@ class Qwen3_VisionTransformer(nn.Module):
         )
         return np.concatenate([cu_seqlens_qk, cu_seqlens_v, cu_seqlens_o])
 
+    def _get_cached_embeddings(
+        self, grid_thw_list: list[list[int]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get position and rotary embeddings with per-grid caching.
+
+        This method caches embeddings per grid configuration (t, h, w) to avoid
+        redundant computation when the same grid sizes are encountered repeatedly.
+
+        Args:
+            grid_thw_list: List of [T, H, W] for each image
+
+        Returns:
+            Tuple of (pos_embeds, rotary_cos, rotary_sin)
+        """
+        pos_embeds_list: list[torch.Tensor] = []
+        rotary_cos_list: list[torch.Tensor] = []
+        rotary_sin_list: list[torch.Tensor] = []
+
+        for grid in grid_thw_list:
+            t, h, w = grid
+            grid_key = (t, h, w)
+
+            if grid_key in self._embedding_cache:
+                # Cache hit - use cached embeddings
+                cached = self._embedding_cache[grid_key]
+                pos_embeds_list.append(cached["pos_embeds"])
+                rotary_cos_list.append(cached["rotary_cos"])
+                rotary_sin_list.append(cached["rotary_sin"])
+            else:
+                # Cache miss - compute and cache
+                single_grid = [[t, h, w]]
+                pos_embed = self.fast_pos_embed_interpolate(single_grid)
+                rotary_cos, rotary_sin = self.rot_pos_emb(single_grid)
+
+                # Cache for future use
+                self._embedding_cache[grid_key] = {
+                    "pos_embeds": pos_embed,
+                    "rotary_cos": rotary_cos,
+                    "rotary_sin": rotary_sin,
+                }
+
+                pos_embeds_list.append(pos_embed)
+                rotary_cos_list.append(rotary_cos)
+                rotary_sin_list.append(rotary_sin)
+
+        # Concatenate all embeddings
+        pos_embeds = torch.cat(pos_embeds_list, dim=0)
+        rotary_pos_emb_cos = torch.cat(rotary_cos_list, dim=0)
+        rotary_pos_emb_sin = torch.cat(rotary_sin_list, dim=0)
+
+        return pos_embeds, rotary_pos_emb_cos, rotary_pos_emb_sin
+
     def forward(
         self,
         x: torch.Tensor,
@@ -666,9 +723,11 @@ class Qwen3_VisionTransformer(nn.Module):
             grid_thw_list = grid_thw.tolist()
             grid_thw = grid_thw.cpu().numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+        # Get embeddings with caching for eager mode optimization
+        pos_embeds, rotary_pos_emb_cos, rotary_pos_emb_sin = (
+            self._get_cached_embeddings(grid_thw_list)
+        )
         hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             axis=0, dtype=np.int32
