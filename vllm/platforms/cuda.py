@@ -364,6 +364,7 @@ class CudaPlatformBase(Platform):
             AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.TE_FP8,
         ]
 
     @classmethod

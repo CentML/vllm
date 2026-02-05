@@ -2651,19 +2651,11 @@ class GPUModelRunner(
                         if piecewise_result is not None:
                             curr_group_outputs = piecewise_result
                         else:
-                            # Fall back to non-padded execution.
-                            # Run the encoder.
-                            # `curr_group_outputs` is either of the following:
-                            # 1. A tensor of shape
-                            #    (num_items, feature_size, hidden_size)
-                            #    in case feature_size is fixed across all
-                            #    multimodal items.
-                            # 2. A list or tuple (length: num_items) of tensors,
-                            #    each of shape (feature_size, hidden_size) in
-                            #    case the feature size is dynamic depending on
-                            #    the input multimodal items.
-                            curr_group_outputs = model.embed_multimodal(
-                                **mm_kwargs_group
+                            # Fall back to eager execution, one image at a time.
+                            # This ensures consistent behavior and reduces peak
+                            # memory usage compared to batch processing.
+                            curr_group_outputs = self._execute_encoder_one_by_one_eager(
+                                model, mm_kwargs_group, modality, num_items
                             )
 
             sanity_check_mm_encoder_outputs(
@@ -2824,6 +2816,82 @@ class GPUModelRunner(
                 self.encoder_cudagraph_padded_mode,
             )
         return None
+
+    def _execute_encoder_one_by_one_eager(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+        num_items: int,
+    ) -> list[torch.Tensor]:
+        """
+        Execute encoder in eager mode, processing one image at a time.
+
+        This ensures consistent behavior and reduces peak memory usage
+        compared to batch processing all images together.
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+            num_items: Number of items in the batch
+
+        Returns:
+            List of encoder outputs, one per image
+        """
+        # For single item, just process directly
+        if num_items == 1:
+            return list(model.embed_multimodal(**mm_kwargs_group))
+
+        # Only process image/video modalities one-by-one
+        if modality not in ("image", "video"):
+            return list(model.embed_multimodal(**mm_kwargs_group))
+
+        # Extract batched data
+        if modality == "image":
+            batched_pixel_values = mm_kwargs_group.get("pixel_values")
+            grid_thw_list = mm_kwargs_group.get("image_grid_thw")
+            grid_key = "image_grid_thw"
+            pixel_key = "pixel_values"
+        else:  # video
+            batched_pixel_values = mm_kwargs_group.get("pixel_values_videos")
+            grid_thw_list = mm_kwargs_group.get("video_grid_thw")
+            grid_key = "video_grid_thw"
+            pixel_key = "pixel_values_videos"
+
+        # If we can't extract the data, fall back to batch processing
+        if batched_pixel_values is None or grid_thw_list is None:
+            return list(model.embed_multimodal(**mm_kwargs_group))
+
+        # Convert grid_thw to list if tensor
+        if isinstance(grid_thw_list, torch.Tensor):
+            grid_thw_list = grid_thw_list.tolist()
+
+        # Process each image one at a time
+        outputs: list[torch.Tensor] = []
+        patch_offset = 0
+
+        for grid_thw in grid_thw_list:
+            t, h, w = grid_thw
+            num_patches = t * h * w
+
+            # Slice pixel_values for this image
+            single_pixel_values = batched_pixel_values[
+                patch_offset : patch_offset + num_patches
+            ]
+            patch_offset += num_patches
+
+            # Build single-image kwargs
+            single_mm_inputs = {
+                pixel_key: single_pixel_values,
+                grid_key: torch.tensor([grid_thw], dtype=torch.int64),
+            }
+
+            # Process this single image
+            single_output = model.embed_multimodal(**single_mm_inputs)
+            outputs.append(single_output[0])
+
+        return outputs
 
     def _execute_grouped_batched_encoder(
         self,
