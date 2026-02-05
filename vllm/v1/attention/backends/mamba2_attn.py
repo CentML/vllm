@@ -330,12 +330,14 @@ class Mamba2AttentionMetadataBuilder(
         # CUDA graph padding for decodes
         elif (
             0 < num_decodes <= self.decode_cudagraph_max_bs
+            and num_decode_tokens <= self.decode_cudagraph_max_bs
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             # Pad for CUDA graph (pure spec decode batch)
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_decode_tokens)
-            assert num_input_tokens % (1 + self.num_spec_tokens) == 0
-            padded_bs = num_input_tokens // (1 + self.num_spec_tokens)
+            # assert num_input_tokens % (1 + self.num_spec_tokens) == 0
+            # padded_bs = num_input_tokens // (1 + self.num_spec_tokens)
+            padded_bs = min(self.decode_cudagraph_max_bs, num_input_tokens)
             self.decode_state_indices_tensor_buffer[:num_decodes].copy_(
                 decode_state_indices_tensor, non_blocking=True
             )
