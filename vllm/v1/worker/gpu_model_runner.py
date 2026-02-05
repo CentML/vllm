@@ -3312,6 +3312,7 @@ class GPUModelRunner(
 
         # Helper to create dummy inputs for a given num_patches
         def create_dummy_inputs(num_patches: int):
+            assert visual is not None  # for mypy
             patch_embed = getattr(visual, "patch_embed", None)
             if patch_embed is not None:
                 temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
@@ -3374,6 +3375,7 @@ class GPUModelRunner(
             )
 
         def run_forward(num_patches: int):
+            assert visual is not None  # for mypy
             (
                 pixel_values,
                 pos_embeds,
