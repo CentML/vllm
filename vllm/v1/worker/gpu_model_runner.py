@@ -3264,6 +3264,9 @@ class GPUModelRunner(
         if visual is None or not hasattr(visual, "forward_piecewise"):
             return
 
+        # Assert for mypy - visual is not None after the check above
+        assert visual is not None
+
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
         merge_size_sq = spatial_merge_size**2
 

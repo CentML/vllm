@@ -73,6 +73,7 @@ class PiecewiseBackend:
         logger.debug_once(log_string)
 
         # Use encoder-specific capture sizes for encoder compilation
+        self.compile_sizes: list[Any] | None = None
         if self.is_encoder_compilation:
             encoder_capture_sizes = (
                 self.compilation_config.encoder_cudagraph_capture_sizes
