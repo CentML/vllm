@@ -2468,13 +2468,11 @@ class GPUModelRunner(
                             )
 
                 # Check if grouped batch returned partial results
-                has_partial_results = (
-                    grouped_batched_result is not None
-                    and any(r is not None for r in grouped_batched_result)
+                has_partial_results = grouped_batched_result is not None and any(
+                    r is not None for r in grouped_batched_result
                 )
-                all_complete = (
-                    grouped_batched_result is not None
-                    and all(r is not None for r in grouped_batched_result)
+                all_complete = grouped_batched_result is not None and all(
+                    r is not None for r in grouped_batched_result
                 )
 
                 if all_complete:
@@ -2490,11 +2488,12 @@ class GPUModelRunner(
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
-                    curr_group_outputs_lst = (
-                        list(grouped_batched_result)
-                        if has_partial_results
-                        else [None] * num_items
-                    )
+                    if has_partial_results and grouped_batched_result is not None:
+                        curr_group_outputs_lst: list[torch.Tensor | None] = list(
+                            grouped_batched_result
+                        )
+                    else:
+                        curr_group_outputs_lst = [None] * num_items
 
                     # Get batched pixel_values and grid_thw
                     if modality == "image":
@@ -2664,6 +2663,7 @@ class GPUModelRunner(
                 curr_group_outputs,
                 expected_num_items=num_items,
             )
+            assert curr_group_outputs is not None  # sanity_check ensures this
             encoder_outputs.extend(curr_group_outputs)
 
         # Cache the encoder outputs by mm_hash
