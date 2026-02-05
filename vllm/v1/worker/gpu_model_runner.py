@@ -2825,7 +2825,7 @@ class GPUModelRunner(
         grid_thw_list: list[list[int]],
         modality: str,
         target_batch_size: int,
-    ) -> list[torch.Tensor] | None:
+    ) -> list[torch.Tensor | None] | None:
         """
         Execute encoder using grouped batched CUDA graphs with contiguous packing.
 
@@ -2847,7 +2847,9 @@ class GPUModelRunner(
             target_batch_size: Target batch size for grouping (e.g., 4)
 
         Returns:
-            List of output tensors, or None if batched mode not available
+            List of output tensors (may contain None for unprocessed images),
+            or None if no images could be processed with batched mode.
+            Caller should handle None entries by processing them separately.
         """
         if self.encoder_cudagraph_manager is None:
             return None
