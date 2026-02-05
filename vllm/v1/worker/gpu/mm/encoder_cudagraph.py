@@ -221,9 +221,10 @@ class EncoderCudaGraphManager:
                 "(TP=1, PP=1, DP=1), using optimized sync scheme"
             )
 
-        # Track which grids have had their embedding buffers modified by run_padded().
-        # This allows run() to skip restoring cached tensors when not needed.
-        self.modified_grids: set[tuple[int, int, int]] = set()
+        # Track which grids have had their embedding buffers modified by run_padded()
+        # or run_batched_contiguous(). This allows run() to skip restoring cached
+        # tensors when not needed. Keys are (batch_size, t, h, w).
+        self.modified_grids: set[tuple[int, int, int, int]] = set()
 
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
