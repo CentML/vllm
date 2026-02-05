@@ -2467,7 +2467,18 @@ class GPUModelRunner(
                                 )
                             )
 
-                if grouped_batched_result is not None:
+                # Check if grouped batch returned partial results
+                has_partial_results = (
+                    grouped_batched_result is not None
+                    and any(r is not None for r in grouped_batched_result)
+                )
+                all_complete = (
+                    grouped_batched_result is not None
+                    and all(r is not None for r in grouped_batched_result)
+                )
+
+                if all_complete:
+                    # All images processed by grouped batch
                     curr_group_outputs = grouped_batched_result
                 elif (
                     self.encoder_cudagraph_manager is not None
@@ -2475,11 +2486,15 @@ class GPUModelRunner(
                     and num_items > 1
                     and modality in ("image", "video")
                 ):
-                    # Fall back to one-by-one processing
+                    # Fall back to one-by-one processing for remaining images
                     # Process each image individually for CUDA graph support
                     # Extract batched data and slice per-image to avoid
                     # re-calling group_mm_kwargs_by_modality overhead
-                    curr_group_outputs_lst = []
+                    curr_group_outputs_lst = (
+                        list(grouped_batched_result)
+                        if has_partial_results
+                        else [None] * num_items
+                    )
 
                     # Get batched pixel_values and grid_thw
                     if modality == "image":
@@ -2502,11 +2517,21 @@ class GPUModelRunner(
 
                         # Calculate patch boundaries for slicing
                         patch_offset = 0
-                        if self.encoder_cudagraph_verbose:
+                        # Count how many need one-by-one processing
+                        num_remaining = sum(
+                            1 for o in curr_group_outputs_lst if o is None
+                        )
+                        if self.encoder_cudagraph_verbose and num_remaining > 0:
+                            remaining_grids = [
+                                grid_thw_list[i]
+                                for i, o in enumerate(curr_group_outputs_lst)
+                                if o is None
+                            ]
                             logger.info(
-                                "Processing %d images one-at-a-time, grids=%s",
-                                len(grid_thw_list),
-                                grid_thw_list,
+                                "Processing %d remaining images one-at-a-time, "
+                                "grids=%s",
+                                num_remaining,
+                                remaining_grids,
                             )
                         for img_idx, grid_thw in enumerate(grid_thw_list):
                             t, h, w = grid_thw
@@ -2517,6 +2542,10 @@ class GPUModelRunner(
                                 patch_offset : patch_offset + num_patches
                             ]
                             patch_offset += num_patches
+
+                            # Skip if already processed by grouped batch
+                            if curr_group_outputs_lst[img_idx] is not None:
+                                continue
 
                             # Build single-image kwargs for CUDA graph (list format)
                             single_mm_inputs_for_cudagraph = {
@@ -2532,7 +2561,7 @@ class GPUModelRunner(
                                 1,
                             )
                             if single_result is not None:
-                                curr_group_outputs_lst.extend(single_result)
+                                curr_group_outputs_lst[img_idx] = single_result[0]
                             else:
                                 # Fall back to eager for this image
                                 # Model expects grid_thw as CPU tensor (.numpy())
@@ -2546,7 +2575,7 @@ class GPUModelRunner(
                                 single_output = model.embed_multimodal(
                                     **single_mm_inputs_for_eager
                                 )
-                                curr_group_outputs_lst.extend(single_output)
+                                curr_group_outputs_lst[img_idx] = single_output[0]
 
                         curr_group_outputs = curr_group_outputs_lst
                     else:
@@ -2932,18 +2961,19 @@ class GPUModelRunner(
 
             processed += target_batch_size
 
-        # Check if all images were processed
-        num_eager = sum(1 for o in outputs if o is None)
-        if num_eager > 0:
-            if self.encoder_cudagraph_verbose:
-                logger.info(
-                    "Grouped batch incomplete: %d/%d with cudagraph, "
-                    "%d fallback to eager",
-                    cudagraph_processed,
-                    num_images,
-                    num_eager,
-                )
-            # Some images not processed, fall back to other modes
+        # Log summary
+        num_unprocessed = sum(1 for o in outputs if o is None)
+        if self.encoder_cudagraph_verbose and num_unprocessed > 0:
+            logger.info(
+                "Grouped batch: %d/%d with cudagraph, %d remainder",
+                cudagraph_processed,
+                num_images,
+                num_unprocessed,
+            )
+
+        # Return partial results - caller will handle None entries
+        # Return None only if no images were processed at all
+        if cudagraph_processed == 0:
             return None
 
         return outputs
