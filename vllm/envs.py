@@ -216,6 +216,8 @@ if TYPE_CHECKING:
     VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL: bool = False
     VLLM_USE_TRITON_POS_EMBED: bool = False
     VLLM_POS_EMBED_CACHE_SIZE: int = 100
+    VLLM_MM_ENCODER_FP8_ATTN: bool = False
+    VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH: str | None = None
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1454,6 +1456,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # average at BF16; 100 entries ≈ 0.9 GB.
     "VLLM_POS_EMBED_CACHE_SIZE": lambda: int(
         os.getenv("VLLM_POS_EMBED_CACHE_SIZE", "100")
+    # Controls whether to use FP8 attention for multimodal encoder (e.g., ViT)
+    "VLLM_MM_ENCODER_FP8_ATTN": lambda: bool(
+        int(os.getenv("VLLM_MM_ENCODER_FP8_ATTN", "0"))
+    ),
+    # Path to JSON file containing FP8 attention scales for multimodal encoder
+    "VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH": lambda: os.getenv(
+        "VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH", None
     ),
     # If set to 1/True, use the TRTLLM attention backend in flashinfer.
     # If set to 0/False, use the default attention backend in flashinfer.
