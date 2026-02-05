@@ -79,6 +79,115 @@ CUSTOM_GRID_CONFIGS = [
 # but still benefit from CUDA graphs via padding.
 DEFAULT_PADDED_BUCKET_SIZES = [100, 128]
 
+# Top 100 most common grids for embedding cache pre-warming.
+# Pre-warming these grids at startup avoids cold-start embedding computation
+# at runtime, eliminating ~20 small kernel launches per grid on first encounter.
+# Based on MLPerf VLM dataset analysis (~71% coverage with top 100 grids).
+EMBEDDING_WARMUP_GRIDS: list[tuple[int, int, int]] = [
+    # Top 50 grids (sorted by frequency)
+    (1, 62, 62),
+    (1, 32, 32),
+    (1, 50, 50),
+    (1, 38, 38),
+    (1, 76, 76),
+    (1, 94, 94),
+    (1, 64, 64),
+    (1, 124, 124),
+    (1, 68, 68),
+    (1, 100, 100),
+    (1, 16, 16),
+    (1, 24, 24),
+    (1, 46, 46),
+    (1, 44, 44),
+    (1, 42, 42),
+    (1, 40, 40),
+    (1, 56, 56),
+    (1, 128, 128),
+    (1, 18, 18),
+    (1, 28, 28),
+    (1, 34, 34),
+    (1, 80, 80),
+    (1, 30, 30),
+    (1, 38, 50),
+    (1, 22, 22),
+    (1, 112, 112),
+    (1, 36, 36),
+    (1, 34, 50),
+    (1, 188, 188),
+    (1, 14, 20),
+    (1, 90, 90),
+    (1, 44, 42),
+    (1, 16, 18),
+    (1, 54, 54),
+    (1, 48, 48),
+    (1, 40, 42),
+    (1, 60, 60),
+    (1, 88, 88),
+    (1, 26, 26),
+    (1, 156, 156),
+    (1, 94, 62),
+    (1, 30, 38),
+    (1, 24, 38),
+    (1, 20, 20),
+    (1, 24, 16),
+    (1, 18, 16),
+    (1, 120, 120),
+    (1, 60, 80),
+    (1, 52, 52),
+    (1, 66, 66),
+    # Next 50 grids
+    (1, 20, 14),
+    (1, 24, 32),
+    (1, 160, 160),
+    (1, 28, 38),
+    (1, 30, 40),
+    (1, 38, 42),
+    (1, 58, 58),
+    (1, 20, 32),
+    (1, 50, 38),
+    (1, 48, 64),
+    (1, 78, 78),
+    (1, 24, 20),
+    (1, 42, 62),
+    (1, 62, 94),
+    (1, 36, 42),
+    (1, 32, 20),
+    (1, 150, 150),
+    (1, 50, 42),
+    (1, 50, 76),
+    (1, 72, 72),
+    (1, 32, 24),
+    (1, 46, 42),
+    (1, 92, 94),
+    (1, 82, 82),
+    (1, 32, 38),
+    (1, 90, 94),
+    (1, 14, 22),
+    (1, 76, 100),
+    (1, 94, 92),
+    (1, 24, 18),
+    (1, 54, 42),
+    (1, 38, 32),
+    (1, 18, 24),
+    (1, 28, 32),
+    (1, 30, 42),
+    (1, 56, 76),
+    (1, 62, 42),
+    (1, 28, 50),
+    (1, 32, 42),
+    (1, 36, 50),
+    (1, 38, 24),
+    (1, 108, 82),
+    (1, 16, 20),
+    (1, 26, 38),
+    (1, 38, 36),
+    (1, 34, 42),
+    (1, 76, 50),
+    (1, 38, 56),
+    (1, 48, 42),
+    (1, 30, 32),
+]
+
 
 class EncoderCudaGraphManager:
     """
@@ -671,6 +780,59 @@ class EncoderCudaGraphManager:
             encoder_graph_mem / 1024**3,
             used_mem_after / 1024**3,
             free_mem_after / 1024**3,
+        )
+
+        # Pre-warm embedding cache for common grids
+        self._prewarm_embedding_cache(vision_encoder)
+
+    def _prewarm_embedding_cache(self, vision_encoder: nn.Module) -> None:
+        """
+        Pre-warm the embedding cache for common grid configurations.
+
+        This avoids cold-start embedding computation at runtime by pre-computing
+        embeddings for the top 100 most common grids. Each grid that would
+        otherwise trigger ~20 small kernel launches on first encounter will
+        instead hit the cache.
+
+        Args:
+            vision_encoder: The vision encoder module with precompute_for_cudagraph
+        """
+        if not hasattr(vision_encoder, "precompute_for_cudagraph"):
+            logger.debug(
+                "Vision encoder lacks precompute_for_cudagraph, skipping warmup"
+            )
+            return
+
+        # Filter out grids that are already cached (from graph capture)
+        grids_to_warm = [
+            g for g in EMBEDDING_WARMUP_GRIDS if g not in self.grid_embedding_cache
+        ]
+
+        if not grids_to_warm:
+            logger.debug("All warmup grids already cached")
+            return
+
+        logger.info(
+            "Pre-warming embedding cache for %d grids (%d already cached)",
+            len(grids_to_warm),
+            len(EMBEDDING_WARMUP_GRIDS) - len(grids_to_warm),
+        )
+
+        for grid in grids_to_warm:
+            t, h, w = grid
+            try:
+                cached = vision_encoder.precompute_for_cudagraph([[t, h, w]])
+                self.grid_embedding_cache[grid] = {
+                    "pos_embeds": cached["pos_embeds"],
+                    "rotary_pos_emb_cos": cached["rotary_pos_emb_cos"],
+                    "rotary_pos_emb_sin": cached["rotary_pos_emb_sin"],
+                }
+            except Exception as e:
+                logger.debug("Failed to pre-warm grid %s: %s", grid, e)
+
+        logger.info(
+            "Embedding cache warmed: %d grids total",
+            len(self.grid_embedding_cache),
         )
 
     def get_graph_for_grid(
