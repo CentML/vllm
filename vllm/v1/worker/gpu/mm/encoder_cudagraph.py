@@ -180,13 +180,13 @@ class EncoderCudaGraphManager:
         self.output_buffers: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
         # Cached pre-computed tensors for CUDA graph replay (exact match mode)
-        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary embeddings, etc.
+        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary, etc.
         self.cached_tensors: dict[
             tuple[int, int, int, int], dict[str, torch.Tensor]
         ] = {}
 
         # Input buffers for embeddings (padded mode with runtime computation)
-        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary_cos/sin, cu_seqlens
+        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary, cu_seqlens
         self.embedding_buffers: dict[
             tuple[int, int, int, int], dict[str, torch.Tensor]
         ] = {}
