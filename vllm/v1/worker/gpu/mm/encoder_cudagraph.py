@@ -1158,7 +1158,9 @@ class EncoderCudaGraphManager:
             rotary_cos = cached["rotary_pos_emb_cos"]
             rotary_sin = cached["rotary_pos_emb_sin"]
         else:
-            # Cache miss - compute and cache for future use
+            # Cache miss - compute on-the-fly but do NOT cache at runtime.
+            # Caching at runtime causes OOM due to unbounded memory growth.
+            # Only pre-warmed grids from EMBEDDING_WARMUP_GRIDS are cached.
             if self.vision_encoder is None:
                 logger.warning("Grid %s not cached and no vision encoder", grid_key)
                 return None
@@ -1166,14 +1168,10 @@ class EncoderCudaGraphManager:
             pos_embeds = actual_embeds["pos_embeds"]
             rotary_cos = actual_embeds["rotary_pos_emb_cos"]
             rotary_sin = actual_embeds["rotary_pos_emb_sin"]
-            # Cache for future use
-            self.grid_embedding_cache[grid_key] = {
-                "pos_embeds": pos_embeds,
-                "rotary_pos_emb_cos": rotary_cos,
-                "rotary_pos_emb_sin": rotary_sin,
-            }
             if self.verbose:
-                logger.info("Embedding cache miss for grid %s (now cached)", grid_key)
+                logger.info(
+                    "Embedding cache miss for grid %s (computed on-the-fly)", grid_key
+                )
 
         # Get embedding buffers for the bucket
         embed_buffers = self.embedding_buffers[graph_key]

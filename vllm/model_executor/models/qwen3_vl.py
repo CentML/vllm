@@ -94,6 +94,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.mm.encoder_cudagraph import EMBEDDING_WARMUP_GRIDS
 
 from .interfaces import (
     MultiModalEmbeddings,
@@ -136,6 +137,9 @@ _MAX_FRAMES_PER_VIDEO = 24576
 # Batch buckets for cuDNN graph caching - graphs are cached per bucket size
 # This avoids creating a new graph for each unique batch size at runtime
 BATCH_BUCKETS = [8, 16, 32, 64]
+
+# Set of pre-warmed grids for O(1) lookup in embedding cache
+_EMBEDDING_WARMUP_GRIDS_SET: set[tuple[int, int, int]] = set(EMBEDDING_WARMUP_GRIDS)
 
 
 @support_torch_compile(
@@ -659,8 +663,9 @@ class Qwen3_VisionTransformer(nn.Module):
         """
         Get position and rotary embeddings with per-grid caching.
 
-        This method caches embeddings per grid configuration (t, h, w) to avoid
-        redundant computation when the same grid sizes are encountered repeatedly.
+        This method caches embeddings only for grids in EMBEDDING_WARMUP_GRIDS
+        to avoid unbounded memory growth. Grids not in the warmup set are
+        computed on-the-fly without caching.
 
         Args:
             grid_thw_list: List of [T, H, W] for each image
@@ -683,17 +688,19 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_cos_list.append(cached["rotary_cos"])
                 rotary_sin_list.append(cached["rotary_sin"])
             else:
-                # Cache miss - compute and cache
+                # Cache miss - compute embeddings
                 single_grid = [[t, h, w]]
                 pos_embed = self.fast_pos_embed_interpolate(single_grid)
                 rotary_cos, rotary_sin = self.rot_pos_emb(single_grid)
 
-                # Cache for future use
-                self._embedding_cache[grid_key] = {
-                    "pos_embeds": pos_embed,
-                    "rotary_cos": rotary_cos,
-                    "rotary_sin": rotary_sin,
-                }
+                # Only cache if grid is in pre-warmed set to prevent OOM.
+                # Caching at runtime causes unbounded memory growth.
+                if grid_key in _EMBEDDING_WARMUP_GRIDS_SET:
+                    self._embedding_cache[grid_key] = {
+                        "pos_embeds": pos_embed,
+                        "rotary_cos": rotary_cos,
+                        "rotary_sin": rotary_sin,
+                    }
 
                 pos_embeds_list.append(pos_embed)
                 rotary_cos_list.append(rotary_cos)
