@@ -2583,8 +2583,15 @@ class GPUModelRunner(
                         if self.encoder_cudagraph_verbose:
                             logger.info(
                                 "ViT: cudagraph_result=None, piecewise_enabled=%s "
-                                "(piecewise=%s, padded_mode=%s)",
+                                "(full_cudagraph=%s, piecewise=%s, padded_mode=%s)",
                                 piecewise_enabled,
+                                getattr(
+                                    self.compilation_config,
+                                    "cudagraph_mm_encoder",
+                                    False,
+                                )
+                                if self.compilation_config
+                                else None,
                                 getattr(
                                     self.compilation_config,
                                     "encoder_cudagraph_piecewise",
@@ -2843,8 +2850,26 @@ class GPUModelRunner(
             t, h, w = grid
             patch_offsets.append(patch_offsets[-1] + t * h * w)
 
+        # Calculate how many full batches and remainder
+        num_full_batches = num_images // target_batch_size
+        num_grouped = num_full_batches * target_batch_size
+        num_remainder = num_images - num_grouped
+
+        if self.encoder_cudagraph_verbose:
+            logger.info(
+                "Processing %d images: %d in %d group(s) of %d, "
+                "%d remainder (eager), grids=%s",
+                num_images,
+                num_grouped,
+                num_full_batches,
+                target_batch_size,
+                num_remainder,
+                grid_thw_list,
+            )
+
         outputs = [None] * num_images
         processed = 0
+        cudagraph_processed = 0
 
         # Process full batches
         while processed + target_batch_size <= num_images:
@@ -2895,12 +2920,12 @@ class GPUModelRunner(
                         output_offset : output_offset + actual_tokens
                     ].clone()
                     output_offset += actual_tokens
+                cudagraph_processed += target_batch_size
 
                 if self.encoder_cudagraph_verbose:
                     logger.info(
-                        "Grouped batch (contiguous): batch_size=%d, "
-                        "grids=%s, graph_key=%s",
-                        target_batch_size,
+                        "  Group %d: grids=%s, graph_key=%s",
+                        processed // target_batch_size + 1,
                         batch_grids,
                         graph_key,
                     )
@@ -2908,7 +2933,16 @@ class GPUModelRunner(
             processed += target_batch_size
 
         # Check if all images were processed
-        if any(o is None for o in outputs):
+        num_eager = sum(1 for o in outputs if o is None)
+        if num_eager > 0:
+            if self.encoder_cudagraph_verbose:
+                logger.info(
+                    "Grouped batch incomplete: %d/%d with cudagraph, "
+                    "%d fallback to eager",
+                    cudagraph_processed,
+                    num_images,
+                    num_eager,
+                )
             # Some images not processed, fall back to other modes
             return None
 
