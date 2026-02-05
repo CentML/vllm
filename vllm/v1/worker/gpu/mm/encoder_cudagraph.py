@@ -869,17 +869,15 @@ class EncoderCudaGraphManager:
         )
         if graph_key is None:
             # Don't count miss here - caller will count it when falling back to eager
-            max_available = (
-                max(
-                    self._compute_output_tokens((t, h, w), spatial_merge_size)
-                    for (bs, t, h, w) in self.graphs
-                    if bs == 1  # Only consider batch_size=1 graphs
-                )
-                if self.graphs
-                else 0
-            )
+            # Calculate max available tokens from batch_size=1 graphs (if any)
+            bs1_tokens = [
+                self._compute_output_tokens((t, h, w), spatial_merge_size)
+                for (bs, t, h, w) in self.graphs
+                if bs == 1
+            ]
+            max_available = max(bs1_tokens) if bs1_tokens else 0
             logger.debug(
-                "No bucket found for %d tokens, max available: %d",
+                "No bucket found for %d tokens (batch_size=1), max available: %d",
                 num_output_tokens,
                 max_available,
             )
