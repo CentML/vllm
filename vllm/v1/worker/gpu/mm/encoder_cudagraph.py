@@ -812,11 +812,12 @@ class EncoderCudaGraphManager:
             logger.debug("All warmup grids already cached")
             return
 
-        logger.info(
-            "Pre-warming embedding cache for %d grids (%d already cached)",
-            len(grids_to_warm),
-            len(EMBEDDING_WARMUP_GRIDS) - len(grids_to_warm),
-        )
+        if self.verbose:
+            logger.info(
+                "Pre-warming embedding cache for %d grids (%d already cached)",
+                len(grids_to_warm),
+                len(EMBEDDING_WARMUP_GRIDS) - len(grids_to_warm),
+            )
 
         for grid in grids_to_warm:
             t, h, w = grid
@@ -830,13 +831,14 @@ class EncoderCudaGraphManager:
             except Exception as e:
                 logger.debug("Failed to pre-warm grid %s: %s", grid, e)
 
-        # Calculate embedding cache memory consumption
-        cache_memory_bytes = self._compute_embedding_cache_memory()
-        logger.info(
-            "Embedding cache warmed: %d grids total, memory: %.2f MiB",
-            len(self.grid_embedding_cache),
-            cache_memory_bytes / (1024 * 1024),
-        )
+        # Calculate and log embedding cache memory consumption
+        if self.verbose:
+            cache_memory_bytes = self._compute_embedding_cache_memory()
+            logger.info(
+                "Embedding cache warmed: %d grids total, memory: %.2f MiB",
+                len(self.grid_embedding_cache),
+                cache_memory_bytes / (1024 * 1024),
+            )
 
     def _compute_embedding_cache_memory(self) -> int:
         """

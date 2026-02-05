@@ -706,6 +706,20 @@ class Qwen3_VisionTransformer(nn.Module):
 
         return pos_embeds, rotary_pos_emb_cos, rotary_pos_emb_sin
 
+    def get_embedding_cache_memory(self) -> int:
+        """
+        Compute the total GPU memory consumption of the embedding cache.
+
+        Returns:
+            Total memory in bytes used by all cached embeddings.
+        """
+        total_bytes = 0
+        for grid, cached in self._embedding_cache.items():
+            for key, tensor in cached.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_bytes += tensor.numel() * tensor.element_size()
+        return total_bytes
+
     def forward(
         self,
         x: torch.Tensor,
