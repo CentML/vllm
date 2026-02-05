@@ -181,11 +181,15 @@ class EncoderCudaGraphManager:
 
         # Cached pre-computed tensors for CUDA graph replay (exact match mode)
         # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary embeddings, etc.
-        self.cached_tensors: dict[tuple[int, int, int, int], dict[str, torch.Tensor]] = {}
+        self.cached_tensors: dict[
+            tuple[int, int, int, int], dict[str, torch.Tensor]
+        ] = {}
 
         # Input buffers for embeddings (padded mode with runtime computation)
         # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary_cos/sin, cu_seqlens
-        self.embedding_buffers: dict[tuple[int, int, int, int], dict[str, torch.Tensor]] = {}
+        self.embedding_buffers: dict[
+            tuple[int, int, int, int], dict[str, torch.Tensor]
+        ] = {}
 
         # Store metadata about captured graphs
         self.captured_metadata: dict[tuple[int, int, int, int], dict[str, Any]] = {}
@@ -301,9 +305,7 @@ class EncoderCudaGraphManager:
         if compilation_config is None:
             return [1]
 
-        batch_sizes = getattr(
-            compilation_config, "encoder_cudagraph_batch_sizes", None
-        )
+        batch_sizes = getattr(compilation_config, "encoder_cudagraph_batch_sizes", None)
         if batch_sizes is None:
             return [1]  # Legacy mode: batch_size=1 only
         return sorted(batch_sizes)
@@ -415,7 +417,9 @@ class EncoderCudaGraphManager:
         graph_key = (batch_size, t, h, w)
         logger.debug(
             "Capturing encoder CUDA graph for key %s (batch_size=%d, grid=%s)",
-            graph_key, batch_size, grid_config
+            graph_key,
+            batch_size,
+            grid_config,
         )
 
         # Prepare dummy inputs for batch
@@ -454,8 +458,7 @@ class EncoderCudaGraphManager:
             cached = vision_encoder.precompute_for_cudagraph(grid_thw)
             self.cached_tensors[graph_key] = cached
             logger.debug(
-                "Pre-computed cached tensors for key %s: "
-                "pos_embeds=%s, cu_seqlens=%s",
+                "Pre-computed cached tensors for key %s: pos_embeds=%s, cu_seqlens=%s",
                 graph_key,
                 cached["pos_embeds"].shape,
                 cached["cu_seqlens"].shape,
@@ -1054,7 +1057,8 @@ class EncoderCudaGraphManager:
         if len(grid_thw) != batch_size:
             logger.warning(
                 "grid_thw length (%d) doesn't match batch_size (%d)",
-                len(grid_thw), batch_size
+                len(grid_thw),
+                batch_size,
             )
             return None
 
@@ -1065,8 +1069,9 @@ class EncoderCudaGraphManager:
         for grid in grid_thw[1:]:
             if grid != base_grid:
                 logger.warning(
-                    "run_batched requires all images to have same grid, "
-                    "got %s and %s", base_grid, grid
+                    "run_batched requires all images to have same grid, got %s and %s",
+                    base_grid,
+                    grid,
                 )
                 return None
 
@@ -1140,7 +1145,9 @@ class EncoderCudaGraphManager:
         if self.verbose:
             logger.info(
                 "run_batched(): graph_key=%s, batch_size=%d, input_shape=%s",
-                graph_key, batch_size, pixel_values.shape,
+                graph_key,
+                batch_size,
+                pixel_values.shape,
             )
 
         if self.is_single_gpu:
@@ -1194,7 +1201,8 @@ class EncoderCudaGraphManager:
         if len(grid_thw_list) != batch_size:
             logger.warning(
                 "grid_thw_list length (%d) doesn't match graph batch_size (%d)",
-                len(grid_thw_list), batch_size
+                len(grid_thw_list),
+                batch_size,
             )
             return None
 
@@ -1218,7 +1226,8 @@ class EncoderCudaGraphManager:
         if actual_input_patches > bucket_input_patches:
             logger.warning(
                 "Input patches (%d) exceed bucket capacity (%d).",
-                actual_input_patches, bucket_input_patches,
+                actual_input_patches,
+                bucket_input_patches,
             )
             self.eager_fallbacks += 1
             return None
@@ -1227,7 +1236,8 @@ class EncoderCudaGraphManager:
         if pixel_values.device != input_buffer.device:
             logger.warning(
                 "Device mismatch: expected %s, got %s.",
-                input_buffer.device, pixel_values.device,
+                input_buffer.device,
+                pixel_values.device,
             )
             self.eager_fallbacks += 1
             return None
@@ -1235,7 +1245,8 @@ class EncoderCudaGraphManager:
         if pixel_values.dtype != input_buffer.dtype:
             logger.warning(
                 "Dtype mismatch: expected %s, got %s.",
-                input_buffer.dtype, pixel_values.dtype,
+                input_buffer.dtype,
+                pixel_values.dtype,
             )
             self.eager_fallbacks += 1
             return None
@@ -1307,16 +1318,14 @@ class EncoderCudaGraphManager:
             cu_seqlens_list, dtype=torch.int32, device=self.device
         )
         max_seqlen = max(sequence_lengths)
-        max_seqlen_tensor = torch.tensor(
-            max_seqlen, dtype=torch.int32, device="cpu"
-        )
+        max_seqlen_tensor = torch.tensor(max_seqlen, dtype=torch.int32, device="cpu")
         sequence_lengths_tensor = torch.tensor(
             sequence_lengths, dtype=torch.int32, device=self.device
         )
 
         # Update cu_seqlens buffer - need to handle size mismatch
         # The captured buffer may be larger, so we update only the actual part
-        embed_buffers["cu_seqlens"][:len(cu_seqlens_list)].copy_(
+        embed_buffers["cu_seqlens"][: len(cu_seqlens_list)].copy_(
             cu_seqlens_tensor, non_blocking=True
         )
         embed_buffers["max_seqlen"].copy_(max_seqlen_tensor, non_blocking=True)
@@ -1331,8 +1340,11 @@ class EncoderCudaGraphManager:
             logger.info(
                 "run_batched_contiguous(): graph_key=%s, grids=%s, "
                 "actual_patches=%d, bucket_patches=%d, cu_seqlens=%s",
-                graph_key, grid_thw_list, actual_input_patches,
-                bucket_input_patches, cu_seqlens_list,
+                graph_key,
+                grid_thw_list,
+                actual_input_patches,
+                bucket_input_patches,
+                cu_seqlens_list,
             )
 
         if self.is_single_gpu:

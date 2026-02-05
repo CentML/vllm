@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import math
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -2438,23 +2437,34 @@ class GPUModelRunner(
                             grid_thw_list = grid_thw_list.tolist()
 
                         # Find largest batch size that fits
-                        target_batch_size = max(
-                            bs for bs in self.encoder_cudagraph_batch_sizes
-                            if bs <= num_items
-                        ) if any(bs <= num_items for bs in self.encoder_cudagraph_batch_sizes) else None
+                        target_batch_size = (
+                            max(
+                                bs
+                                for bs in self.encoder_cudagraph_batch_sizes
+                                if bs <= num_items
+                            )
+                            if any(
+                                bs <= num_items
+                                for bs in self.encoder_cudagraph_batch_sizes
+                            )
+                            else None
+                        )
 
                         if target_batch_size is not None and target_batch_size > 1:
                             if self.encoder_cudagraph_verbose:
                                 logger.info(
                                     "Trying grouped batch: %d images, target_bs=%d",
-                                    num_items, target_batch_size
+                                    num_items,
+                                    target_batch_size,
                                 )
-                            grouped_batched_result = self._execute_grouped_batched_encoder(
-                                model,
-                                batched_pixel_values,
-                                grid_thw_list,
-                                modality,
-                                target_batch_size,
+                            grouped_batched_result = (
+                                self._execute_grouped_batched_encoder(
+                                    model,
+                                    batched_pixel_values,
+                                    grid_thw_list,
+                                    modality,
+                                    target_batch_size,
+                                )
                             )
 
                 if grouped_batched_result is not None:
@@ -2575,12 +2585,20 @@ class GPUModelRunner(
                                 "ViT: cudagraph_result=None, piecewise_enabled=%s "
                                 "(piecewise=%s, padded_mode=%s)",
                                 piecewise_enabled,
-                                getattr(self.compilation_config,
-                                        "encoder_cudagraph_piecewise", False)
-                                if self.compilation_config else None,
-                                getattr(self.compilation_config,
-                                        "encoder_cudagraph_padded_mode", True)
-                                if self.compilation_config else None,
+                                getattr(
+                                    self.compilation_config,
+                                    "encoder_cudagraph_piecewise",
+                                    False,
+                                )
+                                if self.compilation_config
+                                else None,
+                                getattr(
+                                    self.compilation_config,
+                                    "encoder_cudagraph_padded_mode",
+                                    True,
+                                )
+                                if self.compilation_config
+                                else None,
                             )
 
                         if piecewise_enabled:
@@ -2813,8 +2831,10 @@ class GPUModelRunner(
 
         # Sort images by output token count for efficient grouping
         # Keep track of original indices for reordering output
-        indexed_grids = [(i, grid, compute_output_tokens(grid))
-                         for i, grid in enumerate(grid_thw_list)]
+        indexed_grids = [
+            (i, grid, compute_output_tokens(grid))
+            for i, grid in enumerate(grid_thw_list)
+        ]
         sorted_grids = sorted(indexed_grids, key=lambda x: x[2])
 
         # Calculate patch offsets for slicing pixel_values
@@ -2829,8 +2849,9 @@ class GPUModelRunner(
         # Process full batches
         while processed + target_batch_size <= num_images:
             # Get the next batch of images (sorted by size)
-            batch_indices = [sorted_grids[processed + i][0]
-                             for i in range(target_batch_size)]
+            batch_indices = [
+                sorted_grids[processed + i][0] for i in range(target_batch_size)
+            ]
             batch_grids = [grid_thw_list[i] for i in batch_indices]
 
             # Calculate max output tokens needed in this batch
@@ -2871,7 +2892,7 @@ class GPUModelRunner(
                 for i, idx in enumerate(batch_indices):
                     actual_tokens = compute_output_tokens(batch_grids[i])
                     outputs[idx] = result[
-                        output_offset:output_offset + actual_tokens
+                        output_offset : output_offset + actual_tokens
                     ].clone()
                     output_offset += actual_tokens
 
@@ -2879,7 +2900,9 @@ class GPUModelRunner(
                     logger.info(
                         "Grouped batch (contiguous): batch_size=%d, "
                         "grids=%s, graph_key=%s",
-                        target_batch_size, batch_grids, graph_key
+                        target_batch_size,
+                        batch_grids,
+                        graph_key,
                     )
 
             processed += target_batch_size
@@ -2929,7 +2952,7 @@ class GPUModelRunner(
                 "total_actual_tokens": 0,
                 "total_padded_tokens": 0,
                 "capture_size_hits": {},  # capture_size -> count
-                "fallback_reasons": {},   # reason -> count
+                "fallback_reasons": {},  # reason -> count
             }
 
     def _record_piecewise_fallback(self, reason: str):
@@ -2963,11 +2986,12 @@ class GPUModelRunner(
         total_padded = stats["total_padded_tokens"]
         waste_pct = (
             (total_padded - total_actual) / total_padded * 100
-            if total_padded > 0 else 0
+            if total_padded > 0
+            else 0
         )
 
         lines = [
-            f"Piecewise padded stats:",
+            "Piecewise padded stats:",
             f"  Calls: {stats['calls']}, Executions: {stats['executions']}",
             f"  Total actual tokens: {total_actual}",
             f"  Total padded tokens: {total_padded}",
@@ -3002,8 +3026,10 @@ class GPUModelRunner(
             List of encoder outputs if padding was applied, None otherwise
         """
         if self.encoder_cudagraph_verbose:
-            logger.info("ViT PIECEWISE: _execute_encoder_piecewise_padded called, "
-                        "modality=%s", modality)
+            logger.info(
+                "ViT PIECEWISE: _execute_encoder_piecewise_padded called, modality=%s",
+                modality,
+            )
 
         # Only support image/video modalities
         if modality not in ("image", "video"):
@@ -3107,22 +3133,22 @@ class GPUModelRunner(
                     (1001,), dtype=cu_seqlens.dtype, device=cu_seqlens.device
                 ),
                 "sequence_lengths": torch.zeros(
-                    (1000,), dtype=sequence_lengths.dtype,
-                    device=sequence_lengths.device
+                    (1000,),
+                    dtype=sequence_lengths.dtype,
+                    device=sequence_lengths.device,
                 ),
             }
             self._piecewise_buffers[capture_size] = buffers
             if self.encoder_cudagraph_verbose:
                 logger.info(
-                    "ViT PIECEWISE: Allocated buffers for capture_size=%d "
-                    "(patches=%d)",
-                    capture_size, padded_num_patches
+                    "ViT PIECEWISE: Allocated buffers for capture_size=%d (patches=%d)",
+                    capture_size,
+                    padded_num_patches,
                 )
 
         # Copy data into pre-allocated buffers (no allocation, no zeros kernel)
         padded_pixel_values = buffers["pixel_values"]
-        padded_pixel_values[:num_input_patches].copy_(
-            pixel_values.type(visual.dtype))
+        padded_pixel_values[:num_input_patches].copy_(pixel_values.type(visual.dtype))
 
         padded_pos_embeds = buffers["pos_embeds"]
         padded_pos_embeds[:num_input_patches].copy_(pos_embeds)
@@ -3155,8 +3181,9 @@ class GPUModelRunner(
 
         # Update max_seqlen if padding sequence is larger
         if padding_patches > max_seqlen.item():
-            max_seqlen = torch.tensor(padding_patches, dtype=max_seqlen.dtype,
-                                      device=max_seqlen.device)
+            max_seqlen = torch.tensor(
+                padding_patches, dtype=max_seqlen.dtype, device=max_seqlen.device
+            )
 
         # Call forward_piecewise directly with pre-computed and padded tensors
         # Enable CUDA graph capture/replay by setting the proper forward context
@@ -3178,7 +3205,7 @@ class GPUModelRunner(
             )
 
         # Split output by actual token counts for each image (exclude padding)
-        merge_size_sq = spatial_merge_size ** 2
+        merge_size_sq = spatial_merge_size**2
         sizes = [t * h * w // merge_size_sq for t, h, w in grid_thw_list]
         real_outputs = list(encoder_output[:actual_output_tokens].split(sizes))
 
@@ -3190,8 +3217,10 @@ class GPUModelRunner(
             stats = self._piecewise_stats
             total_waste_pct = (
                 (stats["total_padded_tokens"] - stats["total_actual_tokens"])
-                / stats["total_padded_tokens"] * 100
-                if stats["total_padded_tokens"] > 0 else 0
+                / stats["total_padded_tokens"]
+                * 100
+                if stats["total_padded_tokens"] > 0
+                else 0
             )
             logger.info(
                 "ViT PIECEWISE PADDED: actual=%d, capture_size=%d, "
@@ -3236,12 +3265,12 @@ class GPUModelRunner(
             return
 
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
-        merge_size_sq = spatial_merge_size ** 2
+        merge_size_sq = spatial_merge_size**2
 
         # Convert capture_sizes to patches
         capture_sizes_patches = sorted(
             [size * merge_size_sq for size in capture_sizes],
-            reverse=True  # Largest first like LM
+            reverse=True,  # Largest first like LM
         )
 
         # Helper to create dummy inputs for a given num_patches
@@ -3255,8 +3284,9 @@ class GPUModelRunner(
                     raw_in_channels = getattr(proj, "in_channels", 3)
                 else:
                     raw_in_channels = 3
-                input_channels = (raw_in_channels * temporal_patch_size
-                                  * patch_size * patch_size)
+                input_channels = (
+                    raw_in_channels * temporal_patch_size * patch_size * patch_size
+                )
             else:
                 input_channels = 3 * 2 * 14 * 14
 
@@ -3266,8 +3296,9 @@ class GPUModelRunner(
                 device=self.device,
             )
 
-            hidden_size = getattr(visual, "hidden_size",
-                                 getattr(visual, "embed_dim", 1152))
+            hidden_size = getattr(
+                visual, "hidden_size", getattr(visual, "embed_dim", 1152)
+            )
 
             pos_embeds = torch.zeros(
                 (num_patches, hidden_size),
@@ -3295,12 +3326,26 @@ class GPUModelRunner(
                 [num_patches], dtype=torch.int32, device=self.device
             )
 
-            return (pixel_values, pos_embeds, rotary_cos, rotary_sin,
-                    cu_seqlens, max_seqlen, sequence_lengths)
+            return (
+                pixel_values,
+                pos_embeds,
+                rotary_cos,
+                rotary_sin,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+            )
 
         def run_forward(num_patches: int):
-            (pixel_values, pos_embeds, rotary_cos, rotary_sin,
-             cu_seqlens, max_seqlen, sequence_lengths) = create_dummy_inputs(num_patches)
+            (
+                pixel_values,
+                pos_embeds,
+                rotary_cos,
+                rotary_sin,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+            ) = create_dummy_inputs(num_patches)
 
             with set_forward_context(None, self.vllm_config):
                 _ = visual.forward_piecewise(
@@ -3349,17 +3394,16 @@ class GPUModelRunner(
             return
 
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
-        merge_size_sq = spatial_merge_size ** 2
+        merge_size_sq = spatial_merge_size**2
 
         # Convert capture_sizes to patches, largest first
         capture_sizes_patches = sorted(
-            [size * merge_size_sq for size in capture_sizes],
-            reverse=True
+            [size * merge_size_sq for size in capture_sizes], reverse=True
         )
 
         logger.info(
             "Capturing encoder piecewise CUDA graphs for %d sizes",
-            len(capture_sizes_patches)
+            len(capture_sizes_patches),
         )
 
         for num_patches in capture_sizes_patches:
@@ -3370,8 +3414,9 @@ class GPUModelRunner(
                 patch_size = getattr(patch_embed, "patch_size", 14)
                 proj = getattr(patch_embed, "proj", None)
                 raw_in_channels = getattr(proj, "in_channels", 3) if proj else 3
-                input_channels = (raw_in_channels * temporal_patch_size
-                                  * patch_size * patch_size)
+                input_channels = (
+                    raw_in_channels * temporal_patch_size * patch_size * patch_size
+                )
             else:
                 input_channels = 3 * 2 * 14 * 14
 
@@ -3381,8 +3426,9 @@ class GPUModelRunner(
                 device=self.device,
             )
 
-            hidden_size = getattr(visual, "hidden_size",
-                                 getattr(visual, "embed_dim", 1152))
+            hidden_size = getattr(
+                visual, "hidden_size", getattr(visual, "embed_dim", 1152)
+            )
             pos_embeds = torch.zeros(
                 (num_patches, hidden_size),
                 dtype=visual.dtype,

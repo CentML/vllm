@@ -417,11 +417,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             # backend entirely to avoid shape tracking issues. The encoder will
             # use torch.compile directly and EncoderCudaGraphManager handles
             # full cudagraph capture separately.
-            encoder_skip_piecewise = (
-                self.vllm_backend.is_encoder
-                and not getattr(
-                    self.compilation_config, "encoder_cudagraph_piecewise", False
-                )
+            encoder_skip_piecewise = self.vllm_backend.is_encoder and not getattr(
+                self.compilation_config, "encoder_cudagraph_piecewise", False
             )
 
             if encoder_skip_piecewise:
