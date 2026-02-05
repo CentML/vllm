@@ -230,6 +230,13 @@ class EncoderCudaGraphManager:
         # tensors when not needed. Keys are (batch_size, t, h, w).
         self.modified_grids: set[tuple[int, int, int, int]] = set()
 
+        # Per-grid embedding cache for batched contiguous mode
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin
+        # This avoids recomputing embeddings at runtime - just look up and concat
+        self.grid_embedding_cache: dict[
+            tuple[int, int, int], dict[str, torch.Tensor]
+        ] = {}
+
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
@@ -463,6 +470,23 @@ class EncoderCudaGraphManager:
                 cached["pos_embeds"].shape,
                 cached["cu_seqlens"].shape,
             )
+
+            # Cache per-grid embeddings for batched contiguous mode
+            # This avoids recomputing embeddings at runtime - just lookup and concat
+            grid_key = (t, h, w)
+            if grid_key not in self.grid_embedding_cache:
+                # Compute embeddings for a single image of this grid size
+                single_cached = vision_encoder.precompute_for_cudagraph([[t, h, w]])
+                self.grid_embedding_cache[grid_key] = {
+                    "pos_embeds": single_cached["pos_embeds"],
+                    "rotary_pos_emb_cos": single_cached["rotary_pos_emb_cos"],
+                    "rotary_pos_emb_sin": single_cached["rotary_pos_emb_sin"],
+                }
+                logger.debug(
+                    "Cached per-grid embeddings for grid %s: pos_embeds=%s",
+                    grid_key,
+                    single_cached["pos_embeds"].shape,
+                )
 
             # Create INPUT BUFFERS for embeddings (padded mode runtime computation)
             # These buffers can be updated at runtime before graph replay
@@ -942,9 +966,33 @@ class EncoderCudaGraphManager:
         if not self.is_single_gpu and self.replay_done_event is not None:
             self.replay_done_event.synchronize()
 
-        # Compute embeddings for ACTUAL grid, then pad to bucket size.
-        # This ensures correct position embeddings for the actual input size.
-        actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
+        # Look up cached embeddings for this grid, or compute if not cached
+        t, h, w = grid_thw[0]
+        grid_key = (t, h, w)
+
+        if grid_key in self.grid_embedding_cache:
+            # Use cached embeddings (fast path - no computation)
+            cached = self.grid_embedding_cache[grid_key]
+            pos_embeds = cached["pos_embeds"]
+            rotary_cos = cached["rotary_pos_emb_cos"]
+            rotary_sin = cached["rotary_pos_emb_sin"]
+        else:
+            # Cache miss - compute and cache for future use
+            if self.vision_encoder is None:
+                logger.warning("Grid %s not cached and no vision encoder", grid_key)
+                return None
+            actual_embeds = self.vision_encoder.precompute_for_cudagraph(grid_thw)
+            pos_embeds = actual_embeds["pos_embeds"]
+            rotary_cos = actual_embeds["rotary_pos_emb_cos"]
+            rotary_sin = actual_embeds["rotary_pos_emb_sin"]
+            # Cache for future use
+            self.grid_embedding_cache[grid_key] = {
+                "pos_embeds": pos_embeds,
+                "rotary_pos_emb_cos": rotary_cos,
+                "rotary_pos_emb_sin": rotary_sin,
+            }
+            if self.verbose:
+                logger.info("Embedding cache miss for grid %s (now cached)", grid_key)
 
         # Get embedding buffers for the bucket
         embed_buffers = self.embedding_buffers[graph_key]
@@ -958,30 +1006,31 @@ class EncoderCudaGraphManager:
         # Copy actual pixel values to the beginning of the buffer
         input_buffer[:num_input_patches].copy_(pixel_values, non_blocking=True)
 
-        # Copy actual embeddings to the beginning of the buffers (pad with zeros)
-        actual_num_patches = actual_embeds["pos_embeds"].shape[0]
+        # Copy cached/computed embeddings to the beginning of the buffers
+        actual_num_patches = pos_embeds.shape[0]
         embed_buffers["pos_embeds"][:actual_num_patches].copy_(
-            actual_embeds["pos_embeds"], non_blocking=True
+            pos_embeds, non_blocking=True
         )
         embed_buffers["rotary_pos_emb_cos"][:actual_num_patches].copy_(
-            actual_embeds["rotary_pos_emb_cos"], non_blocking=True
+            rotary_cos, non_blocking=True
         )
         embed_buffers["rotary_pos_emb_sin"][:actual_num_patches].copy_(
-            actual_embeds["rotary_pos_emb_sin"], non_blocking=True
+            rotary_sin, non_blocking=True
+        )
+
+        # Compute cu_seqlens for single image (simple: [0, num_output_tokens])
+        cu_seqlens = torch.tensor(
+            [0, num_output_tokens], dtype=torch.int32, device=self.device
+        )
+        max_seqlen = torch.tensor(num_output_tokens, dtype=torch.int32, device="cpu")
+        sequence_lengths = torch.tensor(
+            [num_output_tokens], dtype=torch.int32, device=self.device
         )
 
         # Update cu_seqlens and max_seqlen to actual values
-        # cu_seqlens shape is [num_images + 1], for single image: [0, num_patches]
-        # We copy actual values so flash attention processes only the real tokens
-        embed_buffers["cu_seqlens"].copy_(
-            actual_embeds["cu_seqlens"], non_blocking=True
-        )
-        embed_buffers["max_seqlen"].copy_(
-            actual_embeds["max_seqlen"], non_blocking=True
-        )
-        embed_buffers["sequence_lengths"].copy_(
-            actual_embeds["sequence_lengths"], non_blocking=True
-        )
+        embed_buffers["cu_seqlens"][:2].copy_(cu_seqlens, non_blocking=True)
+        embed_buffers["max_seqlen"].copy_(max_seqlen, non_blocking=True)
+        embed_buffers["sequence_lengths"][:1].copy_(sequence_lengths, non_blocking=True)
 
         # Mark this grid as modified so run() knows to restore cached tensors
         self.modified_grids.add(graph_key)
@@ -1275,25 +1324,53 @@ class EncoderCudaGraphManager:
         # Copy actual pixel values to the beginning of the buffer (contiguous)
         input_buffer[:actual_input_patches].copy_(pixel_values, non_blocking=True)
 
-        # Compute embeddings for each actual grid and pack contiguously
-        # Also build cu_seqlens from actual cumulative sizes
+        # Look up cached embeddings for each grid and pack contiguously
+        # This avoids expensive per-image precompute_for_cudagraph calls
         pos_embeds_list = []
         rotary_cos_list = []
         rotary_sin_list = []
         sequence_lengths = []
+        cache_miss = False
 
         for grid in grid_thw_list:
-            # Compute embeddings for this actual grid
-            actual_embeds = self.vision_encoder.precompute_for_cudagraph([grid])
-            pos_embeds_list.append(actual_embeds["pos_embeds"])
-            rotary_cos_list.append(actual_embeds["rotary_pos_emb_cos"])
-            rotary_sin_list.append(actual_embeds["rotary_pos_emb_sin"])
-            # Output tokens for this image
             t, h, w = grid
+            grid_key = (t, h, w)
             output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
             sequence_lengths.append(output_tokens)
 
-        # Concatenate embeddings (contiguous packing)
+            # Try to use cached embeddings (populated during graph capture)
+            if grid_key in self.grid_embedding_cache:
+                cached = self.grid_embedding_cache[grid_key]
+                pos_embeds_list.append(cached["pos_embeds"])
+                rotary_cos_list.append(cached["rotary_pos_emb_cos"])
+                rotary_sin_list.append(cached["rotary_pos_emb_sin"])
+            else:
+                # Cache miss - need to compute (should be rare after warmup)
+                cache_miss = True
+                if self.vision_encoder is not None:
+                    actual_embeds = self.vision_encoder.precompute_for_cudagraph([grid])
+                    pos_embeds_list.append(actual_embeds["pos_embeds"])
+                    rotary_cos_list.append(actual_embeds["rotary_pos_emb_cos"])
+                    rotary_sin_list.append(actual_embeds["rotary_pos_emb_sin"])
+                    # Cache for future use
+                    self.grid_embedding_cache[grid_key] = {
+                        "pos_embeds": actual_embeds["pos_embeds"],
+                        "rotary_pos_emb_cos": actual_embeds["rotary_pos_emb_cos"],
+                        "rotary_pos_emb_sin": actual_embeds["rotary_pos_emb_sin"],
+                    }
+                else:
+                    logger.warning("Grid %s not cached and no vision encoder", grid_key)
+                    return None
+
+        if cache_miss and self.verbose:
+            uncached_grids = [
+                g for g in grid_thw_list if tuple(g) not in self.grid_embedding_cache
+            ]
+            logger.info(
+                "Embedding cache miss for grids: %s (now cached)", uncached_grids
+            )
+
+        # Concatenate cached embeddings (just tensor concat, no computation)
         packed_pos_embeds = torch.cat(pos_embeds_list, dim=0)
         packed_rotary_cos = torch.cat(rotary_cos_list, dim=0)
         packed_rotary_sin = torch.cat(rotary_sin_list, dim=0)
