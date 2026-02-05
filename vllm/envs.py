@@ -214,6 +214,8 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_USE_CUDNN_PREFILL: bool = False
     VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL: bool = False
+    VLLM_MM_ENCODER_FP8_ATTN: bool = False
+    VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH: str | None = None
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1441,6 +1443,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Controls whether to use TRT-LLM ragged DeepSeek prefill
     "VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL": lambda: bool(
         int(os.getenv("VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL", "0"))
+    ),
+    # Controls whether to use FP8 attention for multimodal encoder (e.g., ViT)
+    "VLLM_MM_ENCODER_FP8_ATTN": lambda: bool(
+        int(os.getenv("VLLM_MM_ENCODER_FP8_ATTN", "0"))
+    ),
+    # Path to JSON file containing FP8 attention scales for multimodal encoder
+    "VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH": lambda: os.getenv(
+        "VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH", None
     ),
     # If set to 1/True, use the TRTLLM attention backend in flashinfer.
     # If set to 0/False, use the default attention backend in flashinfer.
