@@ -2773,10 +2773,17 @@ class GPUModelRunner(
         target_batch_size: int,
     ) -> list[torch.Tensor] | None:
         """
-        Execute encoder using grouped batched CUDA graphs.
+        Execute encoder using grouped batched CUDA graphs with contiguous packing.
 
-        Groups images by grid size, pads to largest in group, and uses
-        batched CUDA graph for groups of target_batch_size.
+        Groups images by output token count, packs them contiguously (no interleaved
+        padding), and uses a bucket-based CUDA graph for groups of target_batch_size.
+
+        Memory layout (contiguous packing):
+            Buffer: [img0][img1][img2][img3][PADDING at end]
+            cu_seqlens: [0, size0, size0+size1, ..., total_actual]
+
+        This ensures flash attention reads correct data for each sequence, as
+        cu_seqlens reflects actual boundaries. Padding at end is ignored.
 
         Args:
             model: The multimodal model
@@ -2793,20 +2800,24 @@ class GPUModelRunner(
 
         num_images = len(grid_thw_list)
         if num_images < target_batch_size:
-            # Not enough images for a full batch, fall back to eager
+            # Not enough images for a full batch, fall back to other modes
             return None
 
         # Get spatial merge size for output token calculation
         visual = getattr(model, "visual", None)
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
 
-        # Sort images by grid size (patch count) for efficient grouping
+        def compute_output_tokens(grid: list[int]) -> int:
+            t, h, w = grid
+            return t * (h // spatial_merge_size) * (w // spatial_merge_size)
+
+        # Sort images by output token count for efficient grouping
         # Keep track of original indices for reordering output
-        indexed_grids = [(i, grid, grid[0] * grid[1] * grid[2])
+        indexed_grids = [(i, grid, compute_output_tokens(grid))
                          for i, grid in enumerate(grid_thw_list)]
         sorted_grids = sorted(indexed_grids, key=lambda x: x[2])
 
-        # Calculate patch offsets for slicing
+        # Calculate patch offsets for slicing pixel_values
         patch_offsets = [0]
         for grid in grid_thw_list:
             t, h, w = grid
@@ -2822,81 +2833,60 @@ class GPUModelRunner(
                              for i in range(target_batch_size)]
             batch_grids = [grid_thw_list[i] for i in batch_indices]
 
-            # Find the largest grid in this batch (for padding)
-            max_patches = max(g[0] * g[1] * g[2] for g in batch_grids)
-            max_grid = None
-            for g in batch_grids:
-                if g[0] * g[1] * g[2] == max_patches:
-                    max_grid = g
-                    break
+            # Calculate max output tokens needed in this batch
+            max_output_tokens = max(compute_output_tokens(g) for g in batch_grids)
 
-            # Check if we have a graph for this batch_size and grid
-            graph_key = self.encoder_cudagraph_manager.get_graph_for_grid(
-                [max_grid] * target_batch_size, batch_size=target_batch_size
+            # Find a bucket that can fit max_output_tokens for this batch_size
+            graph_key = self.encoder_cudagraph_manager.find_bucket_for_tokens(
+                max_output_tokens, spatial_merge_size, batch_size=target_batch_size
             )
             if graph_key is None:
-                # No graph for this configuration, skip to eager
+                # No suitable bucket, skip this batch
                 processed += target_batch_size
                 continue
 
-            # Pad all images in batch to max_grid size
-            padded_pixels_list = []
+            # Pack pixel values contiguously (no interleaved padding)
+            pixels_list = []
             for idx in batch_indices:
                 start = patch_offsets[idx]
                 end = patch_offsets[idx + 1]
                 img_pixels = batched_pixel_values[start:end]
+                pixels_list.append(img_pixels)
 
-                actual_patches = img_pixels.shape[0]
-                if actual_patches < max_patches:
-                    # Pad with zeros
-                    padding = torch.zeros(
-                        max_patches - actual_patches,
-                        img_pixels.shape[1],
-                        dtype=img_pixels.dtype,
-                        device=img_pixels.device,
-                    )
-                    img_pixels = torch.cat([img_pixels, padding], dim=0)
-                padded_pixels_list.append(img_pixels)
+            # Concatenate contiguously - NO padding between images
+            contiguous_pixels = torch.cat(pixels_list, dim=0)
 
-            # Concatenate for batched execution
-            batched_input = torch.cat(padded_pixels_list, dim=0)
-
-            # Run batched CUDA graph
-            result = self.encoder_cudagraph_manager.run_batched(
-                batched_input,
-                [max_grid] * target_batch_size,
-                batch_size=target_batch_size,
+            # Run batched CUDA graph with contiguous packing
+            result = self.encoder_cudagraph_manager.run_batched_contiguous(
+                contiguous_pixels,
+                batch_grids,
+                graph_key,
+                spatial_merge_size=spatial_merge_size,
             )
 
             if result is not None:
-                # Split output by image and trim to actual size
-                output_tokens_per_image = (
-                    max_grid[0]
-                    * (max_grid[1] // spatial_merge_size)
-                    * (max_grid[2] // spatial_merge_size)
-                )
+                # Extract outputs using cumulative sizes (contiguous layout)
+                # cu_seqlens = [0, size0, size0+size1, ..., total]
+                output_offset = 0
                 for i, idx in enumerate(batch_indices):
-                    actual_grid = grid_thw_list[idx]
-                    actual_tokens = (
-                        actual_grid[0]
-                        * (actual_grid[1] // spatial_merge_size)
-                        * (actual_grid[2] // spatial_merge_size)
-                    )
-                    start = i * output_tokens_per_image
-                    # Trim to actual output size
-                    outputs[idx] = result[start:start + actual_tokens].clone()
+                    actual_tokens = compute_output_tokens(batch_grids[i])
+                    outputs[idx] = result[
+                        output_offset:output_offset + actual_tokens
+                    ].clone()
+                    output_offset += actual_tokens
 
                 if self.encoder_cudagraph_verbose:
                     logger.info(
-                        "Grouped batch: batch_size=%d, max_grid=%s, processed=%d",
-                        target_batch_size, max_grid, target_batch_size
+                        "Grouped batch (contiguous): batch_size=%d, "
+                        "grids=%s, graph_key=%s",
+                        target_batch_size, batch_grids, graph_key
                     )
 
             processed += target_batch_size
 
         # Check if all images were processed
         if any(o is None for o in outputs):
-            # Some images not processed, fall back to full eager
+            # Some images not processed, fall back to other modes
             return None
 
         return outputs
