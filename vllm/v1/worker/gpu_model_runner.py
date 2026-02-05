@@ -2895,7 +2895,6 @@ class GPUModelRunner(
 
         if self.encoder_cudagraph_verbose:
             # Pre-compute padding waste estimate for logging
-            total_actual_tokens = sum(x[2] for x in sorted_grids)
             total_bucket_tokens = 0
             waste_per_batch = []
 
