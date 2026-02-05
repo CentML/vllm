@@ -2967,6 +2967,13 @@ class GPUModelRunner(
             )
             if graph_key is None:
                 # No suitable bucket, skip this batch
+                if self.encoder_cudagraph_verbose:
+                    logger.info(
+                        "  SKIP batch %d: no bucket for max_tokens=%d, grids=%s",
+                        processed // target_batch_size + 1,
+                        max_output_tokens,
+                        batch_grids,
+                    )
                 processed += target_batch_size
                 continue
 
@@ -3007,6 +3014,18 @@ class GPUModelRunner(
                         processed // target_batch_size + 1,
                         batch_grids,
                         graph_key,
+                    )
+            else:
+                # run_batched_contiguous returned None - log why
+                if self.encoder_cudagraph_verbose:
+                    total_patches = contiguous_pixels.shape[0]
+                    logger.info(
+                        "  FAIL batch %d: run_batched_contiguous returned None, "
+                        "graph_key=%s, total_patches=%d, grids=%s",
+                        processed // target_batch_size + 1,
+                        graph_key,
+                        total_patches,
+                        batch_grids,
                     )
 
             processed += target_batch_size
