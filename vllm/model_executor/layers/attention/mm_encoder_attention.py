@@ -106,7 +106,7 @@ class MMEncoderAttention(CustomOp):
 
         # Initialize Transformer Engine FP8 attention if backend is TE
         # for each batch size
-        self.te_attn_op = dict()
+        self.te_attn_op = None
         self.te_fp8_recipe = None
         self.is_te_fp8_backend = (
             self.attn_backend == AttentionBackendEnum.TE_FP8
@@ -331,17 +331,28 @@ class MMEncoderAttention(CustomOp):
         
         max_seqlen = TE_FIXED_MAX_SEQLEN
 
-        with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
-            output = self.te_attn_op(
-                query,
-                key,
-                value,
-                attention_mask=None,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_kv=max_seqlen,
-            )
+        # NVTX annotation with all parameters for lazy_init and te_attn_op
+        nvtx_msg = (
+            f"TE_FP8_BSHD: "
+            f"Q={tuple(query.shape)}, K={tuple(key.shape)}, V={tuple(value.shape)}, "
+            f"num_heads={self.num_heads}, kv_channels={padded_head_size}, "
+            f"num_gqa_groups={num_gqa_groups}, attn_mask_type={attn_mask_type}, "
+            f"softmax_scale={self.scale}, qkv_format=bshd, "
+            f"cu_seqlens={cu_seqlens.shape if cu_seqlens is not None else None}, "
+            f"max_seqlen={max_seqlen}"
+        )
+        with torch.cuda.nvtx.range(nvtx_msg):
+            with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
+                output = self.te_attn_op(
+                    query,
+                    key,
+                    value,
+                    attention_mask=None,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
+                )
         
         # Output is (batch, seq, heads, padded_dim) or (batch, seq, heads*padded_dim)
         # Handle both cases
@@ -445,17 +456,27 @@ class MMEncoderAttention(CustomOp):
             qkv_format="thd",
         )
         
-        with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
-            output = self.te_attn_op[bsz](
-                query,
-                key,
-                value,
-                attention_mask=None,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_kv=max_seqlen,
-            )
+        # NVTX annotation with all parameters for lazy_init and te_attn_op
+        nvtx_msg = (
+            f"TE_FP8_THD: "
+            f"Q={tuple(query.shape)}, K={tuple(key.shape)}, V={tuple(value.shape)}, "
+            f"batch_size={bsz}, num_heads={self.num_heads}, kv_channels={padded_head_size}, "
+            f"num_gqa_groups={num_gqa_groups}, attn_mask_type={attn_mask_type}, "
+            f"softmax_scale={self.scale}, qkv_format=thd, "
+            f"cu_seqlens={cu_seqlens.shape}, max_seqlen={max_seqlen}"
+        )
+        with torch.cuda.nvtx.range(nvtx_msg):
+            with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
+                output = self.te_attn_op[bsz](
+                    query,
+                    key,
+                    value,
+                    attention_mask=None,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
+                )
         
         # TE returns (T, H*D_padded) flattened, need to reshape to (T, H, D_padded) first
         if output.dim() == 2:
