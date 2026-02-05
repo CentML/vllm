@@ -23,6 +23,10 @@ logger = init_logger(__name__)
 # This avoids creating a new graph for each unique batch size at runtime
 TE_BATCH_BUCKETS = [1, 2, 4, 8, 16, 32]
 
+# Seqlen buckets for BSHD format - Q/K/V tensors are padded to these sizes
+# so cuDNN sees a fixed set of tensor shapes and avoids recompilation
+TE_SEQLEN_BUCKETS = [2048, 4096, 6144, 10240, 16384, 25600, 35840, 65536]
+
 # Fixed max_seqlen to avoid cuDNN recompilation when sequence lengths vary
 TE_FIXED_MAX_SEQLEN = 128 * 1024
 
@@ -151,6 +155,17 @@ class MMEncoderAttention(CustomOp):
             value = torch.repeat_interleave(value, num_repeat, dim=2)
 
         return query, key, value
+
+    @staticmethod
+    def _find_seqlen_bucket(seqlen: int) -> int | None:
+        """Find the smallest seqlen bucket that can fit the given seqlen.
+
+        Returns None if seqlen exceeds the largest bucket.
+        """
+        for bucket in TE_SEQLEN_BUCKETS:
+            if bucket >= seqlen:
+                return bucket
+        return None
 
     def _pad_cu_seqlens_to_bucket(
         self,
@@ -305,7 +320,18 @@ class MMEncoderAttention(CustomOp):
             query = torch.nn.functional.pad(query, (0, pad_size))
             key = torch.nn.functional.pad(key, (0, pad_size))
             value = torch.nn.functional.pad(value, (0, pad_size))
-        
+
+        # Pad Q/K/V seqlen dimension to a bucket size to avoid cuDNN
+        # recompilation when different images have different resolutions.
+        # cu_seqlens already tracks the real sequence boundaries.
+        bucket_seqlen = self._find_seqlen_bucket(q_len)
+        if bucket_seqlen is not None and bucket_seqlen > q_len:
+            seq_pad = bucket_seqlen - q_len
+            # Pad S dimension: shape is (B, S, H, D), so pad dim=1
+            query = torch.nn.functional.pad(query, (0, 0, 0, 0, 0, seq_pad))
+            key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, seq_pad))
+            value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, seq_pad))
+
         # Determine if we have variable sequence lengths
         # cu_seqlens indicates variable lengths when provided
         attention_mask = None
@@ -354,12 +380,18 @@ class MMEncoderAttention(CustomOp):
                     max_seqlen_kv=max_seqlen,
                 )
         
-        # Output is (batch, seq, heads, padded_dim) or (batch, seq, heads*padded_dim)
-        # Handle both cases
+        # Output is (batch, padded_seq, heads, padded_dim) or
+        # (batch, padded_seq, heads*padded_dim).
+        # Handle both cases.
         if output.dim() == 3:
-            # Output is (batch, seq, heads*dim) flattened
-            output = output.reshape(bsz, q_len, self.num_heads, padded_head_size)
-        
+            # Output is (batch, padded_seq, heads*dim) flattened
+            output = output.reshape(
+                bsz, output.size(1), self.num_heads, padded_head_size
+            )
+
+        # Slice back to original seqlen (remove S-dimension padding)
+        output = output[:, :q_len, :, :]
+
         # Remove head padding if needed
         if needs_padding:
             output = output[..., :original_head_size]
@@ -371,7 +403,6 @@ class MMEncoderAttention(CustomOp):
         else:
             # Already in (batch, seq, num_heads, head_size) format
             pass
-        
         
         return output
 
