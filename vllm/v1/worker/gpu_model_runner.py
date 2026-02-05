@@ -2598,7 +2598,6 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         return sampler_output
 
     def _bookkeeping_sync(
@@ -3372,6 +3371,8 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
             return output
