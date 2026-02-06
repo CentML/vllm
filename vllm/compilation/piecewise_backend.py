@@ -72,8 +72,35 @@ class PiecewiseBackend:
         log_string = f"PiecewiseBackend: compile_ranges: {self.compile_ranges}"
         logger.debug_once(log_string)
 
-        self.compile_sizes = self.compilation_config.compile_sizes
-        log_string = f"PiecewiseBackend: compile_sizes: {self.compile_sizes}"
+        # Use encoder-specific capture sizes for encoder compilation
+        self.compile_sizes: list[Any] | None = None
+        if self.is_encoder_compilation:
+            encoder_capture_sizes = (
+                self.compilation_config.encoder_cudagraph_capture_sizes
+            )
+            if encoder_capture_sizes is not None:
+                # Convert from output tokens to input patches
+                # encoder_cudagraph_capture_sizes is specified in output tokens
+                # but runtime_shape (from sym_shape_indices) is in input patches
+                merge_size_sq = self.compilation_config.encoder_spatial_merge_size**2
+                self.compile_sizes = [
+                    size * merge_size_sq for size in encoder_capture_sizes
+                ]
+                logger.debug_once(
+                    "PiecewiseBackend: converted encoder capture sizes from "
+                    "output tokens %s to input patches %s (merge_size²=%d)",
+                    tuple(encoder_capture_sizes),
+                    tuple(self.compile_sizes),
+                    merge_size_sq,
+                )
+            else:
+                self.compile_sizes = None
+        else:
+            self.compile_sizes = self.compilation_config.compile_sizes
+        log_string = (
+            f"PiecewiseBackend: compile_sizes: {self.compile_sizes} "
+            f"(is_encoder={self.is_encoder_compilation})"
+        )
         logger.debug_once(log_string)
 
         self.sym_shape_indices = sym_shape_indices
@@ -143,15 +170,13 @@ class PiecewiseBackend:
             range_entry.compiled = True
             self.to_be_compiled_ranges.remove(range_entry.compile_range)
 
+            is_exact_size = range_entry.compile_range.is_single_size()
+
             # args are real arguments
             # fakify for range, real args for concrete size.
             # For concrete size, we clear the shape env in
             # compiler_manager.compile() so no need to fakify.
-            args_list = (
-                self._fakify_args(args)
-                if not range_entry.compile_range.is_single_size()
-                else list(args)
-            )
+            args_list = self._fakify_args(args) if not is_exact_size else list(args)
             range_entry.runnable = self.vllm_backend.compiler_manager.compile(
                 self.graph,
                 args_list,
@@ -169,23 +194,53 @@ class PiecewiseBackend:
         # If not found, we search for the range entry
         # that contains the runtime shape.
         if self.compile_sizes is None:
+            logger.debug(
+                "PIECEWISE: compile_sizes is None, shape=%d, is_encoder=%s",
+                runtime_shape,
+                self.is_encoder_compilation,
+            )
             return None
 
         if runtime_shape in self.compile_sizes:
+            # Exact match with capture size - will use cudagraph
+            logger.debug(
+                "PIECEWISE: exact match shape=%d in compile_sizes, is_encoder=%s",
+                runtime_shape,
+                self.is_encoder_compilation,
+            )
             return self.range_entries[Range(start=runtime_shape, end=runtime_shape)]
         else:
+            # No exact match - fall back to compile_ranges (no cudagraph)
             for range in self.compile_ranges:
                 if runtime_shape in range:
+                    logger.debug(
+                        "PIECEWISE: shape=%d not in compile_sizes, "
+                        "using compile_range=%s (NO CUDAGRAPH), is_encoder=%s",
+                        runtime_shape,
+                        range,
+                        self.is_encoder_compilation,
+                    )
                     return self.range_entries[range]
+            # Shape not in any range - will cause assertion error
+            logger.warning(
+                "PIECEWISE: shape=%d not in compile_sizes=%s or "
+                "compile_ranges=%s, is_encoder=%s",
+                runtime_shape,
+                self.compile_sizes,
+                self.compile_ranges,
+                self.is_encoder_compilation,
+            )
         return None
 
     def __call__(self, *args: Any) -> Any:
         runtime_shape = args[self.sym_shape_indices[0]]
+
         range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
             f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
         )
 
-        self._maybe_compile_for_range_entry(range_entry, args)
-        return range_entry.runnable(*args)
+        self._maybe_compile_for_range_entry(range_entry, args)  # type: ignore[arg-type]
+
+        return range_entry.runnable(*args)  # type: ignore[union-attr]

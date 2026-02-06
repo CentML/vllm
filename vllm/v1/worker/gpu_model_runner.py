@@ -155,6 +155,7 @@ from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
+from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -425,6 +426,15 @@ class GPUModelRunner(
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Encoder CUDA graph manager for ViT
+        self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
+        self.encoder_cudagraph_verbose: bool = False
+        self.encoder_cudagraph_budget_mode: bool = False
+        # Pre-allocated buffers for piecewise padded mode (lazily initialized)
+        # Key: capture_size (output tokens), Value: dict of buffers
+        self._piecewise_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        self._init_encoder_cudagraph_manager()
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -680,6 +690,65 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.layerwise_nvtx_hooks_registered = False
 
+    def _init_encoder_cudagraph_manager(self) -> None:
+        """Initialize encoder CUDA graph manager if enabled in config."""
+        if self.compilation_config is None:
+            return
+
+        # Always check verbose logging first (applies to all modes)
+        self.encoder_cudagraph_verbose = getattr(
+            self.compilation_config,
+            "encoder_cudagraph_verbose",
+            False,
+        )
+
+        # Check if piecewise encoder cudagraph mode is enabled
+        # In piecewise mode, torch.compile handles graph splitting at attention ops,
+        # so we don't need the full EncoderCudaGraphManager
+        encoder_cudagraph_piecewise = getattr(
+            self.compilation_config, "encoder_cudagraph_piecewise", False
+        )
+        if encoder_cudagraph_piecewise:
+            compile_mm_encoder = getattr(
+                self.compilation_config, "compile_mm_encoder", False
+            )
+            if not compile_mm_encoder:
+                logger.warning(
+                    "encoder_cudagraph_piecewise=True requires "
+                    "compile_mm_encoder=True. Piecewise encoder cudagraph "
+                    "will not be effective."
+                )
+            else:
+                logger.info(
+                    "Piecewise encoder CUDA graph mode enabled. "
+                    "torch.compile will handle graph splitting at attention ops."
+                )
+            return
+
+        if not getattr(self.compilation_config, "cudagraph_mm_encoder", False):
+            return
+
+        encoder_graph_pool = torch.cuda.graph_pool_handle()
+
+        self.encoder_cudagraph_manager = EncoderCudaGraphManager(
+            vllm_config=self.vllm_config,
+            device=self.device,
+            dtype=self.dtype,
+            graph_pool=encoder_graph_pool,
+            verbose=self.encoder_cudagraph_verbose,
+        )
+
+        # Check if budget batching is configured
+        self.encoder_cudagraph_budget_mode = bool(
+            self.encoder_cudagraph_manager.token_budgets
+            and self.encoder_cudagraph_manager.max_images_per_batch > 0
+        )
+
+        logger.info(
+            "Encoder CUDA graph manager initialized: budget_mode=%s",
+            self.encoder_cudagraph_budget_mode,
+        )
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:
@@ -713,7 +782,7 @@ class GPUModelRunner(
 
         attn_layers = self.compilation_config.static_forward_context
         for name, module in attn_layers.items():
-            if isinstance(module, (Attention, MLAAttention)):
+            if isinstance(module, Attention | MLAAttention):
                 # TODO: Generally, scale is 1.0 if user uses on-the-fly fp8
                 # kvcache quant. However, to get better accuracy, compression
                 # frameworks like llm-compressors allow users to tune the
@@ -2302,20 +2371,48 @@ class GPUModelRunner(
                     curr_group_outputs_lst.extend(micro_batch_outputs)
 
                 curr_group_outputs = curr_group_outputs_lst
+            elif self.encoder_cudagraph_budget_mode:
+                # Budget batch mode: replaces grouped batch, one-by-one,
+                # exact match, and padded modes
+                budget_result = self._execute_budget_batch(
+                    model, mm_kwargs_group, modality, num_items
+                )
+                if budget_result is not None:
+                    curr_group_outputs = budget_result
+                else:
+                    # Fall back to eager
+                    if self.encoder_cudagraph_verbose:
+                        logger.info(
+                            "ViT BUDGET BATCH fallback to eager: "
+                            "modality=%s, num_items=%d",
+                            modality,
+                            num_items,
+                        )
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
             else:
-                # Run the encoder.
-                # `curr_group_outputs` is either of the following:
-                # 1. A tensor of shape (num_items, feature_size, hidden_size)
-                # in case feature_size is fixed across all multimodal items.
-                # 2. A list or tuple (length: num_items) of tensors,
-                # each of shape (feature_size, hidden_size) in case the feature
-                # size is dynamic depending on the input multimodal items.
-                curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                # No budget mode: try piecewise -> eager
+                piecewise_result = None
+                piecewise_enabled = self.compilation_config is not None and getattr(
+                    self.compilation_config,
+                    "encoder_cudagraph_piecewise",
+                    False,
+                )
+
+                if piecewise_enabled:
+                    piecewise_result = self._execute_encoder_piecewise_padded(
+                        model, mm_kwargs_group, modality
+                    )
+
+                if piecewise_result is not None:
+                    curr_group_outputs = piecewise_result
+                else:
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
                 expected_num_items=num_items,
             )
+            assert curr_group_outputs is not None  # sanity_check ensures this
             encoder_outputs.extend(curr_group_outputs)
 
         # Cache the encoder outputs by mm_hash
@@ -2324,7 +2421,758 @@ class GPUModelRunner(
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
+        # Log encoder CUDA graph stats periodically (verbose only)
+        if self.encoder_cudagraph_manager is not None:
+            self.encoder_cudagraph_manager.get_stats(
+                verbose=self.encoder_cudagraph_verbose
+            )
+
         return encoder_outputs
+
+    def _execute_budget_batch(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+        num_items: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Execute the encoder using budget batch CUDA graphs.
+
+        Sorts images by output token count (smallest first), greedily packs
+        them into budget-sized batches, and replays the smallest fitting
+        CUDA graph. Falls back to None (eager) if any batch can't find a
+        fitting budget graph.
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+            num_items: Number of items in the batch
+
+        Returns:
+            List of encoder outputs if CUDA graph was used, None otherwise
+        """
+        manager = self.encoder_cudagraph_manager
+        if manager is None or not manager.budget_graph_keys:
+            return None
+
+        if modality not in ("image", "video"):
+            return None
+
+        # Extract grid_thw
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
+        if grid_thw is None:
+            return None
+
+        # Convert to list if tensor
+        if hasattr(grid_thw, "tolist"):
+            grid_thw = grid_thw.tolist()
+
+        # Extract pixel_values
+        if modality == "image":
+            pixel_values = mm_kwargs_group.get("pixel_values")
+        else:  # video
+            pixel_values = mm_kwargs_group.get("pixel_values_videos")
+
+        if pixel_values is None:
+            return None
+
+        # Ensure pixel_values is on the correct device
+        pixel_values = pixel_values.to(
+            device=self.device, dtype=self.dtype
+        ).contiguous()
+
+        # Get spatial merge size
+        visual = getattr(model, "visual", None)
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        max_budget = max(manager.budget_graph_keys.keys())
+        max_images = manager.max_images_per_batch
+
+        # Compute per-image info: (output_tokens, input_patches, orig_idx)
+        image_info: list[tuple[int, int, int]] = []
+        for i, (t, h, w) in enumerate(grid_thw):
+            out_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            in_patches = t * h * w
+            image_info.append((out_tokens, in_patches, i))
+
+        # Sort by output tokens ascending (small first)
+        sorted_images = sorted(image_info, key=lambda x: x[0])
+
+        # Compute pixel_values offsets for each original image
+        patch_offsets = [0]
+        for t, h, w in grid_thw:
+            patch_offsets.append(patch_offsets[-1] + t * h * w)
+
+        # Greedy packing into budget batches
+        batches: list[list[tuple[int, int, int]]] = []
+        current_batch: list[tuple[int, int, int]] = []
+        current_tokens = 0
+
+        for out_tokens, in_patches, orig_idx in sorted_images:
+            if (
+                current_tokens + out_tokens <= max_budget
+                and len(current_batch) < max_images
+            ):
+                current_batch.append((out_tokens, in_patches, orig_idx))
+                current_tokens += out_tokens
+            else:
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [(out_tokens, in_patches, orig_idx)]
+                current_tokens = out_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        # Execute each packed batch
+        outputs: list[torch.Tensor | None] = [None] * len(grid_thw)
+
+        for batch in batches:
+            total_out_tokens = sum(out_tok for out_tok, _, _ in batch)
+
+            # Find smallest budget graph that fits
+            graph_key = manager.find_budget_graph(total_out_tokens)
+            if graph_key is None:
+                logger.debug(
+                    "No budget graph for %d tokens, falling back to eager",
+                    total_out_tokens,
+                )
+                return None
+
+            # Concatenate pixel values in sorted order
+            pv_slices = []
+            batch_grids = []
+            for _, _, orig_idx in batch:
+                start = patch_offsets[orig_idx]
+                end = patch_offsets[orig_idx + 1]
+                pv_slices.append(pixel_values[start:end])
+                batch_grids.append(grid_thw[orig_idx])
+
+            packed_pv = torch.cat(pv_slices, dim=0)
+
+            # Run the budget graph
+            output = manager.run_batched_contiguous(
+                packed_pv, batch_grids, graph_key, spatial_merge_size
+            )
+            if output is None:
+                logger.debug(
+                    "Budget graph replay failed for key %s, falling back to eager",
+                    graph_key,
+                )
+                return None
+
+            # Split output by per-image output token counts
+            offset = 0
+            for out_tokens, _, orig_idx in batch:
+                outputs[orig_idx] = output[offset : offset + out_tokens].clone()
+                offset += out_tokens
+
+            if self.encoder_cudagraph_verbose:
+                bs, gt, gh, gw = graph_key
+                budget_tokens = (
+                    bs * gt * (gh // spatial_merge_size) * (gw // spatial_merge_size)
+                )
+                logger.info(
+                    "ViT BUDGET BATCH: %d images, %d tokens, "
+                    "budget=%d, waste=%.1f%%, graph_key=%s",
+                    len(batch),
+                    total_out_tokens,
+                    budget_tokens,
+                    (budget_tokens - total_out_tokens) / budget_tokens * 100,
+                    graph_key,
+                )
+
+        # Check all images were processed
+        if any(o is None for o in outputs):
+            return None
+
+        return outputs  # type: ignore[return-value]
+
+    def _find_nearest_encoder_capture_size(self, num_tokens: int) -> int | None:
+        """Find the smallest capture size >= num_tokens for piecewise mode.
+
+        Args:
+            num_tokens: The actual number of output tokens
+
+        Returns:
+            The nearest capture size, or None if no suitable size found
+        """
+        if self.compilation_config is None:
+            return None
+
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return None
+
+        # Find smallest size >= num_tokens
+        for size in sorted(capture_sizes):
+            if size >= num_tokens:
+                return size
+
+        # num_tokens exceeds all capture sizes
+        return None
+
+    # Class-level counters for piecewise padded mode statistics
+    _piecewise_stats: dict = {}
+
+    @classmethod
+    def _init_piecewise_stats(cls):
+        if not cls._piecewise_stats:
+            cls._piecewise_stats = {
+                "calls": 0,
+                "executions": 0,
+                "total_actual_tokens": 0,
+                "total_padded_tokens": 0,
+                "capture_size_hits": {},  # capture_size -> count
+                "fallback_reasons": {},  # reason -> count
+            }
+
+    def _record_piecewise_fallback(self, reason: str):
+        self._init_piecewise_stats()
+        self._piecewise_stats["calls"] += 1
+        self._piecewise_stats["fallback_reasons"][reason] = (
+            self._piecewise_stats["fallback_reasons"].get(reason, 0) + 1
+        )
+        if self.encoder_cudagraph_verbose:
+            logger.info("ViT PIECEWISE fallback: %s", reason)
+
+    @classmethod
+    def _record_piecewise_execution(cls, actual_tokens: int, capture_size: int):
+        cls._init_piecewise_stats()
+        cls._piecewise_stats["calls"] += 1
+        cls._piecewise_stats["executions"] += 1
+        cls._piecewise_stats["total_actual_tokens"] += actual_tokens
+        cls._piecewise_stats["total_padded_tokens"] += capture_size
+        cls._piecewise_stats["capture_size_hits"][capture_size] = (
+            cls._piecewise_stats["capture_size_hits"].get(capture_size, 0) + 1
+        )
+
+    @classmethod
+    def get_piecewise_stats_summary(cls) -> str:
+        cls._init_piecewise_stats()
+        stats = cls._piecewise_stats
+        if stats["calls"] == 0:
+            return "Piecewise padded: no calls"
+
+        total_actual = stats["total_actual_tokens"]
+        total_padded = stats["total_padded_tokens"]
+        waste_pct = (
+            (total_padded - total_actual) / total_padded * 100
+            if total_padded > 0
+            else 0
+        )
+
+        lines = [
+            "Piecewise padded stats:",
+            f"  Calls: {stats['calls']}, Executions: {stats['executions']}",
+            f"  Total actual tokens: {total_actual}",
+            f"  Total padded tokens: {total_padded}",
+            f"  Padding waste: {waste_pct:.1f}%",
+            f"  Capture size hits: {stats['capture_size_hits']}",
+            f"  Fallback reasons: {stats['fallback_reasons']}",
+        ]
+        return "\n".join(lines)
+
+    def _execute_encoder_piecewise_padded(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+    ) -> list[torch.Tensor] | None:
+        """Execute encoder with padding for piecewise cudagraph mode.
+
+        Pre-computes embeddings outside the compiled graph, pads all tensors
+        to the nearest capture size, then calls forward_piecewise. This allows
+        cudagraph capture at fixed sizes while handling variable batch sizes.
+
+        The key insight is that position embeddings depend on grid dimensions
+        and must be computed OUTSIDE the compiled graph. By pre-computing them
+        and padding, we can achieve cudagraph hits for the compiled regions.
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+
+        Returns:
+            List of encoder outputs if padding was applied, None otherwise
+        """
+        if self.encoder_cudagraph_verbose:
+            logger.info(
+                "ViT PIECEWISE: _execute_encoder_piecewise_padded called, modality=%s",
+                modality,
+            )
+
+        # Only support image/video modalities
+        if modality not in ("image", "video"):
+            self._record_piecewise_fallback(f"unsupported_modality:{modality}")
+            return None
+
+        # Extract grid_thw and pixel_values
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        pixel_key = "pixel_values"
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
+            pixel_key = "pixel_values_videos"
+        if grid_thw is None:
+            self._record_piecewise_fallback("no_grid_thw")
+            return None
+
+        pixel_values = mm_kwargs_group.get(pixel_key)
+        if pixel_values is None:
+            self._record_piecewise_fallback("no_pixel_values")
+            return None
+
+        # Convert to list if tensor
+        if hasattr(grid_thw, "tolist"):
+            grid_thw_list = grid_thw.tolist()
+        else:
+            grid_thw_list = list(grid_thw)
+
+        # Get visual encoder and check for forward_piecewise support
+        visual = getattr(model, "visual", None)
+        if visual is None:
+            self._record_piecewise_fallback("no_visual_encoder")
+            return None
+
+        # Check if forward_piecewise is available
+        if not hasattr(visual, "forward_piecewise"):
+            self._record_piecewise_fallback("no_forward_piecewise_method")
+            return None
+
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        # Calculate actual tokens
+        actual_num_patches = sum(t * h * w for t, h, w in grid_thw_list)
+        actual_output_tokens = actual_num_patches // (spatial_merge_size**2)
+
+        # Find nearest capture size
+        capture_size = self._find_nearest_encoder_capture_size(actual_output_tokens)
+        if capture_size is None:
+            self._record_piecewise_fallback(
+                f"no_capture_size_for_{actual_output_tokens}_tokens"
+            )
+            return None
+
+        # Calculate padding needed
+        padding_output_tokens = capture_size - actual_output_tokens
+        padding_patches = padding_output_tokens * (spatial_merge_size**2)
+        padded_num_patches = capture_size * (spatial_merge_size**2)
+
+        # Pre-compute embeddings for real images (OUTSIDE compiled graph)
+        # This is the key to making piecewise padding work
+        precomputed = visual.precompute_for_cudagraph(grid_thw_list)
+        pos_embeds = precomputed["pos_embeds"]
+        rotary_pos_emb_cos = precomputed["rotary_pos_emb_cos"]
+        rotary_pos_emb_sin = precomputed["rotary_pos_emb_sin"]
+        cu_seqlens = precomputed["cu_seqlens"]
+        max_seqlen = precomputed["max_seqlen"]
+        sequence_lengths = precomputed["sequence_lengths"]
+
+        num_input_patches = pixel_values.shape[0]
+
+        # Get or create pre-allocated buffers for this capture_size
+        # This avoids allocation and zeros kernels on every call
+        buffers = self._piecewise_buffers.get(capture_size)
+        if buffers is None:
+            # Lazily allocate buffers on first use for this capture_size
+            # Using torch.zeros ensures padding region is valid (not garbage)
+            # The zeros kernel only runs once per capture_size, not per call
+            buffers = {
+                "pixel_values": torch.zeros(
+                    (padded_num_patches, pixel_values.shape[1]),
+                    dtype=visual.dtype,
+                    device=pixel_values.device,
+                ),
+                "pos_embeds": torch.zeros(
+                    (padded_num_patches, pos_embeds.shape[1]),
+                    dtype=pos_embeds.dtype,
+                    device=pos_embeds.device,
+                ),
+                "rotary_cos": torch.zeros(
+                    (padded_num_patches, rotary_pos_emb_cos.shape[1]),
+                    dtype=rotary_pos_emb_cos.dtype,
+                    device=rotary_pos_emb_cos.device,
+                ),
+                "rotary_sin": torch.zeros(
+                    (padded_num_patches, rotary_pos_emb_sin.shape[1]),
+                    dtype=rotary_pos_emb_sin.dtype,
+                    device=rotary_pos_emb_sin.device,
+                ),
+                # Pre-allocate cu_seqlens with max possible entries
+                # (assuming max ~1000 images per batch is more than enough)
+                "cu_seqlens": torch.zeros(
+                    (1001,), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+                ),
+                "sequence_lengths": torch.zeros(
+                    (1000,),
+                    dtype=sequence_lengths.dtype,
+                    device=sequence_lengths.device,
+                ),
+            }
+            self._piecewise_buffers[capture_size] = buffers
+            if self.encoder_cudagraph_verbose:
+                logger.info(
+                    "ViT PIECEWISE: Allocated buffers for capture_size=%d (patches=%d)",
+                    capture_size,
+                    padded_num_patches,
+                )
+
+        # Copy data into pre-allocated buffers (no allocation, no zeros kernel)
+        padded_pixel_values = buffers["pixel_values"]
+        padded_pixel_values[:num_input_patches].copy_(pixel_values.type(visual.dtype))
+
+        padded_pos_embeds = buffers["pos_embeds"]
+        padded_pos_embeds[:num_input_patches].copy_(pos_embeds)
+
+        padded_rotary_cos = buffers["rotary_cos"]
+        padded_rotary_cos[:num_input_patches].copy_(rotary_pos_emb_cos)
+
+        padded_rotary_sin = buffers["rotary_sin"]
+        padded_rotary_sin[:num_input_patches].copy_(rotary_pos_emb_sin)
+
+        # Update cu_seqlens to include padding as a separate sequence
+        num_seqs = cu_seqlens.shape[0]
+        padded_cu_seqlens = buffers["cu_seqlens"]
+        padded_cu_seqlens[:num_seqs].copy_(cu_seqlens)
+        if padding_patches > 0:
+            # Add padding sequence boundary
+            padded_cu_seqlens[num_seqs] = cu_seqlens[-1] + padding_patches
+            num_seqs += 1
+
+        num_seq_lens = sequence_lengths.shape[0]
+        padded_sequence_lengths = buffers["sequence_lengths"]
+        padded_sequence_lengths[:num_seq_lens].copy_(sequence_lengths)
+        if padding_patches > 0:
+            padded_sequence_lengths[num_seq_lens] = padding_patches
+            num_seq_lens += 1
+
+        # Slice to actual size needed
+        padded_cu_seqlens = padded_cu_seqlens[:num_seqs]
+        padded_sequence_lengths = padded_sequence_lengths[:num_seq_lens]
+
+        # Update max_seqlen if padding sequence is larger
+        if padding_patches > max_seqlen.item():
+            max_seqlen = torch.tensor(
+                padding_patches, dtype=max_seqlen.dtype, device=max_seqlen.device
+            )
+
+        # Call forward_piecewise directly with pre-computed and padded tensors
+        # Enable CUDA graph capture/replay by setting the proper forward context
+        batch_desc = BatchDescriptor(num_tokens=padded_num_patches)
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=batch_desc,
+        ):
+            encoder_output = visual.forward_piecewise(
+                x=padded_pixel_values,
+                pos_embeds=padded_pos_embeds,
+                rotary_pos_emb_cos=padded_rotary_cos,
+                rotary_pos_emb_sin=padded_rotary_sin,
+                cu_seqlens=padded_cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=padded_sequence_lengths,
+            )
+
+        # Split output by actual token counts for each image (exclude padding)
+        merge_size_sq = spatial_merge_size**2
+        sizes = [t * h * w // merge_size_sq for t, h, w in grid_thw_list]
+        real_outputs = list(encoder_output[:actual_output_tokens].split(sizes))
+
+        # Record statistics
+        self._record_piecewise_execution(actual_output_tokens, capture_size)
+
+        if self.encoder_cudagraph_verbose:
+            waste_pct = padding_output_tokens / capture_size * 100
+            stats = self._piecewise_stats
+            total_waste_pct = (
+                (stats["total_padded_tokens"] - stats["total_actual_tokens"])
+                / stats["total_padded_tokens"]
+                * 100
+                if stats["total_padded_tokens"] > 0
+                else 0
+            )
+            logger.info(
+                "ViT PIECEWISE PADDED: actual=%d, capture_size=%d, "
+                "padding=%d (%.1f%%), num_images=%d | "
+                "cumulative: executions=%d, total_actual=%d, total_padded=%d, "
+                "waste=%.1f%%",
+                actual_output_tokens,
+                capture_size,
+                padding_output_tokens,
+                waste_pct,
+                len(grid_thw_list),
+                stats["executions"],
+                stats["total_actual_tokens"],
+                stats["total_padded_tokens"],
+                total_waste_pct,
+            )
+
+        return real_outputs
+
+    def warmup_encoder_piecewise(self) -> None:
+        """Warmup and capture encoder piecewise compilation.
+
+        This mimics LM's two-phase approach:
+        1. Warmup phase: Compile ranges with fake tensors (is_exact_size=False)
+        2. Capture phase: Compile all exact capture_sizes upfront (is_exact_size=True)
+
+        This ensures no compilation happens during execution.
+        """
+        if not getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
+            return
+
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return
+
+        # Get visual encoder
+        model = self.model
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "forward_piecewise"):
+            return
+
+        # Assert for mypy - visual is not None after the check above
+        assert visual is not None
+
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+        merge_size_sq = spatial_merge_size**2
+
+        # Convert capture_sizes to patches
+        capture_sizes_patches = sorted(
+            [size * merge_size_sq for size in capture_sizes],
+            reverse=True,  # Largest first like LM
+        )
+
+        # Helper to create dummy inputs for a given num_patches
+        def create_dummy_inputs(num_patches: int):
+            assert visual is not None  # for mypy
+            patch_embed = getattr(visual, "patch_embed", None)
+            if patch_embed is not None:
+                temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
+                patch_size = getattr(patch_embed, "patch_size", 14)
+                proj = getattr(patch_embed, "proj", None)
+                if proj is not None:
+                    raw_in_channels = getattr(proj, "in_channels", 3)
+                else:
+                    raw_in_channels = 3
+                input_channels = (
+                    raw_in_channels * temporal_patch_size * patch_size * patch_size
+                )
+            else:
+                input_channels = 3 * 2 * 14 * 14
+
+            pixel_values = torch.zeros(
+                (num_patches, input_channels),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            hidden_size = getattr(
+                visual, "hidden_size", getattr(visual, "embed_dim", 1152)
+            )
+
+            pos_embeds = torch.zeros(
+                (num_patches, hidden_size),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
+            rotary_cos = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+            rotary_sin = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            cu_seqlens = torch.tensor(
+                [0, num_patches], dtype=torch.int32, device=self.device
+            )
+            max_seqlen = torch.tensor(num_patches, device=self.device)
+            sequence_lengths = torch.tensor(
+                [num_patches], dtype=torch.int32, device=self.device
+            )
+
+            return (
+                pixel_values,
+                pos_embeds,
+                rotary_cos,
+                rotary_sin,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+            )
+
+        def run_forward(num_patches: int):
+            assert visual is not None  # for mypy
+            (
+                pixel_values,
+                pos_embeds,
+                rotary_cos,
+                rotary_sin,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+            ) = create_dummy_inputs(num_patches)
+
+            with set_forward_context(None, self.vllm_config):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+        # ============================================================
+        # Phase 1: Warmup compile_ranges with fake tensors
+        # ============================================================
+        # Use a size that's NOT in capture_sizes to trigger range compilation
+        # with fake tensors (is_exact_size=False)
+        max_capture_size = max(capture_sizes)  # In output tokens
+        warmup_size_tokens = max_capture_size + 1
+        warmup_size = warmup_size_tokens * merge_size_sq
+
+        # Make sure warmup_size is not an exact capture_size
+        capture_sizes_patches_set = set(capture_sizes_patches)
+        if warmup_size in capture_sizes_patches_set:
+            warmup_size_tokens = max_capture_size + 2
+            warmup_size = warmup_size_tokens * merge_size_sq
+
+        run_forward(warmup_size)
+        torch.cuda.empty_cache()
+
+    def _capture_encoder_piecewise_cudagraphs(self) -> None:
+        """Capture encoder piecewise CUDA graphs for all capture sizes.
+
+        Called during capture_model() when cudagraph capturing is enabled.
+        This triggers CUDAGraphWrapper to capture graphs for each size.
+        """
+        capture_sizes = getattr(
+            self.compilation_config, "encoder_cudagraph_capture_sizes", None
+        )
+        if capture_sizes is None or len(capture_sizes) == 0:
+            return
+
+        model = self.model
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "forward_piecewise"):
+            return
+
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+        merge_size_sq = spatial_merge_size**2
+
+        # Convert capture_sizes to patches, largest first
+        capture_sizes_patches = sorted(
+            [size * merge_size_sq for size in capture_sizes], reverse=True
+        )
+
+        logger.info(
+            "Capturing encoder piecewise CUDA graphs for %d sizes",
+            len(capture_sizes_patches),
+        )
+
+        for num_patches in capture_sizes_patches:
+            # Create dummy inputs
+            patch_embed = getattr(visual, "patch_embed", None)
+            if patch_embed is not None:
+                temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
+                patch_size = getattr(patch_embed, "patch_size", 14)
+                proj = getattr(patch_embed, "proj", None)
+                raw_in_channels = getattr(proj, "in_channels", 3) if proj else 3
+                input_channels = (
+                    raw_in_channels * temporal_patch_size * patch_size * patch_size
+                )
+            else:
+                input_channels = 3 * 2 * 14 * 14
+
+            pixel_values = torch.zeros(
+                (num_patches, input_channels),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            hidden_size = getattr(
+                visual, "hidden_size", getattr(visual, "embed_dim", 1152)
+            )
+            pos_embeds = torch.zeros(
+                (num_patches, hidden_size),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
+            rotary_cos = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+            rotary_sin = torch.zeros(
+                (num_patches, rotary_dim),
+                dtype=visual.dtype,
+                device=self.device,
+            )
+
+            cu_seqlens = torch.tensor(
+                [0, num_patches], dtype=torch.int32, device=self.device
+            )
+            max_seqlen = torch.tensor(num_patches, device=self.device)
+            sequence_lengths = torch.tensor(
+                [num_patches], dtype=torch.int32, device=self.device
+            )
+
+            # Two-pass capture like LM:
+            # Pass 1: NONE mode - triggers torch.compile without CUDA graph capture
+            with set_forward_context(None, self.vllm_config):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+            # Pass 2: PIECEWISE mode - triggers CUDAGraphWrapper capture
+            # (compilation already done in pass 1)
+            batch_desc = BatchDescriptor(num_tokens=num_patches)
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+                batch_descriptor=batch_desc,
+            ):
+                _ = visual.forward_piecewise(
+                    x=pixel_values,
+                    pos_embeds=pos_embeds,
+                    rotary_pos_emb_cos=rotary_cos,
+                    rotary_pos_emb_sin=rotary_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    sequence_lengths=sequence_lengths,
+                )
+
+            torch.cuda.empty_cache()
+
+        logger.info("Encoder piecewise CUDA graph capture complete")
 
     def _gather_mm_embeddings(
         self,
@@ -2431,7 +3279,7 @@ class GPUModelRunner(
 
     def get_model(self) -> nn.Module:
         # get raw model out of the cudagraph wrapper.
-        if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
+        if isinstance(self.model, CUDAGraphWrapper | UBatchWrapper):
             return self.model.unwrap()
         return self.model
 
@@ -3994,7 +4842,7 @@ class GPUModelRunner(
             return None
 
         layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
-        if layer_ids and isinstance(layer_ids, (list, tuple)):
+        if layer_ids and isinstance(layer_ids, list | tuple):
             return tuple(layer_ids)
 
         return None
@@ -4795,8 +5643,39 @@ class GPUModelRunner(
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         set_cudagraph_capturing_enabled(True)
+
+        start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        start_total_memory = torch.cuda.mem_get_info()[1]
+        logger.info(
+            "Starting CUDA graph capture: %.2f GiB used, %.2f GiB free",
+            (start_total_memory - start_free_gpu_memory) / 1024**3,
+            start_free_gpu_memory / 1024**3,
+        )
+
+        # Capture encoder CUDA graphs first (if enabled)
+        # Encoder uses a dedicated graph pool separate from decoder,
+        # captured outside the decoder's graph_capture context for clean isolation
+        if self.encoder_cudagraph_manager is not None:
+            with freeze_gc():
+                self._capture_encoder_cudagraphs()
+            after_encoder_free = torch.cuda.mem_get_info()[0]
+            encoder_mem = start_free_gpu_memory - after_encoder_free
+            logger.info(
+                "Encoder CUDA graphs captured: %.2f GiB used by encoder graphs, "
+                "%.2f GiB free",
+                encoder_mem / 1024**3,
+                after_encoder_free / 1024**3,
+            )
+
+        # Capture encoder piecewise CUDA graphs (if enabled)
+        if getattr(self.compilation_config, "encoder_cudagraph_piecewise", False):
+            with freeze_gc():
+                self._capture_encoder_piecewise_cudagraphs()
+
+        # Capture decoder/LM CUDA graphs in their own context with global pool
         with freeze_gc(), graph_capture(device=self.device):
-            start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            before_decoder_free = torch.cuda.mem_get_info()[0]
+
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
 
@@ -4845,6 +5724,20 @@ class GPUModelRunner(
 
             torch.cuda.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            decoder_mem = before_decoder_free - end_free_gpu_memory
+            logger.info(
+                "Decoder CUDA graphs captured: %.2f GiB used by decoder graphs, "
+                "%.2f GiB free",
+                decoder_mem / 1024**3,
+                end_free_gpu_memory / 1024**3,
+            )
+
+        total_cudagraph_mem = start_free_gpu_memory - end_free_gpu_memory
+        logger.info(
+            "CUDA graph capture complete: total %.2f GiB for all graphs, %.2f GiB free",
+            total_cudagraph_mem / 1024**3,
+            end_free_gpu_memory / 1024**3,
+        )
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -4868,6 +5761,24 @@ class GPUModelRunner(
             scope="local",
         )
         return cuda_graph_size
+
+    def _capture_encoder_cudagraphs(self) -> None:
+        """Capture CUDA graphs for the vision encoder."""
+        if self.encoder_cudagraph_manager is None:
+            return
+
+        model = self.model
+        if not hasattr(model, "visual") or model.visual is None:
+            logger.warning(
+                "Model does not have a visual encoder, "
+                "skipping encoder CUDA graph capture"
+            )
+            return
+
+        self.encoder_cudagraph_manager.capture(
+            vision_encoder=model.visual,
+            embed_multimodal_fn=model.embed_multimodal,
+        )
 
     def _capture_cudagraphs(
         self,

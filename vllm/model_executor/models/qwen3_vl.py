@@ -52,6 +52,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.distributed import get_pp_group, parallel_state
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.conv import Conv3dLayer
@@ -65,6 +66,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.vision import should_torch_compile_mm_vit
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
@@ -92,6 +94,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.gpu.mm.encoder_cudagraph import EMBEDDING_WARMUP_GRIDS
 
 from .interfaces import (
     MultiModalEmbeddings,
@@ -135,7 +138,14 @@ _MAX_FRAMES_PER_VIDEO = 24576
 # This avoids creating a new graph for each unique batch size at runtime
 BATCH_BUCKETS = [8, 16, 32, 64]
 
+# Set of pre-warmed grids for O(1) lookup in embedding cache
+_EMBEDDING_WARMUP_GRIDS_SET: set[tuple[int, int, int]] = set(EMBEDDING_WARMUP_GRIDS)
 
+
+@support_torch_compile(
+    dynamic_arg_dims={"x": 0},
+    enable_if=should_torch_compile_mm_vit,
+)
 class Qwen3_VisionPatchEmbed(nn.Module):
     def __init__(
         self,
@@ -207,6 +217,18 @@ class Qwen3_VisionMLP(nn.Module):
         return mlp_output
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+        "cu_seqlens": 0,
+        "rotary_pos_emb_cos": 0,
+        "rotary_pos_emb_sin": 0,
+        "max_seqlen": 0,
+        "sequence_lengths": 0,  # Batch dimension is dynamic
+    },
+    mark_unbacked_dims={"max_seqlen": 0},
+    enable_if=should_torch_compile_mm_vit,
+)
 class Qwen3_VisionBlock(nn.Module):
     def __init__(
         self,
@@ -266,6 +288,10 @@ class Qwen3_VisionBlock(nn.Module):
         return x
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"x": 0},
+    enable_if=should_torch_compile_mm_vit,
+)
 class Qwen3_VisionPatchMerger(nn.Module):
     def __init__(
         self,
@@ -300,6 +326,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear_fc1",
             disable_tp=use_data_parallel,
+            return_bias=False,
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -309,6 +336,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.linear_fc2",
             disable_tp=use_data_parallel,
+            return_bias=False,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -317,9 +345,9 @@ class Qwen3_VisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
-        x_parallel, _ = self.linear_fc1(x)
+        x_parallel = self.linear_fc1(x)
         x_parallel = self.act_fn(x_parallel)
-        out, _ = self.linear_fc2(x_parallel)
+        out = self.linear_fc2(x_parallel)
         return out
 
 
@@ -360,12 +388,15 @@ class Qwen3_VisionTransformer(nn.Module):
             1 + len(self.deepstack_visual_indexes)
         )
 
-        self.patch_embed = Qwen3_VisionPatchEmbed(
-            patch_size=self.patch_size,
-            temporal_patch_size=self.temporal_patch_size,
-            in_channels=vision_config.in_channels,
-            hidden_size=self.hidden_size,
-        )
+        from vllm.compilation.backends import set_model_tag
+
+        with set_model_tag("Qwen3_VisionPatchEmbed", is_encoder=True):
+            self.patch_embed = Qwen3_VisionPatchEmbed(
+                patch_size=self.patch_size,
+                temporal_patch_size=self.temporal_patch_size,
+                in_channels=vision_config.in_channels,
+                hidden_size=self.hidden_size,
+            )
 
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
 
@@ -378,31 +409,37 @@ class Qwen3_VisionTransformer(nn.Module):
             rope_parameters={"partial_rotary_factor": 0.5},
         )
 
-        self.merger = Qwen3_VisionPatchMerger(
-            d_model=vision_config.out_hidden_size,
-            context_dim=self.hidden_size,
-            norm_layer=norm_layer,
-            spatial_merge_size=self.spatial_merge_size,
-            quant_config=quant_config,
-            multimodal_config=multimodal_config,
-            prefix=f"{prefix}.merger",
-        )
+        with set_model_tag("Qwen3_VisionPatchMerger", is_encoder=True):
+            self.merger = Qwen3_VisionPatchMerger(
+                d_model=vision_config.out_hidden_size,
+                context_dim=self.hidden_size,
+                norm_layer=norm_layer,
+                spatial_merge_size=self.spatial_merge_size,
+                quant_config=quant_config,
+                multimodal_config=multimodal_config,
+                prefix=f"{prefix}.merger",
+            )
 
-        self.deepstack_merger_list = nn.ModuleList(
-            [
-                Qwen3_VisionPatchMerger(
-                    d_model=vision_config.out_hidden_size,
-                    context_dim=self.hidden_size,
-                    spatial_merge_size=self.spatial_merge_size,
-                    use_postshuffle_norm=True,
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    multimodal_config=multimodal_config,
-                    prefix=f"{prefix}.deepstack_merger_list.{layer_idx}",
-                )
-                for layer_idx in range(len(self.deepstack_visual_indexes))
-            ]
-        )
+        with set_model_tag("Qwen3_VisionPatchMerger_postshuffle_norm", is_encoder=True):
+            self.deepstack_merger_list = nn.ModuleList(
+                [
+                    Qwen3_VisionPatchMerger(
+                        d_model=vision_config.out_hidden_size,
+                        context_dim=self.hidden_size,
+                        spatial_merge_size=self.spatial_merge_size,
+                        use_postshuffle_norm=True,
+                        norm_layer=norm_layer,
+                        quant_config=quant_config,
+                        multimodal_config=multimodal_config,
+                        prefix=f"{prefix}.deepstack_merger_list.{layer_idx}",
+                    )
+                    for layer_idx in range(len(self.deepstack_visual_indexes))
+                ]
+            )
+
+        # Per-grid embedding cache for eager mode optimization
+        # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin
+        self._embedding_cache: dict[tuple[int, int, int], dict[str, torch.Tensor]] = {}
 
         attn_backend_override = (
             multimodal_config.mm_encoder_attn_backend if multimodal_config else None
@@ -424,28 +461,31 @@ class Qwen3_VisionTransformer(nn.Module):
                 f"Qwen3-VL does not support {self.attn_backend} backend now."
             )
 
-        workspace_buffer = (
-            None
-            if self.attn_backend != AttentionBackendEnum.FLASHINFER
-            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
-        )
-
-        self.blocks = nn.ModuleList(
-            [
-                Qwen3_VisionBlock(
-                    dim=self.hidden_size,
-                    num_heads=self.num_heads,
-                    mlp_hidden_dim=vision_config.intermediate_size,
-                    act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    multimodal_config=multimodal_config,
-                    prefix=f"{prefix}.blocks.{layer_idx}",
-                    workspace_buffer=workspace_buffer,
+        with set_model_tag("Qwen3_VisionBlock", is_encoder=True):
+            workspace_buffer = (
+                None
+                if self.attn_backend != AttentionBackendEnum.FLASHINFER
+                else torch.zeros(
+                    128 * 1024 * 1024, dtype=torch.uint8, device=self.device
                 )
-                for layer_idx in range(vision_config.depth)
-            ]
-        )
+            )
+
+            self.blocks = nn.ModuleList(
+                [
+                    Qwen3_VisionBlock(
+                        dim=self.hidden_size,
+                        num_heads=self.num_heads,
+                        mlp_hidden_dim=vision_config.intermediate_size,
+                        act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
+                        norm_layer=norm_layer,
+                        quant_config=quant_config,
+                        multimodal_config=multimodal_config,
+                        prefix=f"{prefix}.blocks.{layer_idx}",
+                        workspace_buffer=workspace_buffer,
+                    )
+                    for layer_idx in range(vision_config.depth)
+                ]
+            )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -617,6 +657,76 @@ class Qwen3_VisionTransformer(nn.Module):
         )
         return np.concatenate([cu_seqlens_qk, cu_seqlens_v, cu_seqlens_o])
 
+    def _get_cached_embeddings(
+        self, grid_thw_list: list[list[int]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get position and rotary embeddings with per-grid caching.
+
+        This method caches embeddings only for grids in EMBEDDING_WARMUP_GRIDS
+        to avoid unbounded memory growth. Grids not in the warmup set are
+        computed on-the-fly without caching.
+
+        Args:
+            grid_thw_list: List of [T, H, W] for each image
+
+        Returns:
+            Tuple of (pos_embeds, rotary_cos, rotary_sin)
+        """
+        pos_embeds_list: list[torch.Tensor] = []
+        rotary_cos_list: list[torch.Tensor] = []
+        rotary_sin_list: list[torch.Tensor] = []
+
+        for grid in grid_thw_list:
+            t, h, w = grid
+            grid_key = (t, h, w)
+
+            if grid_key in self._embedding_cache:
+                # Cache hit - use cached embeddings
+                cached = self._embedding_cache[grid_key]
+                pos_embeds_list.append(cached["pos_embeds"])
+                rotary_cos_list.append(cached["rotary_cos"])
+                rotary_sin_list.append(cached["rotary_sin"])
+            else:
+                # Cache miss - compute embeddings
+                single_grid = [[t, h, w]]
+                pos_embed = self.fast_pos_embed_interpolate(single_grid)
+                rotary_cos, rotary_sin = self.rot_pos_emb(single_grid)
+
+                # Only cache if grid is in pre-warmed set to prevent OOM.
+                # Caching at runtime causes unbounded memory growth.
+                if grid_key in _EMBEDDING_WARMUP_GRIDS_SET:
+                    self._embedding_cache[grid_key] = {
+                        "pos_embeds": pos_embed,
+                        "rotary_cos": rotary_cos,
+                        "rotary_sin": rotary_sin,
+                    }
+
+                pos_embeds_list.append(pos_embed)
+                rotary_cos_list.append(rotary_cos)
+                rotary_sin_list.append(rotary_sin)
+
+        # Concatenate all embeddings
+        pos_embeds = torch.cat(pos_embeds_list, dim=0)
+        rotary_pos_emb_cos = torch.cat(rotary_cos_list, dim=0)
+        rotary_pos_emb_sin = torch.cat(rotary_sin_list, dim=0)
+
+        return pos_embeds, rotary_pos_emb_cos, rotary_pos_emb_sin
+
+    def get_embedding_cache_memory(self) -> int:
+        """
+        Compute the total GPU memory consumption of the embedding cache.
+
+        Returns:
+            Total memory in bytes used by all cached embeddings.
+        """
+        total_bytes = 0
+        for grid, cached in self._embedding_cache.items():
+            for key, tensor in cached.items():
+                if isinstance(tensor, torch.Tensor):
+                    total_bytes += tensor.numel() * tensor.element_size()
+        return total_bytes
+
     def forward(
         self,
         x: torch.Tensor,
@@ -628,13 +738,17 @@ class Qwen3_VisionTransformer(nn.Module):
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
             grid_thw = np.array(grid_thw, dtype=np.int32)
+        elif isinstance(grid_thw, np.ndarray):
+            grid_thw_list = grid_thw.tolist()
         else:
             grid_thw_list = grid_thw.tolist()
-            grid_thw = grid_thw.numpy()
+            grid_thw = grid_thw.cpu().numpy()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+        # Get embeddings with caching for eager mode optimization
+        pos_embeds, rotary_pos_emb_cos, rotary_pos_emb_sin = (
+            self._get_cached_embeddings(grid_thw_list)
+        )
         hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
         cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             axis=0, dtype=np.int32
@@ -681,6 +795,204 @@ class Qwen3_VisionTransformer(nn.Module):
         hidden_states = torch.cat(
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        return hidden_states
+
+    def forward_cudagraph(
+        self,
+        x: torch.Tensor,
+        pos_embeds: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass optimized for CUDA graph capture/replay.
+
+        This method accepts pre-computed position embeddings, rotary embeddings,
+        and cumulative sequence lengths to avoid CPU operations during CUDA graph
+        replay. All tensor arguments must be on the correct device.
+
+        Args:
+            x: Input pixel values [num_patches, patch_channels]
+            pos_embeds: Pre-computed position embeddings [num_patches, hidden_size]
+            rotary_pos_emb_cos: Pre-computed rotary cosine embeddings
+            rotary_pos_emb_sin: Pre-computed rotary sine embeddings
+            cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
+            max_seqlen: Pre-computed max sequence length (scalar tensor on GPU)
+            sequence_lengths: Pre-computed sequence lengths (for FlashInfer CuDNN)
+
+        Returns:
+            Vision encoder output tensor
+        """
+        # Patch embedding (GPU operation)
+        hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_states = self.patch_embed(hidden_states)
+
+        # Add pre-computed position embeddings
+        hidden_states = hidden_states + pos_embeds
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        # Run through transformer blocks with pre-computed values
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
+                    hidden_states
+                )
+                deepstack_feature_lists.append(deepstack_feature)
+
+        hidden_states = self.merger(hidden_states)
+        hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
+        return hidden_states
+
+    def precompute_for_cudagraph(
+        self,
+        grid_thw: list[list[int]],
+    ) -> dict[str, torch.Tensor]:
+        """
+        Pre-compute all grid-dependent tensors for CUDA graph capture.
+
+        This method computes position embeddings, rotary embeddings, and
+        cumulative sequence lengths that are fixed for a given grid configuration.
+        These can be cached and reused during CUDA graph replay.
+
+        Args:
+            grid_thw: List of [T, H, W] for each image
+
+        Returns:
+            Dict containing pre-computed tensors:
+            - pos_embeds: Position embeddings
+            - rotary_pos_emb_cos: Rotary cosine embeddings
+            - rotary_pos_emb_sin: Rotary sine embeddings
+            - cu_seqlens: Cumulative sequence lengths (on GPU)
+            - max_seqlen: Maximum sequence length (scalar tensor on GPU)
+        """
+        # Compute position embeddings
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+
+        # Compute rotary embeddings
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
+
+        # Compute cumulative sequence lengths
+        grid_thw_np = np.array(grid_thw, dtype=np.int32)
+        cu_seqlens = np.repeat(
+            grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]
+        ).cumsum(axis=0, dtype=np.int32)
+        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            sequence_lengths = self.add_padding_to_fi_seqlens(
+                sequence_lengths, len(sequence_lengths), 0
+            )
+            cu_seqlens = self.compute_flashinfer_cu_seqlens(
+                cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
+        cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+        sequence_lengths = torch.from_numpy(sequence_lengths).to(
+            self.device, non_blocking=True
+        )
+
+        # Compute max sequence length as CPU scalar tensor
+        # Using CPU tensor is important for CUDA graph capture: .item() on CPU
+        # tensor doesn't trigger GPU sync, so it won't invalidate capture.
+        max_seqlen_gpu = (
+            torch.tensor(128 * 1024, device=self.device)
+            # setting to 128k to avoid cudnn recompilation
+            # TODO: use the real max_seqlen once cudnn compilation is optimized
+            if self.attn_backend == AttentionBackendEnum.FLASHINFER
+            else self.compute_attn_mask_seqlen(cu_seqlens)
+        )
+        max_seqlen = max_seqlen_gpu.cpu()  # Move to CPU to avoid GPU sync on .item()
+
+        return {
+            "pos_embeds": pos_embeds,
+            "rotary_pos_emb_cos": rotary_pos_emb_cos,
+            "rotary_pos_emb_sin": rotary_pos_emb_sin,
+            "cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            "sequence_lengths": sequence_lengths,
+        }
+
+    def forward_piecewise(
+        self,
+        x: torch.Tensor,
+        pos_embeds: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass optimized for piecewise CUDA graph mode with batched images.
+
+        This method accepts pre-computed position embeddings, rotary embeddings,
+        and cumulative sequence lengths. Unlike forward_cudagraph which processes
+        one image at a time, this method handles batched images with padding for
+        piecewise cudagraph optimization.
+
+        The key difference from the regular forward() is that all grid-dependent
+        computations (position embeddings, rotary embeddings, cu_seqlens) are
+        pre-computed outside the compiled graph, allowing padding to be applied
+        to match cudagraph capture sizes.
+
+        Args:
+            x: Input pixel values [num_patches, patch_channels]
+            pos_embeds: Pre-computed position embeddings [num_patches, hidden_size]
+            rotary_pos_emb_cos: Pre-computed rotary cosine embeddings
+            rotary_pos_emb_sin: Pre-computed rotary sine embeddings
+            cu_seqlens: Pre-computed cumulative sequence lengths (on GPU)
+            max_seqlen: Pre-computed max sequence length (scalar tensor, can be CPU)
+            sequence_lengths: Pre-computed sequence lengths (for FlashInfer CuDNN)
+
+        Returns:
+            Vision encoder output tensor [num_output_tokens, hidden_size]
+        """
+        # Patch embedding (GPU operation)
+        hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_states = self.patch_embed(hidden_states)
+
+        # Ensure max_seqlen is on GPU for attention kernels
+        if max_seqlen.device.type == "cpu":
+            max_seqlen = max_seqlen.to(self.device, non_blocking=True)
+
+        # Add pre-computed position embeddings
+        hidden_states = hidden_states + pos_embeds
+
+        hidden_states = hidden_states.unsqueeze(1)
+
+        # Run through transformer blocks with pre-computed values
+        deepstack_feature_lists = []
+        for layer_num, blk in enumerate(self.blocks):
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
+                deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](
+                    hidden_states
+                )
+                deepstack_feature_lists.append(deepstack_feature)
+
+        hidden_states = self.merger(hidden_states)
+        hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1359,6 +1671,7 @@ class Qwen3VLForConditionalGeneration(
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
+        self.vllm_config = vllm_config
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
@@ -1373,7 +1686,7 @@ class Qwen3VLForConditionalGeneration(
             self.visual = None
         else:
             self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
+                vision_config=config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
                 multimodal_config=multimodal_config,
@@ -1510,12 +1823,16 @@ class Qwen3VLForConditionalGeneration(
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, pixel_values, grid_thw.tolist(), rope_type="rope_3d"
-                )
-            else:
-                image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.visual,
+                        pixel_values,
+                        grid_thw.tolist(),
+                        rope_type="rope_3d",
+                    )
+                else:
+                    image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
@@ -1534,13 +1851,16 @@ class Qwen3VLForConditionalGeneration(
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype
             )
-            if self.use_data_parallel:
-                grid_thw_list = grid_thw.tolist()
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, pixel_values_videos, grid_thw_list, rope_type="rope_3d"
-                )
-            else:
-                video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.visual,
+                        pixel_values_videos,
+                        grid_thw.tolist(),
+                        rope_type="rope_3d",
+                    )
+                else:
+                    video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size

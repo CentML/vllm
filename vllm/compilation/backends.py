@@ -412,6 +412,22 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                 i for i, x in enumerate(args) if isinstance(x, torch.SymInt)
             ]
 
+            # Check if we should use piecewise backend for this compilation
+            # For encoder with encoder_cudagraph_piecewise=False, skip piecewise
+            # backend entirely to avoid shape tracking issues. The encoder will
+            # use torch.compile directly and EncoderCudaGraphManager handles
+            # full cudagraph capture separately.
+            encoder_skip_piecewise = self.vllm_backend.is_encoder and not getattr(
+                self.compilation_config, "encoder_cudagraph_piecewise", False
+            )
+
+            if encoder_skip_piecewise:
+                # For encoder without piecewise mode, just use the compiled
+                # submodule directly. EncoderCudaGraphManager will capture
+                # the full graph later.
+                self.module.__dict__[target] = submod
+                return output
+
             # Lazy import here to avoid circular import
             from .piecewise_backend import PiecewiseBackend
 
@@ -424,10 +440,13 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                 self.vllm_backend,
             )
 
-            if (
+            # Check if we should use piecewise cudagraphs for this compilation
+            use_piecewise_cudagraph = (
                 self.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
                 and not self.compilation_config.use_inductor_graph_partition
-            ):
+            )
+
+            if use_piecewise_cudagraph:
                 # We're using Dynamo-based piecewise splitting, so we wrap
                 # the whole subgraph with a static graph wrapper.
                 from .cuda_graph import CUDAGraphOptions
@@ -555,6 +574,13 @@ class VllmBackend:
         # in future we need PostGradPassManager.uuid() to be executed
         # only at compile time.
         self.inductor_config = deepcopy(self.compilation_config.inductor_compile_config)
+
+        # Disable cache for encoder compilation to avoid assertion errors
+        # with simple graphs (e.g., Conv3d) that don't produce AOT artifacts.
+        # This skips the save in InductorStandaloneAdaptor.compile().
+        if self.is_encoder:
+            self.inductor_config["force_disable_caches"] = True
+
         # `torch.compile` is JIT compiled, so we don't need to
         # do anything here
 
@@ -716,6 +742,10 @@ class VllmBackend:
         if self.compilation_config.use_inductor_graph_partition:
             # Let Inductor decide partitioning; avoid FX-level pre-splitting.
             fx_split_ops: list[str] = []
+        elif self.is_encoder:
+            # For encoder compilation, use encoder-specific splitting ops
+            # to enable piecewise cudagraph (attention in eager, rest in graph)
+            fx_split_ops = self.compilation_config.get_encoder_splitting_ops()
         else:
             fx_split_ops = self.compilation_config.splitting_ops or []
 

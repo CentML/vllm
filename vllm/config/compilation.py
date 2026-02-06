@@ -438,6 +438,58 @@ class CompilationConfig:
     on selected platforms. Disabled by default until more models
     are supported/tested to work."""
 
+    # Encoder (ViT) CUDA graph settings
+    cudagraph_mm_encoder: bool = False
+    """Whether to enable CUDA graph capture for multimodal encoders (ViT).
+    When enabled, CUDA graphs are captured for the vision encoder to eliminate
+    kernel launch overhead. Requires fixed input sizes via bucketing.
+    Experimental feature - use with caution."""
+
+    encoder_cudagraph_verbose: bool = False
+    """Enable verbose logging for encoder CUDA graph execution.
+    When True, logs each ViT input size and CUDA graph hit/miss status.
+    Useful for debugging and analyzing CUDA graph utilization."""
+
+    encoder_cudagraph_token_budgets: list[int] | None = None
+    """List of total output token budget levels for budget batch CUDA graphs.
+    E.g., [2048, 4096, 8192]. For each budget, one graph is captured with
+    max_images_per_batch image slots. At runtime, images are sorted
+    smallest-first and greedily packed; the smallest fitting budget graph is
+    selected. Works with FA2 and FA4 attention backends only.
+    Requires encoder_cudagraph_max_images_per_batch to also be set."""
+
+    encoder_cudagraph_max_images_per_batch: int | None = None
+    """Maximum number of images per budget batch. The captured CUDA graph
+    has fixed cu_seqlens of size max_images_per_batch + 1. Empty slots use
+    zero-length sequences (no-op in flash attention). Used together with
+    encoder_cudagraph_token_budgets."""
+
+    encoder_cudagraph_piecewise: bool = False
+    """Enable piecewise CUDA graph mode for encoder (ViT).
+    When True, torch.compile splits the encoder graph at attention ops, so:
+    - Non-attention ops (norm, MLP, patch_embed, merger) are captured in CUDA graphs
+    - Attention ops run in eager mode with original batch structure
+    This allows batching multiple images together while still benefiting from
+    CUDA graphs for the non-attention parts. More efficient than one-by-one
+    processing when batch sizes vary.
+    Requires compile_mm_encoder=True. Mutually exclusive with cudagraph_mm_encoder."""
+
+    encoder_cudagraph_capture_sizes: list[int] | None = None
+    """CUDA graph capture sizes (token counts) for encoder piecewise mode.
+    These are the total token counts at which CUDA graphs are captured.
+    For Qwen3-VL with spatial_merge_size=2:
+    - (1, 32, 32) grid → 1024 patches → 256 output tokens
+    - (1, 64, 64) grid → 4096 patches → 1024 output tokens
+    - (1, 94, 94) grid → 8836 patches → 2209 output tokens
+    Example: [256, 512, 1024, 2048, 4096, 8192, 16384]
+    If None, encoder piecewise mode will use compile_ranges only (no cudagraph)."""
+
+    encoder_spatial_merge_size: int = 2
+    """Spatial merge size for vision encoder (e.g., 2 for Qwen3-VL).
+    This converts encoder_cudagraph_capture_sizes (output tokens) to input patches.
+    Input patches = output tokens * spatial_merge_size².
+    Default is 2, which is common for Qwen-VL family models."""
+
     # Inductor capture
     compile_sizes: list[int | str] | None = None
     """Sizes to compile for inductor. In addition
@@ -620,6 +672,15 @@ class CompilationConfig:
         "vllm::gdn_attention_core",
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
+    ]
+
+    # Encoder (ViT) attention ops; used for piecewise cudagraphs on encoders
+    # These ops depend on batch structure (cu_seqlens), so they must be
+    # excluded from cudagraph capture to allow batching multiple images.
+    _encoder_attention_ops: ClassVar[list[str]] = [
+        "vllm::flash_attn_maxseqlen_wrapper",
+        "vllm::fa4_flash_attn_maxseqlen_wrapper",
+        "vllm::flashinfer_wrapper",
     ]
 
     def compute_hash(self) -> str:
@@ -1022,6 +1083,15 @@ class CompilationConfig:
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in self._attention_ops
         )
+
+    def get_encoder_splitting_ops(self) -> list[str]:
+        """Get splitting ops for encoder (ViT) compilation.
+
+        For piecewise cudagraph on encoders, we split at attention ops
+        so that non-attention ops (norm, MLP) can be captured in cudagraphs
+        while attention runs in eager mode with batched images.
+        """
+        return list(self._encoder_attention_ops)
 
     def is_attention_compiled_piecewise(self) -> bool:
         if not self.splitting_ops_contain_attention():
