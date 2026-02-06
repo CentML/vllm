@@ -445,57 +445,10 @@ class CompilationConfig:
     kernel launch overhead. Requires fixed input sizes via bucketing.
     Experimental feature - use with caution."""
 
-    encoder_cudagraph_bucket_sizes: list[int] | None = None
-    """Square grid side lengths for padded CUDA graph execution. Each size N
-    creates a bucket grid (1, N, N). Inputs with max(H, W) <= N are padded to
-    fit the bucket. Example: [32, 64, 94, 128, 188, 256, 312] captures grids
-    (1, 32, 32), (1, 64, 64), etc. Used with encoder_cudagraph_padded_mode=True."""
-
-    encoder_cudagraph_grid_configs: list[tuple[int, int, int]] | str | None = None
-    """Grid configurations (T, H, W in patch units) for exact-match CUDA graph
-    capture. Can be a list of tuples or preset "custom" (top 30 most common grids,
-    58.9% exact match coverage). If None, uses "custom" as default."""
-
-    encoder_cudagraph_padded_mode: bool = True
-    """Whether to use padded execution for encoder CUDA graphs.
-    When True, inputs smaller than a captured bucket are padded to fit.
-    Padded: pixel_values, pos_embeds, rotary_embeds (with zeros).
-    NOT padded: cu_seqlens, max_seqlen (set to actual values so flash
-    attention only processes real tokens). Output is trimmed to actual size.
-    When False, only exact grid matches use CUDA graphs."""
-
-    encoder_cudagraph_max_grid_size: int = 256
-    """Maximum grid dimension (H or W) for encoder CUDA graph capture.
-    Grids with H > max or W > max are skipped to limit GPU memory usage.
-    Memory scales roughly with H*W:
-    - 128x128: ~0.8 GiB
-    - 188x188: ~1.7 GiB
-    - 256x256: ~3.2 GiB
-    Set lower (e.g., 128, 188, 218) on memory-constrained systems.
-    Default 256 captures all grids in CUSTOM_GRID_CONFIGS."""
-
     encoder_cudagraph_verbose: bool = False
     """Enable verbose logging for encoder CUDA graph execution.
-    When True, logs each ViT input size and CUDA graph hit/miss/padded status.
-    Useful for debugging and analyzing CUDA graph utilization.
-    When False, only logs summary stats at the end of execution."""
-
-    encoder_cudagraph_one_by_one: bool = True
-    """Enable one-by-one image processing for multi-image batches.
-    When True (default), multi-image batches are processed individually to
-    maximize CUDA graph hit rate.
-    When False, multi-image batches are processed together in eager mode,
-    which may be faster when CUDA graph overhead (sync, memory) outweighs
-    the kernel launch savings.
-    Set to False if you observe throughput regression with encoder CUDA graphs."""
-
-    encoder_cudagraph_batch_sizes: list[int] | None = None
-    """Batch sizes for grouped batched CUDA graph capture.
-    When set (e.g., [4]), captures graphs for processing multiple images
-    together. Images are grouped by similar grid sizes and padded to the
-    largest grid in each group. Single graph replay for the whole group.
-    Example: [4] captures batch_size=4 graphs only (1-3 images use eager).
-    Default None uses legacy one-by-one mode (batch_size=1 per image)."""
+    When True, logs each ViT input size and CUDA graph hit/miss status.
+    Useful for debugging and analyzing CUDA graph utilization."""
 
     encoder_cudagraph_token_budgets: list[int] | None = None
     """List of total output token budget levels for budget batch CUDA graphs.
