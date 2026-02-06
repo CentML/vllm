@@ -210,12 +210,6 @@ class EncoderCudaGraphManager:
         self.input_buffers: dict[tuple[int, int, int, int], dict[str, Any]] = {}
         self.output_buffers: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
-        # Cached pre-computed tensors for CUDA graph replay (exact match mode)
-        # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary, etc.
-        self.cached_tensors: dict[
-            tuple[int, int, int, int], dict[str, torch.Tensor]
-        ] = {}
-
         # Input buffers for embeddings (padded mode with runtime computation)
         # Key: (batch_size, t, h, w), Value: dict with pos_embeds, rotary, cu_seqlens
         self.embedding_buffers: dict[
@@ -455,15 +449,7 @@ class EncoderCudaGraphManager:
         ) and hasattr(vision_encoder, "precompute_for_cudagraph")
 
         if has_cudagraph_forward:
-            # Pre-compute tensors for the batched grid (used for exact match mode)
             cached = vision_encoder.precompute_for_cudagraph(grid_thw)
-            self.cached_tensors[graph_key] = cached
-            logger.debug(
-                "Pre-computed cached tensors for key %s: pos_embeds=%s, cu_seqlens=%s",
-                graph_key,
-                cached["pos_embeds"].shape,
-                cached["cu_seqlens"].shape,
-            )
 
             # Cache per-grid embeddings for batched contiguous mode
             # This avoids recomputing embeddings at runtime - just lookup and concat
@@ -987,9 +973,6 @@ class EncoderCudaGraphManager:
             seq_len_buf[:batch_size].copy_(sequence_lengths_tensor, non_blocking=True)
         embed_buffers["max_seqlen"].copy_(max_seqlen_tensor, non_blocking=True)
 
-        # Mark this grid as modified so run() knows to restore cached tensors
-        self.modified_grids.add(graph_key)
-
         if self.verbose:
             logger.info(
                 "run_batched_contiguous(): graph_key=%s, grids=%s, "
@@ -1012,14 +995,6 @@ class EncoderCudaGraphManager:
             self.replay_done_event.record()
             self.replay_done_event.synchronize()
             return self.output_buffers[graph_key].clone()
-
-    def count_miss(self) -> None:
-        """Count when falling back to eager mode.
-
-        This should be called by the caller when neither run() nor run_padded()
-        succeeded and eager execution is used.
-        """
-        self.eager_fallbacks += 1
 
     def get_stats(self, verbose: bool = True) -> dict[str, Any]:
         """Get and optionally log cache statistics.
