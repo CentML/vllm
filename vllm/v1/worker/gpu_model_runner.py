@@ -431,6 +431,7 @@ class GPUModelRunner(
         self.encoder_cudagraph_padded_mode: bool = True
         self.encoder_cudagraph_verbose: bool = False
         self.encoder_cudagraph_one_by_one: bool = True
+        self.encoder_cudagraph_budget_mode: bool = False
         # Pre-allocated buffers for piecewise padded mode (lazily initialized)
         # Key: capture_size (output tokens), Value: dict of buffers
         self._piecewise_buffers: dict[int, dict[str, torch.Tensor]] = {}
@@ -777,14 +778,22 @@ class GPUModelRunner(
             verbose=self.encoder_cudagraph_verbose,
         )
 
+        # Check if budget batching is configured
+        self.encoder_cudagraph_budget_mode = bool(
+            self.encoder_cudagraph_manager.token_budgets
+            and self.encoder_cudagraph_manager.max_images_per_batch > 0
+        )
+
         # Log configuration
         grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
             "Encoder CUDA graph manager initialized: "
-            "padded_mode=%s, one_by_one=%s, num_grids=%d, grids=%s, "
+            "padded_mode=%s, one_by_one=%s, budget_mode=%s, "
+            "num_grids=%d, grids=%s, "
             "using dedicated encoder graph pool",
             self.encoder_cudagraph_padded_mode,
             self.encoder_cudagraph_one_by_one,
+            self.encoder_cudagraph_budget_mode,
             len(grid_configs),
             grid_configs,
         )
@@ -2411,10 +2420,29 @@ class GPUModelRunner(
                     curr_group_outputs_lst.extend(micro_batch_outputs)
 
                 curr_group_outputs = curr_group_outputs_lst
+            elif self.encoder_cudagraph_budget_mode:
+                # Budget batch mode: replaces grouped batch, one-by-one,
+                # exact match, and padded modes
+                budget_result = self._execute_budget_batch(
+                    model, mm_kwargs_group, modality, num_items
+                )
+                if budget_result is not None:
+                    curr_group_outputs = budget_result
+                else:
+                    # Fall back to eager
+                    if self.encoder_cudagraph_verbose:
+                        logger.info(
+                            "ViT BUDGET BATCH fallback to eager: "
+                            "modality=%s, num_items=%d",
+                            modality,
+                            num_items,
+                        )
+                    curr_group_outputs = model.embed_multimodal(
+                        **mm_kwargs_group
+                    )
             else:
-                # Try to use CUDA graph if available
-                # First try grouped batched mode if configured (batch_size > 1)
-                # Then fall back to one-by-one mode
+                # Legacy mode: grouped batch -> one-by-one -> single ->
+                # piecewise -> eager
                 grouped_batched_result = None
                 if (
                     self.encoder_cudagraph_manager is not None
@@ -2824,6 +2852,165 @@ class GPUModelRunner(
                 self.encoder_cudagraph_padded_mode,
             )
         return None
+
+    def _execute_budget_batch(
+        self,
+        model: "SupportsMultiModal",
+        mm_kwargs_group: dict,
+        modality: str,
+        num_items: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Execute the encoder using budget batch CUDA graphs.
+
+        Sorts images by output token count (smallest first), greedily packs
+        them into budget-sized batches, and replays the smallest fitting
+        CUDA graph. Falls back to None (eager) if any batch can't find a
+        fitting budget graph.
+
+        Args:
+            model: The multimodal model
+            mm_kwargs_group: Batched multimodal kwargs
+            modality: The modality type ("image" or "video")
+            num_items: Number of items in the batch
+
+        Returns:
+            List of encoder outputs if CUDA graph was used, None otherwise
+        """
+        manager = self.encoder_cudagraph_manager
+        if manager is None or not manager.budget_graph_keys:
+            return None
+
+        if modality not in ("image", "video"):
+            return None
+
+        # Extract grid_thw
+        grid_thw = mm_kwargs_group.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = mm_kwargs_group.get("video_grid_thw")
+        if grid_thw is None:
+            return None
+
+        # Convert to list if tensor
+        if hasattr(grid_thw, "tolist"):
+            grid_thw = grid_thw.tolist()
+
+        # Extract pixel_values
+        if modality == "image":
+            pixel_values = mm_kwargs_group.get("pixel_values")
+        else:  # video
+            pixel_values = mm_kwargs_group.get("pixel_values_videos")
+
+        if pixel_values is None:
+            return None
+
+        # Ensure pixel_values is on the correct device
+        pixel_values = pixel_values.to(
+            device=self.device, dtype=self.dtype
+        ).contiguous()
+
+        # Get spatial merge size
+        visual = getattr(model, "visual", None)
+        spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        max_budget = max(manager.budget_graph_keys.keys())
+        max_images = manager.max_images_per_batch
+
+        # Compute per-image info: (output_tokens, input_patches, orig_idx)
+        image_info: list[tuple[int, int, int]] = []
+        for i, (t, h, w) in enumerate(grid_thw):
+            out_tokens = (
+                t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            )
+            in_patches = t * h * w
+            image_info.append((out_tokens, in_patches, i))
+
+        # Sort by output tokens ascending (small first)
+        sorted_images = sorted(image_info, key=lambda x: x[0])
+
+        # Compute pixel_values offsets for each original image
+        patch_offsets = [0]
+        for t, h, w in grid_thw:
+            patch_offsets.append(patch_offsets[-1] + t * h * w)
+
+        # Greedy packing into budget batches
+        batches: list[list[tuple[int, int, int]]] = []
+        current_batch: list[tuple[int, int, int]] = []
+        current_tokens = 0
+
+        for out_tokens, in_patches, orig_idx in sorted_images:
+            if (
+                current_tokens + out_tokens <= max_budget
+                and len(current_batch) < max_images
+            ):
+                current_batch.append((out_tokens, in_patches, orig_idx))
+                current_tokens += out_tokens
+            else:
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [(out_tokens, in_patches, orig_idx)]
+                current_tokens = out_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        # Execute each packed batch
+        outputs: list[torch.Tensor | None] = [None] * len(grid_thw)
+
+        for batch in batches:
+            total_out_tokens = sum(out_tok for out_tok, _, _ in batch)
+
+            # Find smallest budget graph that fits
+            graph_key = manager.find_budget_graph(total_out_tokens)
+            if graph_key is None:
+                logger.debug(
+                    "No budget graph for %d tokens, falling back to eager",
+                    total_out_tokens,
+                )
+                return None
+
+            # Concatenate pixel values in sorted order
+            pv_slices = []
+            batch_grids = []
+            for _, _, orig_idx in batch:
+                start = patch_offsets[orig_idx]
+                end = patch_offsets[orig_idx + 1]
+                pv_slices.append(pixel_values[start:end])
+                batch_grids.append(grid_thw[orig_idx])
+
+            packed_pv = torch.cat(pv_slices, dim=0)
+
+            # Run the budget graph
+            output = manager.run_batched_contiguous(
+                packed_pv, batch_grids, graph_key, spatial_merge_size
+            )
+            if output is None:
+                logger.debug(
+                    "Budget graph replay failed for key %s, "
+                    "falling back to eager",
+                    graph_key,
+                )
+                return None
+
+            # Split output by per-image output token counts
+            offset = 0
+            for out_tokens, _, orig_idx in batch:
+                outputs[orig_idx] = output[offset:offset + out_tokens].clone()
+                offset += out_tokens
+
+            if self.encoder_cudagraph_verbose:
+                logger.info(
+                    "ViT BUDGET BATCH: %d images, %d tokens, graph_key=%s",
+                    len(batch),
+                    total_out_tokens,
+                    graph_key,
+                )
+
+        # Check all images were processed
+        if any(o is None for o in outputs):
+            return None
+
+        return outputs  # type: ignore[return-value]
 
     def _execute_grouped_batched_encoder(
         self,
