@@ -1552,19 +1552,14 @@ class EncoderCudaGraphManager:
                 rotary_cos_list.append(cached["rotary_pos_emb_cos"])
                 rotary_sin_list.append(cached["rotary_pos_emb_sin"])
             else:
-                # Cache miss - need to compute (should be rare after warmup)
+                # Cache miss - compute on-the-fly but don't cache
+                # (avoids unbounded GPU memory growth at runtime)
                 cache_miss_grids.append(grid_key)
                 if self.vision_encoder is not None:
                     actual_embeds = self.vision_encoder.precompute_for_cudagraph([grid])
                     pos_embeds_list.append(actual_embeds["pos_embeds"])
                     rotary_cos_list.append(actual_embeds["rotary_pos_emb_cos"])
                     rotary_sin_list.append(actual_embeds["rotary_pos_emb_sin"])
-                    # Cache for future use
-                    self.grid_embedding_cache[grid_key] = {
-                        "pos_embeds": actual_embeds["pos_embeds"],
-                        "rotary_pos_emb_cos": actual_embeds["rotary_pos_emb_cos"],
-                        "rotary_pos_emb_sin": actual_embeds["rotary_pos_emb_sin"],
-                    }
                 else:
                     logger.warning("Grid %s not cached and no vision encoder", grid_key)
                     return None
@@ -1572,7 +1567,8 @@ class EncoderCudaGraphManager:
         if cache_miss_grids and self.verbose:
             uncached_grids = cache_miss_grids
             logger.info(
-                "Embedding cache miss for grids: %s (now cached)", uncached_grids
+                "Embedding cache miss for grids: %s (computed on-the-fly)",
+                uncached_grids,
             )
 
         # Concatenate cached embeddings (just tensor concat, no computation)
