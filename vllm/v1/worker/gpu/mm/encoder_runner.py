@@ -258,9 +258,7 @@ class EncoderRunner:
         visual = getattr(model, "visual", None)
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
 
-        return self._execute_budget_batch(
-            pixel_values, grid_thw, spatial_merge_size
-        )
+        return self._execute_budget_batch(pixel_values, grid_thw, spatial_merge_size)
 
     def _execute_budget_batch(
         self,
