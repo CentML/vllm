@@ -2588,10 +2588,19 @@ class GPUModelRunner(
                 offset += out_tokens
 
             if self.encoder_cudagraph_verbose:
+                bs, gt, gh, gw = graph_key
+                budget_tokens = (
+                    bs * gt * (gh // spatial_merge_size)
+                    * (gw // spatial_merge_size)
+                )
                 logger.info(
-                    "ViT BUDGET BATCH: %d images, %d tokens, graph_key=%s",
+                    "ViT BUDGET BATCH: %d images, %d tokens, "
+                    "budget=%d, waste=%.1f%%, graph_key=%s",
                     len(batch),
                     total_out_tokens,
+                    budget_tokens,
+                    (budget_tokens - total_out_tokens)
+                    / budget_tokens * 100,
                     graph_key,
                 )
 
