@@ -735,6 +735,98 @@ class EncoderCudaGraphManager:
             cached_suffix,
         )
 
+    def capture_budget_graphs(self, vision_encoder: nn.Module) -> None:
+        """
+        Capture CUDA graphs for budget batching mode.
+
+        For each configured token_budget, captures a graph with
+        max_images_per_batch image slots. The graph uses a synthetic grid
+        that produces the right tensor shapes. At runtime, embedding buffers
+        are overwritten with actual per-image values from grid_embedding_cache.
+
+        Args:
+            vision_encoder: The vision encoder module
+        """
+        if not self.token_budgets or self.max_images_per_batch <= 0:
+            return
+
+        merge = getattr(vision_encoder, "spatial_merge_size", 2)
+
+        for token_budget in self.token_budgets:
+            per_image_output = token_budget // self.max_images_per_batch
+            if per_image_output <= 0:
+                logger.warning(
+                    "token_budget=%d too small for max_images=%d, skipping",
+                    token_budget,
+                    self.max_images_per_batch,
+                )
+                continue
+
+            # Synthetic grid: (1, merge, per_image_output * merge)
+            # Output tokens per image = 1 * (merge/merge) * (per_image_output*merge/merge)
+            #                        = 1 * 1 * per_image_output = per_image_output
+            # Total output = max_images * per_image_output = token_budget
+            grid_config = (1, merge, per_image_output * merge)
+
+            try:
+                if self.is_single_gpu:
+                    self.capture_graph_for_grid(
+                        grid_config,
+                        vision_encoder,
+                        batch_size=self.max_images_per_batch,
+                    )
+                else:
+                    with graph_capture(device=self.device):
+                        self.capture_graph_for_grid(
+                            grid_config,
+                            vision_encoder,
+                            batch_size=self.max_images_per_batch,
+                        )
+
+                graph_key = (
+                    self.max_images_per_batch,
+                    1,
+                    merge,
+                    per_image_output * merge,
+                )
+                self.budget_graph_keys[token_budget] = graph_key
+                logger.info(
+                    "Captured budget graph: token_budget=%d, "
+                    "max_images=%d, graph_key=%s",
+                    token_budget,
+                    self.max_images_per_batch,
+                    graph_key,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to capture budget graph for token_budget=%d: %s",
+                    token_budget,
+                    e,
+                )
+
+    def find_budget_graph(
+        self,
+        total_output_tokens: int,
+    ) -> tuple[int, int, int, int] | None:
+        """
+        Find the smallest budget graph that fits the given total output tokens.
+
+        Args:
+            total_output_tokens: Total output tokens for the packed batch
+
+        Returns:
+            Graph key (batch_size, t, h, w) or None if no budget fits
+        """
+        best_key = None
+        best_budget = float("inf")
+
+        for budget, graph_key in self.budget_graph_keys.items():
+            if budget >= total_output_tokens and budget < best_budget:
+                best_budget = budget
+                best_key = graph_key
+
+        return best_key
+
     @torch.inference_mode()
     def capture(
         self,
@@ -832,6 +924,10 @@ class EncoderCudaGraphManager:
 
         # Pre-warm embedding cache for common grids
         self._prewarm_embedding_cache(vision_encoder)
+
+        # Capture budget batch graphs if configured
+        if self.token_budgets and self.max_images_per_batch > 0:
+            self.capture_budget_graphs(vision_encoder)
 
     def _prewarm_embedding_cache(self, vision_encoder: nn.Module) -> None:
         """
