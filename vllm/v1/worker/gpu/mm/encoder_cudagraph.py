@@ -880,8 +880,10 @@ class EncoderCudaGraphManager:
         for grid in grid_thw_list:
             t, h, w = grid
             grid_key = (t, h, w)
-            output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
-            sequence_lengths.append(output_tokens)
+            # Each temporal frame is a separate attention sequence in patch space.
+            # This matches the eager path: np.repeat(h*w, t) per image.
+            for _ in range(t):
+                sequence_lengths.append(h * w)
 
             # Try to use cached embeddings (populated during graph capture)
             if grid_key in self.grid_embedding_cache:
@@ -935,6 +937,17 @@ class EncoderCudaGraphManager:
         # For budget graphs: pad cu_seqlens to batch_size + 1 by repeating
         # the last value. This creates zero-length sequences for empty slots
         # that flash attention skips (no-op).
+        # Note: num_sequences = sum(t_i) for all images. For images (t=1),
+        # this equals num_images <= batch_size. For videos (t>1), it could
+        # exceed batch_size — fall back to eager in that case.
+        if is_budget_graph and len(sequence_lengths) > batch_size:
+            logger.debug(
+                "Too many sequences (%d) for budget graph batch_size (%d), "
+                "falling back to eager",
+                len(sequence_lengths),
+                batch_size,
+            )
+            return None
         if is_budget_graph and len(cu_seqlens_list) < batch_size + 1:
             last_val = cu_seqlens_list[-1]
             while len(cu_seqlens_list) < batch_size + 1:
