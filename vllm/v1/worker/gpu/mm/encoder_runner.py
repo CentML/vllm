@@ -49,7 +49,7 @@ class EncoderRunner:
 
         # Encoder CUDA graph manager (optional)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
-        self.encoder_cudagraph_padded_mode: bool = True
+        self.encoder_cudagraph_budget_mode: bool = False
         self._encoder_call_count: int = 0
         self._init_encoder_cudagraph_manager()
 
@@ -68,22 +68,10 @@ class EncoderRunner:
         # Import here to avoid circular imports
         from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 
-        bucket_sizes = getattr(
-            compilation_config, "encoder_cudagraph_bucket_sizes", None
-        )
-
-        # Check if padded mode is enabled
-        self.encoder_cudagraph_padded_mode = getattr(
-            compilation_config,
-            "encoder_cudagraph_padded_mode",
-            True,  # Default to padded mode for better CUDA graph utilization
-        )
-
         self.encoder_cudagraph_manager = EncoderCudaGraphManager(
             vllm_config=self.vllm_config,
             device=self.device,
             dtype=self.dtype,
-            bucket_sizes=bucket_sizes,
         )
 
         # Check if budget batching is configured
@@ -92,15 +80,9 @@ class EncoderRunner:
             and self.encoder_cudagraph_manager.max_images_per_batch > 0
         )
 
-        # Log configuration
-        grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
-            "Encoder CUDA graph manager initialized: "
-            "padded_mode=%s, budget_mode=%s, num_grids=%d, grids=%s",
-            self.encoder_cudagraph_padded_mode,
+            "Encoder CUDA graph manager initialized: budget_mode=%s",
             self.encoder_cudagraph_budget_mode,
-            len(grid_configs),
-            grid_configs,
         )
 
     def capture_encoder_cudagraphs(
@@ -178,31 +160,6 @@ class EncoderRunner:
 
         return grid_thw
 
-    def _estimate_visual_tokens(
-        self,
-        mm_kwargs_group: dict,
-        modality: str,
-    ) -> int | None:
-        """
-        Estimate the number of visual tokens for CUDA graph bucket selection.
-
-        Returns None if estimation is not possible.
-        """
-        grid_thw = self._get_grid_thw_from_kwargs(mm_kwargs_group, modality)
-        if grid_thw is None:
-            return None
-
-        # Calculate total visual tokens (after spatial merge, assuming 2x2)
-        # Formula: sum of (T * H/merge * W/merge) for each item
-        # Note: grid_thw contains [T, H, W] where H and W are already in patch units
-        spatial_merge_size = 2  # Default for Qwen-VL models
-        total_tokens = 0
-        for t, h, w in grid_thw:
-            tokens_per_image = t * (h // spatial_merge_size) * (w // spatial_merge_size)
-            total_tokens += tokens_per_image
-
-        return total_tokens
-
     @torch.inference_mode()
     def execute_mm_encoder(
         self,
@@ -258,12 +215,11 @@ class EncoderRunner:
         num_items: int,
     ) -> list[torch.Tensor] | None:
         """
-        Execute the encoder using CUDA graphs if a matching graph is available.
+        Execute the encoder using budget batch CUDA graphs.
 
-        Supports three modes:
-        1. Budget batching: Pack multiple images into budget-sized graphs
-        2. Exact match: Only use CUDA graph if grid_thw exactly matches
-        3. Padded mode: Pad inputs to fit the smallest available bucket
+        Packs images (sorted smallest-first) into budget-sized batches
+        and replays the smallest fitting CUDA graph. Falls back to eager
+        if no budget graph fits.
 
         Args:
             model: The multimodal model
@@ -275,6 +231,9 @@ class EncoderRunner:
             List of encoder outputs if CUDA graph was used, None otherwise
         """
         if self.encoder_cudagraph_manager is None:
+            return None
+
+        if not self.encoder_cudagraph_budget_mode:
             return None
 
         # Extract grid_thw from kwargs
@@ -299,65 +258,9 @@ class EncoderRunner:
         visual = getattr(model, "visual", None)
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
 
-        # Try budget batching for all images (single or multi)
-        if self.encoder_cudagraph_budget_mode:
-            result = self._execute_budget_batch(
-                pixel_values, grid_thw, spatial_merge_size
-            )
-            if result is not None:
-                return result
-
-        # Fall back to single-image path
-        if len(grid_thw) != 1:
-            logger.debug(
-                "CUDA graph single-image path: got %d images. Using eager mode.",
-                len(grid_thw),
-            )
-            return None
-
-        t, h, w = grid_thw[0]
-        num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
-
-        # Try exact match first
-        grid_key = self.encoder_cudagraph_manager.get_graph_for_grid(grid_thw)
-        if grid_key is not None:
-            # Exact match found - try to run
-            output = self.encoder_cudagraph_manager.run(pixel_values, grid_thw)
-            if output is not None:
-                logger.info(
-                    "ViT CUDA graph EXACT: grid=(%d, %d, %d), tokens=%d",
-                    t,
-                    h,
-                    w,
-                    num_output_tokens,
-                )
-                return [output[:num_output_tokens]]
-
-        # Try padded execution if enabled
-        if self.encoder_cudagraph_padded_mode:
-            padded_result = self.encoder_cudagraph_manager.run_padded(
-                pixel_values,
-                grid_thw,
-                num_output_tokens,
-                spatial_merge_size,
-            )
-            if padded_result is not None:
-                output, padding_waste = padded_result
-                logger.info(
-                    "ViT CUDA graph PADDED: grid=(%d, %d, %d), tokens=%d, waste=%d",
-                    t,
-                    h,
-                    w,
-                    num_output_tokens,
-                    padding_waste,
-                )
-                return [output]
-
-        # No CUDA graph available
-        logger.info(
-            "ViT EAGER: grid=(%d, %d, %d), tokens=%d", t, h, w, num_output_tokens
+        return self._execute_budget_batch(
+            pixel_values, grid_thw, spatial_merge_size
         )
-        return None
 
     def _execute_budget_batch(
         self,
