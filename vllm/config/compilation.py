@@ -497,6 +497,20 @@ class CompilationConfig:
     Example: [4] captures batch_size=4 graphs only (1-3 images use eager).
     Default None uses legacy one-by-one mode (batch_size=1 per image)."""
 
+    encoder_cudagraph_token_budgets: list[int] | None = None
+    """List of total output token budget levels for budget batch CUDA graphs.
+    E.g., [2048, 4096, 8192]. For each budget, one graph is captured with
+    max_images_per_batch image slots. At runtime, images are sorted
+    smallest-first and greedily packed; the smallest fitting budget graph is
+    selected. Works with FA2 and FA4 attention backends only.
+    Requires encoder_cudagraph_max_images_per_batch to also be set."""
+
+    encoder_cudagraph_max_images_per_batch: int | None = None
+    """Maximum number of images per budget batch. The captured CUDA graph
+    has fixed cu_seqlens of size max_images_per_batch + 1. Empty slots use
+    zero-length sequences (no-op in flash attention). Used together with
+    encoder_cudagraph_token_budgets."""
+
     encoder_cudagraph_piecewise: bool = False
     """Enable piecewise CUDA graph mode for encoder (ViT).
     When True, torch.compile splits the encoder graph at attention ops, so:
