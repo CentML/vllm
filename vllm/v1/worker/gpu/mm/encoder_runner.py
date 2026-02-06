@@ -310,8 +310,7 @@ class EncoderRunner:
         # Fall back to single-image path
         if len(grid_thw) != 1:
             logger.debug(
-                "CUDA graph single-image path: got %d images. "
-                "Using eager mode.",
+                "CUDA graph single-image path: got %d images. Using eager mode.",
                 len(grid_thw),
             )
             return None
@@ -336,14 +335,14 @@ class EncoderRunner:
 
         # Try padded execution if enabled
         if self.encoder_cudagraph_padded_mode:
-            result = self.encoder_cudagraph_manager.run_padded(
+            padded_result = self.encoder_cudagraph_manager.run_padded(
                 pixel_values,
                 grid_thw,
                 num_output_tokens,
                 spatial_merge_size,
             )
-            if result is not None:
-                output, padding_waste = result
+            if padded_result is not None:
+                output, padding_waste = padded_result
                 logger.info(
                     "ViT CUDA graph PADDED: grid=(%d, %d, %d), tokens=%d, waste=%d",
                     t,
@@ -456,8 +455,7 @@ class EncoderRunner:
             )
             if output is None:
                 logger.debug(
-                    "Budget graph replay failed for key %s, "
-                    "falling back to eager",
+                    "Budget graph replay failed for key %s, falling back to eager",
                     graph_key,
                 )
                 return None
@@ -468,7 +466,7 @@ class EncoderRunner:
                 outputs[orig_idx] = output[offset : offset + out_tokens].clone()
                 offset += out_tokens
 
-            if self.encoder_cudagraph_manager.verbose:
+            if manager.verbose:
                 logger.info(
                     "ViT BUDGET BATCH: %d images, %d tokens, graph_key=%s",
                     len(batch),

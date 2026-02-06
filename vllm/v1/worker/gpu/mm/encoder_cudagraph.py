@@ -377,6 +377,9 @@ class EncoderCudaGraphManager:
             )
             return
 
+        if token_budgets is None or max_images is None:
+            return
+
         if max_images <= 0:
             logger.warning(
                 "encoder_cudagraph_max_images_per_batch must be positive. "
@@ -398,8 +401,7 @@ class EncoderCudaGraphManager:
         self.max_images_per_batch = max_images
 
         logger.info(
-            "Budget batching configured: token_budgets=%s, "
-            "max_images_per_batch=%d",
+            "Budget batching configured: token_budgets=%s, max_images_per_batch=%d",
             self.token_budgets,
             self.max_images_per_batch,
         )
@@ -773,8 +775,9 @@ class EncoderCudaGraphManager:
                 continue
 
             # Synthetic grid: (1, merge, per_image_output * merge)
-            # Output tokens per image = 1 * (merge/merge) * (per_image_output*merge/merge)
-            #                        = 1 * 1 * per_image_output = per_image_output
+            # Output tokens per image:
+            # 1 * (merge/merge) * (per_image_output*merge/merge)
+            # = per_image_output
             # Total output = max_images * per_image_output = token_budget
             grid_config = (1, merge, per_image_output * merge)
 
@@ -1753,7 +1756,9 @@ class EncoderCudaGraphManager:
         cu_seqlens_tensor = torch.tensor(
             cu_seqlens_list, dtype=torch.int32, device=self.device
         )
-        max_seqlen = max(s for s in sequence_lengths if s > 0) if sequence_lengths else 0
+        max_seqlen = (
+            max(s for s in sequence_lengths if s > 0) if sequence_lengths else 0
+        )
         max_seqlen_tensor = torch.tensor(max_seqlen, dtype=torch.int32, device="cpu")
         sequence_lengths_tensor = torch.tensor(
             sequence_lengths, dtype=torch.int32, device=self.device
@@ -1771,9 +1776,7 @@ class EncoderCudaGraphManager:
             cu_seqlens_buf[: len(cu_seqlens_list)].copy_(
                 cu_seqlens_tensor, non_blocking=True
             )
-            seq_len_buf[:batch_size].copy_(
-                sequence_lengths_tensor, non_blocking=True
-            )
+            seq_len_buf[:batch_size].copy_(sequence_lengths_tensor, non_blocking=True)
         embed_buffers["max_seqlen"].copy_(max_seqlen_tensor, non_blocking=True)
 
         # Mark this grid as modified so run() knows to restore cached tensors
