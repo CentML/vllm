@@ -1640,8 +1640,8 @@ class EncoderCudaGraphManager:
         if not pixel_values.is_contiguous():
             pixel_values = pixel_values.contiguous()
 
-        # Count images processed, not replay count (for accurate hit rate)
-        self.cache_hits += batch_size
+        # Count actual images processed (for accurate hit rate)
+        self.cache_hits += num_actual_images
 
         # Wait for any previous graph replay to complete
         if not self.is_single_gpu and self.replay_done_event is not None:
