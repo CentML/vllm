@@ -256,11 +256,6 @@ class EncoderCudaGraphManager:
                 "(TP=1, PP=1, DP=1), using optimized sync scheme"
             )
 
-        # Track which grids have had their embedding buffers modified by run_padded()
-        # or run_batched_contiguous(). This allows run() to skip restoring cached
-        # tensors when not needed. Keys are (batch_size, t, h, w).
-        self.modified_grids: set[tuple[int, int, int, int]] = set()
-
         # Per-grid embedding cache for batched contiguous mode
         # Key: (t, h, w), Value: dict with pos_embeds, rotary_cos, rotary_sin
         # This avoids recomputing embeddings at runtime - just look up and concat
