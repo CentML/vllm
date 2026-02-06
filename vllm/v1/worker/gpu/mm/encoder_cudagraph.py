@@ -384,6 +384,16 @@ class EncoderCudaGraphManager:
             )
             return
 
+        bad_budgets = [b for b in token_budgets if b % max_images != 0]
+        if bad_budgets:
+            logger.warning(
+                "encoder_cudagraph_token_budgets values %s are not divisible "
+                "by max_images_per_batch=%d. Budget batching disabled.",
+                bad_budgets,
+                max_images,
+            )
+            return
+
         self.token_budgets = sorted(token_budgets)
         self.max_images_per_batch = max_images
 
@@ -1665,7 +1675,7 @@ class EncoderCudaGraphManager:
         rotary_cos_list = []
         rotary_sin_list = []
         sequence_lengths = []
-        cache_miss = False
+        cache_miss_grids: list[tuple[int, int, int]] = []
 
         for grid in grid_thw_list:
             t, h, w = grid
@@ -1681,7 +1691,7 @@ class EncoderCudaGraphManager:
                 rotary_sin_list.append(cached["rotary_pos_emb_sin"])
             else:
                 # Cache miss - need to compute (should be rare after warmup)
-                cache_miss = True
+                cache_miss_grids.append(grid_key)
                 if self.vision_encoder is not None:
                     actual_embeds = self.vision_encoder.precompute_for_cudagraph([grid])
                     pos_embeds_list.append(actual_embeds["pos_embeds"])
@@ -1697,10 +1707,8 @@ class EncoderCudaGraphManager:
                     logger.warning("Grid %s not cached and no vision encoder", grid_key)
                     return None
 
-        if cache_miss and self.verbose:
-            uncached_grids = [
-                g for g in grid_thw_list if tuple(g) not in self.grid_embedding_cache
-            ]
+        if cache_miss_grids and self.verbose:
+            uncached_grids = cache_miss_grids
             logger.info(
                 "Embedding cache miss for grids: %s (now cached)", uncached_grids
             )
