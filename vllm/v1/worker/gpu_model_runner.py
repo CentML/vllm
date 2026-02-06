@@ -2394,19 +2394,14 @@ class GPUModelRunner(
                             modality,
                             num_items,
                         )
-                    curr_group_outputs = model.embed_multimodal(
-                        **mm_kwargs_group
-                    )
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
             else:
                 # No budget mode: try piecewise -> eager
                 piecewise_result = None
-                piecewise_enabled = (
-                    self.compilation_config is not None
-                    and getattr(
-                        self.compilation_config,
-                        "encoder_cudagraph_piecewise",
-                        False,
-                    )
+                piecewise_enabled = self.compilation_config is not None and getattr(
+                    self.compilation_config,
+                    "encoder_cudagraph_piecewise",
+                    False,
                 )
 
                 if piecewise_enabled:
@@ -2417,9 +2412,7 @@ class GPUModelRunner(
                 if piecewise_result is not None:
                     curr_group_outputs = piecewise_result
                 else:
-                    curr_group_outputs = model.embed_multimodal(
-                        **mm_kwargs_group
-                    )
+                    curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -2508,9 +2501,7 @@ class GPUModelRunner(
         # Compute per-image info: (output_tokens, input_patches, orig_idx)
         image_info: list[tuple[int, int, int]] = []
         for i, (t, h, w) in enumerate(grid_thw):
-            out_tokens = (
-                t * (h // spatial_merge_size) * (w // spatial_merge_size)
-            )
+            out_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
             in_patches = t * h * w
             image_info.append((out_tokens, in_patches, i))
 
@@ -2575,8 +2566,7 @@ class GPUModelRunner(
             )
             if output is None:
                 logger.debug(
-                    "Budget graph replay failed for key %s, "
-                    "falling back to eager",
+                    "Budget graph replay failed for key %s, falling back to eager",
                     graph_key,
                 )
                 return None
@@ -2584,14 +2574,13 @@ class GPUModelRunner(
             # Split output by per-image output token counts
             offset = 0
             for out_tokens, _, orig_idx in batch:
-                outputs[orig_idx] = output[offset:offset + out_tokens].clone()
+                outputs[orig_idx] = output[offset : offset + out_tokens].clone()
                 offset += out_tokens
 
             if self.encoder_cudagraph_verbose:
                 bs, gt, gh, gw = graph_key
                 budget_tokens = (
-                    bs * gt * (gh // spatial_merge_size)
-                    * (gw // spatial_merge_size)
+                    bs * gt * (gh // spatial_merge_size) * (gw // spatial_merge_size)
                 )
                 logger.info(
                     "ViT BUDGET BATCH: %d images, %d tokens, "
@@ -2599,8 +2588,7 @@ class GPUModelRunner(
                     len(batch),
                     total_out_tokens,
                     budget_tokens,
-                    (budget_tokens - total_out_tokens)
-                    / budget_tokens * 100,
+                    (budget_tokens - total_out_tokens) / budget_tokens * 100,
                     graph_key,
                 )
 
