@@ -1719,14 +1719,14 @@ class EncoderCudaGraphManager:
         packed_rotary_sin = torch.cat(rotary_sin_list, dim=0)
 
         # Copy packed embeddings to buffer (padding remains zero at end)
-        actual_output_tokens = packed_pos_embeds.shape[0]
-        embed_buffers["pos_embeds"][:actual_output_tokens].copy_(
+        actual_embed_len = packed_pos_embeds.shape[0]
+        embed_buffers["pos_embeds"][:actual_embed_len].copy_(
             packed_pos_embeds, non_blocking=True
         )
-        embed_buffers["rotary_pos_emb_cos"][:actual_output_tokens].copy_(
+        embed_buffers["rotary_pos_emb_cos"][:actual_embed_len].copy_(
             packed_rotary_cos, non_blocking=True
         )
-        embed_buffers["rotary_pos_emb_sin"][:actual_output_tokens].copy_(
+        embed_buffers["rotary_pos_emb_sin"][:actual_embed_len].copy_(
             packed_rotary_sin, non_blocking=True
         )
 
