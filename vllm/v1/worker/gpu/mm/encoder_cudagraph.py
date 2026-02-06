@@ -1571,10 +1571,22 @@ class EncoderCudaGraphManager:
             return None
 
         batch_size = graph_key[0]
-        if len(grid_thw_list) != batch_size:
+        num_actual_images = len(grid_thw_list)
+        is_budget_graph = graph_key in self.budget_graph_keys.values()
+
+        if num_actual_images > batch_size:
             logger.warning(
-                "grid_thw_list length (%d) doesn't match graph batch_size (%d)",
-                len(grid_thw_list),
+                "grid_thw_list length (%d) exceeds graph batch_size (%d)",
+                num_actual_images,
+                batch_size,
+            )
+            return None
+
+        if num_actual_images != batch_size and not is_budget_graph:
+            logger.warning(
+                "grid_thw_list length (%d) doesn't match graph batch_size (%d)"
+                " and not a budget graph",
+                num_actual_images,
                 batch_size,
             )
             return None
