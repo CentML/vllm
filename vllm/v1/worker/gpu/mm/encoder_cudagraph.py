@@ -15,10 +15,6 @@ Primary execution mode - Budget Batching:
   value, creating zero-length sequences for empty slots (no-op in FA2/FA4).
 - Works with any number of images (1 or many) and any grid sizes.
 
-Legacy modes (used by gpu_model_runner.py):
-- Exact match: Replay when grid_thw exactly matches a captured config.
-- Padded: Pad inputs to fit the smallest captured bucket.
-
 Key design principles:
 1. Capture graphs based on token budgets, not grid sizes
 2. Reuse one graph for any batch where total tokens fit the budget
@@ -29,7 +25,7 @@ Key design principles:
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -38,9 +34,6 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-
-if TYPE_CHECKING:
-    pass
 
 logger = init_logger(__name__)
 
@@ -214,9 +207,6 @@ class EncoderCudaGraphManager:
         self.embedding_buffers: dict[
             tuple[int, int, int, int], dict[str, torch.Tensor]
         ] = {}
-
-        # Store metadata about captured graphs
-        self.captured_metadata: dict[tuple[int, int, int, int], dict[str, Any]] = {}
 
         # Vision encoder reference for runtime embedding computation (set at capture)
         self.vision_encoder = None
@@ -427,16 +417,6 @@ class EncoderCudaGraphManager:
         self.input_buffers[graph_key] = {
             "pixel_values": pixel_values.clone(),
             "grid_thw": grid_thw,
-        }
-
-        # Store metadata
-        self.captured_metadata[graph_key] = {
-            "num_output_tokens": dummy_inputs["num_output_tokens"],
-            "num_output_tokens_per_image": dummy_inputs["num_output_tokens_per_image"],
-            "num_pixel_patches": dummy_inputs["num_pixel_patches"],
-            "num_pixel_patches_per_image": dummy_inputs["num_pixel_patches_per_image"],
-            "patch_input_channels": dummy_inputs["patch_input_channels"],
-            "batch_size": batch_size,
         }
 
         # Store vision encoder reference for runtime embedding computation
@@ -905,10 +885,9 @@ class EncoderCudaGraphManager:
                     return None
 
         if cache_miss_grids and self.verbose:
-            uncached_grids = cache_miss_grids
             logger.info(
                 "Embedding cache miss for grids: %s (computed on-the-fly)",
-                uncached_grids,
+                cache_miss_grids,
             )
 
         # Concatenate cached embeddings (just tensor concat, no computation)

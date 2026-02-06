@@ -728,12 +728,6 @@ class GPUModelRunner(
         if not getattr(self.compilation_config, "cudagraph_mm_encoder", False):
             return
 
-        self.encoder_cudagraph_verbose = getattr(
-            self.compilation_config,
-            "encoder_cudagraph_verbose",
-            False,
-        )
-
         encoder_graph_pool = torch.cuda.graph_pool_handle()
 
         self.encoder_cudagraph_manager = EncoderCudaGraphManager(
