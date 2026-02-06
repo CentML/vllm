@@ -495,7 +495,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Install FlashInfer from CentML fork
 # https://github.com/CentML/flashinfer/tree/mlperf-inf-mm-q3vl-v6.0
 ARG FLASHINFER_REPO=https://github.com/CentML/flashinfer.git
-ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0
+ARG FLASHINFER_BRANCH=mlperf-inf-mm-q3vl-v6.0-rc1
 ARG FLASHINFER_CUBIN_VERSION=0.5.3
 ARG FLASHINFER_JIT_CACHE_VERSION=0.5.3
 RUN --mount=type=cache,target=/root/.cache/uv \
