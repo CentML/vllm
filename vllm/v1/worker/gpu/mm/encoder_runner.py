@@ -260,9 +260,10 @@ class EncoderRunner:
         """
         Execute the encoder using CUDA graphs if a matching graph is available.
 
-        Supports two modes:
-        1. Exact match: Only use CUDA graph if grid_thw exactly matches
-        2. Padded mode: Pad inputs to fit the smallest available bucket
+        Supports three modes:
+        1. Budget batching: Pack multiple images into budget-sized graphs
+        2. Exact match: Only use CUDA graph if grid_thw exactly matches
+        3. Padded mode: Pad inputs to fit the smallest available bucket
 
         Args:
             model: The multimodal model
@@ -281,15 +282,6 @@ class EncoderRunner:
         if grid_thw is None:
             return None
 
-        # Currently only supports single-image batches for CUDA graph
-        if len(grid_thw) != 1:
-            logger.debug(
-                "CUDA graph only supports single-image batches, "
-                "got %d images. Using eager mode.",
-                len(grid_thw),
-            )
-            return None
-
         # Extract pixel_values
         if modality == "image":
             pixel_values = mm_kwargs_group.get("pixel_values")
@@ -306,6 +298,24 @@ class EncoderRunner:
         # Get spatial merge size for token calculations
         visual = getattr(model, "visual", None)
         spatial_merge_size = getattr(visual, "spatial_merge_size", 2)
+
+        # Try budget batching for all images (single or multi)
+        if self.encoder_cudagraph_budget_mode:
+            result = self._execute_budget_batch(
+                pixel_values, grid_thw, spatial_merge_size
+            )
+            if result is not None:
+                return result
+
+        # Fall back to single-image path
+        if len(grid_thw) != 1:
+            logger.debug(
+                "CUDA graph single-image path: got %d images. "
+                "Using eager mode.",
+                len(grid_thw),
+            )
+            return None
+
         t, h, w = grid_thw[0]
         num_output_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
 
@@ -349,6 +359,128 @@ class EncoderRunner:
             "ViT EAGER: grid=(%d, %d, %d), tokens=%d", t, h, w, num_output_tokens
         )
         return None
+
+    def _execute_budget_batch(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: list[list[int]],
+        spatial_merge_size: int,
+    ) -> list[torch.Tensor] | None:
+        """
+        Execute images using budget batch CUDA graphs.
+
+        Sorts images by output token count (smallest first), greedily packs
+        them into budget-sized batches, and replays the appropriate CUDA graph.
+
+        Args:
+            pixel_values: Concatenated pixel values for all images
+            grid_thw: List of [T, H, W] for each image
+            spatial_merge_size: Spatial merge size (e.g., 2)
+
+        Returns:
+            List of per-image output tensors in original order, or None
+        """
+        manager = self.encoder_cudagraph_manager
+        if manager is None or not manager.budget_graph_keys:
+            return None
+
+        max_budget = max(manager.budget_graph_keys.keys())
+        max_images = manager.max_images_per_batch
+
+        # Compute per-image info: (output_tokens, input_patches, original_idx)
+        image_info: list[tuple[int, int, int]] = []
+        for i, (t, h, w) in enumerate(grid_thw):
+            out_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+            in_patches = t * h * w
+            image_info.append((out_tokens, in_patches, i))
+
+        # Sort by output tokens ascending (small first)
+        sorted_images = sorted(image_info, key=lambda x: x[0])
+
+        # Compute pixel_values offsets for each original image
+        patch_offsets = [0]
+        for t, h, w in grid_thw:
+            patch_offsets.append(patch_offsets[-1] + t * h * w)
+
+        # Greedy packing into budget batches
+        batches: list[list[tuple[int, int, int]]] = []
+        current_batch: list[tuple[int, int, int]] = []
+        current_tokens = 0
+
+        for out_tokens, in_patches, orig_idx in sorted_images:
+            if (
+                current_tokens + out_tokens <= max_budget
+                and len(current_batch) < max_images
+            ):
+                current_batch.append((out_tokens, in_patches, orig_idx))
+                current_tokens += out_tokens
+            else:
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [(out_tokens, in_patches, orig_idx)]
+                current_tokens = out_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        # Execute each packed batch
+        outputs: list[torch.Tensor | None] = [None] * len(grid_thw)
+
+        for batch in batches:
+            total_out_tokens = sum(out_tok for out_tok, _, _ in batch)
+
+            # Find smallest budget graph that fits
+            graph_key = manager.find_budget_graph(total_out_tokens)
+            if graph_key is None:
+                # No budget fits - fall back entirely
+                logger.debug(
+                    "No budget graph for %d tokens, falling back to eager",
+                    total_out_tokens,
+                )
+                return None
+
+            # Concatenate pixel values in sorted order
+            pv_slices = []
+            batch_grids = []
+            for _, _, orig_idx in batch:
+                start = patch_offsets[orig_idx]
+                end = patch_offsets[orig_idx + 1]
+                pv_slices.append(pixel_values[start:end])
+                batch_grids.append(grid_thw[orig_idx])
+
+            packed_pv = torch.cat(pv_slices, dim=0)
+
+            # Run the budget graph
+            output = manager.run_batched_contiguous(
+                packed_pv, batch_grids, graph_key, spatial_merge_size
+            )
+            if output is None:
+                logger.debug(
+                    "Budget graph replay failed for key %s, "
+                    "falling back to eager",
+                    graph_key,
+                )
+                return None
+
+            # Split output by per-image output token counts
+            offset = 0
+            for out_tokens, _, orig_idx in batch:
+                outputs[orig_idx] = output[offset : offset + out_tokens].clone()
+                offset += out_tokens
+
+            if self.encoder_cudagraph_manager.verbose:
+                logger.info(
+                    "ViT BUDGET BATCH: %d images, %d tokens, graph_key=%s",
+                    len(batch),
+                    total_out_tokens,
+                    graph_key,
+                )
+
+        # Check all images were processed
+        if any(o is None for o in outputs):
+            return None
+
+        return outputs  # type: ignore[return-value]
 
     def gather_mm_embeddings(
         self,
