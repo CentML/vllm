@@ -428,9 +428,7 @@ class GPUModelRunner(
 
         # Encoder CUDA graph manager for ViT
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
-        self.encoder_cudagraph_padded_mode: bool = True
         self.encoder_cudagraph_verbose: bool = False
-        self.encoder_cudagraph_one_by_one: bool = True
         self.encoder_cudagraph_budget_mode: bool = False
         # Pre-allocated buffers for piecewise padded mode (lazily initialized)
         # Key: capture_size (output tokens), Value: dict of buffers
@@ -734,32 +732,11 @@ class GPUModelRunner(
             self.compilation_config, "encoder_cudagraph_bucket_sizes", None
         )
 
-        # Check if padded mode is enabled
-        self.encoder_cudagraph_padded_mode = getattr(
-            self.compilation_config,
-            "encoder_cudagraph_padded_mode",
-            True,  # Default to padded mode for better CUDA graph utilization
-        )
-
         # Check if verbose logging is enabled
         self.encoder_cudagraph_verbose = getattr(
             self.compilation_config,
             "encoder_cudagraph_verbose",
             False,  # Default to quiet mode
-        )
-
-        # Check if one-by-one processing is enabled for multi-image batches
-        self.encoder_cudagraph_one_by_one = getattr(
-            self.compilation_config,
-            "encoder_cudagraph_one_by_one",
-            True,  # Default to one-by-one for higher CUDA graph hit rate
-        )
-
-        # Get batch sizes for grouped batched mode
-        self.encoder_cudagraph_batch_sizes = getattr(
-            self.compilation_config,
-            "encoder_cudagraph_batch_sizes",
-            None,  # Default None means legacy mode (batch_size=1 only)
         )
 
         # Create a dedicated graph pool for encoder CUDA graphs
@@ -788,11 +765,8 @@ class GPUModelRunner(
         grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
             "Encoder CUDA graph manager initialized: "
-            "padded_mode=%s, one_by_one=%s, budget_mode=%s, "
-            "num_grids=%d, grids=%s, "
+            "budget_mode=%s, num_grids=%d, grids=%s, "
             "using dedicated encoder graph pool",
-            self.encoder_cudagraph_padded_mode,
-            self.encoder_cudagraph_one_by_one,
             self.encoder_cudagraph_budget_mode,
             len(grid_configs),
             grid_configs,
@@ -2441,258 +2415,28 @@ class GPUModelRunner(
                         **mm_kwargs_group
                     )
             else:
-                # Legacy mode: grouped batch -> one-by-one -> single ->
-                # piecewise -> eager
-                grouped_batched_result = None
-                if (
-                    self.encoder_cudagraph_manager is not None
-                    and self.encoder_cudagraph_batch_sizes is not None
-                    and num_items > 1
-                    and modality in ("image", "video")
-                ):
-                    # Try grouped batched mode
-                    if modality == "image":
-                        batched_pixel_values = mm_kwargs_group.get("pixel_values")
-                        grid_thw_list = mm_kwargs_group.get("image_grid_thw")
-                    else:  # video
-                        batched_pixel_values = mm_kwargs_group.get(
-                            "pixel_values_videos"
-                        )
-                        grid_thw_list = mm_kwargs_group.get("video_grid_thw")
-
-                    if batched_pixel_values is not None and grid_thw_list is not None:
-                        if isinstance(grid_thw_list, torch.Tensor):
-                            grid_thw_list = grid_thw_list.tolist()
-
-                        # Find largest batch size that fits
-                        target_batch_size = (
-                            max(
-                                bs
-                                for bs in self.encoder_cudagraph_batch_sizes
-                                if bs <= num_items
-                            )
-                            if any(
-                                bs <= num_items
-                                for bs in self.encoder_cudagraph_batch_sizes
-                            )
-                            else None
-                        )
-
-                        if target_batch_size is not None and target_batch_size > 1:
-                            if self.encoder_cudagraph_verbose:
-                                logger.info(
-                                    "Trying grouped batch: %d images, target_bs=%d",
-                                    num_items,
-                                    target_batch_size,
-                                )
-                            grouped_batched_result = (
-                                self._execute_grouped_batched_encoder(
-                                    model,
-                                    batched_pixel_values,
-                                    grid_thw_list,
-                                    modality,
-                                    target_batch_size,
-                                )
-                            )
-
-                # Check if grouped batch returned partial results
-                has_partial_results = grouped_batched_result is not None and any(
-                    r is not None for r in grouped_batched_result
-                )
-                all_complete = grouped_batched_result is not None and all(
-                    r is not None for r in grouped_batched_result
-                )
-
-                if all_complete:
-                    # All images processed by grouped batch
-                    # all_complete ensures no None entries
-                    curr_group_outputs = cast(
-                        list[torch.Tensor], grouped_batched_result
+                # No budget mode: try piecewise -> eager
+                piecewise_result = None
+                piecewise_enabled = (
+                    self.compilation_config is not None
+                    and getattr(
+                        self.compilation_config,
+                        "encoder_cudagraph_piecewise",
+                        False,
                     )
-                elif (
-                    self.encoder_cudagraph_manager is not None
-                    and self.encoder_cudagraph_one_by_one
-                    and num_items > 1
-                    and modality in ("image", "video")
-                ):
-                    # Fall back to one-by-one processing for remaining images
-                    # Process each image individually for CUDA graph support
-                    # Extract batched data and slice per-image to avoid
-                    # re-calling group_mm_kwargs_by_modality overhead
-                    # Note: list may contain None for unprocessed images;
-                    # these will be filled in by one-by-one processing below
-                    if has_partial_results and grouped_batched_result is not None:
-                        curr_group_outputs_lst = cast(
-                            list[torch.Tensor], list(grouped_batched_result)
-                        )
-                    else:
-                        curr_group_outputs_lst = cast(
-                            list[torch.Tensor], [None] * num_items
-                        )
+                )
 
-                    # Get batched pixel_values and grid_thw
-                    if modality == "image":
-                        batched_pixel_values = mm_kwargs_group.get("pixel_values")
-                        grid_thw_list = mm_kwargs_group.get("image_grid_thw")
-                        grid_key = "image_grid_thw"
-                        pixel_key = "pixel_values"
-                    else:  # video
-                        batched_pixel_values = mm_kwargs_group.get(
-                            "pixel_values_videos"
-                        )
-                        grid_thw_list = mm_kwargs_group.get("video_grid_thw")
-                        grid_key = "video_grid_thw"
-                        pixel_key = "pixel_values_videos"
+                if piecewise_enabled:
+                    piecewise_result = self._execute_encoder_piecewise_padded(
+                        model, mm_kwargs_group, modality
+                    )
 
-                    if batched_pixel_values is not None and grid_thw_list is not None:
-                        # Convert grid_thw to list if tensor
-                        if isinstance(grid_thw_list, torch.Tensor):
-                            grid_thw_list = grid_thw_list.tolist()
-
-                        # Calculate patch boundaries for slicing
-                        patch_offset = 0
-                        # Count how many need one-by-one processing
-                        num_remaining = sum(
-                            1 for o in curr_group_outputs_lst if o is None
-                        )
-                        if self.encoder_cudagraph_verbose and num_remaining > 0:
-                            remaining_grids = [
-                                grid_thw_list[i]
-                                for i, o in enumerate(curr_group_outputs_lst)
-                                if o is None
-                            ]
-                            logger.info(
-                                "Processing %d remaining images one-at-a-time, "
-                                "grids=%s",
-                                num_remaining,
-                                remaining_grids,
-                            )
-                        for img_idx, grid_thw in enumerate(grid_thw_list):
-                            t, h, w = grid_thw
-                            num_patches = t * h * w
-
-                            # Slice pixel_values for this image
-                            single_pixel_values = batched_pixel_values[
-                                patch_offset : patch_offset + num_patches
-                            ]
-                            patch_offset += num_patches
-
-                            # Skip if already processed by grouped batch
-                            if curr_group_outputs_lst[img_idx] is not None:
-                                continue
-
-                            # Build single-image kwargs for CUDA graph (list format)
-                            single_mm_inputs_for_cudagraph = {
-                                pixel_key: single_pixel_values,
-                                grid_key: [grid_thw],
-                            }
-
-                            # Try CUDA graph for this single image
-                            single_result = self._execute_with_encoder_cudagraph(
-                                model,
-                                single_mm_inputs_for_cudagraph,
-                                modality,
-                                1,
-                            )
-                            if single_result is not None:
-                                curr_group_outputs_lst[img_idx] = single_result[0]
-                            else:
-                                # Fall back to eager for this image
-                                # Model expects grid_thw as CPU tensor (.numpy())
-                                single_mm_inputs_for_eager = {
-                                    pixel_key: single_pixel_values,
-                                    grid_key: torch.tensor(
-                                        [grid_thw],
-                                        dtype=torch.int64,
-                                    ),  # Keep on CPU
-                                }
-                                single_output = model.embed_multimodal(
-                                    **single_mm_inputs_for_eager
-                                )
-                                curr_group_outputs_lst[img_idx] = single_output[0]
-
-                        curr_group_outputs = curr_group_outputs_lst
-                    else:
-                        # Fallback to eager if data extraction fails
-                        curr_group_outputs = model.embed_multimodal(**mm_kwargs_group)
+                if piecewise_result is not None:
+                    curr_group_outputs = piecewise_result
                 else:
-                    # Single item or no CUDA graph manager - try CUDA graph
-                    cudagraph_result = None
-                    if self.encoder_cudagraph_manager is not None:
-                        cudagraph_result = self._execute_with_encoder_cudagraph(
-                            model, mm_kwargs_group, modality, num_items
-                        )
-
-                    if cudagraph_result is not None:
-                        # CUDA graph was used successfully
-                        curr_group_outputs = cudagraph_result
-                    else:
-                        # Try piecewise padded execution if enabled
-                        piecewise_result = None
-                        piecewise_enabled = (
-                            self.compilation_config is not None
-                            and getattr(
-                                self.compilation_config,
-                                "encoder_cudagraph_piecewise",
-                                False,
-                            )
-                            and getattr(
-                                self.compilation_config,
-                                "encoder_cudagraph_padded_mode",
-                                True,
-                            )
-                        )
-
-                        if self.encoder_cudagraph_verbose:
-                            logger.info(
-                                "ViT: cudagraph_result=None, piecewise_enabled=%s "
-                                "(full_cudagraph=%s, piecewise=%s, padded_mode=%s)",
-                                piecewise_enabled,
-                                getattr(
-                                    self.compilation_config,
-                                    "cudagraph_mm_encoder",
-                                    False,
-                                )
-                                if self.compilation_config
-                                else None,
-                                getattr(
-                                    self.compilation_config,
-                                    "encoder_cudagraph_piecewise",
-                                    False,
-                                )
-                                if self.compilation_config
-                                else None,
-                                getattr(
-                                    self.compilation_config,
-                                    "encoder_cudagraph_padded_mode",
-                                    True,
-                                )
-                                if self.compilation_config
-                                else None,
-                            )
-
-                        if piecewise_enabled:
-                            piecewise_result = self._execute_encoder_piecewise_padded(
-                                model, mm_kwargs_group, modality
-                            )
-
-                        if piecewise_result is not None:
-                            curr_group_outputs = piecewise_result
-                        else:
-                            # Fall back to non-padded execution.
-                            # Run the encoder.
-                            # `curr_group_outputs` is either of the following:
-                            # 1. A tensor of shape
-                            #    (num_items, feature_size, hidden_size)
-                            #    in case feature_size is fixed across all
-                            #    multimodal items.
-                            # 2. A list or tuple (length: num_items) of tensors,
-                            #    each of shape (feature_size, hidden_size) in
-                            #    case the feature size is dynamic depending on
-                            #    the input multimodal items.
-                            curr_group_outputs = model.embed_multimodal(
-                                **mm_kwargs_group
-                            )
+                    curr_group_outputs = model.embed_multimodal(
+                        **mm_kwargs_group
+                    )
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
