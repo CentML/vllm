@@ -963,16 +963,28 @@ class Qwen3_VisionTransformer(nn.Module):
         # Patch embedding (GPU operation)
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         hidden_states = self.patch_embed(hidden_states)
-
+        logger.debug(
+            "forward_piecewise 0, hidden_states.shape=%s hidden_states_addresses=%s",
+            hidden_states.shape,
+            hidden_states.data_ptr(),
+        )
         # Ensure max_seqlen is on GPU for attention kernels
         if max_seqlen.device.type == "cpu":
             max_seqlen = max_seqlen.to(self.device, non_blocking=True)
 
         # Add pre-computed position embeddings
-        hidden_states = hidden_states + pos_embeds
-
+        hidden_states.add_(pos_embeds)
+        logger.debug(
+            "forward_piecewise 1, hidden_states.shape=%s hidden_states_addresses=%s",
+            hidden_states.shape,
+            hidden_states.data_ptr(),
+        )
         hidden_states = hidden_states.unsqueeze(1)
-
+        logger.debug(
+            "forward_piecewise 2, hidden_states.shape=%s hidden_states_addresses=%s",
+            hidden_states.shape,
+            hidden_states.data_ptr(),
+        )
         # Run through transformer blocks with pre-computed values
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
@@ -983,6 +995,13 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
                 sequence_lengths=sequence_lengths,
+            )
+            logger.debug(
+                "forward_piecewise 3, layer_num=%s, hidden_states.shape=%s \
+                hidden_states_addresses=%s",
+                layer_num,
+                hidden_states.shape,
+                hidden_states.data_ptr(),
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)

@@ -2763,8 +2763,7 @@ class GPUModelRunner(
         # Calculate padding needed
         padding_output_tokens = capture_size - actual_output_tokens
         padding_patches = padding_output_tokens * (spatial_merge_size**2)
-        padded_num_patches = capture_size * (spatial_merge_size**2)
-
+        total_num_patches = capture_size * (spatial_merge_size**2)
         # Pre-compute embeddings for real images (OUTSIDE compiled graph)
         # This is the key to making piecewise padding work
         precomputed = visual.precompute_for_cudagraph(grid_thw_list)
@@ -2779,55 +2778,25 @@ class GPUModelRunner(
 
         # Get or create pre-allocated buffers for this capture_size
         # This avoids allocation and zeros kernels on every call
-        buffers = self._piecewise_buffers.get(capture_size)
+        buffers = self._piecewise_buffers.get(total_num_patches)
         if buffers is None:
-            # Lazily allocate buffers on first use for this capture_size
-            # Using torch.zeros ensures padding region is valid (not garbage)
-            # The zeros kernel only runs once per capture_size, not per call
-            buffers = {
-                "pixel_values": torch.zeros(
-                    (padded_num_patches, pixel_values.shape[1]),
-                    dtype=visual.dtype,
-                    device=pixel_values.device,
-                ),
-                "pos_embeds": torch.zeros(
-                    (padded_num_patches, pos_embeds.shape[1]),
-                    dtype=pos_embeds.dtype,
-                    device=pos_embeds.device,
-                ),
-                "rotary_cos": torch.zeros(
-                    (padded_num_patches, rotary_pos_emb_cos.shape[1]),
-                    dtype=rotary_pos_emb_cos.dtype,
-                    device=rotary_pos_emb_cos.device,
-                ),
-                "rotary_sin": torch.zeros(
-                    (padded_num_patches, rotary_pos_emb_sin.shape[1]),
-                    dtype=rotary_pos_emb_sin.dtype,
-                    device=rotary_pos_emb_sin.device,
-                ),
-                # Pre-allocate cu_seqlens with max possible entries
-                # (assuming max ~1000 images per batch is more than enough)
-                "cu_seqlens": torch.zeros(
-                    (1001,), dtype=cu_seqlens.dtype, device=cu_seqlens.device
-                ),
-                "sequence_lengths": torch.zeros(
-                    (1000,),
-                    dtype=sequence_lengths.dtype,
-                    device=sequence_lengths.device,
-                ),
-            }
-            self._piecewise_buffers[capture_size] = buffers
-            if self.encoder_cudagraph_verbose:
-                logger.info(
-                    "ViT PIECEWISE: Allocated buffers for capture_size=%d (patches=%d)",
-                    capture_size,
-                    padded_num_patches,
-                )
-
+            logger.warning(
+                "ViT PIECEWISE: No buffers found for capture_size=%d", total_num_patches
+            )
+            return None
+        logger.debug(
+            "execute _execute_encoder_piecewise_padded, total_num_patches=%s",
+            total_num_patches,
+        )
+        logger.debug(
+            "execute _execute_encoder_piecewise_padded, buffers pixel_values.shape=%s \
+            pixel_values_addresses=%s",
+            buffers["pixel_values"].shape,
+            buffers["pixel_values"].data_ptr(),
+        )
         # Copy data into pre-allocated buffers (no allocation, no zeros kernel)
         padded_pixel_values = buffers["pixel_values"]
         padded_pixel_values[:num_input_patches].copy_(pixel_values.type(visual.dtype))
-
         padded_pos_embeds = buffers["pos_embeds"]
         padded_pos_embeds[:num_input_patches].copy_(pos_embeds)
 
@@ -2865,7 +2834,7 @@ class GPUModelRunner(
 
         # Call forward_piecewise directly with pre-computed and padded tensors
         # Enable CUDA graph capture/replay by setting the proper forward context
-        batch_desc = BatchDescriptor(num_tokens=padded_num_patches)
+        batch_desc = BatchDescriptor(num_tokens=total_num_patches)
         with set_forward_context(
             None,
             self.vllm_config,
@@ -2974,7 +2943,7 @@ class GPUModelRunner(
 
             pixel_values = torch.zeros(
                 (num_patches, input_channels),
-                dtype=visual.dtype,
+                dtype=visual.dtype,  # type:ignore[union-attr]
                 device=self.device,
             )
 
@@ -2984,19 +2953,19 @@ class GPUModelRunner(
 
             pos_embeds = torch.zeros(
                 (num_patches, hidden_size),
-                dtype=visual.dtype,
+                dtype=visual.dtype,  # type:ignore[union-attr]
                 device=self.device,
             )
 
             rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
             rotary_cos = torch.zeros(
                 (num_patches, rotary_dim),
-                dtype=visual.dtype,
+                dtype=visual.dtype,  # type:ignore[union-attr]
                 device=self.device,
             )
             rotary_sin = torch.zeros(
                 (num_patches, rotary_dim),
-                dtype=visual.dtype,
+                dtype=visual.dtype,  # type:ignore[union-attr]
                 device=self.device,
             )
 
@@ -3031,7 +3000,7 @@ class GPUModelRunner(
             ) = create_dummy_inputs(num_patches)
 
             with set_forward_context(None, self.vllm_config):
-                _ = visual.forward_piecewise(
+                _ = visual.forward_piecewise(  # type:ignore[union-attr]
                     x=pixel_values,
                     pos_embeds=pos_embeds,
                     rotary_pos_emb_cos=rotary_cos,
@@ -3090,66 +3059,86 @@ class GPUModelRunner(
         )
 
         for num_patches in capture_sizes_patches:
-            # Create dummy inputs
-            patch_embed = getattr(visual, "patch_embed", None)
-            if patch_embed is not None:
-                temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
-                patch_size = getattr(patch_embed, "patch_size", 14)
-                proj = getattr(patch_embed, "proj", None)
-                raw_in_channels = getattr(proj, "in_channels", 3) if proj else 3
-                input_channels = (
-                    raw_in_channels * temporal_patch_size * patch_size * patch_size
+            # Get or create persistent buffers for this capture_size
+            # CRITICAL: We must use the same buffers during capture and replay
+            # to ensure stable CUDA graph input addresses
+            buffers = self._piecewise_buffers.get(num_patches)
+            if buffers is None:
+                # Create dummy inputs
+                patch_embed = getattr(visual, "patch_embed", None)
+                if patch_embed is not None:
+                    temporal_patch_size = getattr(patch_embed, "temporal_patch_size", 2)
+                    patch_size = getattr(patch_embed, "patch_size", 14)
+                    proj = getattr(patch_embed, "proj", None)
+                    raw_in_channels = getattr(proj, "in_channels", 3) if proj else 3
+                    input_channels = (
+                        raw_in_channels * temporal_patch_size * patch_size * patch_size
+                    )
+                else:
+                    input_channels = 3 * 2 * 14 * 14
+
+                hidden_size = getattr(
+                    visual, "hidden_size", getattr(visual, "embed_dim", 1152)
                 )
-            else:
-                input_channels = 3 * 2 * 14 * 14
+                rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
 
-            pixel_values = torch.zeros(
-                (num_patches, input_channels),
-                dtype=visual.dtype,
-                device=self.device,
-            )
+                # Create persistent buffers (same as runtime path)
+                buffers = {
+                    "pixel_values": torch.zeros(
+                        (num_patches, input_channels),
+                        dtype=visual.dtype,
+                        device=self.device,
+                    ),
+                    "pos_embeds": torch.zeros(
+                        (num_patches, hidden_size),
+                        dtype=visual.dtype,
+                        device=self.device,
+                    ),
+                    "rotary_cos": torch.zeros(
+                        (num_patches, rotary_dim),
+                        dtype=visual.dtype,
+                        device=self.device,
+                    ),
+                    "rotary_sin": torch.zeros(
+                        (num_patches, rotary_dim),
+                        dtype=visual.dtype,
+                        device=self.device,
+                    ),
+                    "cu_seqlens": torch.zeros(
+                        (1001,), dtype=torch.int32, device=self.device
+                    ),
+                    "sequence_lengths": torch.zeros(
+                        (1000,), dtype=torch.int32, device=self.device
+                    ),
+                }
+                self._piecewise_buffers[num_patches] = buffers
 
-            hidden_size = getattr(
-                visual, "hidden_size", getattr(visual, "embed_dim", 1152)
+            logger.debug(
+                "capture _capture_encoder_piecewise_cudagraphs, num_patches=%s",
+                num_patches,
             )
-            pos_embeds = torch.zeros(
-                (num_patches, hidden_size),
-                dtype=visual.dtype,
-                device=self.device,
+            logger.debug(
+                "capture _capture_encoder_piecewise_cudagraphs, \
+                buffers pixel_values.shape=%s \
+                pixel_values_addresses=%s",
+                buffers["pixel_values"].shape,
+                buffers["pixel_values"].data_ptr(),
             )
+            # Use the persistent buffers for capture
+            pixel_values = buffers["pixel_values"]
+            pos_embeds = buffers["pos_embeds"]
+            rotary_cos = buffers["rotary_cos"]
+            rotary_sin = buffers["rotary_sin"]
 
-            rotary_dim = hidden_size // getattr(visual, "num_heads", 16) // 2
-            rotary_cos = torch.zeros(
-                (num_patches, rotary_dim),
-                dtype=visual.dtype,
-                device=self.device,
-            )
-            rotary_sin = torch.zeros(
-                (num_patches, rotary_dim),
-                dtype=visual.dtype,
-                device=self.device,
-            )
+            # Initialize cu_seqlens and sequence_lengths from buffers
+            cu_seqlens = buffers["cu_seqlens"]
+            cu_seqlens[0] = 0
+            cu_seqlens[1] = num_patches
 
-            cu_seqlens = torch.tensor(
-                [0, num_patches], dtype=torch.int32, device=self.device
-            )
             max_seqlen = torch.tensor(num_patches, device=self.device)
-            sequence_lengths = torch.tensor(
-                [num_patches], dtype=torch.int32, device=self.device
-            )
 
-            # Two-pass capture like LM:
-            # Pass 1: NONE mode - triggers torch.compile without CUDA graph capture
-            with set_forward_context(None, self.vllm_config):
-                _ = visual.forward_piecewise(
-                    x=pixel_values,
-                    pos_embeds=pos_embeds,
-                    rotary_pos_emb_cos=rotary_cos,
-                    rotary_pos_emb_sin=rotary_sin,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    sequence_lengths=sequence_lengths,
-                )
+            sequence_lengths = buffers["sequence_lengths"]
+            sequence_lengths[0] = num_patches
 
             # Pass 2: PIECEWISE mode - triggers CUDAGraphWrapper capture
             # (compilation already done in pass 1)

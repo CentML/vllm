@@ -299,6 +299,13 @@ class CUDAGraphWrapper:
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
+            # print x shapes and names
+            for x in args:
+                if isinstance(x, torch.Tensor):
+                    # torch.Tensor does not have a .name() attribute.
+                    logger.debug(
+                        "replay, x.shape=%s x.data_ptr=%s", x.shape, x.data_ptr()
+                    )
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "

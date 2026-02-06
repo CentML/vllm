@@ -45,6 +45,11 @@ class PiecewiseBackend:
         self.graph = graph
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
+        # record local cache dir when initializing the backend
+        # since we are referencing the global variable of compilation_config
+        # this value may be changed during the compilation process
+        # resulting in incorrect cache file paths
+        # self.local_cache_dir = str(self.compilation_config.local_cache_dir)
         self.piecewise_compile_index = piecewise_compile_index
         self.total_piecewise_compiles = total_piecewise_compiles
         self.vllm_backend = vllm_backend
@@ -69,39 +74,7 @@ class PiecewiseBackend:
                 start=last_compile_range.start, end=max_int32
             )
 
-        log_string = f"PiecewiseBackend: compile_ranges: {self.compile_ranges}"
-        logger.debug_once(log_string)
-
-        # Use encoder-specific capture sizes for encoder compilation
-        self.compile_sizes: list[Any] | None = None
-        if self.is_encoder_compilation:
-            encoder_capture_sizes = (
-                self.compilation_config.encoder_cudagraph_capture_sizes
-            )
-            if encoder_capture_sizes is not None:
-                # Convert from output tokens to input patches
-                # encoder_cudagraph_capture_sizes is specified in output tokens
-                # but runtime_shape (from sym_shape_indices) is in input patches
-                merge_size_sq = self.compilation_config.encoder_spatial_merge_size**2
-                self.compile_sizes = [
-                    size * merge_size_sq for size in encoder_capture_sizes
-                ]
-                logger.debug_once(
-                    "PiecewiseBackend: converted encoder capture sizes from "
-                    "output tokens %s to input patches %s (merge_size²=%d)",
-                    tuple(encoder_capture_sizes),
-                    tuple(self.compile_sizes),
-                    merge_size_sq,
-                )
-            else:
-                self.compile_sizes = None
-        else:
-            self.compile_sizes = self.compilation_config.compile_sizes
-        log_string = (
-            f"PiecewiseBackend: compile_sizes: {self.compile_sizes} "
-            f"(is_encoder={self.is_encoder_compilation})"
-        )
-        logger.debug_once(log_string)
+        self.compile_sizes = self.compilation_config.compile_sizes
 
         self.sym_shape_indices = sym_shape_indices
 
@@ -177,6 +150,10 @@ class PiecewiseBackend:
             # For concrete size, we clear the shape env in
             # compiler_manager.compile() so no need to fakify.
             args_list = self._fakify_args(args) if not is_exact_size else list(args)
+            # old_local_cache_dir = self.compilation_config.local_cache_dir
+            # # restore the local cache dir to the original value when
+            # initializing the backend
+            # self.compilation_config.local_cache_dir = self.local_cache_dir
             range_entry.runnable = self.vllm_backend.compiler_manager.compile(
                 self.graph,
                 args_list,
@@ -186,7 +163,7 @@ class PiecewiseBackend:
                 graph_index=self.piecewise_compile_index,
                 num_graphs=self.total_piecewise_compiles,
             )
-
+            # self.compilation_config.local_cache_dir = old_local_cache_dir
             self.check_for_ending_compilation()
 
     def _find_range_for_shape(self, runtime_shape: int) -> RangeEntry | None:
