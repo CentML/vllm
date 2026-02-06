@@ -346,6 +346,54 @@ class EncoderCudaGraphManager:
             tuple[int, int, int], dict[str, torch.Tensor]
         ] = {}
 
+        # Budget batching config
+        # Maps token_budget -> graph_key for budget batch CUDA graphs
+        self.budget_graph_keys: dict[int, tuple[int, int, int, int]] = {}
+        self.token_budgets: list[int] = []
+        self.max_images_per_batch: int = 0
+        self._read_budget_config()
+
+    def _read_budget_config(self) -> None:
+        """Read budget batching configuration from compilation config."""
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config is None:
+            return
+
+        token_budgets = getattr(
+            compilation_config, "encoder_cudagraph_token_budgets", None
+        )
+        max_images = getattr(
+            compilation_config, "encoder_cudagraph_max_images_per_batch", None
+        )
+
+        if token_budgets is None and max_images is None:
+            return
+
+        if (token_budgets is None) != (max_images is None):
+            logger.warning(
+                "encoder_cudagraph_token_budgets and "
+                "encoder_cudagraph_max_images_per_batch must both be set. "
+                "Budget batching disabled."
+            )
+            return
+
+        if max_images <= 0:
+            logger.warning(
+                "encoder_cudagraph_max_images_per_batch must be positive. "
+                "Budget batching disabled."
+            )
+            return
+
+        self.token_budgets = sorted(token_budgets)
+        self.max_images_per_batch = max_images
+
+        logger.info(
+            "Budget batching configured: token_budgets=%s, "
+            "max_images_per_batch=%d",
+            self.token_budgets,
+            self.max_images_per_batch,
+        )
+
     def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
         """Get encoder grid configurations from config or use defaults."""
         compilation_config = self.vllm_config.compilation_config
