@@ -728,29 +728,18 @@ class GPUModelRunner(
         if not getattr(self.compilation_config, "cudagraph_mm_encoder", False):
             return
 
-        bucket_sizes = getattr(
-            self.compilation_config, "encoder_cudagraph_bucket_sizes", None
-        )
-
-        # Check if verbose logging is enabled
         self.encoder_cudagraph_verbose = getattr(
             self.compilation_config,
             "encoder_cudagraph_verbose",
-            False,  # Default to quiet mode
+            False,
         )
 
-        # Create a dedicated graph pool for encoder CUDA graphs
-        # This keeps encoder and decoder graph memory separate for:
-        # 1. Better memory isolation and predictability
-        # 2. Independent memory management for each subsystem
-        # 3. Easier debugging of memory usage
         encoder_graph_pool = torch.cuda.graph_pool_handle()
 
         self.encoder_cudagraph_manager = EncoderCudaGraphManager(
             vllm_config=self.vllm_config,
             device=self.device,
             dtype=self.dtype,
-            bucket_sizes=bucket_sizes,
             graph_pool=encoder_graph_pool,
             verbose=self.encoder_cudagraph_verbose,
         )
@@ -761,15 +750,9 @@ class GPUModelRunner(
             and self.encoder_cudagraph_manager.max_images_per_batch > 0
         )
 
-        # Log configuration
-        grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
-            "Encoder CUDA graph manager initialized: "
-            "budget_mode=%s, num_grids=%d, grids=%s, "
-            "using dedicated encoder graph pool",
+            "Encoder CUDA graph manager initialized: budget_mode=%s",
             self.encoder_cudagraph_budget_mode,
-            len(grid_configs),
-            grid_configs,
         )
 
     def update_max_model_len(self, max_model_len: int) -> None:

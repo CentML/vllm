@@ -47,38 +47,6 @@ logger = init_logger(__name__)
 
 # Grid configurations for CUDA graph capture (T, H, W in patch units)
 #
-# Strategy: Prioritize small grids where kernel launch overhead dominates.
-# For larger grids, computation time dominates and CUDA graph benefit is minimal.
-#
-# Grids larger than max_grid_size (default 96) should use padded mode or eager.
-CUSTOM_GRID_CONFIGS = [
-    # === Tier 1: Very small grids (<=32) ===
-    (1, 16, 16),  # 256 patches
-    (1, 24, 24),  # 576 patches
-    (1, 32, 32),  # 1024 patches
-    # === Tier 2: Small grids (33-50) ===
-    (1, 38, 38),  # 1444 patches
-    (1, 40, 40),  # 1600 patches
-    (1, 42, 42),  # 1764 patches
-    (1, 44, 44),  # 1936 patches
-    (1, 46, 46),  # 2116 patches
-    (1, 50, 50),  # 2500 patches
-    # === Tier 3: Medium-small grids (51-70) ===
-    (1, 56, 56),  # 3136 patches
-    (1, 62, 62),  # 3844 patches
-    (1, 64, 64),  # 4096 patches
-    (1, 68, 68),  # 4624 patches
-    # === Tier 4: Medium grids (71-96) ===
-    (1, 76, 76),  # 5776 patches
-    (1, 80, 80),  # 6400 patches
-    (1, 94, 94),  # 8836 patches
-]
-
-# Default bucket sizes for padded mode (creates square grids)
-# These cover medium-large grids that are too big for exact match capture
-# but still benefit from CUDA graphs via padding.
-DEFAULT_PADDED_BUCKET_SIZES = [100, 128]
-
 # Top 100 most common grids for embedding cache pre-warming.
 # Pre-warming these grids at startup avoids cold-start embedding computation
 # at runtime, eliminating ~20 small kernel launches per grid on first encounter.
@@ -213,8 +181,6 @@ class EncoderCudaGraphManager:
         vllm_config: VllmConfig,
         device: torch.device,
         dtype: torch.dtype,
-        bucket_sizes: list[int] | None = None,
-        grid_configs: list[tuple[int, int, int]] | None = None,
         graph_pool: Any | None = None,
         verbose: bool = False,
     ):
@@ -223,51 +189,7 @@ class EncoderCudaGraphManager:
         self.dtype = dtype
         self.verbose = verbose
 
-        # Get batch sizes from config (for grouped batched mode)
-        self.batch_sizes = self._get_batch_sizes_from_config()
-
-        # Get grid configs from config or use defaults (for exact match)
-        if grid_configs is None:
-            grid_configs = self._get_grid_configs_from_config()
-
-        # Get bucket sizes from config (for padded mode)
-        if bucket_sizes is None:
-            bucket_sizes = self._get_bucket_sizes_from_config()
-
-        # Merge: grid_configs (exact match) + bucket_sizes (padded mode square grids)
-        # Bucket sizes create square grids (1, size, size) for padded mode
-        grid_set = set(grid_configs)
-        for size in bucket_sizes:
-            grid_set.add((1, size, size))
-
-        # Filter out grids that are too large to capture efficiently
-        # Large grids (e.g., 256x256+) consume massive memory (~14+ GiB each)
-        # and are better served by eager mode or padded execution
-        max_grid_size = self._get_max_grid_size_from_config()
-        filtered_grids = []
-        skipped_grids = []
-        for grid in grid_set:
-            t, h, w = grid
-            if h <= max_grid_size and w <= max_grid_size:
-                filtered_grids.append(grid)
-            else:
-                skipped_grids.append(grid)
-
-        if skipped_grids:
-            top_skipped = sorted(
-                skipped_grids, key=lambda x: x[1] * x[2], reverse=True
-            )[:5]
-            logger.info(
-                "Skipping %d grids exceeding max_grid_size=%d: %s...",
-                len(skipped_grids),
-                max_grid_size,
-                top_skipped,
-            )
-
-        self.grid_configs = filtered_grids
-
         # CUDA graph storage - keyed by (batch_size, t, h, w) tuple
-        # For legacy mode (batch_sizes=None), key is (1, t, h, w)
         self.graphs: dict[tuple[int, int, int, int], torch.cuda.CUDAGraph] = {}
         # Use private pools by default to avoid segfaults with rapid back-to-back
         # graph replays during one-by-one multi-image processing.
@@ -405,86 +327,6 @@ class EncoderCudaGraphManager:
             self.token_budgets,
             self.max_images_per_batch,
         )
-
-    def _get_grid_configs_from_config(self) -> list[tuple[int, int, int]]:
-        """Get encoder grid configurations from config or use defaults."""
-        compilation_config = self.vllm_config.compilation_config
-        if compilation_config is None:
-            return CUSTOM_GRID_CONFIGS
-
-        # Check for encoder-specific grid config
-        grid_configs = getattr(
-            compilation_config, "encoder_cudagraph_grid_configs", None
-        )
-        if grid_configs is not None:
-            # Handle preset name or custom list
-            if isinstance(grid_configs, str):
-                if grid_configs == "custom":
-                    return CUSTOM_GRID_CONFIGS
-                else:
-                    logger.warning(
-                        "Unknown grid config preset '%s', using 'custom'",
-                        grid_configs,
-                    )
-                    return CUSTOM_GRID_CONFIGS
-            return [tuple(cfg) for cfg in grid_configs]
-
-        return CUSTOM_GRID_CONFIGS
-
-    def _get_bucket_sizes_from_config(self) -> list[int]:
-        """Get encoder CUDA graph bucket sizes from config.
-
-        Bucket sizes enable padded mode for grids that don't have exact matches.
-        Default buckets (100, 128) cover medium-large grids efficiently.
-        """
-        compilation_config = self.vllm_config.compilation_config
-        if compilation_config is None:
-            return DEFAULT_PADDED_BUCKET_SIZES
-
-        encoder_sizes = getattr(
-            compilation_config, "encoder_cudagraph_bucket_sizes", None
-        )
-        return (
-            encoder_sizes if encoder_sizes is not None else DEFAULT_PADDED_BUCKET_SIZES
-        )
-
-    def _get_max_grid_size_from_config(self) -> int:
-        """Get maximum grid size for encoder CUDA graph capture.
-
-        Large grids consume massive GPU memory per graph and provide minimal
-        benefit since computation time dominates over launch overhead.
-
-        Default is 96 to focus memory on small grids where benefit is highest.
-        Grids larger than this will use padded mode (if buckets configured) or eager.
-        """
-        compilation_config = self.vllm_config.compilation_config
-        if compilation_config is None:
-            return 96  # Focus on small grids where benefit is highest
-
-        max_size = getattr(
-            compilation_config,
-            "encoder_cudagraph_max_grid_size",
-            96,  # Default: max 96x96 grids for exact match
-        )
-        return max_size
-
-    def _get_batch_sizes_from_config(self) -> list[int]:
-        """Get batch sizes for grouped batched CUDA graph capture.
-
-        When set (e.g., [4]), captures graphs for processing multiple images
-        together with the same grid size. Images are grouped by grid size and
-        padded to the largest in each group.
-
-        Default is [1] for legacy one-by-one mode.
-        """
-        compilation_config = self.vllm_config.compilation_config
-        if compilation_config is None:
-            return [1]
-
-        batch_sizes = getattr(compilation_config, "encoder_cudagraph_batch_sizes", None)
-        if batch_sizes is None:
-            return [1]  # Legacy mode: batch_size=1 only
-        return sorted(batch_sizes)
 
     def _compute_output_tokens(
         self,
@@ -845,90 +687,14 @@ class EncoderCudaGraphManager:
             logger.warning("Encoder CUDA graphs already captured, skipping")
             return
 
-        # Build list of (batch_size, grid_config) combinations to capture
-        capture_combinations = []
-        for batch_size in self.batch_sizes:
-            for grid_config in self.grid_configs:
-                capture_combinations.append((batch_size, grid_config))
-
-        # Log initial memory state
-        free_mem_before, total_mem = torch.cuda.mem_get_info(self.device)
-        used_mem_before = total_mem - free_mem_before
-        logger.info(
-            "Capturing encoder CUDA graphs for %d combinations "
-            "(batch_sizes=%s, grids=%d) "
-            "(GPU memory: %.2f GiB used, %.2f GiB free)",
-            len(capture_combinations),
-            self.batch_sizes,
-            len(self.grid_configs),
-            used_mem_before / 1024**3,
-            free_mem_before / 1024**3,
-        )
-
-        # Capture from smallest to largest so that common smaller grids are
-        # captured first. If we run out of memory, only large grids will fail.
-        capture_combinations = sorted(
-            capture_combinations,
-            key=lambda x: x[0] * x[1][0] * x[1][1] * x[1][2],  # batch * t * h * w
-            reverse=False,  # Smallest first
-        )
-
-        if is_global_first_rank():
-            capture_combinations = tqdm(
-                capture_combinations, desc="Capturing encoder CUDA graphs"
-            )
-
-        # Capture each graph. For single-GPU mode, capture directly on current stream
-        # to avoid stream synchronization overhead at replay time.
-        # For multi-GPU mode, use graph_capture() context to coordinate with TP/PP.
-        for batch_size, grid_config in capture_combinations:
-            try:
-                if self.is_single_gpu:
-                    # Single-GPU: capture on current stream (no separate stream)
-                    self.capture_graph_for_grid(
-                        grid_config,
-                        vision_encoder,
-                        batch_size=batch_size,
-                    )
-                else:
-                    # Multi-GPU: use graph_capture() for TP/PP coordination
-                    with graph_capture(device=self.device):
-                        self.capture_graph_for_grid(
-                            grid_config,
-                            vision_encoder,
-                            batch_size=batch_size,
-                        )
-            except Exception as e:
-                logger.warning(
-                    "Failed to capture encoder CUDA graph for "
-                    "batch_size=%d, grid=%s: %s. Will use eager mode.",
-                    batch_size,
-                    grid_config,
-                    e,
-                )
-
-        self.captured = True
-
-        # Log final memory state
-        free_mem_after, _ = torch.cuda.mem_get_info(self.device)
-        used_mem_after = total_mem - free_mem_after
-        encoder_graph_mem = used_mem_after - used_mem_before
-        logger.info(
-            "Captured %d encoder CUDA graphs (configs: %s). "
-            "Encoder graph memory: %.2f GiB (GPU: %.2f GiB used, %.2f GiB free)",
-            len(self.graphs),
-            sorted(self.graphs.keys()),
-            encoder_graph_mem / 1024**3,
-            used_mem_after / 1024**3,
-            free_mem_after / 1024**3,
-        )
-
         # Pre-warm embedding cache for common grids
         self._prewarm_embedding_cache(vision_encoder)
 
-        # Capture budget batch graphs if configured
+        # Capture budget batch graphs
         if self.token_budgets and self.max_images_per_batch > 0:
             self.capture_budget_graphs(vision_encoder)
+
+        self.captured = True
 
     def _prewarm_embedding_cache(self, vision_encoder: nn.Module) -> None:
         """
