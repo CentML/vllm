@@ -31,9 +31,13 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import graph_capture
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    graph_capture,
+)
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -797,7 +801,6 @@ class EncoderCudaGraphManager:
         input_buffer = self.input_buffers[graph_key]["pixel_values"]
         actual_input_patches = pixel_values.shape[0]
         bucket_input_patches = input_buffer.shape[0]
-
         if actual_input_patches > bucket_input_patches:
             logger.warning(
                 "Input patches (%d) exceed bucket capacity (%d).",
@@ -927,10 +930,39 @@ class EncoderCudaGraphManager:
                 batch_size,
             )
             return None
+
+        is_flashinfer = (
+            self.vllm_config.model_config.multimodal_config.mm_encoder_attn_backend
+            == AttentionBackendEnum.FLASHINFER
+        )
         if is_budget_graph and len(cu_seqlens_list) < batch_size + 1:
             last_val = cu_seqlens_list[-1]
             while len(cu_seqlens_list) < batch_size + 1:
                 cu_seqlens_list.append(last_val)
+            if is_flashinfer:
+                hidden_size = (
+                    self.vllm_config.model_config.hf_config.vision_config.hidden_size
+                )
+                use_data_parallel = (
+                    self.vllm_config.model_config.multimodal_config.mm_encoder_tp_mode
+                    == "data"
+                    if self.vllm_config.model_config.multimodal_config
+                    else False
+                )
+                tp_size = (
+                    1 if use_data_parallel else get_tensor_model_parallel_world_size()
+                )
+                scale = hidden_size // tp_size
+                cu_seqlens_qk = [
+                    cu_seqlens_list[i] * scale * 2 for i in range(len(cu_seqlens_list))
+                ]
+                cu_seqlens_v = [
+                    cu_seqlens_list[i] * scale * 3 for i in range(len(cu_seqlens_list))
+                ]
+                cu_seqlens_o = [
+                    cu_seqlens_list[i] * scale for i in range(len(cu_seqlens_list))
+                ]
+                cu_seqlens_list = cu_seqlens_qk + cu_seqlens_v + cu_seqlens_o
 
         # For budget graphs: pad sequence_lengths with zeros for empty slots
         if is_budget_graph and len(sequence_lengths) < batch_size:
