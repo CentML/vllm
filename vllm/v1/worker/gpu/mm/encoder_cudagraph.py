@@ -1723,29 +1723,50 @@ class EncoderCudaGraphManager:
         )
 
         # Build cu_seqlens from actual cumulative sizes
-        # cu_seqlens = [0, size0, size0+size1, ..., total]
+        # cu_seqlens = [0, size0, size0+size1, ..., total_actual]
         cu_seqlens_list = [0]
         for length in sequence_lengths:
             cu_seqlens_list.append(cu_seqlens_list[-1] + length)
 
+        # For budget graphs: pad cu_seqlens to batch_size + 1 by repeating
+        # the last value. This creates zero-length sequences for empty slots
+        # that flash attention skips (no-op).
+        if is_budget_graph and len(cu_seqlens_list) < batch_size + 1:
+            last_val = cu_seqlens_list[-1]
+            while len(cu_seqlens_list) < batch_size + 1:
+                cu_seqlens_list.append(last_val)
+
+        # For budget graphs: pad sequence_lengths with zeros for empty slots
+        if is_budget_graph and len(sequence_lengths) < batch_size:
+            sequence_lengths = list(sequence_lengths) + [0] * (
+                batch_size - len(sequence_lengths)
+            )
+
         cu_seqlens_tensor = torch.tensor(
             cu_seqlens_list, dtype=torch.int32, device=self.device
         )
-        max_seqlen = max(sequence_lengths)
+        max_seqlen = max(s for s in sequence_lengths if s > 0) if sequence_lengths else 0
         max_seqlen_tensor = torch.tensor(max_seqlen, dtype=torch.int32, device="cpu")
         sequence_lengths_tensor = torch.tensor(
             sequence_lengths, dtype=torch.int32, device=self.device
         )
 
-        # Update cu_seqlens buffer - need to handle size mismatch
-        # The captured buffer may be larger, so we update only the actual part
-        embed_buffers["cu_seqlens"][: len(cu_seqlens_list)].copy_(
-            cu_seqlens_tensor, non_blocking=True
-        )
+        # Copy full cu_seqlens and sequence_lengths to buffers
+        # For budget graphs, sizes match exactly (padded to batch_size + 1).
+        # For non-budget graphs, copy only the actual part.
+        cu_seqlens_buf = embed_buffers["cu_seqlens"]
+        seq_len_buf = embed_buffers["sequence_lengths"]
+        if is_budget_graph:
+            cu_seqlens_buf.copy_(cu_seqlens_tensor, non_blocking=True)
+            seq_len_buf.copy_(sequence_lengths_tensor, non_blocking=True)
+        else:
+            cu_seqlens_buf[: len(cu_seqlens_list)].copy_(
+                cu_seqlens_tensor, non_blocking=True
+            )
+            seq_len_buf[:batch_size].copy_(
+                sequence_lengths_tensor, non_blocking=True
+            )
         embed_buffers["max_seqlen"].copy_(max_seqlen_tensor, non_blocking=True)
-        embed_buffers["sequence_lengths"][:batch_size].copy_(
-            sequence_lengths_tensor, non_blocking=True
-        )
 
         # Mark this grid as modified so run() knows to restore cached tensors
         self.modified_grids.add(graph_key)
