@@ -425,6 +425,14 @@ class GPUModelRunner(
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
+        # Per-iteration timing via CUDA events (non-blocking).
+        # Enabled by VLLM_ITER_TIMING=1 env var.
+        import os
+        self._iter_timing_enabled = os.environ.get("VLLM_ITER_TIMING", "0") == "1"
+        self._iter_timing_events: list[torch.cuda.Event] | None = None
+        self._iter_timing_prev: list[torch.cuda.Event] | None = None
+        self._iter_timing_meta: tuple[int, int, int, int, int, int] | None = None
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -3249,6 +3257,58 @@ class GPUModelRunner(
                 )
             )
 
+            # Log previous iteration's GPU timing (events already completed)
+            if (
+                self._iter_timing_enabled
+                and self._iter_timing_prev is not None
+                and self._iter_timing_meta is not None
+            ):
+                prev_vit_start, prev_vit_end, prev_lm_start, prev_lm_end = (
+                    self._iter_timing_prev
+                )
+                vit_ms = prev_vit_start.elapsed_time(prev_vit_end)
+                lm_ms = prev_lm_start.elapsed_time(prev_lm_end)
+                iter_ms = prev_vit_start.elapsed_time(prev_lm_end)
+                (
+                    p_enc,
+                    p_prefill,
+                    p_decode,
+                    p_running,
+                    p_new,
+                    p_total,
+                ) = self._iter_timing_meta
+                other_ms = iter_ms - vit_ms - lm_ms
+                bottleneck = (
+                    "VIT"
+                    if p_enc > 0 and vit_ms > lm_ms * 0.3
+                    else ("PREFILL" if p_prefill > p_decode else "DECODE")
+                )
+                logger.info(
+                    "ITER TIMING [%s]: iter=%.1fms ViT=%.1fms "
+                    "LM=%.1fms other=%.1fms | "
+                    "prefill=%d decode=%d total=%d | "
+                    "encoder=%d running=%d new=%d",
+                    bottleneck,
+                    iter_ms,
+                    vit_ms,
+                    lm_ms,
+                    other_ms,
+                    p_prefill,
+                    p_decode,
+                    p_total,
+                    p_enc,
+                    p_running,
+                    p_new,
+                )
+
+            # Record ViT start event (before _preprocess which runs ViT)
+            if self._iter_timing_enabled:
+                if self._iter_timing_events is None:
+                    self._iter_timing_events = [
+                        torch.cuda.Event(enable_timing=True) for _ in range(4)
+                    ]
+                self._iter_timing_events[0].record()
+
             (
                 input_ids,
                 inputs_embeds,
@@ -3259,6 +3319,10 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+            # Record ViT end event (after _preprocess)
+            if self._iter_timing_enabled and self._iter_timing_events is not None:
+                self._iter_timing_events[1].record()
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3274,6 +3338,10 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+        # Record LM start event (before model forward)
+        if self._iter_timing_enabled and self._iter_timing_events is not None:
+            self._iter_timing_events[2].record()
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3297,6 +3365,29 @@ class GPUModelRunner(
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
+            )
+
+        # Record LM end event and save metadata for next iteration
+        if self._iter_timing_enabled and self._iter_timing_events is not None:
+            self._iter_timing_events[3].record()
+            self._iter_timing_prev = list(self._iter_timing_events)
+            self._iter_timing_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(4)
+            ]
+            # Compute prefill vs decode token breakdown:
+            # decode requests get 1 token, prefill requests get > 1
+            total_tokens = scheduler_output.total_num_scheduled_tokens
+            decode_tokens = sum(
+                1 for n in scheduler_output.num_scheduled_tokens.values() if n == 1
+            )
+            prefill_tokens = total_tokens - decode_tokens
+            self._iter_timing_meta = (
+                len(scheduler_output.scheduled_encoder_inputs),
+                prefill_tokens,
+                decode_tokens,
+                self.input_batch.num_reqs,
+                len(scheduler_output.scheduled_new_reqs),
+                total_tokens,
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
