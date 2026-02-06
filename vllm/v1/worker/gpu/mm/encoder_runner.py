@@ -86,12 +86,19 @@ class EncoderRunner:
             bucket_sizes=bucket_sizes,
         )
 
+        # Check if budget batching is configured
+        self.encoder_cudagraph_budget_mode = bool(
+            self.encoder_cudagraph_manager.token_budgets
+            and self.encoder_cudagraph_manager.max_images_per_batch > 0
+        )
+
         # Log configuration
         grid_configs = self.encoder_cudagraph_manager.grid_configs
         logger.info(
             "Encoder CUDA graph manager initialized: "
-            "padded_mode=%s, num_grids=%d, grids=%s",
+            "padded_mode=%s, budget_mode=%s, num_grids=%d, grids=%s",
             self.encoder_cudagraph_padded_mode,
+            self.encoder_cudagraph_budget_mode,
             len(grid_configs),
             grid_configs,
         )
