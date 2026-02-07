@@ -58,10 +58,10 @@ def initialize_fi_ar_workspace(
         comm_backend=comm_backend,
     )
 
-    logger.debug(
-        "Initialized shared FlashInfer All Reduce workspace: backend=%s, "
-        "world_size=%d, rank=%d, max_token_num=%d",
-        backend, world_size, rank, max_token_num
+    logger.info(
+        "Initialized FlashInfer All Reduce workspace: backend=%s, "
+        "world_size=%d, rank=%d, max_token_num=%d, hidden_dim=%d, dtype=%s",
+        backend, world_size, rank, max_token_num, hidden_dim, dtype
     )
 
     return _fi_ar_workspace
@@ -82,6 +82,8 @@ class FlashInferAllReduce:
         max_token_num: int = 1024,
     ):
         self.disabled = True
+        import os
+        max_workspace_size = int(os.environ.get("AR_MAX", "1")) * 1024 * 1024
 
         if not fi_ar_available:
             logger.info(
@@ -110,20 +112,23 @@ class FlashInferAllReduce:
         if self.world_size == 1:
             return
 
-        self.max_token_num = max_token_num
+        self.max_workspace_size = max_workspace_size
         self.disabled = False
 
-    def _ensure_workspace(self, hidden_dim: int) -> bool:
+    def _ensure_workspace(self, hidden_dim: int,
+                          dtype: torch.dtype) -> bool:
         """Ensure the all reduce workspace is initialized."""
         if get_fi_ar_workspace() is not None:
             return True
         try:
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            max_token_num = self.max_workspace_size // (hidden_dim * element_size)
             initialize_fi_ar_workspace(
                 world_size=self.world_size,
                 rank=self.rank,
-                max_token_num=self.max_token_num,
+                max_token_num=max_token_num,
                 hidden_dim=hidden_dim,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 group=self.group,
             )
             return True
@@ -154,8 +159,10 @@ class FlashInferAllReduce:
         if num_tokens > self.max_token_num:
             return False
 
-        if not self._ensure_workspace():
+        if not self._ensure_workspace(hidden_dim, input_tensor.dtype):
             return False
+        logger.info("Using FlashInfer All Reduce workspace: num_tokens=%d, max_token_num=%d, hidden_dim=%d, dtype=%s",
+                    num_tokens, self.max_token_num, hidden_dim, input_tensor.dtype)
 
         return True
 
@@ -166,7 +173,6 @@ class FlashInferAllReduce:
             input=input_tensor,
             workspace=workspace,
             pattern=flashinfer_comm.AllReduceFusionPattern.kAllReduce,
-            launch_with_pdl=False,
         )
 
     def destroy(self):

@@ -141,7 +141,8 @@ if flashinfer_comm is not None:
         if workspace.backend == "trtllm":
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
-
+        logger.info("Calling FlashInfer All Reduce Fusion: pattern_code=%d, input_shape=%s", 
+                    pattern_code, allreduce_in.shape)
         # Use the unified API - it handles backend dispatch automatically
         flashinfer_comm.allreduce_fusion(
             input=allreduce_in,

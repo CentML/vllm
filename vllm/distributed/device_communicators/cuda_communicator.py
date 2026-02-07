@@ -158,7 +158,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
             return out
-        # Try FlashInfer All Reduce (Blackwell+)
         fi_ar_comm = self.fi_ar_comm
         if (
             fi_ar_comm is not None
