@@ -3257,11 +3257,14 @@ class GPUModelRunner(
                 )
             )
 
-            # Log previous iteration's GPU timing (events already completed)
+            # Log previous iteration's GPU timing if events completed.
+            # With async scheduling the CPU can be ahead of the GPU,
+            # so check query() before elapsed_time() to avoid blocking.
             if (
                 self._iter_timing_enabled
                 and self._iter_timing_prev is not None
                 and self._iter_timing_meta is not None
+                and self._iter_timing_prev[3].query()
             ):
                 prev_vit_start, prev_vit_end, prev_lm_start, prev_lm_end = (
                     self._iter_timing_prev
