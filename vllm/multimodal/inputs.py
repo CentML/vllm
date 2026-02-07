@@ -477,7 +477,7 @@ class BaseMultiModalField(ABC):
             pin_memory = False
 
         batch = [elem.data for elem in elems]
-        out = self._reduce_data(batch, pin_memory=pin_memory)
+        out = self._reduce_data(batch, pin_memory=pin_memory and device.type != 'cuda')
         return _nested_tensors_h2d(out, device=device)
 
 

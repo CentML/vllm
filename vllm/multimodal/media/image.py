@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from io import BytesIO
 from pathlib import Path
 
 import pybase64
 import torch
+from nvidia import nvimgcodec
 from PIL import Image
 
 from vllm.logger import init_logger
@@ -14,6 +16,16 @@ from ..image import convert_image_mode, rgba_to_rgb
 from .base import MediaIO, MediaWithBytes
 
 logger = init_logger(__file__)
+
+# Thread-local storage for nvimgcodec decoder
+_thread_local = threading.local()
+
+
+def _get_decoder() -> nvimgcodec.Decoder:
+    """Get a per-thread nvimgcodec decoder instance."""
+    if not hasattr(_thread_local, "decoder"):
+        _thread_local.decoder = nvimgcodec.Decoder()
+    return _thread_local.decoder
 
 
 class ImageMediaIO(MediaIO[Image.Image]):
@@ -60,18 +72,38 @@ class ImageMediaIO(MediaIO[Image.Image]):
         else:
             return convert_image_mode(image, self.image_mode)
 
-    def load_bytes(self, data: bytes) -> MediaWithBytes[Image.Image]:
-        image = Image.open(BytesIO(data))
-        return MediaWithBytes(self._convert_image_mode(image), data)
+    def load_bytes(
+        self, data: bytes
+    ) -> MediaWithBytes[Image.Image] | MediaWithBytes[torch.Tensor]:
+        # return self.load_pil_image(data)
+        return self.load_nvimgcodec_image(data)
 
-    def load_base64(self, media_type: str, data: str) -> MediaWithBytes[Image.Image]:
+    def load_base64(
+        self, media_type: str, data: str
+    ) -> MediaWithBytes[Image.Image] | MediaWithBytes[torch.Tensor]:
         return self.load_bytes(pybase64.b64decode(data, validate=True))
 
-    def load_file(self, filepath: Path) -> MediaWithBytes[Image.Image]:
-        with open(filepath, "rb") as f:
-            data = f.read()
+    def load_pil_image(self, data: bytes) -> MediaWithBytes[Image.Image]:
         image = Image.open(BytesIO(data))
         return MediaWithBytes(self._convert_image_mode(image), data)
+
+    def load_nvimgcodec_image(self, data: bytes) -> MediaWithBytes[torch.Tensor]:
+        code_stream = nvimgcodec.CodeStream(data)
+        decoded = _get_decoder().decode(code_stream)
+
+        device = "cuda:0"
+        tensor = torch.as_tensor(decoded, device=device)
+        # HWC -> CHW
+        tensor = tensor.permute(2, 0, 1)
+
+        return MediaWithBytes(tensor, data)
+
+    def load_file(
+        self, filepath: Path
+    ) -> MediaWithBytes[Image.Image] | MediaWithBytes[torch.Tensor]:
+        with open(filepath, "rb") as f:
+            data = f.read()
+        return self.load_bytes(data)
 
     def encode_base64(
         self,
