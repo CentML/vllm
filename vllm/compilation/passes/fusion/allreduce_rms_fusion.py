@@ -38,11 +38,8 @@ if find_spec("flashinfer"):
 
         if hasattr(_flashinfer_comm, "allreduce_fusion"):
             flashinfer_comm = _flashinfer_comm
-        from flashinfer.comm.mnnvl import TorchDistBackend
     except ImportError:
         pass
-
-logger = init_logger(__name__)
 
 if hasattr(torch.ops._C, "scaled_fp4_quant"):
     STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.default
@@ -80,7 +77,12 @@ _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
 
 
 if flashinfer_comm is not None:
-    _FI_WORKSPACE = None
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        destroy_fi_ar_workspace,
+        get_fi_ar_workspace,
+        initialize_fi_ar_workspace,
+    )
+
     MiB = 1024 * 1024
 
     def call_trtllm_fused_allreduce_norm(
@@ -121,7 +123,8 @@ if flashinfer_comm is not None:
             max_one_shot_size is None or current_tensor_size <= max_one_shot_size * MiB
         )
 
-        assert _FI_WORKSPACE is not None, (
+        workspace = get_fi_ar_workspace()
+        assert workspace is not None, (
             "Flashinfer workspace must be initialized when using flashinfer"
         )
         if norm_out is None:
@@ -129,21 +132,23 @@ if flashinfer_comm is not None:
             residual_out = residual
         else:
             # return residual_out as allreduce_out with zeroed residual_in
-            # as flashinfer does not support rms_norm and allreduce_out together
+            # as flashinfer does not support rms_norm
+            # and allreduce_out together
             residual_out = allreduce_in
         
         layout_code = None
         # layout_code only supported by trtllm backend
-        if _FI_WORKSPACE.backend == "trtllm":
+        if workspace.backend == "trtllm":
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
 
         # Use the unified API - it handles backend dispatch automatically
         flashinfer_comm.allreduce_fusion(
             input=allreduce_in,
-            workspace=_FI_WORKSPACE,
+            workspace=workspace,
             pattern=pattern_code,
             launch_with_pdl=launch_with_pdl,
+            output=None,
             residual_out=residual_out,
             norm_out=norm_out,
             quant_out=quant_out,
@@ -736,15 +741,13 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             scope="global",
         )
 
-        global _FI_WORKSPACE
-        _FI_WORKSPACE = flashinfer_comm.create_allreduce_fusion_workspace(
-            backend="auto",  # Let heuristics choose or use user preference
+        initialize_fi_ar_workspace(
             world_size=self.tp_size,
             rank=rank,
             max_token_num=self.max_token_num,
             hidden_dim=self.hidden_dim,
             dtype=self.model_dtype,
-            comm_backend=TorchDistBackend(group=self.group),
+            group=self.group,
         )
         self.allreduce_params = FlashInferFusedAllReduceParams(
             rank=rank,
@@ -757,7 +760,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register_patterns(self) -> None:
-        supports_quantization = _FI_WORKSPACE.backend == "trtllm"
+        supports_quantization = get_fi_ar_workspace().backend == "trtllm"
         for epsilon in [1e-5, 1e-6]:
             if supports_quantization:
                 AllReduceFusedRMSNormStaticQuantFP8Pattern(
@@ -785,7 +788,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                         self.device,
                         self.allreduce_params,
                     ).register(self.patterns)
-
             AllReduceRMSNormPattern(
                 epsilon,
                 self.model_dtype,
@@ -824,7 +826,4 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if getattr(self, "disabled", True):
             return
         if flashinfer_comm is not None:
-            global _FI_WORKSPACE
-            if _FI_WORKSPACE is not None:
-                _FI_WORKSPACE.destroy()
-                _FI_WORKSPACE = None
+            destroy_fi_ar_workspace()
