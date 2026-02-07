@@ -97,6 +97,7 @@ class MMEncoderAttention(CustomOp):
         # During model initialization, the default dtype is set as the model
         # weight and activation dtype.
         dtype = torch.get_default_dtype()
+        self.dtype = dtype
 
         # Try to get vision attention backend from multimodal_config.
         attn_backend_override = None
@@ -290,9 +291,9 @@ class MMEncoderAttention(CustomOp):
         assert self.fp8_quant is not None
         orig_shape = tensor.shape
         # QuantFP8 expects 2D input: (total_tokens, num_heads * head_dim)
-        tensor_2d = tensor.view(orig_shape[0], -1)
-        fp8_tensor, _ = self.fp8_quant(tensor_2d, scale=scale)
-        return fp8_tensor.view(orig_shape)
+        tensor_2d = tensor.reshape(orig_shape[0], -1)
+        fp8_tensor, _ = self.fp8_quant.forward_cuda(tensor_2d, scale=scale)
+        return fp8_tensor.reshape(orig_shape)
 
     def _forward_flashinfer(
         self,
@@ -322,6 +323,7 @@ class MMEncoderAttention(CustomOp):
             q_scale=self._fp8_q_scale if self.fp8_enabled else None,
             k_scale=self._fp8_k_scale if self.fp8_enabled else None,
             v_scale=self._fp8_v_scale if self.fp8_enabled else None,
+            o_data_type=self.dtype if self.fp8_enabled else None,
         )
 
     def _forward_fa4(
