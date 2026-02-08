@@ -273,6 +273,10 @@ def flashinfer_wrapper(
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    o_data_type: torch.dtype | None = None,
 ) -> torch.Tensor:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
@@ -306,6 +310,10 @@ def flashinfer_wrapper(
         batch_offsets_k=batch_offsets_qk,
         batch_offsets_v=batch_offsets_v,
         batch_offsets_o=batch_offsets_o,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        o_data_type=o_data_type,
     )
 
     if is_reshaped:
@@ -323,7 +331,13 @@ def vit_flashinfer_wrapper_fake(
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    o_data_type: torch.dtype | None = None,
 ) -> torch.Tensor:
+    if o_data_type is not None and o_data_type != q.dtype:
+        return torch.empty(q.shape, device=q.device, dtype=o_data_type)
     return torch.empty_like(q)
 
 
@@ -343,7 +357,22 @@ def vit_flashinfer_wrapper(
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    o_data_type: torch.dtype | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.flashinfer_wrapper(
-        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen, sequence_lengths
+        q,
+        k,
+        v,
+        scale,
+        workspace_buffer,
+        cu_seqlens,
+        max_seqlen,
+        sequence_lengths,
+        q_scale,
+        k_scale,
+        v_scale,
+        o_data_type,
     )
