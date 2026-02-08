@@ -11,7 +11,10 @@ import vllm.envs as envs
 from vllm.config import MultiModalConfig
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.input_quant_fp8 import (
+    QuantFP8,
+    quantize_fp8_pad_head_dim_triton,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.models.vision import get_vit_attn_backend
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
@@ -174,7 +177,10 @@ class MMEncoderAttention(CustomOp):
         # Create QuantFP8 for efficient quantization
         self.fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         self.fp8_enabled = True
-
+        self.skip_scale_q = self.fp8_scales["q"] == 1.0
+        self.skip_scale_k = self.fp8_scales["k"] == 1.0
+        self.skip_scale_v = self.fp8_scales["v"] == 1.0
+        
         logger.debug(
             f"FP8 attention enabled for {layer_name}: "
             f"q={self.fp8_scales['q']:.4f}, "
@@ -283,17 +289,31 @@ class MMEncoderAttention(CustomOp):
         self,
         tensor: torch.Tensor,
         scale: torch.Tensor,
+        skip_scale: bool = False,
     ) -> torch.Tensor:
-        """Quantize a 3D tensor (total_tokens, num_heads, head_dim) to FP8.
-
-        Uses QuantFP8 CustomOp for backend-aware quantization.
+        """Quantize a 3D (S, H, D) tensor to FP8.
+        
+        Uses QuantFP8 CustomOp when head_dim is aligned to 16; otherwise
+        falls back to a stride-aware Triton kernel that pads head_dim to
+        a multiple of 16 — no extra copy even for non-contiguous inputs.
         """
         assert self.fp8_quant is not None
         orig_shape = tensor.shape
-        # QuantFP8 expects 2D input: (total_tokens, num_heads * head_dim)
-        tensor_2d = tensor.reshape(orig_shape[0], -1)
-        fp8_tensor, _ = self.fp8_quant.forward_cuda(tensor_2d, scale=scale)
-        return fp8_tensor.reshape(orig_shape)
+        head_dim = orig_shape[-1]
+
+        if head_dim % 16 == 0:
+            if skip_scale:
+                return tensor.to(torch.float8_e4m3fn)
+
+            # QuantFP8 expects 2D input: (total_tokens, num_heads * head_dim)
+            tensor_2d = tensor.reshape(orig_shape[0], -1)
+            fp8_tensor, _ = self.fp8_quant.forward_cuda(
+                tensor_2d, scale=scale
+            )
+            return fp8_tensor.reshape(orig_shape)
+
+        # Fall back to Triton kernel for padding head_dim to a multiple of 16
+        return quantize_fp8_pad_head_dim_triton(tensor, scale, skip_scale=skip_scale)
 
     def _forward_flashinfer(
         self,
@@ -307,11 +327,11 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         if self.fp8_enabled:
             assert self.fp8_quant is not None and self.fp8_scales is not None
-            query = self._quantize_to_fp8(query, self._fp8_q_scale)
-            key = self._quantize_to_fp8(key, self._fp8_k_scale)
-            value = self._quantize_to_fp8(value, self._fp8_v_scale)
+            query = self._quantize_to_fp8(query, self._fp8_q_scale, skip_scale=self.skip_scale_q)
+            key = self._quantize_to_fp8(key, self._fp8_k_scale, skip_scale=self.skip_scale_k)
+            value = self._quantize_to_fp8(value, self._fp8_v_scale, skip_scale=self.skip_scale_v)
 
-        return vit_flashinfer_wrapper(
+        output = vit_flashinfer_wrapper(
             q=query,
             k=key,
             v=value,
@@ -325,6 +345,13 @@ class MMEncoderAttention(CustomOp):
             v_scale=self._fp8_v_scale if self.fp8_enabled else None,
             o_data_type=self.dtype if self.fp8_enabled else None,
         )
+
+        # Un-pad head dimension if it was padded during FP8 quantization
+        if self.fp8_enabled and output.shape[-1] != self.head_size:
+            output = output[..., :self.head_size]
+            output = output.contiguous()
+
+        return output
 
     def _forward_fa4(
         self,

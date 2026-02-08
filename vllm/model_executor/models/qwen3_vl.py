@@ -610,6 +610,18 @@ class Qwen3_VisionTransformer(nn.Module):
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
+
+        # When FP8 attention is enabled and head_dim is not a multiple of 16,
+        # the quantization kernel pads head_dim (e.g. 72 -> 80).  Store the
+        # padded hidden_size so compute_flashinfer_cu_seqlens can produce
+        # element offsets that match the contiguous FP8 tensor strides.
+        self.fp8_vit_attn = envs.VLLM_MM_ENCODER_FP8_ATTN
+        if self.fp8_vit_attn and head_dim % 16 != 0:
+            padded_head_dim = ((head_dim + 15) // 16) * 16
+            self.fp8_padded_hidden_size = self.num_heads * padded_head_dim
+        else:
+            self.fp8_padded_hidden_size = None
+
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
             max_position=8192,
@@ -927,6 +939,27 @@ class Qwen3_VisionTransformer(nn.Module):
         rotary_pos_emb_sin: torch.Tensor | None = None,
     ) -> np.ndarray:
         batch_size = len(cu_seqlens) - 1
+
+        if self.fp8_padded_hidden_size is not None:
+            # FP8 path: after quantization Q/K/V are each independent
+            # contiguous tensors with stride H * padded_D per token.
+            # All sections (QK, V, O) use the same element stride.
+            # The wrapper overrides QK/V batch_offsets to use O offsets.
+            scale = self.fp8_padded_hidden_size // self.tp_size
+            cu_seqlens = cu_seqlens * scale
+            cu_seqlens_padded = self.add_padding_to_fi_seqlens(
+                cu_seqlens, batch_size, cu_seqlens[-1]
+            )
+            return np.concatenate(
+                [cu_seqlens_padded, cu_seqlens_padded, cu_seqlens_padded]
+            )
+
+        # BF16 path: Q/K/V are non-contiguous views into shared buffers.
+        # Element stride per token differs by tensor:
+        #   After rotary: Q,K in [Q,K] buffer -> stride 2×H×D
+        #   No rotary:    Q,K in [Q,K,V] buffer -> stride 3×H×D
+        #   V always in [Q,K,V] buffer -> stride 3×H×D
+        #   O is contiguous -> stride H×D
         scale = self.hidden_size // self.tp_size
         cu_seqlens = cu_seqlens * scale
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
