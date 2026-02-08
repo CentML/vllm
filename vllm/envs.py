@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     VLLM_USE_CUDNN_PREFILL: bool = False
     VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL: bool = False
     VLLM_USE_TRITON_POS_EMBED: bool = False
+    VLLM_POS_EMBED_CACHE_SIZE: int = 100
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
@@ -1447,6 +1448,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # interpolation in Qwen3-VL (replaces ~25 small eager kernels with one).
     "VLLM_USE_TRITON_POS_EMBED": lambda: bool(
         int(os.getenv("VLLM_USE_TRITON_POS_EMBED", "0"))
+    ),
+    # Number of grid configurations to pre-warm in the Qwen3-VL position
+    # embedding cache (0 = disabled, max 100).  Uses ~9 MB per entry on
+    # average at BF16; 100 entries ≈ 0.9 GB.
+    "VLLM_POS_EMBED_CACHE_SIZE": lambda: int(
+        os.getenv("VLLM_POS_EMBED_CACHE_SIZE", "100")
     ),
     # If set to 1/True, use the TRTLLM attention backend in flashinfer.
     # If set to 0/False, use the default attention backend in flashinfer.

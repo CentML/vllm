@@ -368,6 +368,10 @@ _EMBEDDING_WARMUP_GRIDS: list[tuple[int, int, int]] = [
     (1, 48, 42),
     (1, 30, 32),
 ]
+# Slice the list based on VLLM_POS_EMBED_CACHE_SIZE (0 = disabled, max 100).
+_EMBEDDING_WARMUP_GRIDS = _EMBEDDING_WARMUP_GRIDS[
+    : max(0, envs.VLLM_POS_EMBED_CACHE_SIZE)
+]
 _EMBEDDING_WARMUP_GRIDS_SET: set[tuple[int, int, int]] = set(_EMBEDDING_WARMUP_GRIDS)
 
 
