@@ -53,7 +53,9 @@ def _load_fp8_scales_file(path: str | None) -> dict[str, dict[str, float]]:
         if q is not None and k is not None and v is not None:
             scales[layer_name] = {"q": float(q), "k": float(k), "v": float(v)}
 
-    logger.info("Loaded FP8 attention scales from %s (%d layers)", path, len(scales))
+    logger.info_once(
+        "Loaded FP8 attention scales from %s (%d layers)", path, len(scales)
+    )
     return scales
 
 
@@ -127,12 +129,18 @@ class MMEncoderAttention(CustomOp):
 
         logger.info_once(f"Using {self.attn_backend} for MMEncoderAttention.")
 
-        # FP8 attention support
+        # FP8 attention support (currently only FlashInfer cuDNN backend)
         self.fp8_enabled = False
         self.fp8_scales: dict[str, float] | None = None
         self.fp8_quant: QuantFP8 | None = None
 
         if envs.VLLM_MM_ENCODER_FP8_ATTN:
+            if self.attn_backend != AttentionBackendEnum.FLASHINFER:
+                raise ValueError(
+                    "VLLM_MM_ENCODER_FP8_ATTN requires the FlashInfer "
+                    "cuDNN backend (FLASHINFER), but the current ViT "
+                    f"attention backend is {self.attn_backend}."
+                )
             self._init_fp8_attention(prefix)
 
     def _init_fp8_attention(self, layer_name: str) -> None:
@@ -183,7 +191,7 @@ class MMEncoderAttention(CustomOp):
 
         logger.debug(
             "FP8 attention enabled for %s: q=%.4f, k=%.4f, v=%.4f",
-            layer_name,
+            layer_name if layer_name else "MMEncoderAttention",
             self.fp8_scales["q"],
             self.fp8_scales["k"],
             self.fp8_scales["v"],
