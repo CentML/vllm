@@ -53,7 +53,7 @@ def _load_fp8_scales_file(path: str | None) -> dict[str, dict[str, float]]:
         if q is not None and k is not None and v is not None:
             scales[layer_name] = {"q": float(q), "k": float(k), "v": float(v)}
 
-    logger.info(f"Loaded FP8 attention scales from {path} ({len(scales)} layers)")
+    logger.info("Loaded FP8 attention scales from %s (%d layers)", path, len(scales))
     return scales
 
 
@@ -180,12 +180,13 @@ class MMEncoderAttention(CustomOp):
         self.skip_scale_q = self.fp8_scales["q"] == 1.0
         self.skip_scale_k = self.fp8_scales["k"] == 1.0
         self.skip_scale_v = self.fp8_scales["v"] == 1.0
-        
+
         logger.debug(
-            f"FP8 attention enabled for {layer_name}: "
-            f"q={self.fp8_scales['q']:.4f}, "
-            f"k={self.fp8_scales['k']:.4f}, "
-            f"v={self.fp8_scales['v']:.4f}"
+            "FP8 attention enabled for %s: q=%.4f, k=%.4f, v=%.4f",
+            layer_name,
+            self.fp8_scales["q"],
+            self.fp8_scales["k"],
+            self.fp8_scales["v"],
         )
 
     @classmethod
@@ -292,7 +293,7 @@ class MMEncoderAttention(CustomOp):
         skip_scale: bool = False,
     ) -> torch.Tensor:
         """Quantize a 3D (S, H, D) tensor to FP8.
-        
+
         Uses QuantFP8 CustomOp when head_dim is aligned to 16; otherwise
         falls back to a stride-aware Triton kernel that pads head_dim to
         a multiple of 16 — no extra copy even for non-contiguous inputs.
@@ -307,9 +308,7 @@ class MMEncoderAttention(CustomOp):
 
             # QuantFP8 expects 2D input: (total_tokens, num_heads * head_dim)
             tensor_2d = tensor.reshape(orig_shape[0], -1)
-            fp8_tensor, _ = self.fp8_quant.forward_cuda(
-                tensor_2d, scale=scale
-            )
+            fp8_tensor, _ = self.fp8_quant.forward_cuda(tensor_2d, scale=scale)
             return fp8_tensor.reshape(orig_shape)
 
         # Fall back to Triton kernel for padding head_dim to a multiple of 16
@@ -327,9 +326,15 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         if self.fp8_enabled:
             assert self.fp8_quant is not None and self.fp8_scales is not None
-            query = self._quantize_to_fp8(query, self._fp8_q_scale, skip_scale=self.skip_scale_q)
-            key = self._quantize_to_fp8(key, self._fp8_k_scale, skip_scale=self.skip_scale_k)
-            value = self._quantize_to_fp8(value, self._fp8_v_scale, skip_scale=self.skip_scale_v)
+            query = self._quantize_to_fp8(
+                query, self._fp8_q_scale, skip_scale=self.skip_scale_q
+            )
+            key = self._quantize_to_fp8(
+                key, self._fp8_k_scale, skip_scale=self.skip_scale_k
+            )
+            value = self._quantize_to_fp8(
+                value, self._fp8_v_scale, skip_scale=self.skip_scale_v
+            )
 
         output = vit_flashinfer_wrapper(
             q=query,
@@ -348,7 +353,7 @@ class MMEncoderAttention(CustomOp):
 
         # Un-pad head dimension if it was padded during FP8 quantization
         if self.fp8_enabled and output.shape[-1] != self.head_size:
-            output = output[..., :self.head_size]
+            output = output[..., : self.head_size]
             output = output.contiguous()
 
         return output

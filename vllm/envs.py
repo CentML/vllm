@@ -1456,6 +1456,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # average at BF16; 100 entries ≈ 0.9 GB.
     "VLLM_POS_EMBED_CACHE_SIZE": lambda: int(
         os.getenv("VLLM_POS_EMBED_CACHE_SIZE", "100")
+    ),
     # Controls whether to use FP8 attention for multimodal encoder (e.g., ViT)
     "VLLM_MM_ENCODER_FP8_ATTN": lambda: bool(
         int(os.getenv("VLLM_MM_ENCODER_FP8_ATTN", "0"))

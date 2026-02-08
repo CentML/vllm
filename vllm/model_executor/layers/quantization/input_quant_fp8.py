@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+
 import torch
 import torch.nn.functional as F
 
@@ -33,7 +34,7 @@ def _quantize_pad_fp8_kernel(
     stride_yh,  # output stride along head dim
     stride_yd,  # output stride along head_dim dim (usually 1)
     num_heads,
-    n_rows,     # total rows = S * H
+    n_rows,  # total rows = S * H
     n_cols,
     n_cols_padded,
     fp8_min,
@@ -56,10 +57,12 @@ def _quantize_pad_fp8_kernel(
     s = offs_m // num_heads
     h = offs_m % num_heads
 
-    x_ptrs = (x_ptr
-              + s[:, None] * stride_xs
-              + h[:, None] * stride_xh
-              + offs_n[None, :] * stride_xd)
+    x_ptrs = (
+        x_ptr
+        + s[:, None] * stride_xs
+        + h[:, None] * stride_xh
+        + offs_n[None, :] * stride_xd
+    )
     x = tl.load(x_ptrs, mask=mask_in, other=0.0).to(tl.float32)
     if SKIP_SCALE:
         x_q = x
@@ -69,10 +72,12 @@ def _quantize_pad_fp8_kernel(
     x_q = tl.where(mask_in, x_q, 0.0)
     x_q = tl.clamp(x_q, fp8_min, fp8_max).to(y_ptr.dtype.element_ty)
 
-    y_ptrs = (y_ptr
-              + s[:, None] * stride_ys
-              + h[:, None] * stride_yh
-              + offs_n[None, :] * stride_yd)
+    y_ptrs = (
+        y_ptr
+        + s[:, None] * stride_ys
+        + h[:, None] * stride_yh
+        + offs_n[None, :] * stride_yd
+    )
     tl.store(y_ptrs, x_q, mask=mask_out)
 
 
@@ -107,7 +112,7 @@ def quantize_fp8_pad_head_dim_triton(
     num_warps: int | None = None,
     block_m: int | None = None,
 ) -> torch.Tensor:
-    """Quantize a 4D (B, S, H, D) or 3D (S, H, D) tensor to FP8 while padding D to a multiple of 16.
+    """Quantize a 3D/4D tensor to FP8, padding head_dim to a multiple of 16.
 
     Reads directly from the input using its 3D strides, so non-contiguous
     views (e.g. Q/K/V slices from an interleaved QKV buffer) are handled
@@ -115,16 +120,12 @@ def quantize_fp8_pad_head_dim_triton(
     with shape (S, H, padded_D).
     """
     if not HAS_TRITON:
-        raise RuntimeError(
-            "Triton is required to quantize with head_dim padding."
-        )
+        raise RuntimeError("Triton is required to quantize with head_dim padding.")
 
     original_shape = tensor.shape
     if tensor.dim() == 4:
         tensor = tensor.view(-1, tensor.shape[-2], tensor.shape[-1])
-    assert tensor.dim() == 3, (
-        f"Expected 3D input (S, H, D), got {tensor.dim()}D"
-    )
+    assert tensor.dim() == 3, f"Expected 3D input (S, H, D), got {tensor.dim()}D"
     S, H, D = tensor.shape
     padded_head_dim = (D + 15) // 16 * 16
     out_dtype = current_platform.fp8_dtype()
@@ -141,15 +142,18 @@ def quantize_fp8_pad_head_dim_triton(
     if block_n is None or num_warps is None or block_m is None:
         block_n, num_warps, block_m = _get_fp8_pad_quant_config(padded_head_dim)
 
-    grid = (triton.cdiv(n_rows, block_m),
-            triton.cdiv(padded_head_dim, block_n))
+    grid = (triton.cdiv(n_rows, block_m), triton.cdiv(padded_head_dim, block_n))
 
     _quantize_pad_fp8_kernel[grid](
         tensor,
         output,
         scale_1d,
-        tensor.stride(0), tensor.stride(1), tensor.stride(2),
-        output.stride(0), output.stride(1), output.stride(2),
+        tensor.stride(0),
+        tensor.stride(1),
+        tensor.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         H,
         n_rows,
         D,
