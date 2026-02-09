@@ -588,6 +588,15 @@ RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm
 # Until then, add /usr/local/nvidia/lib64 before the image cuda path to allow override.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
+# Install Transformer Engine for FP8 attention support in multimodal encoder
+RUN --mount=type=cache,target=/root/.cache/uv \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends cuda-toolkit-13-0 libcudnn9-dev-cuda-13 && \
+    rm -rf /var/lib/apt/lists/* && \
+    uv pip install --system pybind11 && \
+    NVTE_FRAMEWORK=pytorch uv pip install --system --no-build-isolation \
+        git+https://github.com/NVIDIA/TransformerEngine.git@stable
+
 # Copy examples and benchmarks at the end to minimize cache invalidation
 COPY examples examples
 COPY benchmarks benchmarks
