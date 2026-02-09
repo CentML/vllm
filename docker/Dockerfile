@@ -591,7 +591,7 @@ ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 # Install Transformer Engine for FP8 attention support in multimodal encoder
 RUN --mount=type=cache,target=/root/.cache/uv \
     apt-get update -y && \
-    apt-get install -y --no-install-recommends cuda-toolkit-13-0 libcudnn9-dev-cuda-13 && \
+    apt-get install -y --no-install-recommends cmake cuda-toolkit-13-0 libcudnn9-dev-cuda-13 && \
     rm -rf /var/lib/apt/lists/* && \
     uv pip install --system pybind11 && \
     NVTE_FRAMEWORK=pytorch uv pip install --system --no-build-isolation \
