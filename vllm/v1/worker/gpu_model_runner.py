@@ -2487,10 +2487,12 @@ class GPUModelRunner(
                     and num_items > 1
                     and modality in ("image", "video")
                 ):
-                    # Fall back to one-by-one processing for remaining images
+                    # Fall back to one-by-one processing for remaining images.
                     # Process each image individually for CUDA graph support
+                    # and for TE FP8 compatibility (TE does not support THD
+                    # format for FP8; see MMEncoderAttention._forward_te_fp8).
                     # Extract batched data and slice per-image to avoid
-                    # re-calling group_mm_kwargs_by_modality overhead
+                    # re-calling group_mm_kwargs_by_modality overhead.
                     # Note: list may contain None for unprocessed images;
                     # these will be filled in by one-by-one processing below
                     if has_partial_results and grouped_batched_result is not None:
@@ -2652,8 +2654,8 @@ class GPUModelRunner(
                             curr_group_outputs = piecewise_result
                         else:
                             # Fall back to eager execution, one image at a time.
-                            # This ensures consistent behavior and reduces peak
-                            # memory usage compared to batch processing.
+                            # This is required by the TE FP8 attention backend
+                            # which only supports batch-1 BSHD (see _forward_te_fp8).
                             curr_group_outputs = self._execute_encoder_one_by_one_eager(
                                 model, mm_kwargs_group, modality, num_items
                             )
@@ -2827,8 +2829,14 @@ class GPUModelRunner(
         """
         Execute encoder in eager mode, processing one image at a time.
 
-        This ensures consistent behavior and reduces peak memory usage
-        compared to batch processing all images together.
+        One-at-a-time processing is required by the TE FP8 attention
+        backend (see MMEncoderAttention._forward_te_fp8 in
+        mm_encoder_attention.py). TE does not support THD format for FP8
+        attention, and converting the upstream THD tensor into a proper
+        multi-batch BSHD tensor would be too expensive. Instead, we process
+        one image at a time so that the single-sequence THD tensor can be
+        reinterpreted as BSHD with B=1 and S=T, which is semantically
+        equivalent and avoids any data layout conversion.
 
         Args:
             model: The multimodal model
