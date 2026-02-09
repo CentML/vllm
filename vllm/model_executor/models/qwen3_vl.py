@@ -622,7 +622,15 @@ class Qwen3_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor | list[list[int]],
     ) -> torch.Tensor:
+        # Optional per-iteration sub-timing via CUDA events.
+        # Set by gpu_model_runner when VLLM_ITER_TIMING=1.
+        _t = getattr(self, "_iter_timing_events", None)
+
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+
+        if _t is not None:
+            _t[0].record()  # vit_fwd_start
+
         hidden_states = self.patch_embed(hidden_states)
 
         if isinstance(grid_thw, list):
@@ -661,6 +669,9 @@ class Qwen3_VisionTransformer(nn.Module):
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
 
+        if _t is not None:
+            _t[1].record()  # embed_end (patch + pos + rotary + seqlen setup)
+
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
@@ -677,10 +688,18 @@ class Qwen3_VisionTransformer(nn.Module):
                     hidden_states
                 )
                 deepstack_feature_lists.append(deepstack_feature)
+
+        if _t is not None:
+            _t[2].record()  # blocks_end
+
         hidden_states = self.merger(hidden_states)
         hidden_states = torch.cat(
             [hidden_states] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+
+        if _t is not None:
+            _t[3].record()  # merger_end
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

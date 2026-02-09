@@ -425,13 +425,29 @@ class GPUModelRunner(
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
-        # Per-iteration timing via CUDA events (non-blocking).
+        # Per-iteration timing via CUDA events (GPU) + perf_counter (wall).
         # Enabled by VLLM_ITER_TIMING=1 env var.
+        # GPU time is measured via CUDA events (non-blocking, 1-iter lag).
+        # Wall-clock time is measured via perf_counter() at the start of each
+        # execute_model() call. When the previous iter's last GPU event has
+        # completed (query()=True), the gap between successive starts equals
+        # the true wall-clock iteration time (including CPU overhead).
         import os
-        self._iter_timing_enabled = os.environ.get("VLLM_ITER_TIMING", "0") == "1"
+        self._iter_timing_enabled = (
+            os.environ.get("VLLM_ITER_TIMING", "0") == "1"
+        )
         self._iter_timing_events: list[torch.cuda.Event] | None = None
         self._iter_timing_prev: list[torch.cuda.Event] | None = None
-        self._iter_timing_meta: tuple[int, int, int, int, int, int] | None = None
+        self._iter_timing_meta: tuple[
+            int, int, int, int, int, int
+        ] | None = None
+        self._iter_timing_vit_sub_prev: list[
+            torch.cuda.Event
+        ] | None = None
+        # Wall-clock: perf_counter() at start of each execute_model()
+        self._iter_timing_wall_start: float = 0.0
+        self._iter_timing_wall_start_prev: float = 0.0
+        self._iter_timing_count: int = 0
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
@@ -3108,6 +3124,107 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    def _log_prev_iter_timing(self) -> None:
+        """Log previous iteration's GPU + wall-clock timing (non-blocking).
+
+        Uses event deferral: events recorded in iter N are queried in
+        iter N+1 so that elapsed_time() doesn't block the CPU.
+
+        Wall-clock time = gap between successive execute_model() starts.
+        Since we only log when query()=True (GPU finished before this
+        iter started), wall_ms >= gpu_iter_ms. The difference is CPU
+        overhead (scheduling, batch prep, kernel launch, GIL, etc.).
+        """
+        if self._iter_timing_prev is None or self._iter_timing_meta is None:
+            return
+        # Check if the last event has completed to avoid blocking
+        if not self._iter_timing_prev[5].query():
+            return
+
+        ev = self._iter_timing_prev
+        vit_ms = ev[0].elapsed_time(ev[1])
+        lm_fwd_ms = ev[2].elapsed_time(ev[3])
+        logits_ms = ev[4].elapsed_time(ev[5])
+        lm_ms = lm_fwd_ms + logits_ms  # LM total = forward + logits
+        iter_ms = ev[0].elapsed_time(ev[5])
+        (
+            p_enc,
+            p_prefill,
+            p_decode,
+            p_running,
+            p_new,
+            p_total,
+        ) = self._iter_timing_meta
+        other_ms = iter_ms - vit_ms - lm_ms
+
+        # Wall-clock iteration time (CPU-side)
+        wall_ms = 0.0
+        cpu_overhead_ms = 0.0
+        if self._iter_timing_wall_start_prev > 0:
+            wall_ms = (
+                (self._iter_timing_wall_start
+                 - self._iter_timing_wall_start_prev) * 1000
+            )
+            cpu_overhead_ms = wall_ms - iter_ms
+
+        # Build ViT sub-breakdown string if available
+        vit_sub_str = ""
+        vit_sub = self._iter_timing_vit_sub_prev
+        if vit_sub is not None and p_enc > 0:
+            try:
+                if vit_sub[3].query():
+                    emb_ms = vit_sub[0].elapsed_time(vit_sub[1])
+                    blk_ms = vit_sub[1].elapsed_time(vit_sub[2])
+                    mrg_ms = vit_sub[2].elapsed_time(vit_sub[3])
+                    vit_sub_str = (
+                        f"(emb={emb_ms:.1f} blk={blk_ms:.1f} "
+                        f"mrg={mrg_ms:.1f})"
+                    )
+            except RuntimeError:
+                pass  # events not recorded (ViT skipped)
+
+        logger.info(
+            "ITER %d [%s]: wall=%.1fms gpu=%.1fms "
+            "overhead=%.1fms | ViT=%.1fms%s "
+            "LM=%.1fms(fwd=%.1f logits=%.1f) "
+            "other=%.1fms | "
+            "prefill=%d decode=%d total=%d | "
+            "encoder=%d running=%d new=%d",
+            self._iter_timing_count - 1,
+            self.device,
+            wall_ms,
+            iter_ms,
+            cpu_overhead_ms,
+            vit_ms,
+            vit_sub_str,
+            lm_ms,
+            lm_fwd_ms,
+            logits_ms,
+            other_ms,
+            p_prefill,
+            p_decode,
+            p_total,
+            p_enc,
+            p_running,
+            p_new,
+        )
+
+    def _iter_timing_finalize_early(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Finalize timing on early-return paths (PP non-last rank, etc).
+
+        Resets timing state so the next iteration doesn't try to query
+        unrecorded events.
+        """
+        if not self._iter_timing_enabled or self._iter_timing_events is None:
+            return
+        self._iter_timing_events = None
+        self._iter_timing_prev = None
+        self._iter_timing_meta = None
+        self._iter_timing_vit_sub_prev = None
+        self._iter_timing_wall_start_prev = 0.0
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3257,60 +3374,22 @@ class GPUModelRunner(
                 )
             )
 
-            # Log previous iteration's GPU timing if events completed.
-            # With async scheduling the CPU can be ahead of the GPU,
-            # so check query() before elapsed_time() to avoid blocking.
-            if (
-                self._iter_timing_enabled
-                and self._iter_timing_prev is not None
-                and self._iter_timing_meta is not None
-                and self._iter_timing_prev[3].query()
-            ):
-                prev_vit_start, prev_vit_end, prev_lm_start, prev_lm_end = (
-                    self._iter_timing_prev
-                )
-                vit_ms = prev_vit_start.elapsed_time(prev_vit_end)
-                lm_ms = prev_lm_start.elapsed_time(prev_lm_end)
-                iter_ms = prev_vit_start.elapsed_time(prev_lm_end)
-                (
-                    p_enc,
-                    p_prefill,
-                    p_decode,
-                    p_running,
-                    p_new,
-                    p_total,
-                ) = self._iter_timing_meta
-                other_ms = iter_ms - vit_ms - lm_ms
-                bottleneck = (
-                    "VIT"
-                    if p_enc > 0 and vit_ms > lm_ms * 0.3
-                    else ("PREFILL" if p_prefill > p_decode else "DECODE")
-                )
-                logger.info(
-                    "ITER TIMING [%s]: iter=%.1fms ViT=%.1fms "
-                    "LM=%.1fms other=%.1fms | "
-                    "prefill=%d decode=%d total=%d | "
-                    "encoder=%d running=%d new=%d",
-                    bottleneck,
-                    iter_ms,
-                    vit_ms,
-                    lm_ms,
-                    other_ms,
-                    p_prefill,
-                    p_decode,
-                    p_total,
-                    p_enc,
-                    p_running,
-                    p_new,
-                )
-
-            # Record ViT start event (before _preprocess which runs ViT)
+            # === ITER TIMING: log previous iteration + record vit_start ===
             if self._iter_timing_enabled:
+                self._log_prev_iter_timing()
                 if self._iter_timing_events is None:
                     self._iter_timing_events = [
-                        torch.cuda.Event(enable_timing=True) for _ in range(4)
+                        torch.cuda.Event(enable_timing=True)
+                        for _ in range(6)
                     ]
-                self._iter_timing_events[0].record()
+                self._iter_timing_wall_start = time.perf_counter()
+                self._iter_timing_events[0].record()  # vit_start
+                # Set ViT sub-timing events on the visual module
+                if hasattr(self.model, "visual"):
+                    self.model.visual._iter_timing_events = [
+                        torch.cuda.Event(enable_timing=True)
+                        for _ in range(4)
+                    ]
 
             (
                 input_ids,
@@ -3323,9 +3402,20 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
-            # Record ViT end event (after _preprocess)
-            if self._iter_timing_enabled and self._iter_timing_events is not None:
-                self._iter_timing_events[1].record()
+            # === ITER TIMING: record vit_end, read back ViT sub-events ===
+            if (
+                self._iter_timing_enabled
+                and self._iter_timing_events is not None
+            ):
+                self._iter_timing_events[1].record()  # vit_end
+                if hasattr(self.model, "visual"):
+                    vit_sub = getattr(
+                        self.model.visual, "_iter_timing_events", None
+                    )
+                    self._iter_timing_vit_sub_current = vit_sub
+                    self.model.visual._iter_timing_events = None
+                else:
+                    self._iter_timing_vit_sub_current = None
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3370,28 +3460,13 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        # Record LM end event and save metadata for next iteration
+        # === ITER TIMING: record lm_end (+ fallback logits events) ===
         if self._iter_timing_enabled and self._iter_timing_events is not None:
-            self._iter_timing_events[3].record()
-            self._iter_timing_prev = list(self._iter_timing_events)
-            self._iter_timing_events = [
-                torch.cuda.Event(enable_timing=True) for _ in range(4)
-            ]
-            # Compute prefill vs decode token breakdown:
-            # decode requests get 1 token, prefill requests get > 1
-            total_tokens = scheduler_output.total_num_scheduled_tokens
-            decode_tokens = sum(
-                1 for n in scheduler_output.num_scheduled_tokens.values() if n == 1
-            )
-            prefill_tokens = total_tokens - decode_tokens
-            self._iter_timing_meta = (
-                len(scheduler_output.scheduled_encoder_inputs),
-                prefill_tokens,
-                decode_tokens,
-                self.input_batch.num_reqs,
-                len(scheduler_output.scheduled_new_reqs),
-                total_tokens,
-            )
+            self._iter_timing_events[3].record()  # lm_end
+            # Record logits events at same point as fallback;
+            # they'll be overwritten if compute_logits is reached
+            self._iter_timing_events[4].record()
+            self._iter_timing_events[5].record()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3409,10 +3484,12 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    self._iter_timing_finalize_early(scheduler_output)
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
+                    self._iter_timing_finalize_early(scheduler_output)
                     return self._pool(
                         hidden_states,
                         num_scheduled_tokens,
@@ -3421,7 +3498,19 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                # === ITER TIMING: record logits_start ===
+                if (
+                    self._iter_timing_enabled
+                    and self._iter_timing_events is not None
+                ):
+                    self._iter_timing_events[4].record()
                 logits = self.model.compute_logits(sample_hidden_states)
+                # === ITER TIMING: record logits_end ===
+                if (
+                    self._iter_timing_enabled
+                    and self._iter_timing_events is not None
+                ):
+                    self._iter_timing_events[5].record()
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3451,6 +3540,33 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+
+        # === ITER TIMING: rotate events and save metadata ===
+        if self._iter_timing_enabled and self._iter_timing_events is not None:
+            self._iter_timing_prev = list(self._iter_timing_events)
+            self._iter_timing_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(6)
+            ]
+            self._iter_timing_vit_sub_prev = getattr(
+                self, "_iter_timing_vit_sub_current", None
+            )
+            self._iter_timing_wall_start_prev = self._iter_timing_wall_start
+            self._iter_timing_count += 1
+            total_tokens = scheduler_output.total_num_scheduled_tokens
+            decode_tokens = sum(
+                1
+                for n in scheduler_output.num_scheduled_tokens.values()
+                if n == 1
+            )
+            prefill_tokens = total_tokens - decode_tokens
+            self._iter_timing_meta = (
+                len(scheduler_output.scheduled_encoder_inputs),
+                prefill_tokens,
+                decode_tokens,
+                self.input_batch.num_reqs,
+                len(scheduler_output.scheduled_new_reqs),
+                total_tokens,
+            )
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
