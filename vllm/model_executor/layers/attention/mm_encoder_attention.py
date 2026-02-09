@@ -19,10 +19,6 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
 
 logger = init_logger(__name__)
 
-# Batch buckets for cuDNN graph caching - graphs are cached per bucket size
-# This avoids creating a new graph for each unique batch size at runtime
-TE_BATCH_BUCKETS = [1, 2, 4, 8, 16, 32]
-
 # Seqlen buckets for BSHD format - Q/K/V tensors are padded to these sizes
 # so cuDNN sees a fixed set of tensor shapes and avoids recompilation
 TE_SEQLEN_BUCKETS = [2048, 4096, 6144, 10240, 16384, 25600, 35840, 65536]
@@ -167,29 +163,6 @@ class MMEncoderAttention(CustomOp):
                 return bucket
         return None
 
-    def _pad_cu_seqlens_to_bucket(
-        self,
-        cu_seqlens: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pad cu_seqlens to the next batch bucket size to avoid cuDNN recompilation.
-        
-        cu_seqlens has length (batch_size + 1), so we pad to (bucket_size + 1).
-        Padding value is the last value (total tokens), so padded sequences have 0 length.
-        """
-        batch_size = cu_seqlens.size(0) - 1
-        # Find the next bucket size >= batch_size
-        bucket_size = next(
-            (b for b in TE_BATCH_BUCKETS if b >= batch_size), TE_BATCH_BUCKETS[-1]
-        )
-        if bucket_size == batch_size:
-            return cu_seqlens
-        
-        # Pad cu_seqlens: add entries with the same value as the last entry
-        # This means padded sequences have 0 length
-        padding_size = bucket_size - batch_size
-        padding = cu_seqlens[-1:].expand(padding_size)
-        return torch.cat([cu_seqlens, padding])
-
     def _lazy_init_te_attn(
         self,
         num_attention_heads: int,
@@ -289,15 +262,33 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine FP8 attention with BSHD format.
         
+        IMPORTANT: This function processes ONE sample at a time. When cu_seqlens
+        is provided, it must have length 2 (i.e., [0, seq_len] for a single 
+        sequence).
+        
+        This batch-1 restriction is a limitation of Transformer Engine, not
+        cuDNN. TE does not support THD format for FP8 attention, and converting
+        the upstream THD tensor into a proper multi-batch BSHD tensor would be
+        too expensive. Instead, we manually reinterpret a batch-1 THD tensor as
+        BSHD with B=1 and S=T (the total token count), then call the BSHD
+        kernel. This is semantically consistent because a single sequence in
+        THD is equivalent to B=1 BSHD.
+        
         Input shape:
         (batch_size x seq_len x hidden_size) where hidden_size = num_heads * head_size
         or (batch_size x seq_len x num_heads x head_size)
         
         Uses BSHD format: (batch, seq, heads, dim)
         
-        Note: TE natively supports GQA, so we don't expand KV heads like other backends.
         Note: Head dimension is padded to multiple of 16 for optimal performance.
         """
+        # Validate single-sample constraint
+        if cu_seqlens is not None:
+            assert len(cu_seqlens) == 2, (
+                f"_forward_te_fp8 (BSHD format) requires exactly one sample at a time. "
+                f"cu_seqlens must have length 2 (got {len(cu_seqlens)}). "
+            )
+        
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         is_3d_input = query.dim() == 3
@@ -403,128 +394,6 @@ class MMEncoderAttention(CustomOp):
         else:
             # Already in (batch, seq, num_heads, head_size) format
             pass
-        
-        return output
-
-    def _forward_te_fp8_thd(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        cu_seqlens: torch.Tensor | None = None,
-        max_seqlen: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Forward pass using Transformer Engine FP8 attention with THD format.
-        
-        Input shape:
-        (batch_size x seq_len x hidden_size) where hidden_size = num_heads * head_size
-        or (batch_size x seq_len x num_heads x head_size)
-        
-        Uses THD format: (T, H, D) where T = batch*seq, H = num_heads, D = head_size
-        
-        Note: TE natively supports GQA, so we don't expand KV heads like other backends.
-        Note: Head dimension is padded to multiple of 16 for optimal performance.
-        """
-        bsz, q_len = query.size()[:2]
-        kv_len = key.size(1)
-        is_3d_input = query.dim() == 3
-        
-        # For THD format, we need cu_seqlens
-        # Generate if not provided (assumes uniform sequence lengths)
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(
-                0, (bsz + 1) * q_len, q_len,
-                dtype=torch.int32, device=query.device
-            )
-        
-        # Pad cu_seqlens to the next batch bucket size to avoid cuDNN recompilation
-        cu_seqlens = self._pad_cu_seqlens_to_bucket(cu_seqlens)
-        
-        # Use fixed max_seqlen to avoid cuDNN recompilation when sequence lengths vary
-        max_seqlen = TE_FIXED_MAX_SEQLEN
-        
-        # Transform to THD format: (T, H, D) where T = batch*seq
-        total_tokens_q = bsz * q_len
-        total_tokens_kv = bsz * kv_len
-        
-        if is_3d_input:
-            # Input is (batch, seq, hidden_size) - need to split hidden into (H, D)
-            query = query.view(total_tokens_q, self.num_heads, self.head_size)
-            key = key.view(total_tokens_kv, self.num_kv_heads, self.head_size)
-            value = value.view(total_tokens_kv, self.num_kv_heads, self.head_size)
-        else:
-            # Input is (batch, seq, num_heads, head_size) - just flatten batch and seq
-            query = query.view(total_tokens_q, self.num_heads, self.head_size)
-            key = key.view(total_tokens_kv, self.num_kv_heads, self.head_size)
-            value = value.view(total_tokens_kv, self.num_kv_heads, self.head_size)
-        
-        # Pad head dimension to multiple of 16 for optimal performance
-        original_head_size = self.head_size
-        padded_head_size = ((self.head_size + 15) // 16) * 16
-        needs_padding = padded_head_size != original_head_size
-        
-        if needs_padding:
-            pad_size = padded_head_size - original_head_size
-            query = torch.nn.functional.pad(query, (0, pad_size))
-            key = torch.nn.functional.pad(key, (0, pad_size))
-            value = torch.nn.functional.pad(value, (0, pad_size))
-        
-        # For THD format, attn_mask_type must be "padding" or "padding_causal"
-        attn_mask_type = "padding"
-        
-        # Determine GQA groups - TE will handle the GQA logic internally
-        num_gqa_groups = self.num_kv_heads if self.num_kv_heads != self.num_heads else None
-        
-        # Lazy initialization of TE attention operator
-        
-        self._lazy_init_te_attn(
-            num_attention_heads=self.num_heads,
-            kv_channels=padded_head_size,
-            num_gqa_groups=num_gqa_groups,
-            attn_mask_type=attn_mask_type,
-            softmax_scale=self.scale,
-            qkv_format="thd",
-        )
-        
-        # NVTX annotation with all parameters for lazy_init and te_attn_op
-        nvtx_msg = (
-            f"TE_FP8_THD: "
-            f"Q={tuple(query.shape)}, K={tuple(key.shape)}, V={tuple(value.shape)}, "
-            f"batch_size={bsz}, num_heads={self.num_heads}, kv_channels={padded_head_size}, "
-            f"num_gqa_groups={num_gqa_groups}, attn_mask_type={attn_mask_type}, "
-            f"softmax_scale={self.scale}, qkv_format=thd, "
-            f"cu_seqlens={cu_seqlens.shape}, max_seqlen={max_seqlen}"
-        )
-        with torch.cuda.nvtx.range(nvtx_msg):
-            with fp8_autocast(enabled=True, fp8_recipe=self.te_fp8_recipe):
-                output = self.te_attn_op(
-                    query,
-                    key,
-                    value,
-                    attention_mask=None,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_kv=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_kv=max_seqlen,
-                )
-        
-        # TE returns (T, H*D_padded) flattened, need to reshape to (T, H, D_padded) first
-        if output.dim() == 2:
-            # Output is (T, H*D_padded) - reshape to (T, H, D_padded)
-            output = output.reshape(total_tokens_q, self.num_heads, padded_head_size)
-        
-        # Remove head padding if needed: (T, H, D_padded) -> (T, H, D_original)
-        if needs_padding:
-            output = output[..., :original_head_size]
-        
-        # Reshape back to original format
-        if is_3d_input:
-            # Back to (batch, seq, hidden_size) where hidden_size = H * D
-            output = output.reshape(bsz, q_len, self.num_heads * original_head_size)
-        else:
-            # Back to (batch, seq, num_heads, head_size)
-            output = output.reshape(bsz, q_len, self.num_heads, original_head_size)
-        
         
         return output
 
