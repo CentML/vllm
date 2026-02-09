@@ -3168,6 +3168,9 @@ class GPUModelRunner(
             cpu_overhead_ms = wall_ms - iter_ms
 
         # Build ViT sub-breakdown string if available
+        # Build ViT sub-breakdown string if available.
+        # prep = preprocess overhead outside ViT forward (batching,
+        # cache lookup, gather_mm_embeddings, embed_input_ids, etc.)
         vit_sub_str = ""
         vit_sub = self._iter_timing_vit_sub_prev
         if vit_sub is not None and p_enc > 0:
@@ -3176,9 +3179,10 @@ class GPUModelRunner(
                     emb_ms = vit_sub[0].elapsed_time(vit_sub[1])
                     blk_ms = vit_sub[1].elapsed_time(vit_sub[2])
                     mrg_ms = vit_sub[2].elapsed_time(vit_sub[3])
+                    prep_ms = vit_ms - emb_ms - blk_ms - mrg_ms
                     vit_sub_str = (
                         f"(emb={emb_ms:.1f} blk={blk_ms:.1f} "
-                        f"mrg={mrg_ms:.1f})"
+                        f"mrg={mrg_ms:.1f} prep={prep_ms:.1f})"
                     )
             except RuntimeError:
                 pass  # events not recorded (ViT skipped)
@@ -3376,13 +3380,15 @@ class GPUModelRunner(
 
             # === ITER TIMING: log previous iteration + record vit_start ===
             if self._iter_timing_enabled:
+                # Record wall-clock start BEFORE logging so _log_prev can
+                # compute wall = current_start - prev_start.
+                self._iter_timing_wall_start = time.perf_counter()
                 self._log_prev_iter_timing()
                 if self._iter_timing_events is None:
                     self._iter_timing_events = [
                         torch.cuda.Event(enable_timing=True)
                         for _ in range(6)
                     ]
-                self._iter_timing_wall_start = time.perf_counter()
                 self._iter_timing_events[0].record()  # vit_start
                 # Set ViT sub-timing events on the visual module
                 if hasattr(self.model, "visual"):
