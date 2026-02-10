@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 # Seqlen buckets for BSHD format - Q/K/V tensors are padded to these sizes
 # so cuDNN sees a fixed set of tensor shapes and avoids recompilation
-TE_SEQLEN_BUCKETS = [2048, 4096, 6144, 10240, 16384, 25600, 35840, 65536]
+TE_SEQLEN_BUCKETS = [1024, 2048, 3072, 4096, 5120, 6144, 7168, 9216, 10240, 13312, 16384, 20480, 25600, 35840, 49152, 65536]
 
 # Fixed max_seqlen to avoid cuDNN recompilation when sequence lengths vary
 TE_FIXED_MAX_SEQLEN = 128 * 1024
