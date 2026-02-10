@@ -9,11 +9,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, connection
 from multiprocessing.process import BaseProcess
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import msgspec
-import torch.multiprocessing as torch_mp
 import zmq
 
 from vllm import envs
@@ -65,11 +64,6 @@ class EngineZmqAddresses:
     # Not used by engine, just relayed to front-end in handshake response.
     # Only required for external DP LB case.
     frontend_stats_publish_address: str | None = None
-    # Tensor IPC queues for sharing CUDA tensors between API servers and engines
-    # One queue per engine core for direct GPU tensor transfer
-    tensor_queues: list[Any] | None = None
-    # Index of this engine's tensor queue (set during handshake)
-    tensor_queue_index: int | None = None
 
 
 @dataclass
@@ -81,8 +75,6 @@ class EngineHandshakeMetadata:
 
     addresses: EngineZmqAddresses
     parallel_config: dict[str, int | str | list[int]]
-    # Index of this engine's tensor queue in addresses.tensor_queues
-    tensor_queue_index: int | None = None
 
 
 class CoreEngineProcManager:
@@ -103,7 +95,6 @@ class CoreEngineProcManager:
         executor_class: type[Executor],
         log_stats: bool,
         client_handshake_address: str | None = None,
-        tensor_queues: list[Any] | None = None,
     ):
         context = get_mp_context()
         common_kwargs = {
@@ -116,9 +107,6 @@ class CoreEngineProcManager:
 
         if client_handshake_address:
             common_kwargs["client_handshake_address"] = client_handshake_address
-
-        # Store tensor_queues for passing to engine processes
-        self.tensor_queues = tensor_queues
 
         self.processes: list[BaseProcess] = []
         local_dp_ranks = []
@@ -136,7 +124,6 @@ class CoreEngineProcManager:
                     | {
                         "dp_rank": global_index,
                         "local_dp_rank": local_index,
-                        "tensor_queues": tensor_queues,
                     },
                 )
             )
@@ -813,13 +800,6 @@ def launch_core_engines(
         offline_mode or local_engines_only or (local_engine_count == dp_size)
     )
 
-    # Create tensor IPC queues for sharing multimodal tensors between API servers
-    # and engine cores. One queue per engine core.
-    # Use torch.multiprocessing for tensor sharing via IPC/shared memory.
-    # Set start method to 'spawn' for compatibility with multiprocessing.
-    torch_mp.set_start_method("spawn", force=True)
-    tensor_queues: list[torch_mp.Queue] = [torch_mp.Queue() for _ in range(dp_size)]
-
     # Set up input and output addresses.
     addresses = EngineZmqAddresses(
         inputs=[
@@ -830,7 +810,6 @@ def launch_core_engines(
             get_engine_client_zmq_addr(client_local_only, host)
             for _ in range(num_api_servers)
         ],
-        tensor_queues=tensor_queues,
     )
 
     # Run the DP Coordinator process with rank 0 when in online DP mode.
@@ -929,7 +908,6 @@ def launch_core_engines(
                 local_engine_count=local_engine_count,
                 start_index=dp_rank,
                 local_start_index=local_start_index or 0,
-                tensor_queues=tensor_queues,
             )
         else:
             local_engine_manager = None
@@ -1037,21 +1015,9 @@ def wait_for_engine_startup(
 
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
             # Send init message with DP config info.
-            # Note: tensor_queues are excluded from serialization as they can't be
-            # serialized by msgspec. They are passed directly to engine processes
-            # when spawning them.
-            addresses_for_handshake = EngineZmqAddresses(
-                inputs=addresses.inputs,
-                outputs=addresses.outputs,
-                coordinator_input=addresses.coordinator_input,
-                coordinator_output=addresses.coordinator_output,
-                frontend_stats_publish_address=addresses.frontend_stats_publish_address,
-                tensor_queues=None,  # Don't serialize queues
-                tensor_queue_index=None,  # Will be set separately
-            )
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
-                    addresses=addresses_for_handshake,
+                    addresses=addresses,
                     parallel_config={
                         k: getattr(parallel_config, k)
                         for k in (
@@ -1063,7 +1029,6 @@ def wait_for_engine_startup(
                     }
                     if coordinated_dp
                     else {},
-                    tensor_queue_index=eng_index,
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
