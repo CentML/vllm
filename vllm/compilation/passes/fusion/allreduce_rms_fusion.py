@@ -156,7 +156,6 @@ if flashinfer_comm is not None:
         if workspace.backend == "trtllm":
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
-        logger.info(f"FI AR: Using backend: {workspace.backend}, pattern: {pattern_code}")
 
         flashinfer_comm.allreduce_fusion(
             input=allreduce_in,
