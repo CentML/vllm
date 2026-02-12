@@ -38,6 +38,7 @@ def get_fi_ar_workspace():
 def get_fi_ar_quant_workspace():
     return _fi_ar_quant_workspace
 
+
 def initialize_fi_ar_workspace(
     world_size: int,
     rank: int,
@@ -134,8 +135,10 @@ def initialize_fi_ar_quant_workspace(
 def destroy_fi_ar_workspace():
     global _fi_ar_workspace
     global _fi_ar_quant_workspace
-    if _fi_ar_quant_workspace is not None \
-            and _fi_ar_quant_workspace is not _fi_ar_workspace:
+    if (
+        _fi_ar_quant_workspace is not None
+        and _fi_ar_quant_workspace is not _fi_ar_workspace
+    ):
         _fi_ar_quant_workspace.destroy()
     _fi_ar_quant_workspace = None
     if _fi_ar_workspace is not None:

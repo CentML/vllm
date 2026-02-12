@@ -90,6 +90,8 @@ if flashinfer_comm is not None:
         initialize_fi_ar_workspace,
     )
 
+    ar_fusion_patterns = flashinfer_comm.AllReduceFusionPattern
+
     MiB = 1024 * 1024
 
     def call_trtllm_fused_allreduce_norm(
@@ -132,8 +134,8 @@ if flashinfer_comm is not None:
         # Select workspace based on pattern: quant patterns use the
         # trtllm quant workspace, non-quant patterns use the primary workspace.
         if pattern_code in (
-            flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-            flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
+            ar_fusion_patterns.kARResidualRMSNormFP8Quant,
+            ar_fusion_patterns.kARResidualRMSNormFP4Quant,
         ):
             workspace = get_fi_ar_quant_workspace()
         else:
@@ -751,7 +753,10 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             scope="global",
         )
 
-        for workspace_init_fn in [initialize_fi_ar_workspace, initialize_fi_ar_quant_workspace]:
+        for workspace_init_fn in [
+            initialize_fi_ar_workspace,
+            initialize_fi_ar_quant_workspace,
+        ]:
             try:
                 workspace_init_fn(
                     world_size=self.tp_size,
