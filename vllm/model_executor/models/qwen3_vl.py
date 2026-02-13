@@ -537,30 +537,40 @@ class Qwen3_VisionTransformer(nn.Module):
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor | list[list[int]],
+        *,
+        encoder_metadata: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         hidden_states = self.patch_embed(hidden_states)
 
-        if isinstance(grid_thw, list):
-            grid_thw_list = grid_thw
-            grid_thw = np.array(grid_thw, dtype=np.int32)
+        if encoder_metadata is None:
+            if isinstance(grid_thw, list):
+                grid_thw_list = grid_thw
+                grid_thw = np.array(grid_thw, dtype=np.int32)
+            else:
+                grid_thw_list = grid_thw.tolist()
+                grid_thw = grid_thw.numpy()
+
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+            rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+            cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                axis=0, dtype=np.int32
+            )
+            cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+            cu_seqlens = torch.from_numpy(cu_seqlens)
+
+            max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
         else:
-            grid_thw_list = grid_thw.tolist()
-            grid_thw = grid_thw.numpy()
+            pos_embeds = encoder_metadata['pos_embeds']
+            rotary_pos_emb_cos = encoder_metadata['rotary_pos_emb_cos']
+            rotary_pos_emb_sin = encoder_metadata['rotary_pos_emb_sin']
+            cu_seqlens = encoder_metadata['cu_seqlens']
+            max_seqlen = encoder_metadata['max_seqlen']
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
         hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-
-        cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            axis=0, dtype=np.int32
-        )
-        cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
-        cu_seqlens = torch.from_numpy(cu_seqlens)
-
         hidden_states = hidden_states.unsqueeze(1)
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
