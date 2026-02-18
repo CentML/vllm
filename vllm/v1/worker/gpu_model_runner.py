@@ -2615,11 +2615,11 @@ class GPUModelRunner(
                         self.encoder_cudagraph_manager is not None
                         and modality == "image"
                         and "pixel_values" in mm_kwargs_batch
-                        and "grid_thw" in mm_kwargs_batch
+                        and "image_grid_thw" in mm_kwargs_batch
                     ):
                         cudagraph_output = self.encoder_cudagraph_manager.execute(
                             pixel_values=mm_kwargs_batch["pixel_values"],
-                            grid_thw=mm_kwargs_batch["grid_thw"],
+                            grid_thw=mm_kwargs_batch["image_grid_thw"],
                         )
 
                     if cudagraph_output is not None:
@@ -5731,9 +5731,7 @@ class GPUModelRunner(
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
-                logger.info("Capturing encoder CUDA graphs...")
                 self.encoder_cudagraph_manager.capture()
-                logger.info("Encoder CUDA graph capture complete")
 
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
