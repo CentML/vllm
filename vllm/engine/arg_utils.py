@@ -576,6 +576,7 @@ class EngineArgs:
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
     pt_load_map_location: str | dict[str, str] = LoadConfig.pt_load_map_location
+    warmup_threads: int = LoadConfig.warmup_threads
 
     logits_processors: list[str | type[LogitsProcessor]] | None = (
         ModelConfig.logits_processors
@@ -753,6 +754,11 @@ class EngineArgs:
         load_group.add_argument("--use-tqdm-on-load", **load_kwargs["use_tqdm_on_load"])
         load_group.add_argument(
             "--pt-load-map-location", **load_kwargs["pt_load_map_location"]
+        )
+        load_group.add_argument(
+            "--warmup-threads",
+            "-wt",
+            **load_kwargs["warmup_threads"],
         )
 
         # Attention arguments
@@ -1367,6 +1373,7 @@ class EngineArgs:
             ignore_patterns=self.ignore_patterns,
             use_tqdm_on_load=self.use_tqdm_on_load,
             pt_load_map_location=self.pt_load_map_location,
+            warmup_threads=self.warmup_threads,
         )
 
     def create_speculative_config(

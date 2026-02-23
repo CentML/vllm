@@ -7,6 +7,7 @@ import fnmatch
 import glob
 import hashlib
 import json
+import mmap
 import os
 import tempfile
 import time
@@ -152,6 +153,111 @@ def _natural_sort_key(filepath: str) -> list:
         int(s) if s.isdigit() else s
         for s in re.split(r"(\d+)", os.path.basename(filepath))
     ]
+
+
+# Mappings kept alive (and optionally mlock'd) until load_weights finishes.
+# Used so page cache is not evicted under memory pressure.
+_preload_mappings: list[mmap.mmap] = []
+
+
+def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> list[mmap.mmap]:
+    """Pull checkpoint file pages into the OS page cache using mmap + touch.
+
+    Uses mmap (same path as safetensors safe_open) and touches every page so
+    the kernel definitely has the file in cache. Optionally keeps mappings
+    and mlock's them so pages are not evicted before the loader runs.
+
+    Returns a list of mmap objects to hold (when keep_mappings=True), else [].
+    """
+    page_size = mmap.PAGESIZE
+    kept: list[mmap.mmap] = []
+    for st_file in chunk:
+        try:
+            with open(st_file, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                if size == 0:
+                    continue
+                m = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ)
+                try:
+                    # Touch every page so it is faulted in from disk (or cache).
+                    offset = 0
+                    while offset < size:
+                        # Force a read so the compiler/kernel cannot optimize away.
+                        _ = m[offset]
+                        offset += page_size
+                    if keep_mappings:
+                        try:
+                            if hasattr(m, "mlock"):
+                                m.mlock()
+                        except OSError:
+                            # mlock can fail (e.g. ulimit, no CAP_IPC_LOCK).
+                            pass
+                        kept.append(m)
+                        m = None  # do not close below
+                    else:
+                        m.close()
+                finally:
+                    if m is not None:
+                        m.close()
+        except (OSError, ValueError) as e:
+            logger.warning("Preload failed for %s: %s", st_file, e)
+    return kept
+
+
+def release_preload_mappings() -> None:
+    """Release any mmaps held from preload (call after load_weights finishes)."""
+    global _preload_mappings
+    for m in _preload_mappings:
+        try:
+            m.close()
+        except OSError:
+            pass
+    _preload_mappings = []
+
+
+def preload_checkpoints_to_page_cache(
+    files: list[str],
+    num_threads: int,
+    *,
+    keep_mappings: bool = True,
+) -> None:
+    """Preload checkpoint files into the OS page cache using parallel threads.
+    Only the master (TP rank 0) process should call this; other ranks should
+    barrier until it finishes so that when they read the same files, data is
+    already in RAM.
+
+    Uses mmap and touches every page so the loader (safetensors safe_open/mmap)
+    hits the same cache. If keep_mappings is True, mappings are mlock'd and
+    kept until release_preload_mappings() is called, so the kernel cannot
+    evict them under memory pressure.
+    """
+    global _preload_mappings
+    if num_threads == 0 or not files:
+        return
+    logger.info(
+        "Preloading %d checkpoint files to page cache (%d threads)...",
+        len(files),
+        num_threads,
+    )
+    start = time.perf_counter()
+    # Partition files into num_threads chunks:
+    # chunk i gets files i, i+num_threads, ...
+    chunks: list[list[str]] = [[] for _ in range(num_threads)]
+    for idx, path in enumerate(files):
+        chunks[idx % num_threads].append(path)
+    def _touch_chunk_with_opts(chunk: list[str]) -> list[mmap.mmap]:
+        return _touch_chunk(chunk, keep_mappings=keep_mappings)
+
+    _preload_mappings.clear()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        results = list(executor.map(_touch_chunk_with_opts, chunks))
+    for kept in results:
+        _preload_mappings.extend(kept)
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "Preloaded checkpoints to page cache in %.2f seconds",
+        elapsed,
+    )
 
 
 def maybe_download_from_modelscope(

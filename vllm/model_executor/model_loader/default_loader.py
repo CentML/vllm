@@ -16,6 +16,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -27,7 +28,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
+    preload_checkpoints_to_page_cache,
     pt_weights_iterator,
+    release_preload_mappings,
     safetensors_weights_iterator,
 )
 from vllm.tracing import instrument
@@ -286,6 +289,40 @@ class DefaultModelLoader(BaseModelLoader):
             ):
                 self.load_config.safetensors_load_strategy = "torchao"
 
+        # Preload checkpoint files into page cache on master (TP rank 0) so that
+        # when all TP processes read weights, data is already in RAM.
+        if (
+            self.load_config.warmup_threads > 0
+            and torch.distributed.is_initialized()
+        ):
+            primary_source = DefaultModelLoader.Source(
+                model_config.model,
+                model_config.revision,
+                prefix="",
+                fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                allow_patterns_overrides=getattr(
+                    model, "allow_patterns_overrides", None
+                ),
+            )
+            _, hf_weights_files, _ = self._prepare_weights(
+                primary_source.model_or_path,
+                primary_source.revision,
+                primary_source.fall_back_to_pt,
+                primary_source.allow_patterns_overrides,
+            )
+            # Ensure all ranks have finished downloading before rank 0 preloads.
+            torch.distributed.barrier(
+                device_ids=[get_world_group().local_rank],
+            )
+            if get_tensor_model_parallel_rank() == 0:
+                preload_checkpoints_to_page_cache(
+                    hf_weights_files,
+                    num_threads=self.load_config.warmup_threads,
+                )
+            torch.distributed.barrier(
+                device_ids=[get_world_group().local_rank],
+            )
+
         weights_to_load = {name for name, _ in model.named_parameters()}
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
@@ -304,3 +341,4 @@ class DefaultModelLoader(BaseModelLoader):
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
+        release_preload_mappings()
