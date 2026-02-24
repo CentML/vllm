@@ -30,7 +30,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     np_cache_weights_iterator,
     preload_checkpoints_to_page_cache,
     pt_weights_iterator,
-    release_preload_mappings,
     safetensors_weights_iterator,
 )
 from vllm.tracing import instrument
@@ -341,4 +340,3 @@ class DefaultModelLoader(BaseModelLoader):
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
-        release_preload_mappings()

@@ -155,12 +155,7 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
-# Mappings kept alive (and optionally mlock'd) until load_weights finishes.
-# Used so page cache is not evicted under memory pressure.
-_preload_mappings: list[mmap.mmap] = []
-
-
-def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> list[mmap.mmap]:
+def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> None:
     """Pull checkpoint file pages into the OS page cache using mmap + touch.
 
     Uses mmap (same path as safetensors safe_open) and touches every page so
@@ -170,49 +165,18 @@ def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> list[mmap.mma
     Returns a list of mmap objects to hold (when keep_mappings=True), else [].
     """
     page_size = mmap.PAGESIZE
-    kept: list[mmap.mmap] = []
     for st_file in chunk:
         try:
             with open(st_file, "rb") as f:
                 size = os.fstat(f.fileno()).st_size
                 if size == 0:
                     continue
-                m = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ)
-                try:
+                with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
                     # Touch every page so it is faulted in from disk (or cache).
-                    offset = 0
-                    while offset < size:
-                        # Force a read so the compiler/kernel cannot optimize away.
-                        _ = m[offset]
-                        offset += page_size
-                    if keep_mappings:
-                        try:
-                            if hasattr(m, "mlock"):
-                                m.mlock()
-                        except OSError:
-                            # mlock can fail (e.g. ulimit, no CAP_IPC_LOCK).
-                            pass
-                        kept.append(m)
-                        m = None  # do not close below
-                    else:
-                        m.close()
-                finally:
-                    if m is not None:
-                        m.close()
+                    _ = m[0:size:page_size]
         except (OSError, ValueError) as e:
             logger.warning("Preload failed for %s: %s", st_file, e)
-    return kept
-
-
-def release_preload_mappings() -> None:
-    """Release any mmaps held from preload (call after load_weights finishes)."""
-    global _preload_mappings
-    for m in _preload_mappings:
-        try:
-            m.close()
-        except OSError:
-            pass
-    _preload_mappings = []
+    return
 
 
 def preload_checkpoints_to_page_cache(
@@ -231,7 +195,6 @@ def preload_checkpoints_to_page_cache(
     kept until release_preload_mappings() is called, so the kernel cannot
     evict them under memory pressure.
     """
-    global _preload_mappings
     if num_threads == 0 or not files:
         return
     logger.info(
@@ -248,11 +211,10 @@ def preload_checkpoints_to_page_cache(
     def _touch_chunk_with_opts(chunk: list[str]) -> list[mmap.mmap]:
         return _touch_chunk(chunk, keep_mappings=keep_mappings)
 
-    _preload_mappings.clear()
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
         results = list(executor.map(_touch_chunk_with_opts, chunks))
-    for kept in results:
-        _preload_mappings.extend(kept)
+    #for kept in results:
+    #    _preload_mappings.extend(kept)
     elapsed = time.perf_counter() - start
     logger.info(
         "Preloaded checkpoints to page cache in %.2f seconds",
