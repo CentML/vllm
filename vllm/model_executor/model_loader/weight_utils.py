@@ -155,14 +155,11 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
-def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> None:
+def _touch_chunk(chunk: list[str]) -> None:
     """Pull checkpoint file pages into the OS page cache using mmap + touch.
 
     Uses mmap (same path as safetensors safe_open) and touches every page so
-    the kernel definitely has the file in cache. Optionally keeps mappings
-    and mlock's them so pages are not evicted before the loader runs.
-
-    Returns a list of mmap objects to hold (when keep_mappings=True), else [].
+    the kernel definitely has the file in cache.
     """
     page_size = mmap.PAGESIZE
     for st_file in chunk:
@@ -182,8 +179,6 @@ def _touch_chunk(chunk: list[str], keep_mappings: bool = False) -> None:
 def preload_checkpoints_to_page_cache(
     files: list[str],
     num_threads: int,
-    *,
-    keep_mappings: bool = True,
 ) -> None:
     """Preload checkpoint files into the OS page cache using parallel threads.
     Only the master (TP rank 0) process should call this; other ranks should
@@ -191,9 +186,7 @@ def preload_checkpoints_to_page_cache(
     already in RAM.
 
     Uses mmap and touches every page so the loader (safetensors safe_open/mmap)
-    hits the same cache. If keep_mappings is True, mappings are mlock'd and
-    kept until release_preload_mappings() is called, so the kernel cannot
-    evict them under memory pressure.
+    hits the same cache.
     """
     if num_threads == 0 or not files:
         return
@@ -203,18 +196,16 @@ def preload_checkpoints_to_page_cache(
         num_threads,
     )
     start = time.perf_counter()
-    # Partition files into num_threads chunks:
-    # chunk i gets files i, i+num_threads, ...
-    chunks: list[list[str]] = [[] for _ in range(num_threads)]
+    # Partition files into num_threads chunks (no empty chunks when files < threads):
+    # chunk i gets files i, i+num_chunks, ...
+    num_chunks = min(num_threads, len(files))
+    chunks: list[list[str]] = [[] for _ in range(num_chunks)]
     for idx, path in enumerate(files):
-        chunks[idx % num_threads].append(path)
-    def _touch_chunk_with_opts(chunk: list[str]) -> list[mmap.mmap]:
-        return _touch_chunk(chunk, keep_mappings=keep_mappings)
+        chunks[idx % num_chunks].append(path)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-        results = list(executor.map(_touch_chunk_with_opts, chunks))
-    #for kept in results:
-    #    _preload_mappings.extend(kept)
+        for _ in executor.map(_touch_chunk, chunks):
+            pass
     elapsed = time.perf_counter() - start
     logger.info(
         "Preloaded checkpoints to page cache in %.2f seconds",
