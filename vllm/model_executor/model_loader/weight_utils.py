@@ -788,13 +788,17 @@ def safetensors_weights_iterator(
 
                 asyncio.run(_prefetch_batch())
             start = time.perf_counter()
+            logger.info(
+                "[MYLOG]: Start Heavy %s",
+                re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
+            )
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
             elapsed = time.perf_counter() - start
             logger.info(
-                "[MYLOG]: Heavy %s in %.3f",
+                "[MYLOG]: Finish Heavy %s in %.3f",
                 re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
                 elapsed,
             )
