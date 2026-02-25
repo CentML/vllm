@@ -5,8 +5,9 @@
 import asyncio
 import concurrent.futures
 import fnmatch
-import threading
 import glob
+import multiprocessing
+import threading
 import hashlib
 import json
 import mmap
@@ -157,6 +158,14 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
+def _prefetch_files_in_process(paths: list[str]) -> None:
+    """Run prefetch for multiple files in a separate process (no shared locks).
+    Prefetches run in parallel inside this process; parent never waits."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(paths)) as executor:
+        for _ in executor.map(_prefetch_checkpoint, paths):
+            pass
+
+
 def _prefetch_checkpoint(file_path: str) -> None:
     """Pull a checkpoint file's pages into the OS page cache using mmap + touch.
 
@@ -165,10 +174,12 @@ def _prefetch_checkpoint(file_path: str) -> None:
     """
     page_size = mmap.PAGESIZE
     try:
+        '''
         logger.info(
             "Start prefetching %s",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
         )
+        '''
         start = time.perf_counter()
         with open(file_path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
@@ -178,11 +189,13 @@ def _prefetch_checkpoint(file_path: str) -> None:
                 # Touch every page so it is faulted in from disk (or cache).
                 _ = m[0:size:page_size]
         elapsed = time.perf_counter() - start
+        '''
         logger.info(
             "Finished prefetching %s in %.3f seconds",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
             elapsed,
         )
+        '''
     except (OSError, ValueError) as e:
         logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
     return
