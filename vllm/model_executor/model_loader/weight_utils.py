@@ -784,17 +784,13 @@ def safetensors_weights_iterator(
                     flush=True,
                 )
 
-                def _run_prefetch_in_background() -> None:
-                    with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=len(next_files)) as executor:
-                        for _ in executor.map(_prefetch_checkpoint, next_files):
-                            pass
-
-                prefetch_thread = threading.Thread(
-                    target=_run_prefetch_in_background,
-                    daemon=True,
-                )
-                prefetch_thread.start()
+                for path in next_files:
+                    t = threading.Thread(
+                        target=_prefetch_checkpoint,
+                        args=(path,),
+                        daemon=True,
+                    )
+                    t.start()
             start = time.perf_counter()
             logger.info(
                 "[MYLOG]: Start Heavy %s",
