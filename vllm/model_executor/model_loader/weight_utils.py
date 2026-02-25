@@ -165,9 +165,8 @@ def _prefetch_checkpoint(file_path: str) -> None:
     page_size = mmap.PAGESIZE
     try:
         logger.info(
-            f"Start prefetching %s",
+            "Start prefetching %s",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
-            flush=True,
         )
         start = time.perf_counter()
         with open(file_path, "rb") as f:
@@ -179,10 +178,9 @@ def _prefetch_checkpoint(file_path: str) -> None:
                 _ = m[0:size:page_size]
         elapsed = time.perf_counter() - start
         logger.info(
-            "Finished prefetching %s in %.3f",
+            "Finished prefetching %s in %.3f seconds",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
             elapsed,
-            flush=True,
         )
     except (OSError, ValueError) as e:
         logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
@@ -799,7 +797,6 @@ def safetensors_weights_iterator(
                 "[MYLOG]: Heavy %s in %.3f",
                 re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
                 elapsed,
-                flush=True,
             )
         else:
             with safe_open(st_file, framework="pt") as f:
