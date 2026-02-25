@@ -173,13 +173,13 @@ def _prefetch_checkpoint(file_path: str) -> None:
                 # Touch every page so it is faulted in from disk (or cache).
                 _ = m[0:size:page_size]
         elapsed = time.perf_counter() - start
-        logger.debug(
+        logger.info(
             "Prefetched %s to page cache in %.3f seconds",
             file_path,
             elapsed,
         )
     except (OSError, ValueError) as e:
-        logger.warning("Preload failed for %s: %s", file_path, e)
+        logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
     return
 
 
@@ -783,10 +783,17 @@ def safetensors_weights_iterator(
                     )
 
                 asyncio.run(_prefetch_batch())
+            start = time.perf_counter()
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "[MYLOG]: Loaded weights from %s in %.3f seconds (heavy part)",
+                st_file,
+                elapsed,
+            )
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
