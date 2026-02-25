@@ -6,7 +6,6 @@ import asyncio
 import concurrent.futures
 import fnmatch
 import glob
-import multiprocessing
 import threading
 import hashlib
 import json
@@ -157,20 +156,14 @@ def _natural_sort_key(filepath: str) -> list:
         for s in re.split(r"(\d+)", os.path.basename(filepath))
     ]
 
-
-def _prefetch_files_in_process(paths: list[str]) -> None:
-    """Run prefetch for multiple files in a separate process (no shared locks).
-    Prefetches run in parallel inside this process; parent never waits."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(paths)) as executor:
-        for _ in executor.map(_prefetch_checkpoint, paths):
-            pass
-
-
+POSIX_FADV_WILLNEED = getattr(os, "POSIX_FADV_WILLNEED", 3)
+block_size=16 * 1024 * 1024
 def _prefetch_checkpoint(file_path: str) -> None:
     """Pull a checkpoint file's pages into the OS page cache using mmap + touch.
 
     Uses mmap (same path as safetensors safe_open) and touches every page so
     the kernel definitely has the file in cache.
+    """
     """
     page_size = mmap.PAGESIZE
     try:
@@ -199,6 +192,16 @@ def _prefetch_checkpoint(file_path: str) -> None:
     except (OSError, ValueError) as e:
         logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
     return
+    """
+    fd = os.open(file_path, os.O_RDONLY)
+    try:
+        # Hint: this region will be needed soon.
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED)
+        while os.read(fd, block_size):
+            pass
+    finally:
+        os.close(fd)
 
 
 def maybe_download_from_modelscope(
