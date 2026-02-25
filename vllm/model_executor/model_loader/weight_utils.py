@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for downloading and initializing model weights."""
 
+import asyncio
 import concurrent.futures
 import fnmatch
 import glob
@@ -155,62 +156,24 @@ def _natural_sort_key(filepath: str) -> list:
     ]
 
 
-def _touch_chunk(chunk: list[str]) -> None:
-    """Pull checkpoint file pages into the OS page cache using mmap + touch.
+def _prefetch_checkpoint(file_path: str) -> None:
+    """Pull a checkpoint file's pages into the OS page cache using mmap + touch.
 
     Uses mmap (same path as safetensors safe_open) and touches every page so
     the kernel definitely has the file in cache.
     """
     page_size = mmap.PAGESIZE
-    for st_file in chunk:
-        try:
-            with open(st_file, "rb") as f:
-                size = os.fstat(f.fileno()).st_size
-                if size == 0:
-                    continue
-                with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
-                    # Touch every page so it is faulted in from disk (or cache).
-                    _ = m[0:size:page_size]
-        except (OSError, ValueError) as e:
-            logger.warning("Preload failed for %s: %s", st_file, e)
+    try:
+        with open(file_path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if size == 0:
+                return
+            with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
+                # Touch every page so it is faulted in from disk (or cache).
+                _ = m[0:size:page_size]
+    except (OSError, ValueError) as e:
+        logger.warning("Preload failed for %s: %s", file_path, e)
     return
-
-
-def preload_checkpoints_to_page_cache(
-    files: list[str],
-    num_threads: int,
-) -> None:
-    """Preload checkpoint files into the OS page cache using parallel threads.
-    Only the master (TP rank 0) process should call this; other ranks should
-    barrier until it finishes so that when they read the same files, data is
-    already in RAM.
-
-    Uses mmap and touches every page so the loader (safetensors safe_open/mmap)
-    hits the same cache.
-    """
-    if num_threads == 0 or not files:
-        return
-    logger.info(
-        "Preloading %d checkpoint files to page cache (%d threads)...",
-        len(files),
-        num_threads,
-    )
-    start = time.perf_counter()
-    # Partition files into num_threads chunks (no empty chunks when files < threads):
-    # chunk i gets files i, i+num_chunks, ...
-    num_chunks = min(num_threads, len(files))
-    chunks: list[list[str]] = [[] for _ in range(num_chunks)]
-    for idx, path in enumerate(files):
-        chunks[idx % num_chunks].append(path)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-        for _ in executor.map(_touch_chunk, chunks):
-            pass
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "Preloaded checkpoints to page cache in %.2f seconds",
-        elapsed,
-    )
 
 
 def maybe_download_from_modelscope(
@@ -754,11 +717,14 @@ def safetensors_weights_iterator(
         loading_desc += " (eager)"
 
     leftover_state_dict: dict[str, torch.Tensor] = {}
-    for st_file in tqdm(
-        sorted(hf_weights_files, key=_natural_sort_key),
-        desc=loading_desc,
-        disable=not enable_tqdm(use_tqdm_on_load),
-        bar_format=_BAR_FORMAT,
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    for idx, st_file in enumerate(
+        tqdm(
+            sorted_files,
+            desc=loading_desc,
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+        )
     ):
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
@@ -792,6 +758,18 @@ def safetensors_weights_iterator(
                     unflatten_tensor_state_dict(state_dict, metadata)
                 )
             yield from unflattened_state_dict.items()
+        elif safetensors_load_strategy == "prefetch":
+            # Prefetch next 8 files into page cache in parallel
+            if idx * 8 < len(sorted_files):
+                next_files = sorted_files[idx * 8 : min((idx + 1) * 8, len(sorted_files))]
+                if next_files:
+                    asyncio.run(
+                        asyncio.gather( *[asyncio.to_thread(_prefetch_checkpoint, path) for path in next_files] )
+                    )
+            with safe_open(st_file, framework="pt") as f:
+                for name in f.keys():  # noqa: SIM118
+                    param = f.get_tensor(name)
+                    yield name, param
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
