@@ -771,15 +771,18 @@ def safetensors_weights_iterator(
                  or get_tensor_model_parallel_rank() == 0)
                     and idx * 8 < len(sorted_files)):
                 print(f"[MYLOG]: Prefetching {idx * 8} to {(idx + 1) * 8} files", flush=True)
-                next_files = sorted_files[idx * 8 : (idx + 1) * 8]
-                asyncio.run(
-                    asyncio.gather(
+                next_files = sorted_files[idx * 8:min((idx + 1) * 8,
+                                                     len(sorted_files))]
+
+                async def _prefetch_batch() -> None:
+                    await asyncio.gather(
                         *[
                             asyncio.to_thread(_prefetch_checkpoint, path)
                             for path in next_files
                         ]
                     )
-                )
+
+                asyncio.run(_prefetch_batch())
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
