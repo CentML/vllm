@@ -771,31 +771,30 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         elif safetensors_load_strategy == "prefetch":
-            # Prefetch next 8 files into page cache in parallel (master process only)
+            # Prefetch next 8 files (excluding current) into page cache in parallel;
+            # master process only, fire-and-forget (no wait).
             if ((not torch.distributed.is_initialized()
                  or get_tensor_model_parallel_rank() == 0)
-                    and idx * 8 < len(sorted_files)):
-                print(f"[MYLOG]: Prefetching {idx * 8} to {(idx + 1) * 8} files", flush=True)
-                next_files = sorted_files[idx * 8:min((idx + 1) * 8,
+                    and idx + 1 < len(sorted_files)):
+                next_files = sorted_files[idx + 1:min(idx + 1 + 8,
                                                      len(sorted_files))]
-
-                async def _prefetch_batch() -> None:
-                    await asyncio.gather(
-                        *[
-                            asyncio.to_thread(_prefetch_checkpoint, path)
-                            for path in next_files
-                        ]
-                    )
+                print(
+                    f"[MYLOG]: Prefetching {idx + 1} to "
+                    f"{min(idx + 1 + 8, len(sorted_files))} files",
+                    flush=True,
+                )
 
                 def _run_prefetch_in_background() -> None:
-                    asyncio.run(_prefetch_batch())
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=len(next_files)) as executor:
+                        for _ in executor.map(_prefetch_checkpoint, next_files):
+                            pass
 
                 prefetch_thread = threading.Thread(
                     target=_run_prefetch_in_background,
                     daemon=True,
                 )
                 prefetch_thread.start()
-                # Continue without waiting; prefetch runs in background
             start = time.perf_counter()
             logger.info(
                 "[MYLOG]: Start Heavy %s",
