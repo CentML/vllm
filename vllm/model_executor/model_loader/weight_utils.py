@@ -174,8 +174,8 @@ def _prefetch_checkpoint(file_path: str) -> None:
                 _ = m[0:size:page_size]
         elapsed = time.perf_counter() - start
         logger.info(
-            "Prefetched %s to page cache in %.3f seconds",
-            file_path,
+            "Prefetched %s in %.3f",
+            re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
             elapsed,
         )
     except (OSError, ValueError) as e:
@@ -790,8 +790,8 @@ def safetensors_weights_iterator(
                     yield name, param
             elapsed = time.perf_counter() - start
             logger.info(
-                "[MYLOG]: Loaded weights from %s in %.3f seconds (heavy part)",
-                st_file,
+                "[MYLOG]: Heavy %s in %.3f",
+                re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
                 elapsed,
             )
         else:
