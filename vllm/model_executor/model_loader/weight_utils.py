@@ -5,6 +5,7 @@
 import asyncio
 import concurrent.futures
 import fnmatch
+import threading
 import glob
 import hashlib
 import json
@@ -786,7 +787,15 @@ def safetensors_weights_iterator(
                         ]
                     )
 
-                asyncio.run(_prefetch_batch())
+                def _run_prefetch_in_background() -> None:
+                    asyncio.run(_prefetch_batch())
+
+                prefetch_thread = threading.Thread(
+                    target=_run_prefetch_in_background,
+                    daemon=True,
+                )
+                prefetch_thread.start()
+                # Continue without waiting; prefetch runs in background
             start = time.perf_counter()
             logger.info(
                 "[MYLOG]: Start Heavy %s",
