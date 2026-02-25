@@ -164,6 +164,7 @@ def _prefetch_checkpoint(file_path: str) -> None:
     """
     page_size = mmap.PAGESIZE
     try:
+        start = time.perf_counter()
         with open(file_path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
             if size == 0:
@@ -171,6 +172,12 @@ def _prefetch_checkpoint(file_path: str) -> None:
             with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
                 # Touch every page so it is faulted in from disk (or cache).
                 _ = m[0:size:page_size]
+        elapsed = time.perf_counter() - start
+        logger.debug(
+            "Prefetched %s to page cache in %.3f seconds",
+            file_path,
+            elapsed,
+        )
     except (OSError, ValueError) as e:
         logger.warning("Preload failed for %s: %s", file_path, e)
     return
@@ -763,6 +770,7 @@ def safetensors_weights_iterator(
             if ((not torch.distributed.is_initialized()
                  or get_tensor_model_parallel_rank() == 0)
                     and idx * 8 < len(sorted_files)):
+                print(f"[MYLOG]: Prefetching {idx * 8} to {(idx + 1) * 8} files", flush=True)
                 next_files = sorted_files[idx * 8 : (idx + 1) * 8]
                 asyncio.run(
                     asyncio.gather(
