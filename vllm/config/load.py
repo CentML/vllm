@@ -86,11 +86,6 @@ class LoadConfig:
     in dictionary needs to be double quoted for json parsing. For more details,
     see original doc for `map_location` in https://pytorch.org/docs/stable/generated/torch.load.html
     """
-    warmup_threads: int = 0
-    """Number of threads used to preload checkpoint files into the OS page cache
-    before weight loading (0 = disabled). When > 0, the master (TP rank 0)
-    process reads all checkpoint files in parallel so they are in RAM before
-    tensor-parallel workers load weights. Use --warmup-threads N or -wt N."""
 
     def compute_hash(self) -> str:
         """

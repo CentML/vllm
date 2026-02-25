@@ -759,13 +759,19 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         elif safetensors_load_strategy == "prefetch":
-            # Prefetch next 8 files into page cache in parallel
-            if idx * 8 < len(sorted_files):
-                next_files = sorted_files[idx * 8 : min((idx + 1) * 8, len(sorted_files))]
-                if next_files:
-                    asyncio.run(
-                        asyncio.gather( *[asyncio.to_thread(_prefetch_checkpoint, path) for path in next_files] )
+            # Prefetch next 8 files into page cache in parallel (master process only)
+            if ((not torch.distributed.is_initialized()
+                 or get_tensor_model_parallel_rank() == 0)
+                    and idx * 8 < len(sorted_files)):
+                next_files = sorted_files[idx * 8 : (idx + 1) * 8]
+                asyncio.run(
+                    asyncio.gather(
+                        *[
+                            asyncio.to_thread(_prefetch_checkpoint, path)
+                            for path in next_files
+                        ]
                     )
+                )
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
