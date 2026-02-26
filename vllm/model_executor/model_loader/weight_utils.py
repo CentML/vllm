@@ -6,7 +6,6 @@ import asyncio
 import concurrent.futures
 import fnmatch
 import glob
-import threading
 import hashlib
 import json
 import mmap
@@ -744,6 +743,8 @@ def safetensors_weights_iterator(
 
     leftover_state_dict: dict[str, torch.Tensor] = {}
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    _PREFETCH_COUNTER_PATH = os.path.join(temp_dir, "prefetch")
+    _PREFETCH_LOCK_PATH = os.path.join(temp_dir, "prefetch.lock")
     for idx, st_file in enumerate(
         tqdm(
             sorted_files,
@@ -785,41 +786,24 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         elif safetensors_load_strategy == "prefetch":
-            # Prefetch next 8 files (excluding current) into page cache in parallel;
-            # master process only, fire-and-forget (no wait).
-            if ((not torch.distributed.is_initialized()
-                 or get_tensor_model_parallel_rank() == 0)
-                    and idx + 1 < len(sorted_files)):
-                next_files = sorted_files[idx + 1:min(idx + 1 + 8,
-                                                     len(sorted_files))]
-                #print(
-                #    f"[MYLOG]: Prefetching {idx + 1} to "
-                #    f"{min(idx + 1 + 8, len(sorted_files))} files",
-                #    flush=True,
-                #)
-
-                for path in next_files:
-                    t = threading.Thread(
-                        target=_prefetch_checkpoint,
-                        args=(path,),
-                        daemon=True,
-                    )
-                    t.start()
-            #start = time.perf_counter()
-            #logger.info(
-            #    "[MYLOG]: Start Heavy %s",
-            #    re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
-            #)
+            # Any worker acquires exclusive lock, reads next index, writes index+1,
+            # closes; then prefetches that file. Only one worker gets the lock per
+            # iteration, so one prefetch per iteration; which worker does it varies.
+            with filelock.FileLock(_PREFETCH_LOCK_PATH):
+                with open(_PREFETCH_COUNTER_PATH, "a+") as f:
+                    f.seek(0)
+                    raw = f.read()
+                    next_prefetch_idx = int(raw.strip()) if raw.strip() else 1
+                    f.seek(0)
+                    f.truncate()
+                    f.write(str(next_prefetch_idx + 1))
+                    f.flush()
+            if next_prefetch_idx < len(sorted_files):
+                _prefetch_checkpoint(sorted_files[next_prefetch_idx])
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
-            #elapsed = time.perf_counter() - start
-            #logger.info(
-            #    "[MYLOG]: Finish Heavy %s in %.3f",
-            #    re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
-            #    elapsed,
-            #)
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
