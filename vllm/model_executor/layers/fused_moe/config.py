@@ -229,6 +229,7 @@ class FusedMoEQuantConfig:
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
     is_nvfp4_scale_swizzled: bool = True
+    _g1_scale_c: torch.Tensor | None = None
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -339,6 +340,10 @@ class FusedMoEQuantConfig:
     @property
     def g2_alphas(self) -> torch.Tensor | None:
         return self._w2.alpha_or_gscale
+
+    @property
+    def g1_scale_c(self) -> torch.Tensor | None:
+        return self._g1_scale_c
 
     @property
     def use_fp8_w8a8(self) -> bool:
@@ -473,6 +478,7 @@ class FusedMoEQuantConfig:
         w2_zp: torch.Tensor | None = None,
         weight_dtype: torch.dtype | str | None = None,
         is_nvfp4_scale_swizzled: bool = True,
+        g1_scale_c: torch.Tensor | None = None,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -503,6 +509,7 @@ class FusedMoEQuantConfig:
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
         - is_nvfp4_scale_swizzled: Whether to swizzle the nvfp4 scale swizzling.
+        - g1_scale_c: Pre-computed scale for TRT-LLM FP4 MoE kernel (a2_gscale * g1_alphas)
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -536,6 +543,7 @@ class FusedMoEQuantConfig:
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
             is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+            _g1_scale_c=g1_scale_c,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -738,6 +746,7 @@ def nvfp4_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     is_nvfp4_scale_swizzled: bool = True,
+    g1_scale_c: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and nvp4 weights.
@@ -756,6 +765,7 @@ def nvfp4_moe_quant_config(
         per_out_ch_quant=False,
         block_shape=None,
         is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+        g1_scale_c=g1_scale_c,
     )
 
 
@@ -960,6 +970,12 @@ class FusedMoEParallelConfig:
     def use_fi_all2allv_kernels(self):
         return (
             self.use_all2all_kernels and self.all2all_backend == "flashinfer_all2allv"
+        )
+
+    @property
+    def use_fi_moe_a2a_kernels(self):
+        return (
+            self.use_all2all_kernels and self.all2all_backend == "flashinfer_moe_a2a"
         )
 
     @property
@@ -1242,6 +1258,10 @@ class FusedMoEConfig:
     @property
     def use_fi_all2allv_kernels(self):
         return self.moe_parallel_config.use_fi_all2allv_kernels
+    
+    @property
+    def use_fi_moe_all2all_kernels(self):
+        return self.moe_parallel_config.use_fi_moe_a2a_kernels
 
     @property
     def use_naive_all2all_kernels(self):
