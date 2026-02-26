@@ -155,41 +155,16 @@ def _natural_sort_key(filepath: str) -> list:
         for s in re.split(r"(\d+)", os.path.basename(filepath))
     ]
 
-POSIX_FADV_WILLNEED = getattr(os, "POSIX_FADV_WILLNEED", 3)
-block_size=16 * 1024 * 1024
+
 def _prefetch_checkpoint(file_path: str) -> None:
-    """Pull a checkpoint file's pages into the OS page cache using mmap + touch.
+    """Prefetch a checkpoint file into the OS page cache.
 
-    Uses mmap (same path as safetensors safe_open) and touches every page so
-    the kernel definitely has the file in cache.
+    Opens the file with os.open, optionally hints with posix_fadvise WILLNEED,
+    and reads the file in 16MB blocks so the kernel caches its pages before
+    safetensors loads the same file.
     """
-
-    '''
-    page_size = mmap.PAGESIZE
-    try:
-        logger.info(
-            "Start prefetching %s",
-            re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
-        )
-        start = time.perf_counter()
-        with open(file_path, "rb") as f:
-            size = os.fstat(f.fileno()).st_size
-            if size == 0:
-                return
-            with mmap.mmap(f.fileno(), size, access=mmap.ACCESS_READ) as m:
-                # Touch every page so it is faulted in from disk (or cache).
-                _ = m[0:size:page_size]
-        elapsed = time.perf_counter() - start
-        logger.info(
-            "Finished prefetching %s in %.3f seconds",
-            re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
-            elapsed,
-        )
-    except (OSError, ValueError) as e:
-        logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
-    return
-    '''
-
+    POSIX_FADV_WILLNEED = getattr(os, "POSIX_FADV_WILLNEED", 3)
+    block_size = 16 * 1024 * 1024 # 16MB
     fd = os.open(file_path, os.O_RDONLY)
     try:
         # Hint: this region will be needed soon.
