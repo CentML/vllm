@@ -164,15 +164,14 @@ def _prefetch_checkpoint(file_path: str) -> None:
     Uses mmap (same path as safetensors safe_open) and touches every page so
     the kernel definitely has the file in cache.
     """
-    """
+
+    '''
     page_size = mmap.PAGESIZE
     try:
-        '''
         logger.info(
             "Start prefetching %s",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
         )
-        '''
         start = time.perf_counter()
         with open(file_path, "rb") as f:
             size = os.fstat(f.fileno()).st_size
@@ -182,17 +181,16 @@ def _prefetch_checkpoint(file_path: str) -> None:
                 # Touch every page so it is faulted in from disk (or cache).
                 _ = m[0:size:page_size]
         elapsed = time.perf_counter() - start
-        '''
         logger.info(
             "Finished prefetching %s in %.3f seconds",
             re.search(r"model-(\d+)-of-", file_path).group(1).lstrip("0") or "0",
             elapsed,
         )
-        '''
     except (OSError, ValueError) as e:
         logger.warning("[MYLOG]: Preload failed for %s: %s", file_path, e)
     return
-    """
+    '''
+
     fd = os.open(file_path, os.O_RDONLY)
     try:
         # Hint: this region will be needed soon.
