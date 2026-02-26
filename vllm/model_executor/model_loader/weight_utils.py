@@ -720,6 +720,11 @@ def safetensors_weights_iterator(
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
     _PREFETCH_COUNTER_PATH = os.path.join(temp_dir, "prefetch")
     _PREFETCH_LOCK_PATH = os.path.join(temp_dir, "prefetch.lock")
+    if safetensors_load_strategy == "prefetch":
+        try:
+            os.remove(_PREFETCH_COUNTER_PATH)
+        except FileNotFoundError:
+            pass
     for idx, st_file in enumerate(
         tqdm(
             sorted_files,
