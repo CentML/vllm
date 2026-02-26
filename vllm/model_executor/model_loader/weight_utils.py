@@ -794,11 +794,11 @@ def safetensors_weights_iterator(
                     and idx + 1 < len(sorted_files)):
                 next_files = sorted_files[idx + 1:min(idx + 1 + 8,
                                                      len(sorted_files))]
-                print(
-                    f"[MYLOG]: Prefetching {idx + 1} to "
-                    f"{min(idx + 1 + 8, len(sorted_files))} files",
-                    flush=True,
-                )
+                #print(
+                #    f"[MYLOG]: Prefetching {idx + 1} to "
+                #    f"{min(idx + 1 + 8, len(sorted_files))} files",
+                #    flush=True,
+                #)
 
                 for path in next_files:
                     t = threading.Thread(
@@ -807,21 +807,21 @@ def safetensors_weights_iterator(
                         daemon=True,
                     )
                     t.start()
-            start = time.perf_counter()
-            logger.info(
-                "[MYLOG]: Start Heavy %s",
-                re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
-            )
+            #start = time.perf_counter()
+            #logger.info(
+            #    "[MYLOG]: Start Heavy %s",
+            #    re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
+            #)
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     param = f.get_tensor(name)
                     yield name, param
-            elapsed = time.perf_counter() - start
-            logger.info(
-                "[MYLOG]: Finish Heavy %s in %.3f",
-                re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
-                elapsed,
-            )
+            #elapsed = time.perf_counter() - start
+            #logger.info(
+            #    "[MYLOG]: Finish Heavy %s in %.3f",
+            #    re.search(r"model-(\d+)-of-", st_file).group(1).lstrip("0") or "0",
+            #    elapsed,
+            #)
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
