@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for downloading and initializing model weights."""
 
+import asyncio
 import concurrent.futures
 import fnmatch
+import threading
 import glob
 import hashlib
 import json
@@ -152,6 +154,18 @@ def _natural_sort_key(filepath: str) -> list:
         int(s) if s.isdigit() else s
         for s in re.split(r"(\d+)", os.path.basename(filepath))
     ]
+
+
+def _prefetch_checkpoint(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Opens the file in binary read mode and reads it in 16MB blocks so the
+    kernel caches its pages before safetensors loads the same file.
+    """
+    block_size = 16 * 1024 * 1024 # 16MB
+    with open(file_path, "rb") as f:
+        while f.read(block_size):
+            pass
 
 
 def maybe_download_from_modelscope(
@@ -694,9 +708,41 @@ def safetensors_weights_iterator(
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
 
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    if safetensors_load_strategy == "prefetch":
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+        paths = sorted_files[rank::world_size]
+        max_concurrent = 8
+
+        async def _prefetch_all() -> None:
+            sem = asyncio.Semaphore(max_concurrent)
+
+            async def _prefetch_one(path: str) -> None:
+                async with sem:
+                    await asyncio.to_thread(_prefetch_checkpoint, path)
+
+            await asyncio.gather(*[_prefetch_one(p) for p in paths])
+
+        def _run_prefetch_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_prefetch_all())
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=_run_prefetch_loop, daemon=True)
+        thread.start()
+
     leftover_state_dict: dict[str, torch.Tensor] = {}
     for st_file in tqdm(
-        sorted(hf_weights_files, key=_natural_sort_key),
+        sorted_files,
         desc=loading_desc,
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
