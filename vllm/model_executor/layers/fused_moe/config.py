@@ -974,9 +974,7 @@ class FusedMoEParallelConfig:
 
     @property
     def use_fi_moe_a2a_kernels(self):
-        return (
-            self.use_all2all_kernels and self.all2all_backend == "flashinfer_moe_a2a"
-        )
+        return self.use_all2all_kernels and self.all2all_backend == "flashinfer_moe_a2a"
 
     @property
     def use_batched_activation_format(self):
@@ -1258,7 +1256,7 @@ class FusedMoEConfig:
     @property
     def use_fi_all2allv_kernels(self):
         return self.moe_parallel_config.use_fi_all2allv_kernels
-    
+
     @property
     def use_fi_moe_all2all_kernels(self):
         return self.moe_parallel_config.use_fi_moe_a2a_kernels

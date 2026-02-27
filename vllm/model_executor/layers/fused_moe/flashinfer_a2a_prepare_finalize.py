@@ -115,7 +115,6 @@ class FlashInferA2APrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         output.copy_(fused_expert_output)
 
 
-
 def flashinfer_alltoall_dispatch(
     all2all_manager: All2AllManagerBase,
     global_num_tokens_cpu: list[int],
@@ -236,12 +235,14 @@ class FlashInferMoeA2APrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         top_k: int,
         num_experts: int,
         hidden_size: int,
+        num_dispatchers: int = 1,
     ):
         super().__init__()
         self.max_num_tokens = max_num_tokens
         self.top_k = top_k
         self.num_experts = num_experts
         self.hidden_size = hidden_size
+        self.num_dispatchers_ = num_dispatchers
 
         self.all2all_manager = get_ep_group().device_communicator.all2all_manager
         self.all2all_manager.initialize(
@@ -250,6 +251,37 @@ class FlashInferMoeA2APrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
         )
+
+    @property
+    def activation_format(self) -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    def max_num_tokens_per_rank(self) -> int | None:
+        return None
+
+    def num_dispatchers(self) -> int:
+        return self.num_dispatchers_
+
+    def output_is_reduced(self) -> bool:
+        return False
+
+    def topk_indices_dtype(self) -> torch.dtype | None:
+        return None
+
+    def _apply_router_weight_on_input(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """Apply router weight on input if needed."""
+        if apply_router_weight_on_input:
+            topk = topk_ids.size(1)
+            assert topk == 1, (
+                "apply_router_weight_on_input is only implemented for topk=1"
+            )
+            a1.mul_(topk_weights.to(a1.dtype))
 
     def prepare(
         self,
@@ -260,6 +292,7 @@ class FlashInferMoeA2APrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         self._apply_router_weight_on_input(
             a1, topk_weights, topk_ids, apply_router_weight_on_input
@@ -301,8 +334,12 @@ class FlashInferMoeA2APrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         if a1q_scale is not None:
             a1q_recv, a1q_scale_recv, topk_ids_recv, topk_weights_recv = recv_payloads
             # Apply scale interleaving only for CUTLASS (not TRT-LLM)
-            if quant_config.quant_dtype == "nvfp4" and quant_config.is_nvfp4_scale_swizzled:
+            if (
+                quant_config.quant_dtype == "nvfp4"
+                and quant_config.is_nvfp4_scale_swizzled
+            ):
                 a1q_scale_recv = a1q_scale_recv.view(-1, a1q_scale_recv.shape[-1])
+                a1q_scale_recv = a1q_scale_recv.view(torch.uint8)
                 a1q_scale_recv = nvfp4_block_scale_interleave(a1q_scale_recv)
             a1q_scale_recv = a1q_scale_recv.view(-1, self.hidden_size // 16)
         else:

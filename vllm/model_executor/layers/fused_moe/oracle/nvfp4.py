@@ -363,7 +363,7 @@ def make_nvfp4_moe_quant_config(
             w1_scale=w13_scale,
             w2_scale=w2_scale,
             is_nvfp4_scale_swizzled=False,
-            g1_scale_c=(g1_alphas / a2_scale)
+            g1_scale_c=(g1_alphas / a2_scale),
         )
 
     return nvfp4_moe_quant_config(

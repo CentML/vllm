@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
 )
@@ -15,7 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.flashinfer_a2a_prepare_finalize import (
     FlashInferA2APrepareAndFinalize,
-    FlashInferMoeA2APrepareAndFinalize
+    FlashInferMoeA2APrepareAndFinalize,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
@@ -250,11 +251,14 @@ def maybe_make_prepare_finalize(
 
     elif moe.use_fi_moe_all2all_kernels:
         assert quant_config is not None
+        max_num_tokens = (
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        )
         prepare_finalize = FlashInferMoeA2APrepareAndFinalize(
-            max_num_tokens=moe.max_num_tokens,
+            max_num_tokens=max_num_tokens,
             top_k=moe.experts_per_token,
             num_experts=moe.num_experts,
-            hidden_size=moe.hidden_dim
+            hidden_size=moe.hidden_dim,
         )
 
     elif moe.use_naive_all2all_kernels and allow_new_interface:

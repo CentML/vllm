@@ -767,10 +767,10 @@ class FlashInferMoeA2AManager(All2AllManagerBase):
             comm_backend=CustomCommunicator(get_dp_group().cpu_group),
         )
         total_dispatch_payload_size_per_token = (
-                hidden_size // 2  # nvfp4 hidden states
-                + hidden_size // 16  # fp8 scaling factors
-                + top_k * 4  # int32 topks ids
-                + top_k * 4  # float32 topk weights
+            hidden_size // 2  # nvfp4 hidden states
+            + hidden_size // 16  # fp8 scaling factors
+            + top_k * 4  # int32 topks ids
+            + top_k * 4  # float32 topk weights
         )
         combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
         self.workspace_size = moe_a2a_get_workspace_size_per_rank(
