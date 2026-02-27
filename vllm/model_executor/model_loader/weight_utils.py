@@ -15,6 +15,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
+from concurrent.futures import ThreadPoolExecutor
 
 import filelock
 import huggingface_hub.constants
@@ -152,6 +153,18 @@ def _natural_sort_key(filepath: str) -> list:
         int(s) if s.isdigit() else s
         for s in re.split(r"(\d+)", os.path.basename(filepath))
     ]
+
+
+def _prefetch_checkpoint(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Opens the file in binary read mode and reads it in 16MB blocks so the
+    kernel caches its pages before safetensors loads the same file.
+    """
+    block_size = 16 * 1024 * 1024 # 16MB
+    with open(file_path, "rb") as f:
+        while f.read(block_size):
+            pass
 
 
 def maybe_download_from_modelscope(
@@ -694,9 +707,24 @@ def safetensors_weights_iterator(
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
 
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    if safetensors_load_strategy == "prefetch":
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+        num_prefetch_threads = 8
+        executor = ThreadPoolExecutor(max_workers=num_prefetch_threads)
+        for path in sorted_files[rank::world_size]:
+            executor.submit(_prefetch_checkpoint, path)
+        executor.shutdown(wait=False)
+
     leftover_state_dict: dict[str, torch.Tensor] = {}
     for st_file in tqdm(
-        sorted(hf_weights_files, key=_natural_sort_key),
+        sorted_files,
         desc=loading_desc,
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
