@@ -221,7 +221,7 @@ def test_cutlass_fp4_moe_swiglustep(
         )
 
         kernel = mk.FusedMoEKernel(
-            make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=True),
+            make_moe_prepare_and_finalize_no_dp_ep(use_monolithic=False),
             CutlassExpertsFp4(
                 moe_config=make_dummy_moe_config(),
                 quant_config=quant_config,
@@ -229,13 +229,16 @@ def test_cutlass_fp4_moe_swiglustep(
             inplace=False,
         )
 
-        cutlass_output = kernel(
+        cutlass_output = kernel.apply(
             hidden_states=a,
             w1=w1_q,
             w2=w2_q,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             activation=MoEActivation.SWIGLUSTEP,
+            global_num_experts=e,
+            expert_map=None,
+            apply_router_weight_on_input=False,
         )
 
         # Reference: dequantize everything and run torch_moe with swiglustep
