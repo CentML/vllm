@@ -3,6 +3,7 @@
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.distributed import get_dp_group, get_ep_group
@@ -12,7 +13,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_all2all,
     has_flashinfer_moe_a2a,
 )
-from vllm.utils.import_utils import has_deep_ep, has_mori, has_pplx
+from vllm.utils.import_utils import has_deep_ep, has_mori
 
 from .base_device_communicator import All2AllManagerBase, Cache
 

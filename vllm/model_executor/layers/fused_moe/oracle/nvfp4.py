@@ -73,10 +73,9 @@ def backend_to_kernel_cls(
             TrtLlmNvFp4ExpertsMonolithic,
         )
 
-        # NOTE: prefer Monolthic > Modular, so return Monolithic first.
         return [
-            TrtLlmNvFp4ExpertsMonolithic,
             TrtLlmNvFp4ExpertsModular,
+            TrtLlmNvFp4ExpertsMonolithic,
         ]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_CUTLASS:
