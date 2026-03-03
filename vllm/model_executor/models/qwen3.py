@@ -31,7 +31,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.encoder_only_attention import (
@@ -311,6 +311,14 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.model.aux_hidden_state_layers = layers
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        spec_config = get_current_vllm_config().speculative_config
+        if spec_config and spec_config.draft_model_config:
+            hf_config = spec_config.draft_model_config.hf_config
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            if dflash_config and isinstance(dflash_config, dict):
+                layer_ids = dflash_config.get("target_layer_ids")
+                if layer_ids:
+                    return tuple(layer_ids)
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
