@@ -239,13 +239,28 @@ class FlashInferAllReduce:
 
         return self._ensure_workspace(hidden_dim, input_tensor.dtype)
 
+    _debug_ar_counter = 0
+
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        import sys
         workspace = get_fi_ar_workspace()
-        return flashinfer_comm.allreduce_fusion(
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            FlashInferAllReduce._debug_ar_counter += 1
+            print(f"[Rank {self.rank}] STANDALONE_AR "
+                  f"#{FlashInferAllReduce._debug_ar_counter}: "
+                  f"shape={list(input_tensor.shape)} BEFORE",
+                  file=sys.stderr, flush=True)
+        result = flashinfer_comm.allreduce_fusion(
             input=input_tensor,
             workspace=workspace,
             pattern=flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         )
+        if is_capturing:
+            print(f"[Rank {self.rank}] STANDALONE_AR "
+                  f"#{FlashInferAllReduce._debug_ar_counter}: DONE",
+                  file=sys.stderr, flush=True)
+        return result
 
     def destroy(self):
         if not self.disabled:

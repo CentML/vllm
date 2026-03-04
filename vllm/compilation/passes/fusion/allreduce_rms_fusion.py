@@ -159,6 +159,22 @@ if flashinfer_comm is not None:
             # in vllm we only support swizzled layout
             layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
 
+        # DEBUG: log fused allreduce during capture
+        _is_capturing = torch.cuda.is_current_stream_capturing()
+        if _is_capturing:
+            import sys as _sys
+            import torch.distributed as _dist
+            _r = _dist.get_rank() if _dist.is_initialized() else -1
+            if not hasattr(call_trtllm_fused_allreduce_norm, '_ctr'):
+                call_trtllm_fused_allreduce_norm._ctr = 0
+            call_trtllm_fused_allreduce_norm._ctr += 1
+            _c = call_trtllm_fused_allreduce_norm._ctr
+            print(f"[Rank {_r}] FUSED_AR #{_c}: "
+                  f"shape={list(allreduce_in.shape)}, "
+                  f"backend={workspace.backend}, "
+                  f"pattern={pattern_code} BEFORE",
+                  file=_sys.stderr, flush=True)
+
         flashinfer_comm.allreduce_fusion(
             input=allreduce_in,
             workspace=workspace,
@@ -177,6 +193,10 @@ if flashinfer_comm is not None:
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
         )
+
+        if _is_capturing:
+            print(f"[Rank {_r}] FUSED_AR #{_c}: DONE",
+                  file=_sys.stderr, flush=True)
 
     def call_trtllm_fused_allreduce_norm_fake(
         allreduce_in: torch.Tensor,
