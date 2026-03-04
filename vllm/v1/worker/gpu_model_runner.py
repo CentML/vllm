@@ -5326,14 +5326,25 @@ class GPUModelRunner(
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        import sys as _sys
+        print("DEBUG V1 capture_model: before set_cudagraph_capturing_enabled",
+              file=_sys.stderr, flush=True)
         set_cudagraph_capturing_enabled(True)
+        print("DEBUG V1 capture_model: before freeze_gc + graph_capture",
+              file=_sys.stderr, flush=True)
         with freeze_gc(), graph_capture(device=self.device):
+            print("DEBUG V1 capture_model: inside graph_capture context",
+                  file=_sys.stderr, flush=True)
             start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+            print("DEBUG V1 capture_model: after mem_get_info",
+                  file=_sys.stderr, flush=True)
 
             for (
                 runtime_mode,
                 batch_descs,
             ) in self.cudagraph_dispatcher.get_capture_descs():
+                print(f"DEBUG V1 capture_model: capturing mode={runtime_mode}",
+                      file=_sys.stderr, flush=True)
                 self._capture_cudagraphs(
                     batch_descriptors=batch_descs,
                     cudagraph_runtime_mode=runtime_mode,
