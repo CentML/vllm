@@ -494,10 +494,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             return 0
 
+        import sys as _sys
+        print("DEBUG capture_model: before gc.collect", file=_sys.stderr, flush=True)
         start_time = time.perf_counter()
         gc.collect()
+        print("DEBUG capture_model: before empty_cache", file=_sys.stderr, flush=True)
         torch.accelerator.empty_cache()
+        print("DEBUG capture_model: before mem_get_info", file=_sys.stderr, flush=True)
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        print("DEBUG capture_model: before cudagraph_manager.capture", file=_sys.stderr, flush=True)
 
         with self.maybe_setup_dummy_loras(self.lora_config):
             self.cudagraph_manager.capture(
