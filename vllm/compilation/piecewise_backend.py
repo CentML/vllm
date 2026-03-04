@@ -361,6 +361,11 @@ class PiecewiseBackend:
         result = range_entry.runnable(*args)
         print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
               f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
-              f"shape={runtime_shape} DONE",
+              f"shape={runtime_shape} RAN, syncing...",
+              file=_sys.stderr, flush=True)
+        torch.cuda.synchronize()
+        print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
+              f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
+              f"shape={runtime_shape} DONE (synced)",
               file=_sys.stderr, flush=True)
         return result
