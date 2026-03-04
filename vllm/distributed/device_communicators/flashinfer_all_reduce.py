@@ -240,26 +240,35 @@ class FlashInferAllReduce:
         return self._ensure_workspace(hidden_dim, input_tensor.dtype)
 
     _debug_ar_counter = 0
+    _debug_enabled = False  # set to True during graph_capture context
 
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
         import sys
+
         workspace = get_fi_ar_workspace()
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if is_capturing:
+        if FlashInferAllReduce._debug_enabled:
             FlashInferAllReduce._debug_ar_counter += 1
-            print(f"[Rank {self.rank}] STANDALONE_AR "
-                  f"#{FlashInferAllReduce._debug_ar_counter}: "
-                  f"shape={list(input_tensor.shape)} BEFORE",
-                  file=sys.stderr, flush=True)
+            capturing = torch.cuda.is_current_stream_capturing()
+            print(
+                f"[Rank {self.rank}] STANDALONE_AR "
+                f"#{FlashInferAllReduce._debug_ar_counter}: "
+                f"shape={list(input_tensor.shape)}, "
+                f"capturing={capturing} BEFORE",
+                file=sys.stderr,
+                flush=True,
+            )
         result = flashinfer_comm.allreduce_fusion(
             input=input_tensor,
             workspace=workspace,
             pattern=flashinfer_comm.AllReduceFusionPattern.kAllReduce,
         )
-        if is_capturing:
-            print(f"[Rank {self.rank}] STANDALONE_AR "
-                  f"#{FlashInferAllReduce._debug_ar_counter}: DONE",
-                  file=sys.stderr, flush=True)
+        if FlashInferAllReduce._debug_enabled:
+            print(
+                f"[Rank {self.rank}] STANDALONE_AR "
+                f"#{FlashInferAllReduce._debug_ar_counter}: DONE",
+                file=sys.stderr,
+                flush=True,
+            )
         return result
 
     def destroy(self):

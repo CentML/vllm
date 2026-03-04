@@ -128,6 +128,14 @@ class CudaGraphManager:
         )
         num_tokens_across_dp = make_num_tokens_across_dp(self.dp_size, num_tokens)
 
+        # DEBUG
+        import sys as _sys
+        import torch.distributed as _dist
+        _rank = _dist.get_rank() if _dist.is_initialized() else -1
+        print(f"[Rank {_rank}] WARMUP START: num_tokens={num_tokens}, "
+              f"mode={capture_cg_mode.name}",
+              file=_sys.stderr, flush=True)
+
         # Warm up.
         with set_forward_context(
             attn_metadata,
@@ -144,11 +152,17 @@ class CudaGraphManager:
                 hidden_states = model_output
                 aux_hidden_states = None
 
+        print(f"[Rank {_rank}] WARMUP DONE: num_tokens={num_tokens}",
+              file=_sys.stderr, flush=True)
+
         # Allocate output buffers if not already done.
         if self.hidden_states is None:
             self.hidden_states = torch.empty_like(hidden_states)
         if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
             self.aux_hidden_states = [torch.empty_like(x) for x in aux_hidden_states]
+
+        print(f"[Rank {_rank}] CAPTURE_FN START: num_tokens={num_tokens}",
+              file=_sys.stderr, flush=True)
 
         capture_fn(
             num_tokens=num_tokens,
@@ -160,6 +174,9 @@ class CudaGraphManager:
             slot_mappings=slot_mappings,
             has_lora=has_lora,
         )
+
+        print(f"[Rank {_rank}] CAPTURE_FN DONE: num_tokens={num_tokens}",
+              file=_sys.stderr, flush=True)
 
     def _capture_full_graph(
         self,
@@ -380,8 +397,17 @@ def capture_graphs(
         sizes_to_capture = tqdm(sizes_to_capture, desc=desc)
 
     with graph_capture(device=device):
-        for size in sizes_to_capture:
-            capture_fn(size, capture_cudagraph_mode, **capture_kwargs)
+        # DEBUG: enable allreduce logging during capture context
+        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+            FlashInferAllReduce,
+        )
+        FlashInferAllReduce._debug_enabled = True
+        FlashInferAllReduce._debug_ar_counter = 0
+        try:
+            for size in sizes_to_capture:
+                capture_fn(size, capture_cudagraph_mode, **capture_kwargs)
+        finally:
+            FlashInferAllReduce._debug_enabled = False
 
 
 def prepare_inputs_to_capture(

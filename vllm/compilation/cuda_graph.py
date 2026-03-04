@@ -234,17 +234,22 @@ class CUDAGraphWrapper:
         if entry.cudagraph is None:
             # DEBUG: identify which piecewise subgraph is being captured
             import sys as _sys
+
             _rank = -1
             try:
                 import torch.distributed as _dist
+
                 if _dist.is_initialized():
                     _rank = _dist.get_rank()
             except Exception:
                 pass
-            print(f"[Rank {_rank}] PIECEWISE CAPTURE START: "
-                  f"mode={self.runtime_mode.name}, "
-                  f"batch={entry.batch_descriptor}",
-                  file=_sys.stderr, flush=True)
+            print(
+                f"[Rank {_rank}] PIECEWISE CAPTURE START: "
+                f"mode={self.runtime_mode.name}, "
+                f"batch={entry.batch_descriptor}",
+                file=_sys.stderr,
+                flush=True,
+            )
             if self.cudagraph_options.debug_log_enable:
                 # Since we capture cudagraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -314,9 +319,12 @@ class CUDAGraphWrapper:
             entry.cudagraph = cudagraph
 
             # DEBUG
-            print(f"[Rank {_rank}] PIECEWISE CAPTURE DONE: "
-                  f"batch={entry.batch_descriptor}",
-                  file=_sys.stderr, flush=True)
+            print(
+                f"[Rank {_rank}] PIECEWISE CAPTURE DONE: "
+                f"batch={entry.batch_descriptor}",
+                file=_sys.stderr,
+                flush=True,
+            )
 
             compilation_counter.num_cudagraph_captured += 1
 
