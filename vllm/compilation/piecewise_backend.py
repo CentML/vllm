@@ -281,14 +281,16 @@ class PiecewiseBackend:
         self, range_entry: RangeEntry, args: tuple[Any, ...]
     ) -> Any:
         if not range_entry.compiled:
-            # DEBUG: dump FX graphs for submod_2 (works) and submod_4 (hangs)
+            # DEBUG: dump FX graphs (rank 0 only, to file)
             if self.submod_name in ("submod_2", "submod_4") and self.graph is not None:
-                import sys as _dsys
-                print(f"\n{'='*80}\nDUMP submod_4 FX graph:\n{'='*80}",
-                      file=_dsys.stderr, flush=True)
-                print(self.graph.print_readable(print_output=False),
-                      file=_dsys.stderr, flush=True)
-                print(f"{'='*80}\n", file=_dsys.stderr, flush=True)
+                import torch.distributed as _dd
+                if _dd.is_initialized() and _dd.get_rank() == 0:
+                    fname = f"/tmp/{self.submod_name}_graph.txt"
+                    with open(fname, "w") as _f:
+                        _f.write(self.graph.print_readable(print_output=False))
+                    import sys as _dsys
+                    print(f"DEBUG: Dumped {self.submod_name} to {fname}",
+                          file=_dsys.stderr, flush=True)
             if self.compiled_runnables is not None:
                 range_entry.runnable = self.get_compiled_graph_wrapper(
                     self.compiled_runnables[str(range_entry.compile_range)]
