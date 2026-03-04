@@ -332,6 +332,7 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args: Any) -> Any:
+        import sys as _sys
         runtime_shape = args[self.sym_shape_indices[0]]
         range_entry = self._find_range_for_shape(runtime_shape)
 
@@ -340,4 +341,13 @@ class PiecewiseBackend:
         )
 
         self._maybe_compile_for_range_entry(range_entry, args)
-        return range_entry.runnable(*args)
+        print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
+              f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
+              f"shape={runtime_shape} BEFORE",
+              file=_sys.stderr, flush=True)
+        result = range_entry.runnable(*args)
+        print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
+              f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
+              f"shape={runtime_shape} DONE",
+              file=_sys.stderr, flush=True)
+        return result

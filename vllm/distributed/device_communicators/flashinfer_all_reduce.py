@@ -240,7 +240,7 @@ class FlashInferAllReduce:
         return self._ensure_workspace(hidden_dim, input_tensor.dtype)
 
     _debug_ar_counter = 0
-    _debug_enabled = False  # set to True during graph_capture context
+    _debug_enabled = True  # always enabled for debugging
 
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
         import sys

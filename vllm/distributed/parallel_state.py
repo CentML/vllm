@@ -1290,8 +1290,7 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    # DEBUG: use current stream to test if stream switch causes mnnvl hang
-    context = GraphCaptureContext(torch.cuda.current_stream(device))
+    context = GraphCaptureContext(torch.cuda.Stream(device=device))
     with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
         yield context
 
