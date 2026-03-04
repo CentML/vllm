@@ -333,6 +333,7 @@ class PiecewiseBackend:
 
     def __call__(self, *args: Any) -> Any:
         import sys as _sys
+        import torch
         runtime_shape = args[self.sym_shape_indices[0]]
         range_entry = self._find_range_for_shape(runtime_shape)
 
@@ -344,6 +345,14 @@ class PiecewiseBackend:
               f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
               f"shape={runtime_shape} ENTER (compiled={range_entry.compiled})",
               file=_sys.stderr, flush=True)
+        if not range_entry.compiled:
+            print(f"DEBUG PiecewiseBackend: submod={self.submod_name} "
+                  f"SYNCING before compile...",
+                  file=_sys.stderr, flush=True)
+            torch.cuda.synchronize()
+            print(f"DEBUG PiecewiseBackend: submod={self.submod_name} "
+                  f"SYNC done, starting compile",
+                  file=_sys.stderr, flush=True)
         self._maybe_compile_for_range_entry(range_entry, args)
         print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
               f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
