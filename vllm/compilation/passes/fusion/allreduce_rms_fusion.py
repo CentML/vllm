@@ -177,7 +177,13 @@ if flashinfer_comm is not None:
                 f"shape={list(allreduce_in.shape)}, "
                 f"backend={workspace.backend}, "
                 f"pattern={pattern_code}, "
-                f"capturing={_capturing} BEFORE",
+                f"capturing={_capturing} PRE-SYNC",
+                file=_sys.stderr,
+                flush=True,
+            )
+            torch.cuda.synchronize()
+            print(
+                f"[Rank {_r}] FUSED_AR #{_c}: SYNCED, calling allreduce",
                 file=_sys.stderr,
                 flush=True,
             )
