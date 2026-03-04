@@ -340,10 +340,14 @@ class PiecewiseBackend:
             f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
         )
 
+        print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
+              f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
+              f"shape={runtime_shape} ENTER (compiled={range_entry.compiled})",
+              file=_sys.stderr, flush=True)
         self._maybe_compile_for_range_entry(range_entry, args)
         print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
               f"index={self.piecewise_compile_index}/{self.total_piecewise_compiles}, "
-              f"shape={runtime_shape} BEFORE",
+              f"shape={runtime_shape} RUNNING",
               file=_sys.stderr, flush=True)
         result = range_entry.runnable(*args)
         print(f"DEBUG PiecewiseBackend: submod={self.submod_name}, "
