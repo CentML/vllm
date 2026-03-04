@@ -368,8 +368,8 @@ def main():
         print_results(extract)
 
     if not args.skip_baseline and not args.skip_extract:
-        overhead = (1 - extract["tokens_per_s"] / baseline["tokens_per_s"]) * 100
-        print(f"Extraction overhead: {overhead:+.1f}%")
+        slowdown = baseline["tokens_per_s"] / extract["tokens_per_s"]
+        print("Extraction slowdown factor: {:.2f}x".format(slowdown))
 
 
 if __name__ == "__main__":
