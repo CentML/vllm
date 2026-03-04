@@ -37,6 +37,14 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
+def _make_profiler_config(profile_dir: str) -> dict:
+    """Build a profiler_config dict for torch profiling."""
+    return {
+        "profiler": "torch",
+        "torch_profiler_dir": profile_dir,
+    }
+
+
 def make_random_prompts(
     num_prompts: int, prompt_len: int, vocab_size: int, seed: int = 42
 ) -> list[list[int]]:
@@ -59,8 +67,18 @@ def consume_hidden_states(path: str) -> float:
     return hs.mean().item()
 
 
-def run_baseline(model: str, prompts: list[list[int]], extra_args: dict) -> dict:
+def run_baseline(
+    model: str,
+    prompts: list[list[int]],
+    extra_args: dict,
+    profile_dir: str | None = None,
+) -> dict:
     """Baseline: bulk inference, no hidden state extraction."""
+    if profile_dir:
+        extra_args = {
+            **extra_args,
+            "profiler_config": _make_profiler_config(profile_dir),
+        }
     llm = LLM(model=model, enable_prefix_caching=False, **extra_args)
     sampling_params = SamplingParams(max_tokens=1)
     prompt_inputs = [{"prompt_token_ids": p} for p in prompts]
@@ -68,9 +86,15 @@ def run_baseline(model: str, prompts: list[list[int]], extra_args: dict) -> dict
     # Warmup
     llm.generate(prompt_inputs[:4], sampling_params, use_tqdm=False)
 
+    if profile_dir:
+        llm.start_profile()
+
     t0 = time.perf_counter()
     outputs = llm.generate(prompt_inputs, sampling_params, use_tqdm=True)
     elapsed = time.perf_counter() - t0
+
+    if profile_dir:
+        llm.stop_profile()
 
     total_prompt_tokens = sum(len(o.prompt_token_ids) for o in outputs)
     num_prompts = len(outputs)
@@ -145,7 +169,13 @@ async def _run_extraction_async(
     layers: list[int],
     tmpdir: str,
     extra_args: dict,
+    profile_dir: str | None = None,
 ) -> dict:
+    if profile_dir:
+        extra_args = {
+            **extra_args,
+            "profiler_config": _make_profiler_config(profile_dir),
+        }
     engine_args = AsyncEngineArgs(
         model=model,
         enable_prefix_caching=False,
@@ -180,6 +210,9 @@ async def _run_extraction_async(
             ):
                 pass
 
+        if profile_dir:
+            await engine.start_profile()
+
         # Fill prompt queue
         prompt_queue: asyncio.Queue = asyncio.Queue()
         for idx, token_ids in enumerate(prompts):
@@ -202,6 +235,9 @@ async def _run_extraction_async(
         elapsed = time.perf_counter() - t0
 
         consume_pool.shutdown(wait=True)
+
+        if profile_dir:
+            await engine.stop_profile()
 
         total_prompt_tokens = sum(r["num_prompt_tokens"] for r in results)
         num_prompts = len(results)
@@ -228,6 +264,7 @@ def run_extraction(
     num_clients: int,
     layers: list[int],
     extra_args: dict,
+    profile_dir: str | None = None,
 ) -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
         return asyncio.run(
@@ -238,6 +275,7 @@ def run_extraction(
                 layers,
                 tmpdir,
                 extra_args,
+                profile_dir=profile_dir,
             )
         )
 
@@ -273,6 +311,17 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--load-format", type=str, default=None)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable torch profiler for both baseline and extraction runs.",
+    )
+    parser.add_argument(
+        "--torch-profiler-dir",
+        type=str,
+        default="./vllm_profile",
+        help="Directory to save torch profiler traces (default: ./vllm_profile).",
+    )
     args = parser.parse_args()
 
     extra_args = {
@@ -295,13 +344,26 @@ def main():
         f"{args.prompt_len} tokens each (vocab {vocab_size})"
     )
 
+    profile_dir = args.torch_profiler_dir if args.profile else None
+    if profile_dir:
+        print(f"Torch profiler enabled, traces will be saved to {profile_dir}/")
+
     if not args.skip_baseline:
-        baseline = run_baseline(args.model, prompts, extra_args)
+        baseline_profile_dir = f"{profile_dir}/baseline" if profile_dir else None
+        baseline = run_baseline(
+            args.model, prompts, extra_args, profile_dir=baseline_profile_dir
+        )
         print_results(baseline)
 
     if not args.skip_extract:
+        extract_profile_dir = f"{profile_dir}/extract" if profile_dir else None
         extract = run_extraction(
-            args.model, prompts, args.num_clients, args.layers, extra_args
+            args.model,
+            prompts,
+            args.num_clients,
+            args.layers,
+            extra_args,
+            profile_dir=extract_profile_dir,
         )
         print_results(extract)
 
