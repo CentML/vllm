@@ -515,10 +515,14 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        import sys as _sys
+        print(f"DEBUG: BEFORE kernel_warmup", file=_sys.stderr, flush=True)
         kernel_warmup(self)
+        print(f"DEBUG: AFTER kernel_warmup", file=_sys.stderr, flush=True)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            print(f"DEBUG: BEFORE capture_model", file=_sys.stderr, flush=True)
             cuda_graph_memory_bytes = self.model_runner.capture_model()
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(

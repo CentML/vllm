@@ -269,6 +269,8 @@ class CudaGraphManager:
         kv_cache_config: KVCacheConfig,
         has_lora: bool = False,
     ) -> None:
+        print(f"[Rank {torch.distributed.get_rank()}] CudaGraphManager.capture() ENTERED",
+              file=_sys.stderr, flush=True)
         common_kwargs = dict(
             device=self.device,
             capture_fn=self.capture_graph,

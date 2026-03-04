@@ -25,6 +25,9 @@ logger = init_logger(__name__)
 
 
 def kernel_warmup(worker: "Worker"):
+    import sys as _sys
+    print("DEBUG: kernel_warmup START", file=_sys.stderr, flush=True)
+
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
         envs.VLLM_USE_DEEP_GEMM
@@ -36,6 +39,8 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    print("DEBUG: after deep_gemm_warmup", file=_sys.stderr, flush=True)
+
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
@@ -43,7 +48,9 @@ def kernel_warmup(worker: "Worker"):
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
+        print("DEBUG: BEFORE flashinfer_autotune", file=_sys.stderr, flush=True)
         flashinfer_autotune(worker.model_runner)
+        print("DEBUG: AFTER flashinfer_autotune", file=_sys.stderr, flush=True)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -76,6 +83,8 @@ def kernel_warmup(worker: "Worker"):
             force_attention=True,
             create_mixed_batch=True,
         )
+
+    print("DEBUG: kernel_warmup DONE", file=_sys.stderr, flush=True)
 
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
