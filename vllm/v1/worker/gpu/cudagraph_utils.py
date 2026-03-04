@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys as _sys
+print("DEBUG: cudagraph_utils.py LOADED", file=_sys.stderr, flush=True)
 from collections.abc import Callable
 from typing import Any
 
@@ -396,7 +398,16 @@ def capture_graphs(
     if is_global_first_rank():
         sizes_to_capture = tqdm(sizes_to_capture, desc=desc)
 
+    import torch.distributed as _dist
+    _rank = _dist.get_rank() if _dist.is_initialized() else -1
+    print(f"[Rank {_rank}] capture_graphs CALLED: mode={capture_cudagraph_mode}, "
+          f"sizes={sorted(set(cudagraph_sizes.values()))}", file=_sys.stderr, flush=True)
+
+    print(f"[Rank {_rank}] ENTERING graph_capture context...",
+          file=_sys.stderr, flush=True)
     with graph_capture(device=device):
+        print(f"[Rank {_rank}] INSIDE graph_capture context",
+              file=_sys.stderr, flush=True)
         # DEBUG: enable allreduce logging during capture context
         from vllm.distributed.device_communicators.flashinfer_all_reduce import (
             FlashInferAllReduce,
