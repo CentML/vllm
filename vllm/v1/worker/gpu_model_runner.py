@@ -5412,6 +5412,10 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
+        import sys as _sys
+        import torch.distributed as _dist
+        _rank = _dist.get_rank() if _dist.is_initialized() else -1
+
         for batch_desc in batch_descriptors:
             num_tokens = batch_desc.num_tokens
             num_active_loras = batch_desc.num_active_loras
@@ -5431,21 +5435,29 @@ class GPUModelRunner(
                 )
             )
 
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+            for _wi in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE` is orthogonal to
                 # if we want to warm up attention or not. This is
                 # different from the case where `FULL` implies capture
                 # attention while `PIECEWISE` implies no attention.
 
+                print(f"[Rank {_rank}] WARMUP #{_wi}: "
+                      f"num_tokens={num_tokens}",
+                      file=_sys.stderr, flush=True)
                 dummy_run(
                     num_tokens,
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     allow_microbatching=allow_microbatching,
                     num_active_loras=num_active_loras,
                 )
+                print(f"[Rank {_rank}] WARMUP #{_wi}: DONE",
+                      file=_sys.stderr, flush=True)
 
             # Capture run
+            print(f"[Rank {_rank}] CAPTURE: "
+                  f"num_tokens={num_tokens}, mode={cudagraph_runtime_mode}",
+                  file=_sys.stderr, flush=True)
             dummy_run(
                 num_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -5453,6 +5465,8 @@ class GPUModelRunner(
                 num_active_loras=num_active_loras,
                 is_graph_capturing=True,
             )
+            print(f"[Rank {_rank}] CAPTURE: DONE",
+                  file=_sys.stderr, flush=True)
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
