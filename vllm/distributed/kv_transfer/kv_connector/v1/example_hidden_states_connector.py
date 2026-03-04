@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
+from concurrent.futures import Future, ThreadPoolExecutor
+
 logger = init_logger(__name__)
 
 
@@ -131,6 +133,8 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         self._storage_path = self._kv_transfer_config.get_from_extra_config(
             "shared_storage_path", "/tmp"
         )
+        self._executor = ThreadPoolExecutor(max_workers=2)
+        self._pending_futures: list[Future] = []
         self.cache_layers: list[str] = []  # set by self.register_kv_caches
         logger.info(self._kv_transfer_config)
         logger.info("Shared storage path is %s", self._storage_path)
@@ -148,6 +152,19 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
         self._active_requests: dict[str, NewRequestData] = {}
         self._req_blocks: dict[str, list[int]] = {}
 
+    def _write_to_disk(self, hidden_states, token_ids, filename):
+        tensors = {
+            "hidden_states": hidden_states.detach().cpu(),
+            "token_ids": token_ids.detach().cpu(),
+        }
+        safetensors.torch.save_file(tensors, filename)
+
+    # wait_for_save: drain the queue
+    def wait_for_save(self):
+        for fut in self._pending_futures:
+            fut.result()  # raises if the write failed
+        self._pending_futures.clear()
+
     # ==============================
     # Worker-side methods
     # ==============================
@@ -157,8 +174,8 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass  # Empty implementation of abstract method
 
-    def wait_for_save(self):
-        pass  # Empty implementation of abstract method
+    # def wait_for_save(self):
+    #     pass  # Empty implementation of abstract method
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         from vllm.model_executor.models.extract_hidden_states import (
@@ -210,11 +227,15 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
             hidden_states = extract_from_kv_cache(
                 kv_layer, request.slot_mapping, request.token_ids.shape[0]
             )
-            tensors = {
-                "hidden_states": hidden_states.detach().cpu(),
-                "token_ids": request.token_ids.detach().cpu(),
-            }
-            safetensors.torch.save_file(tensors, request.filename)
+            # Submit to background thread — .cpu() blocks the thread,
+            # not the main worker loop
+            fut = self._executor.submit(
+                self._write_to_disk,
+                hidden_states.clone(),
+                request.token_ids,
+                request.filename,
+            )
+            self._pending_futures.append(fut)
 
     # ==============================
     # Scheduler-side methods
