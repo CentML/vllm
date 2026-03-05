@@ -187,21 +187,27 @@ class FlashInferAllReduce:
             )
             return
         self.max_workspace_size = max_workspace_size * MiB
-        self.max_num_tokens = 0
         self.disabled = False
 
     def _ensure_workspace(self, hidden_dim: int, dtype: torch.dtype) -> bool:
         """Ensure the all reduce workspace is initialized."""
         if get_fi_ar_workspace() is not None:
             return True
-        if self.max_num_tokens == 0:
-            element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
+
+        from vllm.config import get_current_vllm_config_or_none
+
+        # Prioritize initialization using the text model's hidden dim
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None and vllm_config.model_config is not None:
+            hidden_dim = vllm_config.model_config.get_hidden_size()
+
+        element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
+        max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
         try:
             initialize_fi_ar_workspace(
                 world_size=self.world_size,
                 rank=self.rank,
-                max_token_num=self.max_num_tokens,
+                max_token_num=max_num_tokens,
                 hidden_dim=hidden_dim,
                 dtype=dtype,
                 group=self.group,
@@ -230,11 +236,8 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
-        if not self.max_num_tokens:
-            element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
-
-        if num_tokens > self.max_num_tokens:
+        tensor_size = num_tokens * hidden_dim * input_tensor.element_size()
+        if tensor_size > self.max_workspace_size:
             return False
 
         return self._ensure_workspace(hidden_dim, input_tensor.dtype)
