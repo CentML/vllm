@@ -2614,13 +2614,10 @@ class GPUModelRunner(
                     cudagraph_output = None
                     if (
                         self.encoder_cudagraph_manager is not None
-                        and modality == "image"
-                        and "pixel_values" in mm_kwargs_batch
-                        and "image_grid_thw" in mm_kwargs_batch
+                        and self.encoder_cudagraph_manager.supports_modality(modality)
                     ):
                         cudagraph_output = self.encoder_cudagraph_manager.execute(
-                            pixel_values=mm_kwargs_batch["pixel_values"],
-                            grid_thw=mm_kwargs_batch["image_grid_thw"],
+                            mm_kwargs_batch,
                         )
 
                     if cudagraph_output is not None:
@@ -5698,15 +5695,21 @@ class GPUModelRunner(
             and self.supports_mm_inputs
             and self.encoder_cudagraph_manager is None
         ):
-            from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
+            from vllm.model_executor.models.interfaces import (
+                SupportsEncoderCudaGraph,
+                supports_encoder_cudagraph,
+            )
+            from vllm.v1.worker.gpu.mm.encoder_cudagraph import (
+                EncoderCudaGraphManager,
+            )
 
-            model = cast(SupportsMultiModal, self.model)
-            if hasattr(model, "visual"):
+            raw_model = self.get_model()
+            if supports_encoder_cudagraph(raw_model):
                 self.encoder_cudagraph_manager = EncoderCudaGraphManager(
                     vllm_config=self.vllm_config,
                     device=self.device,
                     dtype=self.dtype,
-                    vision_model=model.visual,
+                    model=cast(SupportsEncoderCudaGraph, raw_model),
                 )
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
 
