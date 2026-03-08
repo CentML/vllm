@@ -5689,7 +5689,10 @@ class GPUModelRunner(
             )
             return 0
 
-        # Initialize encoder CUDA graph manager if enabled
+        # Initialize encoder CUDA graph manager if enabled.
+        # Use get_model() to unwrap CUDAGraphWrapper/UBatchWrapper,
+        # because @runtime_checkable Protocol isinstance() checks do not
+        # work through __getattr__ forwarding.
         if (
             self.compilation_config.cudagraph_mm_encoder
             and self.supports_mm_inputs
