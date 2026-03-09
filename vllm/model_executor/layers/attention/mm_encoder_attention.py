@@ -28,6 +28,9 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
 
 logger = init_logger(__name__)
 
+_FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+_FP8_AMAX_HISTORY_LEN = 1024
+
 
 @functools.cache
 def _load_fp8_scales_file(path: str | None) -> dict[str, dict[str, float]]:
@@ -131,6 +134,7 @@ class MMEncoderAttention(CustomOp):
 
         # FP8 attention support (currently only FlashInfer cuDNN backend)
         self.fp8_enabled = False
+        self._fp8_dynamic_scale = False
         self.fp8_scales: dict[str, float] | None = None
         self.fp8_quant: QuantFP8 | None = None
 
@@ -144,20 +148,26 @@ class MMEncoderAttention(CustomOp):
             self._init_fp8_attention(prefix)
 
     def _init_fp8_attention(self, layer_name: str) -> None:
-        """Initialize FP8 attention for this layer."""
+        """Initialize FP8 attention for this layer.
+
+        When a scale file is provided via VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH,
+        static (fixed) scales are loaded.  Otherwise, dynamic delayed scaling
+        is enabled: per-tensor amax values are tracked in a rolling history
+        buffer and scales are recomputed after each forward pass for use in the
+        *next* forward pass (the TE "delayed scaling" strategy).
+        """
         scale_path = envs.VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH
         all_scales = _load_fp8_scales_file(scale_path)
 
         if scale_path is None:
-            # No scale path provided - use scale=1.0 and warn
-            logger.warning_once(
-                "VLLM_MM_ENCODER_FP8_ATTN enabled but "
-                "VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH not set. "
-                "Using scale=1.0 for all Q/K/V (may cause accuracy issues)."
-            )
+            self._fp8_dynamic_scale = True
             self.fp8_scales = {"q": 1.0, "k": 1.0, "v": 1.0}
+            logger.info_once(
+                "FP8 attention enabled with dynamic delayed scaling "
+                "(no scale file provided). Scales will adapt from "
+                "observed Q/K/V amax values."
+            )
         else:
-            # Scale path provided - layer must exist
             layer_scales = all_scales.get(layer_name)
             if layer_scales is None:
                 raise ValueError(
@@ -167,34 +177,54 @@ class MMEncoderAttention(CustomOp):
                 )
             self.fp8_scales = layer_scales
 
-        # Register scale tensors as buffers (auto-move to device with module)
-        # Shape (1, 1, 1, 1) as required by cuDNN
-        self.register_buffer(
-            "_fp8_q_scale",
-            torch.tensor([self.fp8_scales["q"]], dtype=torch.float32).view(1, 1, 1, 1),
-        )
-        self.register_buffer(
-            "_fp8_k_scale",
-            torch.tensor([self.fp8_scales["k"]], dtype=torch.float32).view(1, 1, 1, 1),
-        )
-        self.register_buffer(
-            "_fp8_v_scale",
-            torch.tensor([self.fp8_scales["v"]], dtype=torch.float32).view(1, 1, 1, 1),
-        )
+        # Scale buffers — shape (1, 1, 1, 1) as required by cuDNN.
+        # With dynamic scaling these are updated every forward pass.
+        for attr, key in (
+            ("_fp8_q_scale", "q"),
+            ("_fp8_k_scale", "k"),
+            ("_fp8_v_scale", "v"),
+        ):
+            self.register_buffer(
+                attr,
+                torch.tensor(
+                    [self.fp8_scales[key]], dtype=torch.float32
+                ).view(1, 1, 1, 1),
+            )
 
-        # Create QuantFP8 for efficient quantization
+        # Amax history buffers for dynamic delayed scaling (non-persistent so
+        # they are not included in state_dict / checkpoints).
+        if self._fp8_dynamic_scale:
+            for attr in ("_fp8_q_amax", "_fp8_k_amax", "_fp8_v_amax"):
+                self.register_buffer(
+                    attr,
+                    torch.zeros(
+                        _FP8_AMAX_HISTORY_LEN, dtype=torch.float32
+                    ),
+                    persistent=False,
+                )
+            self._fp8_amax_pos = 0
+
         self.fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         self.fp8_enabled = True
-        self.skip_scale_q = self.fp8_scales["q"] == 1.0
-        self.skip_scale_k = self.fp8_scales["k"] == 1.0
-        self.skip_scale_v = self.fp8_scales["v"] == 1.0
+
+        # With dynamic scaling the scale will change, so never skip scaling.
+        self.skip_scale_q = (
+            not self._fp8_dynamic_scale and self.fp8_scales["q"] == 1.0
+        )
+        self.skip_scale_k = (
+            not self._fp8_dynamic_scale and self.fp8_scales["k"] == 1.0
+        )
+        self.skip_scale_v = (
+            not self._fp8_dynamic_scale and self.fp8_scales["v"] == 1.0
+        )
 
         logger.debug(
-            "FP8 attention enabled for %s: q=%.4f, k=%.4f, v=%.4f",
+            "FP8 attention enabled for %s: q=%.4f, k=%.4f, v=%.4f%s",
             layer_name if layer_name else "MMEncoderAttention",
             self.fp8_scales["q"],
             self.fp8_scales["k"],
             self.fp8_scales["v"],
+            " (dynamic delayed scaling)" if self._fp8_dynamic_scale else "",
         )
 
     @classmethod
@@ -322,6 +352,38 @@ class MMEncoderAttention(CustomOp):
         # Fall back to Triton kernel for padding head_dim to a multiple of 16
         return quantize_fp8_pad_head_dim_triton(tensor, scale, skip_scale=skip_scale)
 
+    @torch.no_grad()
+    def _record_fp8_amax(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> None:
+        """Record max-abs of Q, K, V into the circular amax history."""
+        pos = self._fp8_amax_pos
+        self._fp8_q_amax[pos] = query.abs().max().float()
+        self._fp8_k_amax[pos] = key.abs().max().float()
+        self._fp8_v_amax[pos] = value.abs().max().float()
+        self._fp8_amax_pos = (pos + 1) % _FP8_AMAX_HISTORY_LEN
+
+    @torch.no_grad()
+    def _update_fp8_scales_from_amax(self) -> None:
+        """Recompute Q/K/V scales from amax history (max algorithm).
+
+        scale = max_amax / fp8_max   (vLLM convention: dequant multiplies by
+        scale, quant divides by scale).  Scales are only updated when the
+        observed max-amax is positive and finite; otherwise the previous scale
+        is retained.
+        """
+        for amax_buf, scale_buf in (
+            (self._fp8_q_amax, self._fp8_q_scale),
+            (self._fp8_k_amax, self._fp8_k_scale),
+            (self._fp8_v_amax, self._fp8_v_scale),
+        ):
+            max_amax = amax_buf.max()
+            if max_amax > 0 and torch.isfinite(max_amax):
+                scale_buf.fill_(max_amax / _FP8_E4M3_MAX)
+
     def _forward_flashinfer(
         self,
         query: torch.Tensor,
@@ -334,6 +396,14 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         if self.fp8_enabled:
             assert self.fp8_quant is not None and self.fp8_scales is not None
+
+            # Record amax from the original float tensors *before*
+            # quantization so the values are unscaled.  The scale used for
+            # this quantization was computed from *previous* steps' amax
+            # (delayed scaling).
+            if self._fp8_dynamic_scale:
+                self._record_fp8_amax(query, key, value)
+
             query = self._quantize_to_fp8(
                 query, self._fp8_q_scale, skip_scale=self.skip_scale_q
             )
@@ -363,6 +433,10 @@ class MMEncoderAttention(CustomOp):
         if self.fp8_enabled and output.shape[-1] != self.head_size:
             output = output[..., : self.head_size]
             output = output.contiguous()
+
+        # Update scales for the *next* forward pass from the amax history.
+        if self.fp8_enabled and self._fp8_dynamic_scale:
+            self._update_fp8_scales_from_amax()
 
         return output
 
