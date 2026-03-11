@@ -206,6 +206,8 @@ class MMEncoderAttention(CustomOp):
 
         self.fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         self.fp8_enabled = True
+        self._fp8_log_counter = 0
+        self._fp8_log_interval = 100
 
         # With dynamic scaling the scale will change, so never skip scaling.
         self.skip_scale_q = (
@@ -437,6 +439,20 @@ class MMEncoderAttention(CustomOp):
         # Update scales for the *next* forward pass from the amax history.
         if self.fp8_enabled and self._fp8_dynamic_scale:
             self._update_fp8_scales_from_amax()
+
+        # Periodically log FP8 scales
+        if self.fp8_enabled:
+            self._fp8_log_counter += 1
+            if self._fp8_log_counter % self._fp8_log_interval == 0:
+                logger.info(
+                    "[step %d] FP8 attn scales for %s: "
+                    "q=%.6f, k=%.6f, v=%.6f",
+                    self._fp8_log_counter,
+                    self.layer_name or "MMEncoderAttention",
+                    self._fp8_q_scale.item(),
+                    self._fp8_k_scale.item(),
+                    self._fp8_v_scale.item(),
+                )
 
         return output
 
