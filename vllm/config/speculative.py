@@ -47,7 +47,9 @@ MTPModelTypes = Literal[
     "step3p5_mtp",
 ]
 DFlashModelTypes = Literal["dflash"]
-EagleModelTypes = Literal["eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes]
+EagleModelTypes = Literal[
+    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -183,10 +185,13 @@ class SpeculativeConfig:
         the final hidden states.
         """
         factors: list[Any] = []
-<<<<<<< HEAD
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in ("eagle3", "extract_hidden_states")
+        uses_aux_hidden_states = self.method in (
+            "eagle3",
+            "extract_hidden_states",
+            "dflash",
+        )
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph
@@ -200,11 +205,6 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
-=======
-        # Eagle3 affects the computation graph because it returns intermediate
-        # hidden states in addition to the final hidden state.
-        factors.append(self.method in ("eagle3", "dflash"))
->>>>>>> ce986a30e (wip - agentic draft by claude)
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -785,11 +785,7 @@ class SpeculativeConfig:
             "nemotron_h",
         ]
         if (
-<<<<<<< HEAD
-            self.method in ("eagle3", "extract_hidden_states")
-=======
-            self.method in ("eagle3", "dflash")
->>>>>>> ce986a30e (wip - agentic draft by claude)
+            self.method in ("eagle3", "extract_hidden_states", "dflash")
             and self.target_model_config
             and not any(
                 supported_model in self.target_model_config.hf_text_config.model_type
