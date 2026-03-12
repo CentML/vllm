@@ -32,7 +32,6 @@ _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 _FP8_AMAX_DECAY = 0.95
 
 
-@torch.compile(fullgraph=True)
 def _update_amax_and_scales(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -228,7 +227,7 @@ class MMEncoderAttention(CustomOp):
             for attr in ("_fp8_q_amax", "_fp8_k_amax", "_fp8_v_amax"):
                 self.register_buffer(
                     attr,
-                    torch.zeros(1, dtype=torch.float32),
+                    torch.zeros((), dtype=torch.float32),
                     persistent=False,
                 )
 
