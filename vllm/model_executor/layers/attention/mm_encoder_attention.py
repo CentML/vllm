@@ -29,7 +29,7 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
 logger = init_logger(__name__)
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-_FP8_AMAX_HISTORY_LEN = 1024
+_FP8_AMAX_HISTORY_LEN = 16
 
 
 @functools.cache
@@ -206,8 +206,6 @@ class MMEncoderAttention(CustomOp):
 
         self.fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         self.fp8_enabled = True
-        self._fp8_log_counter = 0
-        self._fp8_log_interval = 100
 
         # With dynamic scaling the scale will change, so never skip scaling.
         self.skip_scale_q = (
@@ -355,36 +353,37 @@ class MMEncoderAttention(CustomOp):
         return quantize_fp8_pad_head_dim_triton(tensor, scale, skip_scale=skip_scale)
 
     @torch.no_grad()
-    def _record_fp8_amax(
+    def _record_amax_and_update_scales(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> None:
-        """Record max-abs of Q, K, V into the circular amax history."""
+        """Record Q/K/V amax values and recompute scales — fully async.
+
+        All work stays on the GPU; there are no device-to-host transfers or
+        Python-level branches on GPU values, so this never stalls the CUDA
+        pipeline.  The three per-tensor reductions (abs-max of Q, K, V) are
+        the only unavoidable extra kernels.
+        """
         pos = self._fp8_amax_pos
-        self._fp8_q_amax[pos] = query.abs().max().float()
-        self._fp8_k_amax[pos] = key.abs().max().float()
-        self._fp8_v_amax[pos] = value.abs().max().float()
         self._fp8_amax_pos = (pos + 1) % _FP8_AMAX_HISTORY_LEN
 
-    @torch.no_grad()
-    def _update_fp8_scales_from_amax(self) -> None:
-        """Recompute Q/K/V scales from amax history (max algorithm).
-
-        scale = max_amax / fp8_max   (vLLM convention: dequant multiplies by
-        scale, quant divides by scale).  Scales are only updated when the
-        observed max-amax is positive and finite; otherwise the previous scale
-        is retained.
-        """
-        for amax_buf, scale_buf in (
-            (self._fp8_q_amax, self._fp8_q_scale),
-            (self._fp8_k_amax, self._fp8_k_scale),
-            (self._fp8_v_amax, self._fp8_v_scale),
+        for tensor, amax_buf, scale_buf in (
+            (query, self._fp8_q_amax, self._fp8_q_scale),
+            (key, self._fp8_k_amax, self._fp8_k_scale),
+            (value, self._fp8_v_amax, self._fp8_v_scale),
         ):
+            # amax of the current (unscaled) tensor — single fused kernel.
+            amax_buf[pos] = tensor.abs().max()
+
+            # scale = max(history) / fp8_max, computed entirely on-device.
+            # torch.clamp(min=) avoids the zero/nan branch without a sync.
             max_amax = amax_buf.max()
-            if max_amax > 0 and torch.isfinite(max_amax):
-                scale_buf.fill_(max_amax / _FP8_E4M3_MAX)
+            scale_buf.fill_(
+                torch.clamp(max_amax, min=torch.finfo(torch.float32).tiny)
+                / _FP8_E4M3_MAX
+            )
 
     def _forward_flashinfer(
         self,
@@ -399,12 +398,13 @@ class MMEncoderAttention(CustomOp):
         if self.fp8_enabled:
             assert self.fp8_quant is not None and self.fp8_scales is not None
 
-            # Record amax from the original float tensors *before*
-            # quantization so the values are unscaled.  The scale used for
-            # this quantization was computed from *previous* steps' amax
-            # (delayed scaling).
+            # Record amax, recompute scales (all on-device, no sync), then
+            # quantize.  The scale used for THIS step already incorporates
+            # THIS step's amax — "current scaling" semantics — which removes
+            # the cold-start problem of pure delayed scaling while keeping
+            # the same steady-state behaviour.
             if self._fp8_dynamic_scale:
-                self._record_fp8_amax(query, key, value)
+                self._record_amax_and_update_scales(query, key, value)
 
             query = self._quantize_to_fp8(
                 query, self._fp8_q_scale, skip_scale=self.skip_scale_q
@@ -435,24 +435,6 @@ class MMEncoderAttention(CustomOp):
         if self.fp8_enabled and output.shape[-1] != self.head_size:
             output = output[..., : self.head_size]
             output = output.contiguous()
-
-        # Update scales for the *next* forward pass from the amax history.
-        if self.fp8_enabled and self._fp8_dynamic_scale:
-            self._update_fp8_scales_from_amax()
-
-        # Periodically log FP8 scales
-        if self.fp8_enabled:
-            self._fp8_log_counter += 1
-            if self._fp8_log_counter % self._fp8_log_interval == 0:
-                logger.info(
-                    "[step %d] FP8 attn scales for %s: "
-                    "q=%.6f, k=%.6f, v=%.6f",
-                    self._fp8_log_counter,
-                    self.layer_name or "MMEncoderAttention",
-                    self._fp8_q_scale.item(),
-                    self._fp8_k_scale.item(),
-                    self._fp8_v_scale.item(),
-                )
 
         return output
 
