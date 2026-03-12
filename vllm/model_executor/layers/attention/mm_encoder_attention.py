@@ -29,33 +29,7 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
 logger = init_logger(__name__)
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-_FP8_AMAX_DECAY = 0.95
-
-
-def _update_amax_and_scales(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_amax: torch.Tensor,
-    k_amax: torch.Tensor,
-    v_amax: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-) -> None:
-    """Fused amax tracking + scale recomputation for Q, K, V.
-
-    Compiled into a minimal number of GPU kernels by Inductor.
-    All arguments are tensors (no Python state), so this is fullgraph-safe.
-    """
-    for tensor, amax_buf, scale_buf in (
-        (q, q_amax, q_scale),
-        (k, k_amax, k_scale),
-        (v, v_amax, v_scale),
-    ):
-        cur_amax = tensor.abs().max()
-        torch.maximum(cur_amax, amax_buf * _FP8_AMAX_DECAY, out=amax_buf)
-        scale_buf.fill_(amax_buf / _FP8_E4M3_MAX)
+_FP8_AMAX_HISTORY_LEN = 16
 
 
 @functools.cache
@@ -178,9 +152,8 @@ class MMEncoderAttention(CustomOp):
 
         When a scale file is provided via VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH,
         static (fixed) scales are loaded.  Otherwise, dynamic scaling is
-        enabled: per-tensor amax values are tracked via an exponential-decay
-        running max and scales are recomputed each forward pass.  This is
-        compile-friendly (no Python state mutation, no graph breaks).
+        enabled: per-tensor amax values are tracked in a circular history
+        buffer and scales are recomputed each forward pass.
         """
         scale_path = envs.VLLM_MM_ENCODER_FP8_ATTN_SCALE_PATH
         all_scales = _load_fp8_scales_file(scale_path)
@@ -191,8 +164,8 @@ class MMEncoderAttention(CustomOp):
             logger.info_once(
                 "FP8 attention enabled with dynamic scaling "
                 "(no scale file provided). Scales will adapt from "
-                "observed Q/K/V amax values (decay=%.4f).",
-                _FP8_AMAX_DECAY,
+                "observed Q/K/V amax values (history_len=%d).",
+                _FP8_AMAX_HISTORY_LEN,
             )
         else:
             layer_scales = all_scales.get(layer_name)
@@ -218,18 +191,18 @@ class MMEncoderAttention(CustomOp):
                 ).view(1, 1, 1, 1),
             )
 
-        # Running-max amax for dynamic scaling.  Instead of a rolling history
-        # buffer (which needs a Python index → graph breaks under compile),
-        # we keep a single scalar per tensor and decay it each step:
-        #   amax_running = max(current_amax, amax_running * decay)
+        # Circular amax history buffers for dynamic scaling.
         # Non-persistent so they are not saved in state_dict / checkpoints.
         if self._fp8_dynamic_scale:
             for attr in ("_fp8_q_amax", "_fp8_k_amax", "_fp8_v_amax"):
                 self.register_buffer(
                     attr,
-                    torch.zeros((), dtype=torch.float32),
+                    torch.zeros(
+                        _FP8_AMAX_HISTORY_LEN, dtype=torch.float32
+                    ),
                     persistent=False,
                 )
+            self._fp8_amax_pos = 0
 
         self.fp8_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         self.fp8_enabled = True
@@ -386,11 +359,27 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> None:
-        _update_amax_and_scales(
-            query, key, value,
-            self._fp8_q_amax, self._fp8_k_amax, self._fp8_v_amax,
-            self._fp8_q_scale, self._fp8_k_scale, self._fp8_v_scale,
-        )
+        """Record Q/K/V amax into circular history and recompute scales.
+
+        All work stays on GPU with no device-to-host sync.  The only
+        Python-side state mutation is the history position counter, which
+        is fine for eager execution (the vision encoder is not typically
+        compiled or captured in CUDA graphs).
+        """
+        pos = self._fp8_amax_pos
+        self._fp8_amax_pos = (pos + 1) % _FP8_AMAX_HISTORY_LEN
+
+        for tensor, amax_buf, scale_buf in (
+            (query, self._fp8_q_amax, self._fp8_q_scale),
+            (key, self._fp8_k_amax, self._fp8_k_scale),
+            (value, self._fp8_v_amax, self._fp8_v_scale),
+        ):
+            amax_buf[pos] = tensor.abs().max()
+            max_amax = amax_buf.max()
+            scale_buf.fill_(
+                torch.clamp(max_amax, min=torch.finfo(torch.float32).tiny)
+                / _FP8_E4M3_MAX
+            )
 
     def _forward_flashinfer(
         self,
