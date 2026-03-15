@@ -361,6 +361,7 @@ class CudaPlatformBase(Platform):
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
         return [
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.FLASH_ATTN_CUTE,
             AttentionBackendEnum.FLASH_ATTN,
         ]
 
@@ -376,10 +377,45 @@ class CudaPlatformBase(Platform):
                 f"Backend {backend} is not supported for vit attention. "
                 f"Supported backends are: {cls.get_supported_vit_attn_backends()}"
             )
+            if backend == AttentionBackendEnum.FLASH_ATTN_CUTE:
+                cc = cls.get_device_capability()
+                if cc is None or cc.major < 10:
+                    raise ValueError(
+                        "FLASH_ATTN_CUTE (FA4) requires Blackwell (SM100+). "
+                        f"Current device: SM{cc.major}{cc.minor}" if cc
+                        else "No device found."
+                    )
+                from vllm.v1.attention.backends.fa4_utils import (
+                    is_flash_attn_cute_available,
+                )
+                if not is_flash_attn_cute_available():
+                    raise ImportError(
+                        "flash_attn.cute is not installed. "
+                        "Install with: pip install "
+                        "git+https://github.com/Dao-AILab/flash-attention.git"
+                        "#subdirectory=flash_attn/cute"
+                    )
             logger.info_once(f"Using backend {backend} for vit attention")
             return backend
 
-        # Try FlashAttention first
+        # On Blackwell, try FA4 first
+        if (cc := cls.get_device_capability()) and cc.major >= 10:
+            try:
+                from vllm.v1.attention.backends.fa4_utils import (
+                    is_flash_attn_cute_available,
+                )
+                if is_flash_attn_cute_available() and dtype in (
+                    torch.float16, torch.bfloat16
+                ):
+                    logger.info_once(
+                        "Auto-selecting FLASH_ATTN_CUTE (FA4) for ViT on "
+                        "Blackwell."
+                    )
+                    return AttentionBackendEnum.FLASH_ATTN_CUTE
+            except ImportError:
+                pass
+
+        # Try FlashAttention (FA2)
         if (cc := cls.get_device_capability()) and cc.major >= 8:
             try:
                 backend_class = AttentionBackendEnum.FLASH_ATTN.get_class()

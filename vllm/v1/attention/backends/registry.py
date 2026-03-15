@@ -58,6 +58,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse.ROCMAiterMLASparseBackend"
     )
     TORCH_SDPA = ""  # this tag is only used for ViT
+    FLASH_ATTN_CUTE = ""  # FA4 via flash_attn.cute, ViT/MM encoder only
     FLASHINFER = "vllm.v1.attention.backends.flashinfer.FlashInferBackend"
     FLASHINFER_MLA = (
         "vllm.v1.attention.backends.mla.flashinfer_mla.FlashInferMLABackend"
