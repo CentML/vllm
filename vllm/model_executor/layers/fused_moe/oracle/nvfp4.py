@@ -39,6 +39,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
+    FLASHINFER_CUTEDSL_MOE = "FLASHINFER_CUTEDSL_MOE"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
 
@@ -47,12 +48,14 @@ FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_TRTLLM,
     NvFp4MoeBackend.FLASHINFER_CUTLASS,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    NvFp4MoeBackend.FLASHINFER_CUTEDSL_MOE,
 ]
 
 fi_2_vllm_backend_map: dict[FlashinferMoeBackend, NvFp4MoeBackend] = {
     FlashinferMoeBackend.CUTLASS: NvFp4MoeBackend.FLASHINFER_CUTLASS,
     FlashinferMoeBackend.TENSORRT_LLM: NvFp4MoeBackend.FLASHINFER_TRTLLM,
     FlashinferMoeBackend.CUTEDSL: NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+    FlashinferMoeBackend.CUTEDSL_MOE: NvFp4MoeBackend.FLASHINFER_CUTEDSL_MOE,
 }
 
 
@@ -93,6 +96,13 @@ def backend_to_kernel_cls(
 
         return [FlashInferCuteDSLExperts]
 
+    elif backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL_MOE:
+        from vllm.model_executor.layers.fused_moe.experts.cutedsl_moe_nvfp4 import (
+            CuteDslMoENvFp4Experts,
+        )
+
+        return [CuteDslMoENvFp4Experts]
+
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.cutlass_moe import (
             CutlassExpertsFp4,
@@ -117,6 +127,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
+        "flashinfer_cutedsl_moe": NvFp4MoeBackend.FLASHINFER_CUTEDSL_MOE,
         "marlin": NvFp4MoeBackend.MARLIN,
     }
     if backend := mapping.get(runner_backend):
@@ -140,6 +151,7 @@ def select_nvfp4_moe_backend(
     # NOTE: the kernels are selected in the following order.
     AVAILABLE_BACKENDS = [
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL_MOE,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.VLLM_CUTLASS,

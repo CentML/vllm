@@ -21,6 +21,7 @@ class FlashinferMoeBackend(Enum):
     TENSORRT_LLM = "TensorRT-LLM"
     CUTLASS = "CUTLASS"
     CUTEDSL = "CUTEDSL"
+    CUTEDSL_MOE = "CUTEDSL_MOE"
 
 
 def activation_to_flashinfer_int(activation: MoEActivation) -> int:
@@ -130,6 +131,7 @@ def is_flashinfer_supporting_global_sf(backend: FlashinferMoeBackend | None) -> 
         FlashinferMoeBackend.CUTLASS,
         FlashinferMoeBackend.TENSORRT_LLM,
         FlashinferMoeBackend.CUTEDSL,
+        FlashinferMoeBackend.CUTEDSL_MOE,
     )
     return backend in backends_supporting_global_sf
 

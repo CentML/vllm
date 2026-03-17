@@ -17,6 +17,7 @@ MoEBackend = Literal[
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_moe",
     "marlin",
     "aiter",
 ]
@@ -38,7 +39,8 @@ class KernelConfig:
     - "cutlass": Use vLLM CUTLASS kernels\n
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels\n
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels\n
-    - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)\n
+    - "flashinfer_cutedsl": Use FlashInfer CuteDSL masked GEMM (FP4)\n
+    - "flashinfer_cutedsl_moe": Use FlashInfer CuteDSL fused MoE (FP4)\n
     - "marlin": Use Marlin kernels (weight-only quantization)\n
     - "aiter": Use AMD AITer kernels (ROCm only)"""
 

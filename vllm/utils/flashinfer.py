@@ -255,6 +255,21 @@ def has_flashinfer_cutedsl_grouped_gemm_nt_masked() -> bool:
 
 
 @functools.cache
+def has_flashinfer_cutedsl_moe() -> bool:
+    """Return ``True`` if FlashInfer CuteDSL fused MoE is available."""
+
+    required_functions = [
+        ("flashinfer.fused_moe.cute_dsl.fused_moe", "CuteDslMoEWrapper"),
+    ]
+
+    for module_name, attr_name in required_functions:
+        mod = _get_submodule(module_name)
+        if not mod or not hasattr(mod, attr_name):
+            return False
+    return True
+
+
+@functools.cache
 def has_nvidia_artifactory() -> bool:
     """Return `True` if NVIDIA's artifactory is accessible.
 
@@ -778,6 +793,7 @@ __all__ = [
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
+    "has_flashinfer_cutedsl_moe",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",
