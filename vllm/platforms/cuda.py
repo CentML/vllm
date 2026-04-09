@@ -205,6 +205,10 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    def is_mnnvl_fabric_supported(cls, device_id: int = 0) -> bool:
+        raise NotImplementedError
+
+    @classmethod
     def log_warnings(cls):
         pass
 
@@ -649,6 +653,28 @@ class NvmlCudaPlatform(CudaPlatformBase):
         return True
 
     @classmethod
+    @with_nvml_context
+    def is_mnnvl_fabric_supported(cls, device_id: int = 0) -> bool:
+        """
+        Check if the GPU is part of an MNNVL (multi-node NVLink) domain.
+        Ported from flashinfer.comm.mnnvl.is_mnnvl_fabric_supported()
+        """
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        try:
+            import ctypes
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+            fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
+            pynvml.nvmlDeviceGetGpuFabricInfoV(
+                handle, ctypes.byref(fabric_info))
+        except Exception:
+            return False
+        return (
+            fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and bool(fabric_info.clusterUuid)
+            and fabric_info.clusterUuid[0] != 0
+        )
+
+    @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
         return pynvml.nvmlDeviceGetName(handle)
@@ -820,6 +846,10 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."
         )
+        return False
+
+    @classmethod
+    def is_mnnvl_fabric_supported(cls, device_id: int = 0) -> bool:
         return False
 
     @classmethod

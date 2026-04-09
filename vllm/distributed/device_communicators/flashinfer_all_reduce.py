@@ -89,16 +89,19 @@ def _create_workspace(
     return workspace
 
 
-def _resolve_fi_ar_backend() -> str:
+def _resolve_fi_ar_backend() -> str | None:
     backend = envs.VLLM_FLASHINFER_ALLREDUCE_BACKEND
     if backend != "auto":
         logger.info_once(f"Using flashinfer allreduce backend: {backend}")
         return backend
 
-    if get_node_count() > 1:  # noqa: SIM108
-        # Use mnnvl backend for multi-node setup since
-        # trtllm backend does not support multi-node allreduce
-        backend = "mnnvl"
+    if get_node_count() > 1:
+        # 'trtllm' backend does not support multi-node, while
+        # 'mnnvl' backend supports multi-node but requires MNNVL.
+        if current_platform.is_mnnvl_fabric_supported():
+            backend = "mnnvl"
+        else:
+            backend = None
     else:
         # Currently defaulting to trtllm backend for single-node
         # setup since mnnvl has issues with cudagraph:
@@ -136,6 +139,13 @@ def get_fi_ar_workspace(
             "Flashinfer allreduce is not supported for multi-node allreduce with "
             "'trtllm' backend. Please use 'mnnvl' backend instead."
         )
+    if backend == "mnnvl" and not current_platform.is_mnnvl_fabric_supported():
+        raise ValueError(
+            "Flashinfer allreduce with 'mnnvl' backend is not supported "
+            "on systems without MNNVL."
+        )
+    if backend is None:
+        return None
 
     # Reuse the quant workspace if it was already created with the same backend
     if _fi_ar_quant_workspace is not None and _fi_ar_quant_workspace.backend == backend:
