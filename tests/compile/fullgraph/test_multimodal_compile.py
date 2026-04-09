@@ -74,6 +74,61 @@ def test_qwen2_5_vl_no_vit_compilation(vllm_runner, monkeypatch):
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_qwen3_vl_compilation(vllm_runner, monkeypatch):
+    """Test that Qwen3-VL vision submodules are compiled.
+
+    This test verifies that the vision submodules (Qwen3_VisionPatchEmbed,
+    Qwen3_VisionPatchMerger, deepstack mergers, and Qwen3_VisionBlock) are
+    properly tagged for compilation by checking that num_models_seen
+    increases to 30: 1 LLM + 1 PatchEmbed + 24 VisionBlocks + 1 merger
+    + 3 deepstack mergers.
+    """
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with (
+        compilation_counter.expect(num_models_seen=30),
+        vllm_runner(
+            "Qwen/Qwen3-VL-2B-Instruct",
+            max_model_len=2048,
+            gpu_memory_utilization=0.8,
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": True,
+            },
+        ) as _,
+    ):
+        pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_qwen3_vl_no_vit_compilation(vllm_runner, monkeypatch):
+    """Test that Qwen3-VL vision submodules are not compiled when the
+    config is passed off
+    """
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with (
+        compilation_counter.expect(num_models_seen=1),
+        vllm_runner(
+            "Qwen/Qwen3-VL-2B-Instruct",
+            max_model_len=2048,
+            gpu_memory_utilization=0.8,
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": False,
+            },
+        ) as _,
+    ):
+        pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
 # Requires Cuda and 8 gpus as well
 @pytest.mark.forked
 @pytest.mark.skip(reason="Skipping due to CI resource constraints")
