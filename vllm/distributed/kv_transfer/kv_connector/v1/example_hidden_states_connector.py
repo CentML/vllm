@@ -340,20 +340,24 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         ready_event.record()
         copy_stream.wait_event(ready_event)
 
-        slot_mapping = attn_metadata.slot_mapping
+        # Use the proposer's GPU slot-mapping buffer (from forward_context)
+        # rather than attn_metadata.slot_mapping. The latter aliases the
+        # batch input buffer, which is overwritten by the next batch's input
+        # prep before copy_stream actually reads it — causing the per-request
+        # extract_from_kv_cache to index the wrong slots and surface NaN/Inf
+        # in the saved tensors. The forward_context buffer is owned by the
+        # proposer and stays stable until the next propose() call.
+        from vllm.forward_context import get_forward_context
+
+        slot_mapping = get_forward_context().slot_mapping[layer_name]
         offset = 0
         for request in connector_metadata.requests:
             with torch.cuda.stream(copy_stream):
                 num_tokens = request.token_ids.shape[0]
-                req_slot_mapping = slot_mapping[offset : offset + num_tokens]
+                # Already on GPU — no H2D needed.
+                slot_mapping_gpu = slot_mapping[offset : offset + num_tokens]
                 offset += num_tokens
 
-                # Move the CPU slot_mapping to GPU on the copy stream so the
-                # implicit H2D inside fancy indexing doesn't sync the default
-                # stream.
-                slot_mapping_gpu = req_slot_mapping.to(
-                    device=kv_layer.device, non_blocking=True
-                )
                 hidden_states_gpu = extract_from_kv_cache(
                     kv_layer, slot_mapping_gpu, num_tokens
                 )
@@ -370,6 +374,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             # token_ids is already on CPU (created in ReqMeta.make_meta).
             assert not request.token_ids.is_cuda, (
                 "Expected token_ids on CPU, got CUDA tensor"
+            )
 
             tensors = {
                 "hidden_states": pinned_hs,

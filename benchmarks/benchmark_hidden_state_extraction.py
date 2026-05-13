@@ -195,8 +195,6 @@ async def _run_extraction_async(
         model=model,
         enable_prefix_caching=False,
         enable_chunked_prefill=False,
-        max_num_batched_tokens=40960,
-        max_model_len=40960,
         speculative_config={
             "method": "extract_hidden_states",
             "num_speculative_tokens": 1,
@@ -332,6 +330,7 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--max-cudagraph-capture-size", type=int, default=None)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--load-format", type=str, default=None)
@@ -370,9 +369,12 @@ def main():
         extra_args["enforce_eager"] = True
     if args.load_format is not None:
         extra_args["load_format"] = args.load_format
+    if args.max_num_seqs is not None:
+        extra_args["max_num_seqs"] = args.max_num_seqs
     if args.max_cudagraph_capture_size is not None:
         extra_args["max_cudagraph_capture_size"] = args.max_cudagraph_capture_size
     extra_args["enable_flashinfer_autotune"] = args.enable_flashinfer_autotune
+    extra_args["compilation_config"] = {"cudagraph_mode": "NONE"}
 
     # Get vocab size from HF config without loading the full model
     hf_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
