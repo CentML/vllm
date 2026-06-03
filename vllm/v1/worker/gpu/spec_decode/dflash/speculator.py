@@ -21,7 +21,10 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
+    DFlashContextKVCudaGraphs,
+    DFlashCudaGraphManager,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
@@ -76,6 +79,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+        self.context_kv_cudagraph: DFlashContextKVCudaGraphs | None = None
         self.draft_kv_cache_group_id: int = -1
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -91,6 +95,21 @@ class DFlashSpeculator(DraftModelSpeculator):
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
         )
+
+        # The context-KV precompute is a separate FULL-graph keyed only on the
+        # context-token count (it never runs attention). Capture it whenever the
+        # query forward uses FULL graphs.
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            capture_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+            self.context_kv_cudagraph = DFlashContextKVCudaGraphs(
+                self.model,
+                self.hidden_states,
+                self.context_positions,
+                self.context_slot_mapping,
+                capture_sizes,
+                self.max_num_tokens,
+                self.device,
+            )
 
     def capture(self, attn_states: dict | None = None) -> None:
         logger.info("Capturing model for DFlash speculator...")
@@ -109,6 +128,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             progress_bar_desc="Capturing dflash CUDA graphs",
         )
+
+        if self.context_kv_cudagraph is not None:
+            self.context_kv_cudagraph.capture()
 
     def load_draft_model(
         self,
@@ -362,16 +384,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_num_tokens,
         )
 
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slot_mapping=(
-                None if dummy_run else self.context_slot_mapping[:num_target_tokens]
-            ),
+        # Pre-insert context K/V into the cache. This runs as its own FULL graph
+        # keyed on the (padded) context-token count when available, falling back
+        # to eager. During dummy runs the block tables are placeholders, so we
+        # skip the cache write to avoid clobbering real entries.
+        ran_context_kv_graph = (
+            not dummy_run
+            and not is_profile
+            and self.context_kv_cudagraph is not None
+            and self.context_kv_cudagraph.maybe_run(num_target_tokens)
         )
+        if not ran_context_kv_graph:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slot_mapping=(
+                    None if dummy_run else self.context_slot_mapping[:num_target_tokens]
+                ),
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -551,6 +581,16 @@ def _prepare_dflash_inputs_kernel(
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+            # Pad the context tail past num_context_tokens. The context-KV
+            # cudagraph always processes a padded bucket of tokens, so padded
+            # rows must carry PAD slots (no K/V write) and an in-range position
+            # (0) to keep RoPE's cos_sin_cache lookup in bounds. ctx_end is the
+            # last request's context end, i.e. the total context-token count.
+            for i in range(ctx_end, max_num_tokens, BLOCK_SIZE):
+                block = i + tl.arange(0, BLOCK_SIZE)
+                mask = block < max_num_tokens
+                tl.store(out_context_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+                tl.store(out_context_positions_ptr + block, 0, mask=mask)
 
 
 def prepare_dflash_inputs(

@@ -3,9 +3,14 @@
 from collections.abc import Callable
 
 import torch
+import torch.nn as nn
+from tqdm import tqdm
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
+from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -19,6 +24,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 def _prepare_dflash_inputs_to_capture(
@@ -122,3 +129,95 @@ class DFlashCudaGraphManager(CudaGraphManager):
             return fwd, attn_state
 
         super().capture(create_forward_fn, progress_bar_desc)
+
+
+class DFlashContextKVCudaGraphs:
+    """Standalone CUDA graphs for ``precompute_and_store_context_kv``, keyed by
+    padded context-token count.
+
+    Unlike the query forward, the context-KV precompute has no attention, no
+    forward context, and no DP sync: it is fixed-shape projection + RoPE + a
+    scatter write into the KV cache. So it needs only fixed-address buffers and
+    a bucketed token count, captured with a bare ``torch.cuda.CUDAGraph`` rather
+    than the full ``CudaGraphManager`` machinery.
+
+    The token count varies per step, so one graph is captured per capture size.
+    At replay the smallest bucket that covers the actual token count is used; the
+    padded tail of ``context_slot_mapping`` (PAD slots) and ``context_positions``
+    (zeros) is filled by ``prepare_dflash_inputs``, while the ``hidden_states``
+    tail is zeroed here so padded rows never produce NaNs.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        hidden_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor,
+        capture_sizes: list[int],
+        max_num_tokens: int,
+        device: torch.device,
+    ):
+        self._model = model
+        self._hidden_states = hidden_states
+        self._context_positions = context_positions
+        self._context_slot_mapping = context_slot_mapping
+        self._sizes = sorted({s for s in capture_sizes if 0 < s <= max_num_tokens})
+        self._device = device
+        self._pool = torch.cuda.graph_pool_handle() if self._sizes else None
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return len(self._sizes) > 0
+
+    def _run(self, num_tokens: int) -> None:
+        self._model.precompute_and_store_context_kv(
+            self._hidden_states[:num_tokens],
+            self._context_positions[:num_tokens],
+            self._context_slot_mapping[:num_tokens],
+        )
+
+    @torch.inference_mode()
+    def capture(
+        self, progress_bar_desc: str = "Capturing dflash context-KV CUDA graphs"
+    ) -> None:
+        if not self._sizes:
+            return
+        # Capture from a safe state: PAD slots (so capture/warmup writes nothing
+        # into the real cache) and zeroed inputs/positions (so RoPE indices stay
+        # in range and no NaNs are produced).
+        self._context_slot_mapping.fill_(PAD_SLOT_ID)
+        self._context_positions.zero_()
+        self._hidden_states.zero_()
+
+        sizes = self._sizes
+        if is_global_first_rank():
+            sizes = tqdm(sizes, desc=progress_bar_desc)
+        with graph_capture(device=self._device):
+            for num_tokens in sizes:
+                self._run(num_tokens)  # warmup
+                logger.debug("Context-KV CG capture: num_tokens=%d", num_tokens)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self._pool):
+                    self._run(num_tokens)
+                self._graphs[num_tokens] = graph
+
+    def maybe_run(self, num_tokens: int) -> bool:
+        """Replay the smallest captured graph that covers ``num_tokens``.
+
+        Returns False if no captured bucket fits, so the caller can fall back to
+        running the precompute eagerly.
+        """
+        bucket = next((s for s in self._sizes if s >= num_tokens), None)
+        if bucket is None:
+            return False
+        # The replayed graph always processes `bucket` tokens. context_positions
+        # and context_slot_mapping tails are already padded by
+        # prepare_dflash_inputs, but hidden_states is filled by a plain copy_
+        # that leaves stale data (possibly NaN) in [num_tokens:bucket]. Zero it
+        # so padded rows produce finite, discarded K/V.
+        if bucket > num_tokens:
+            self._hidden_states[num_tokens:bucket].zero_()
+        self._graphs[bucket].replay()
+        return True
