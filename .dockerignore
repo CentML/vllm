@@ -1,5 +1,12 @@
 /.venv
 /build
+/.deps
+vllm/vllm_flash_attn/*
+!vllm/vllm_flash_attn/__init__.py
+!vllm/vllm_flash_attn/flash_attn_interface.py
+vllm/third_party/triton_kernels/*
+vllm/third_party/deep_gemm/
+vllm/third_party/flashmla/flash_mla_interface.py
 dist
 vllm/*.so
 vllm/vllm-rs

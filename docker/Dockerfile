@@ -1043,6 +1043,7 @@ RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         git \
         less \
+        openssh-client \
         procps \
         vim-tiny \
     && rm -rf /var/lib/apt/lists/*
@@ -1051,10 +1052,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     uv pip install --system pandas matplotlib seaborn datasets scipy plotly
 
 WORKDIR /workspace/vllm-src
-COPY pyproject.toml setup.py README.md ./
-COPY benchmarks benchmarks
-COPY examples examples
-COPY vllm vllm
+COPY . .
 
 RUN python3 - <<'PY_INNER'
 from importlib import metadata
@@ -1066,6 +1064,30 @@ source_pkg = Path("/workspace/vllm-src/vllm").resolve()
 generated_version = installed_pkg / "_version.py"
 if generated_version.exists():
     shutil.copy2(generated_version, source_pkg / "_version.py")
+
+def copy_generated_tree(relative_path, skip=()):
+    src = installed_pkg / relative_path
+    if not src.exists():
+        return
+    dst = source_pkg / relative_path
+    skip = {Path(item) for item in skip}
+    for path in src.rglob("*"):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(src)
+        if rel in skip or "__pycache__" in rel.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        dest = dst / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+
+copy_generated_tree(Path("third_party/deep_gemm"))
+copy_generated_tree(Path("third_party/triton_kernels"))
+copy_generated_tree(Path("third_party/flashmla"))
+copy_generated_tree(
+    Path("vllm_flash_attn"),
+    skip=("__init__.py", "flash_attn_interface.py"),
+)
 
 for artifact in installed_pkg.rglob("*.so"):
     dest = source_pkg / artifact.relative_to(installed_pkg)
@@ -1084,7 +1106,8 @@ PY_INNER
 
 ENV PYTHONPATH=/workspace/vllm-src
 RUN mkdir -p /workspace/.cache \
-    && chmod -R a+rwX /workspace
+    && chmod -R a+rwX /workspace \
+    && git config --system --add safe.directory /workspace/vllm-src
 
 ENTRYPOINT []
 CMD ["/bin/bash"]
