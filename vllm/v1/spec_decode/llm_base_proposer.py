@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import dataclasses
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -432,6 +433,21 @@ class SpecDecodeBaseProposer:
             return logits.argmax(dim=-1), None
         if sampling_metadata.all_greedy:
             return logits.argmax(dim=-1), None
+        if (
+            self.parallel_drafting
+            and self.num_speculative_tokens > 1
+            and sampling_metadata.temperature is not None
+            and sampling_metadata.temperature.shape[0] != logits.shape[0]
+        ):
+            # Parallel drafting produces K logits per request in one pass; the
+            # per-request temperature must be expanded to match the flattened
+            # [batch_size * num_speculative_tokens] layout used by the caller.
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata,
+                temperature=sampling_metadata.temperature.repeat_interleave(
+                    self.num_speculative_tokens
+                ),
+            )
         return compute_probs_and_sample_next_token(logits, sampling_metadata)
 
     def _sample_draft_tokens(

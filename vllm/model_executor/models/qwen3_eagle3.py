@@ -420,7 +420,7 @@ class Eagle3Qwen3ForCausalLM(Qwen3ForCausalLM):
                 "Please provide mask_hidden in the weights."
             )
 
-        skip_substrs = ["mask_hidden"]
+        skip_substrs = ["mask_hidden", "mask_embed"]
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:

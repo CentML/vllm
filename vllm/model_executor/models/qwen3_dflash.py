@@ -68,6 +68,7 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        sliding_window: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
@@ -118,6 +119,7 @@ class DFlashQwen3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            per_layer_sliding_window=sliding_window,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -178,6 +180,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            sliding_window=getattr(config, "sliding_window", None),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -236,6 +239,12 @@ class DFlashQwen3Model(nn.Module):
             self.use_aux_hidden_state = True
 
         current_vllm_config = get_current_vllm_config()
+
+        if getattr(self.config, "sliding_window", None) is not None:
+            logger.warning_once(
+                "Sliding window is enabled for DFlashQwen3Model with window size %d. Ensure that the sliding_window config is set consistently across all layers and matches the value used during training.",
+                self.config.sliding_window,
+            )
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
