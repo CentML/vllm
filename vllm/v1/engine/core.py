@@ -52,7 +52,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
-from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.output import KVCacheUsageMetrics, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
@@ -409,7 +409,11 @@ class EngineCore:
             raise err
 
     @contextmanager
-    def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
+    def log_iteration_details(
+        self,
+        scheduler_output: SchedulerOutput | None,
+        kv_cache_usage: KVCacheUsageMetrics | None = None,
+    ):
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
             yield
             return
@@ -427,26 +431,37 @@ class EngineCore:
             is_dummy = False
         before = time.monotonic()
         yield
-        logger.info(
-            "".join(
+        log_parts: list[str] = [
+            "Iteration(",
+            str(self._iteration_index),
+            "): ",
+            str(iteration_details.num_ctx_requests),
+            " context requests, ",
+            str(iteration_details.num_ctx_tokens),
+            " context tokens, ",
+            str(iteration_details.num_generation_requests),
+            " generation requests, ",
+            str(iteration_details.num_generation_tokens),
+            " generation tokens, iteration elapsed time: ",
+            format((time.monotonic() - before) * 1000, ".2f"),
+            " ms",
+            " (dummy)" if is_dummy else "",
+        ]
+        if kv_cache_usage is not None:
+            log_parts.extend(
                 [
-                    "Iteration(",
-                    str(self._iteration_index),
-                    "): ",
-                    str(iteration_details.num_ctx_requests),
-                    " context requests, ",
-                    str(iteration_details.num_ctx_tokens),
-                    " context tokens, ",
-                    str(iteration_details.num_generation_requests),
-                    " generation requests, ",
-                    str(iteration_details.num_generation_tokens),
-                    " generation tokens, iteration elapsed time: ",
-                    format((time.monotonic() - before) * 1000, ".2f"),
-                    " ms",
-                    " (dummy)" if is_dummy else "",
+                    ", kv cache: ",
+                    format(kv_cache_usage.usage_pct, ".1f"),
+                    "% (",
+                    str(kv_cache_usage.used_blocks),
+                    "/",
+                    str(kv_cache_usage.total_blocks),
+                    " blocks, ",
+                    str(kv_cache_usage.used_tokens),
+                    " tokens)",
                 ]
             )
-        )
+        logger.info("".join(log_parts))
         self._iteration_index += 1
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -465,7 +480,10 @@ class EngineCore:
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(
+                scheduler_output,
+                self.scheduler.get_kv_cache_usage(),
+            ),
         ):
             model_output = future.result()
             if model_output is None:
@@ -539,8 +557,8 @@ class EngineCore:
                         grammar_output, non_block=True
                     )
                 else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
+                    # We need to defer sampling until we have processed
+                    # the model output from the prior step.
                     deferred_scheduler_output = scheduler_output
 
             if not deferred_scheduler_output:
@@ -563,7 +581,10 @@ class EngineCore:
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(
+                scheduler_output,
+                self.scheduler.get_kv_cache_usage(),
+            ),
         ):
             model_output = future.result()
             if model_output is None:
