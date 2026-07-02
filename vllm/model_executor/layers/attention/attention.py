@@ -293,6 +293,11 @@ class Attention(nn.Module, AttentionLayerBase):
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
+        # Emit fp8 attention output for quantized-KV layers (see AttentionConfig).
+        self.fp8_attention_output = (
+            vllm_config.attention_config.fp8_attention_output
+            and kv_cache_dtype in ("fp8", "fp8_e4m3", "nvfp4")
+        )
         if num_kv_heads is None:
             num_kv_heads = num_heads
         assert num_heads % num_kv_heads == 0, (
@@ -475,6 +480,8 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         if output_dtype is None:
             output_dtype = query.dtype
+            if self.fp8_attention_output:
+                output_dtype = current_platform.fp8_dtype()
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables
             # torch.compile to fuse this into previous ops

@@ -8,6 +8,10 @@ from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_to_nvfp4 import (
+    fp8_to_nvfp4_supported_shape,
+    quantize_fp8_to_nvfp4,
+)
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight_for_cutlass,
@@ -147,6 +151,24 @@ class FlashInferCutlassNvFp4LinearKernel(NvFp4LinearKernel):
             x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_bytes)
             output_dtype = qa.orig_dtype
             output_shape = [*qa.orig_shape[:-1], output_size]
+        elif isinstance(x, torch.Tensor) and x.dtype == current_platform.fp8_dtype():
+            # fp8 attention output: quantize fp8 -> nvfp4 in one hop.
+            output_dtype = layer.params_dtype
+            output_shape = [*x.shape[:-1], output_size]
+            x_2d = x.reshape(-1, x.shape[-1])
+            m, k = x_2d.shape
+            if fp8_to_nvfp4_supported_shape(m, k, weights_padding_bytes):
+                x_fp4, x_blockscale = quantize_fp8_to_nvfp4(
+                    x_2d, layer.input_global_scale_inv
+                )
+            else:
+                x_fp4, x_blockscale = scaled_fp4_quant(
+                    x_2d.to(output_dtype),
+                    layer.input_global_scale_inv,
+                    is_sf_swizzled_layout=True,
+                    backend="flashinfer-cutlass",
+                    padded_n=x.shape[-1] + weights_padding_bytes * 2,
+                )
         else:
             assert isinstance(x, torch.Tensor)
             output_dtype = x.dtype

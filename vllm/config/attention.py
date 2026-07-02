@@ -42,6 +42,21 @@ class AttentionConfig:
     disable_flashinfer_q_quantization: bool = False
     """If set, when using fp8 kv, do not quantize Q to fp8."""
 
+    fp8_attention_output: bool = False
+    """If set, attention layers with a quantized KV cache (fp8_e4m3 or nvfp4)
+    allocate their output buffer in fp8 instead of the model dtype: the
+    trtllm-gen FMHA writes fp8 directly (no fp8 -> bf16 dequant pass) and the
+    NVFP4 linear consuming the attention output quantizes fp8 -> nvfp4 in a
+    single hop. Requires trtllm-gen attention and NVFP4 linear weights
+    (e.g. ModelOpt NVFP4 checkpoints)."""
+
+    nvfp4_kv_prefill_predequant: bool = False
+    """If set, pre-dequantize NVFP4 KV-cache pages to an fp8 mock cache in a
+    separate memory-bound pass before the trtllm-gen prefill, instead of
+    unpacking e2m1 inside the compute-bound prefill kernel. The fp8 FMHA then
+    also emits the requested output dtype directly. Only affects models with
+    an NVFP4 KV cache; decode keeps the native NVFP4 path."""
+
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
     Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""
