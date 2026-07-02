@@ -69,6 +69,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.nvfp4_paged_to_fp8 import predequant_nvfp4_paged_to_fp8
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -1334,6 +1335,12 @@ class FlashInferImpl(AttentionImpl):
         else:
             self._nvfp4_fp8_out = None
 
+        self.nvfp4_kv_prefill_predequant = (
+            self.is_kvcache_nvfp4
+            and vllm_config is not None
+            and vllm_config.attention_config.nvfp4_kv_prefill_predequant
+        )
+
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -1625,9 +1632,23 @@ class FlashInferImpl(AttentionImpl):
                         "trtllm-gen prefill. Set "
                         "disable_flashinfer_q_quantization=False."
                     )
-                    mock_kv_cache = nvfp4_kv_data
-                    mock_block_table = block_tables_prefill
-                    prefill_kv_block_scales = nvfp4_kv_block_scales
+                    if self.nvfp4_kv_prefill_predequant:
+                        # Dequantize the prefill pages to an fp8 mock cache;
+                        # the existing bmm1/bmm2 scales apply unchanged.
+                        mock_kv_cache, mock_block_table = predequant_nvfp4_paged_to_fp8(
+                            nvfp4_kv_data,
+                            nvfp4_kv_block_scales,
+                            block_tables_prefill,
+                        )
+                        if needs_fp8_out:
+                            # The fp8 mock cache lets the FMHA write the
+                            # requested output dtype directly.
+                            needs_fp8_out = False
+                            out = output[num_decode_tokens:]
+                    else:
+                        mock_kv_cache = nvfp4_kv_data
+                        mock_block_table = block_tables_prefill
+                        prefill_kv_block_scales = nvfp4_kv_block_scales
                 elif (
                     attn_metadata.q_data_type != FP8_DTYPE
                     and self.kv_cache_dtype.startswith("fp8")
