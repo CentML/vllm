@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -19,6 +19,14 @@ from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cach
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
 from typing_extensions import override
+
+BatchPrefillCuteDSLWrapper: Any
+try:
+    from flashinfer.cute_dsl.attention.wrappers.batch_prefill import (
+        BatchPrefillCuteDSLWrapper,
+    )
+except ImportError:
+    BatchPrefillCuteDSLWrapper = None
 
 from vllm import _custom_ops as custom_ops
 from vllm import envs
@@ -328,6 +336,70 @@ class BatchDCPPrefillWrapper:
         return out
 
 
+class BatchPrefillWithRaggedKVCuteDSLWrapper:
+    def __init__(self, workspace_buffer: torch.Tensor):
+        if BatchPrefillCuteDSLWrapper is None:
+            raise ImportError(
+                "VLLM_FLASHINFER_USE_CUTEDSL_PREFILL requires "
+                "flashinfer.cute_dsl.attention.wrappers.batch_prefill."
+            )
+        self._wrapper = BatchPrefillCuteDSLWrapper(workspace_buffer)
+        self._window_left = -1
+        self._logits_soft_cap = 0.0
+        self._sm_scale = 1.0
+        self._causal = True
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        causal: bool,
+    ) -> None:
+        if logits_soft_cap not in (None, 0.0):
+            raise NotImplementedError(
+                "FlashInfer CuTe-DSL ragged prefill does not support "
+                "logits soft cap yet."
+            )
+        if q_data_type != kv_data_type:
+            raise NotImplementedError(
+                "FlashInfer CuTe-DSL ragged prefill currently requires "
+                "query and KV tensors to have the same dtype."
+            )
+        self._window_left = window_left
+        self._logits_soft_cap = 0.0
+        self._sm_scale = sm_scale
+        self._causal = causal
+        self._wrapper.plan(
+            qo_indptr=qo_indptr,
+            kv_indptr=qo_indptr,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            causal=causal,
+            sm_scale=sm_scale,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            window_left=window_left,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._wrapper.run(q, k, v, out=out)
+
+
 class FlashInferBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -484,7 +556,11 @@ class FlashInferBackend(AttentionBackend):
 class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
-    wrapper: BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper
+    wrapper: (
+        BatchPrefillWithPagedKVCacheWrapper
+        | BatchDCPPrefillWrapper
+        | BatchPrefillWithRaggedKVCuteDSLWrapper
+    )
 
 
 @dataclass
@@ -614,7 +690,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.attention_config = vllm_config.attention_config
         self._workspace_buffer = None
         self._prefill_wrapper: (
-            BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
+            BatchPrefillWithPagedKVCacheWrapper
+            | BatchDCPPrefillWrapper
+            | BatchPrefillWithRaggedKVCuteDSLWrapper
+            | None
         ) = None  # Wrapper for prefill/append
         self._noncausal_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
             None  # Wrapper for non-causal prefill (DFlash)
@@ -914,7 +993,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_prefill_wrapper(
         self,
         causal: bool = True,
-    ) -> BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper:
+    ) -> (
+        BatchPrefillWithPagedKVCacheWrapper
+        | BatchDCPPrefillWrapper
+        | BatchPrefillWithRaggedKVCuteDSLWrapper
+    ):
         if not causal:
             if self.use_dcp:
                 raise NotImplementedError(
@@ -938,6 +1021,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 self._prefill_wrapper = BatchDCPPrefillWrapper(
                     workspace_buffer=self._get_workspace_buffer(),
                     dcp_a2a=self.dcp_a2a,
+                )
+            elif envs.VLLM_FLASHINFER_USE_CUTEDSL_PREFILL:
+                if self.is_kvcache_nvfp4:
+                    raise NotImplementedError(
+                        "FlashInfer CuTe-DSL ragged prefill is not wired for "
+                        "NVFP4 KV cache."
+                    )
+                self._prefill_wrapper = BatchPrefillWithRaggedKVCuteDSLWrapper(
+                    self._get_workspace_buffer()
                 )
             else:
                 # NVFP4 KV cache requires the trtllm-gen backend inside
@@ -1110,6 +1202,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
+        if envs.VLLM_FLASHINFER_USE_CUTEDSL_PREFILL and num_prefills > 0:
+            prefill_use_trtllm = False
         decode_with_flashinfer_trtllm_api = (
             causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
         )
@@ -1351,6 +1445,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                    )
+                elif isinstance(
+                    prefill_wrapper, BatchPrefillWithRaggedKVCuteDSLWrapper
+                ):
+                    assert seq_lens_cpu is not None
+                    query_lens_prefill_cpu = (
+                        qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
+                    )
+                    seq_lens_prefill_cpu = seq_lens_cpu[prefill_start:num_reqs]
+                    if not torch.equal(query_lens_prefill_cpu, seq_lens_prefill_cpu):
+                        raise NotImplementedError(
+                            "FlashInfer CuTe-DSL ragged prefill is only valid "
+                            "when each prefill request has no paged-prefix "
+                            "context. Disable VLLM_FLASHINFER_USE_CUTEDSL_PREFILL "
+                            "for prefix-cached or chunked prefill batches."
+                        )
+                    qo_indptr_prefill_gpu = (
+                        qo_indptr[prefill_start:] - qo_indptr[prefill_start]
+                    )
+                    prefill_wrapper.plan(
+                        qo_indptr=qo_indptr_prefill_gpu,
+                        num_qo_heads=self.num_qo_heads,
+                        num_kv_heads=self.num_kv_heads,
+                        head_dim=self.head_dim,
+                        sm_scale=self.sm_scale,
+                        window_left=self.window_left,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_data_type=self.q_data_type_prefill,
+                        kv_data_type=self.kv_cache_dtype,
+                        causal=attn_metadata.causal,
                     )
                 else:
                     assert isinstance(
@@ -1799,47 +1923,65 @@ class FlashInferImpl(AttentionImpl):
                         out=output[num_decode_tokens:],
                     )
                 else:
-                    assert isinstance(
-                        prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
-                    )
-                    assert prefill_wrapper._window_left == self.window_left
-                    assert prefill_wrapper._logits_soft_cap == (
-                        self.logits_soft_cap or 0.0
-                    )
-                    assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal == attn_metadata.causal
+                    if isinstance(
+                        prefill_wrapper, BatchPrefillWithRaggedKVCuteDSLWrapper
+                    ):
+                        assert prefill_wrapper._window_left == self.window_left
+                        assert prefill_wrapper._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._sm_scale == self.scale
+                        assert prefill_wrapper._causal == attn_metadata.causal
 
-                    if self.is_kvcache_nvfp4:
-                        kv_cache_permute = nvfp4_kv_data
-                    kv_cache_sf = (
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                    )
-
-                    # NVFP4 trtllm kernel only supports FP8 output.
-                    # Use a pre-allocated FP8 buffer and dequantize
-                    # afterwards.
-                    needs_fp8_out_prefill = (
-                        self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
-                    )
-                    if needs_fp8_out_prefill:
-                        out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
+                        prefill_wrapper.run(
+                            prefill_query,
+                            key[num_decode_tokens:],
+                            value[num_decode_tokens:],
+                            out=output[num_decode_tokens:],
+                        )
                     else:
-                        out_prefill = output[num_decode_tokens:]
+                        assert isinstance(
+                            prefill_wrapper, BatchPrefillWithPagedKVCacheWrapper
+                        )
+                        assert prefill_wrapper._window_left == self.window_left
+                        assert prefill_wrapper._logits_soft_cap == (
+                            self.logits_soft_cap or 0.0
+                        )
+                        assert prefill_wrapper._sm_scale == self.scale
+                        assert prefill_wrapper._causal == attn_metadata.causal
 
-                    prefill_wrapper.run(
-                        prefill_query,
-                        kv_cache_permute,
-                        q_scale=layer._q_scale_float,
-                        k_scale=layer._k_scale_float,
-                        v_scale=layer._v_scale_float,
-                        out=out_prefill,
-                        kv_cache_sf=kv_cache_sf,
-                    )
+                        if self.is_kvcache_nvfp4:
+                            kv_cache_permute = nvfp4_kv_data
+                        kv_cache_sf = (
+                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        )
 
-                    if needs_fp8_out_prefill:
-                        output[
-                            num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                        ].copy_(out_prefill.to(output.dtype))
+                        # NVFP4 trtllm kernel only supports FP8 output.
+                        # Use a pre-allocated FP8 buffer and dequantize
+                        # afterwards.
+                        needs_fp8_out_prefill = (
+                            self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                        )
+                        if needs_fp8_out_prefill:
+                            out_prefill = self._nvfp4_fp8_out[:num_prefill_tokens]
+                        else:
+                            out_prefill = output[num_decode_tokens:]
+
+                        prefill_wrapper.run(
+                            prefill_query,
+                            kv_cache_permute,
+                            q_scale=layer._q_scale_float,
+                            k_scale=layer._k_scale_float,
+                            v_scale=layer._v_scale_float,
+                            out=out_prefill,
+                            kv_cache_sf=kv_cache_sf,
+                        )
+
+                        if needs_fp8_out_prefill:
+                            output[
+                                num_decode_tokens : num_decode_tokens
+                                + num_prefill_tokens
+                            ].copy_(out_prefill.to(output.dtype))
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
