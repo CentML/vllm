@@ -21,24 +21,6 @@ import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
 
-import os as _os
-
-if _os.getenv("VLLM_TRACE_COPY") == "1" or _os.getenv("VLLM_TRACE_SYNC") == "1":
-    import sys as _sys
-
-    if "/home/nvidia/yubog" not in _sys.path:
-        _sys.path.insert(0, "/home/nvidia/yubog")
-    if _os.getenv("VLLM_TRACE_COPY") == "1":
-        try:
-            import copy_tracer  # noqa: F401
-        except Exception:
-            pass
-    if _os.getenv("VLLM_TRACE_SYNC") == "1":
-        try:
-            import sync_tracer  # noqa: F401
-        except Exception:
-            pass
-
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
