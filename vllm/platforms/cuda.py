@@ -191,6 +191,50 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 @cache
+def _detect_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Under bounce-buffer CC, device<->host copies are forced synchronous even
+    with ``non_blocking=True`` (the host destination is staged through an
+    encrypted bounce buffer), which stalls the per-step D2H token readback on
+    the thread that issues it. Detected once via NVML and cached.
+
+    Returns:
+        True if CC is enabled (``ccFeature != 0``). Overridable via
+        ``VLLM_CONFIDENTIAL_COMPUTE=1/0``; on any NVML failure, returns False.
+    """
+    forced = envs.VLLM_CONFIDENTIAL_COMPUTE
+    if forced is not None:
+        enabled = forced == "1"
+        logger.info(
+            "NVIDIA Confidential Computing detection overridden by "
+            "VLLM_CONFIDENTIAL_COMPUTE=%r: %s",
+            forced,
+            "enabled" if enabled else "disabled",
+        )
+        return enabled
+    if not torch.cuda.is_available():
+        logger.info("NVIDIA Confidential Computing not detected: CUDA unavailable")
+        return False
+    try:
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools mode).
+            enabled = int(getattr(state, "ccFeature", 0)) != 0
+            logger.info(
+                "NVIDIA Confidential Computing %s via NVML",
+                "detected" if enabled else "not detected",
+            )
+            return enabled
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.info("NVIDIA Confidential Computing not detected: NVML failed: %r", e)
+        return False
+
+
+@cache
 def _get_wsl_kernel_version() -> tuple[int, ...] | None:
     """Return the WSL2 kernel version as a tuple, or None on parse failure.
 
@@ -216,6 +260,9 @@ class CudaPlatformBase(Platform):
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     ]
+
+    def is_confidential_compute(self) -> bool:
+        return _detect_confidential_compute()
 
     @classmethod
     def import_kernels(cls) -> None:

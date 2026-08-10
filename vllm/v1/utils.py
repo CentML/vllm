@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import queue
 import threading
 import time
 import weakref
@@ -107,6 +108,481 @@ class ConstantList(Generic[T], Sequence):
         return self._x.copy()
 
 
+# ---------------------------------------------------------------------------
+# Corrected staged H2D under NVIDIA Confidential Computing (CC).
+#
+# Under CC a host->device cudaMemcpyAsync is forced SYNCHRONOUS: the issuing
+# thread blocks until the copy completes, and because a synchronous copy also
+# waits for everything already queued on its stream, an H2D issued on the
+# compute stream (which still has the in-flight decode forward queued) blocks
+# the scheduler for ~one forward (~ms). The per-step _prepare_inputs H2D copies
+# do exactly this, starving the GPU (measured 4-5ms stalls; see
+# cc_sync_stream_probe.py).
+#
+# Fix (measured 5.1x less scheduler block; see cc_staged_copy_probe.py):
+#   * H2D cpu->staging on a DEDICATED prep stream that has NO forward queued, so
+#     it only pays its own (host-synchronous) transfer (~tens of us) instead of
+#     the forward-drain wait.
+#   * D2D staging->gpu on the CURRENT (compute) stream. A D2D is genuinely async
+#     under CC (it does not block the host for prior stream work), so it merely
+#     enqueues and runs after the forward has finished reading the reused
+#     graph-input buffer -> no host block and no write-after-read race.
+#
+# Correctness relies on the same CC invariant vLLM already assumes elsewhere
+# (see GPUModelRunner.synchronize_input_prep): a pinned H2D is synchronous, so
+# `staging` is fully populated by the time the H2D call returns and the
+# subsequently-enqueued D2D reads valid data even though it is on another stream.
+# Staging is double-buffered so the next step's H2D->staging cannot overwrite a
+# staging buffer whose D2D->gpu has not yet drained on the compute stream.
+# A POOL of idle prep streams per device: each prepare_inputs copy takes the
+# next stream (round-robin) so no copy is queued behind the forward on the
+# compute stream OR behind another copy on a shared prep stream -- none of them
+# block. The D2D leg still goes on the compute stream (see copy_to_gpu) so the
+# graph-input write is ordered after the forward's read.
+_STAGED_H2D_STREAM_POOL: dict[int, list["torch.cuda.Stream"]] = {}
+_STAGED_H2D_POOL_RR: dict[int, int] = {}
+_STAGED_H2D_POOL_SIZE = 16
+_STAGED_H2D_ENABLED: bool | None = None
+
+
+def _staged_h2d_enabled() -> bool:
+    global _STAGED_H2D_ENABLED
+    if _STAGED_H2D_ENABLED is None:
+        import os
+
+        if os.getenv("VLLM_STAGED_H2D", "1") == "0":
+            _STAGED_H2D_ENABLED = False
+        else:
+            try:
+                from vllm.platforms import current_platform
+
+                _STAGED_H2D_ENABLED = bool(
+                    current_platform.is_confidential_compute()
+                )
+                if _STAGED_H2D_ENABLED:
+                    logger.info(
+                        "Staged H2D input copies ENABLED under Confidential "
+                        "Computing (H2D on a dedicated prep stream + D2D on the "
+                        "compute stream) to avoid blocking the scheduler on the "
+                        "in-flight forward."
+                    )
+            except Exception:
+                _STAGED_H2D_ENABLED = False
+    return _STAGED_H2D_ENABLED
+
+
+def _staged_h2d_stream(device: torch.device) -> "torch.cuda.Stream":
+    """Return the next idle prep stream (round-robin) for this device, so each
+    copy inside prepare_inputs gets its own idle stream and none block."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    pool = _STAGED_H2D_STREAM_POOL.get(idx)
+    if pool is None:
+        pool = [
+            torch.cuda.Stream(device=device) for _ in range(_STAGED_H2D_POOL_SIZE)
+        ]
+        _STAGED_H2D_STREAM_POOL[idx] = pool
+        _STAGED_H2D_POOL_RR[idx] = 0
+    i = _STAGED_H2D_POOL_RR[idx]
+    _STAGED_H2D_POOL_RR[idx] = (i + 1) % len(pool)
+    return pool[i]
+
+
+def staged_h2d_copy_(gpu_dst: "torch.Tensor", cpu_src: "torch.Tensor") -> "torch.Tensor":
+    """CC-only staged H2D into an arbitrary (possibly sliced) GPU tensor.
+
+    Copies ``cpu_src`` (pinned CPU) into ``gpu_dst`` without the compute-stream
+    H2D that, under Confidential Computing, forced-syncs the host on the
+    in-flight forward (~30ms). Instead:
+      1. H2D cpu->staging on an idle prep stream. This stream has no prior work,
+         so the (host-synchronous under CC) copy does not wait for the forward.
+      2. D2D staging->gpu_dst on the current (compute) stream: async under CC and
+         correctly ordered before any later kernel that reads gpu_dst.
+    Caller must ensure staged copies are enabled (CC); off CC this would race.
+    """
+    ps = _staged_h2d_stream(gpu_dst.device)
+    with torch.cuda.stream(ps):
+        # Allocate staging on the prep stream so the caching allocator ties the
+        # block to that stream (avoids a cross-stream reuse hazard).
+        stage = torch.empty_like(gpu_dst)
+        stage.copy_(cpu_src, non_blocking=True)
+    gpu_dst.copy_(stage, non_blocking=True)
+    stage.record_stream(torch.cuda.current_stream(gpu_dst.device))
+    return gpu_dst
+
+
+# ---------------------------------------------------------------------------
+# cudaMemcpyAsync2: a thread-offloaded, "async under CC" copy with batched drain.
+#
+# Premise (the CC reality): a cudaMemcpyAsync into/out of encrypted device memory
+# is forced host-SYNCHRONOUS -- the issuing thread blocks inside the call until
+# the copy (and everything queued ahead of it on its stream) completes. So the
+# usual "issue many copies, then sync once" pattern is impossible on one thread:
+# each issue IS a full wait, so the copies serialize on the engine thread.
+#
+# This facility restores that pattern by faking the asynchrony with threads:
+#   * memcpy_async2(dst, src) submits the (blocking-under-CC) copy to a pool of
+#     background workers and returns IMMEDIATELY, registering a completion handle
+#     in a per-thread pending list. The engine thread does not block.
+#   * At the point the engine would otherwise sync before the copies are read,
+#     it calls drain_async_copies2() to wait for ALL outstanding handles at once.
+#
+# Correctness (write-after-read vs the in-flight forward): dst is frequently a
+# persistent CUDA-graph input buffer that the IN-FLIGHT forward is still reading
+# (batch-queue overlap). To avoid clobbering it, we snapshot the caller's compute
+# stream with a CUDA event at submit time and the worker orders its write after
+# that event (wait_event), so the write lands after the in-flight forward's read.
+# Under CC the worker copy is host-synchronous, so once drain_async_copies2()
+# returns the data is fully resident and any consumer stream may read it safely.
+#
+# Whether N concurrent encrypted copies actually overlap (vs. serialize on the
+# bounce buffer) is hardware-dependent; even if they serialize on the device, the
+# engine thread is still unblocked, which is the primary goal. Gated behind
+# VLLM_MEMCPY2 (off by default) so the known-good staged path is the default.
+_MEMCPY2_ENABLED: bool | None = None
+
+
+def _memcpy2_enabled() -> bool:
+    global _MEMCPY2_ENABLED
+    if _MEMCPY2_ENABLED is None:
+        import os
+
+        _MEMCPY2_ENABLED = os.getenv("VLLM_MEMCPY2", "0") == "1"
+        if _MEMCPY2_ENABLED:
+            logger.info(
+                "cudaMemcpyAsync2 ENABLED: prepare-inputs H2D copies opted in via "
+                "prefetch=True are offloaded to a background thread pool and drained "
+                "once before the forward."
+            )
+    return _MEMCPY2_ENABLED
+
+
+_MEMCPY2_ALL: bool | None = None
+
+
+def _memcpy2_all() -> bool:
+    """EXPERIMENT-ONLY blanket switch: route EVERY copy_to_gpu through memcpy2,
+    ignoring the per-call prefetch flag. This is CORRECTNESS-UNSAFE -- prep buffers
+    read on the compute stream during _prepare_inputs (req_indices, query_start_loc,
+    ...) will see stale data (last step's values), so generated tokens are WRONG.
+    Its only purpose is to measure the perf ceiling of fully offloading copies (step
+    time / GPU idle) to decide whether the approach is worth making correct (which
+    would require double-buffered graph-input buffers). Never use for real serving."""
+    global _MEMCPY2_ALL
+    if _MEMCPY2_ALL is None:
+        import os
+
+        _MEMCPY2_ALL = _memcpy2_enabled() and os.getenv("VLLM_MEMCPY2_ALL", "0") == "1"
+        if _MEMCPY2_ALL:
+            logger.warning(
+                "cudaMemcpyAsync2 BLANKET mode (VLLM_MEMCPY2_ALL=1): ALL copy_to_gpu "
+                "offloaded regardless of prefetch. CORRECTNESS-UNSAFE (stale reads of "
+                "prep-consumed buffers -> WRONG output); for perf-ceiling measurement "
+                "only, do NOT serve with this."
+            )
+    return _MEMCPY2_ALL
+
+
+class _Memcpy2Handle:
+    """Completion handle for one background copy. ``wait()`` blocks until the copy
+    has finished (and re-raises any error from the worker)."""
+
+    __slots__ = ("_done", "_err")
+
+    def __init__(self) -> None:
+        self._done = threading.Event()
+        self._err: BaseException | None = None
+
+    def wait(self) -> None:
+        self._done.wait()
+        if self._err is not None:
+            raise self._err
+
+
+class _Memcpy2Pool:
+    """A small pool of daemon threads, each with its own CUDA stream, that perform
+    the (host-synchronous-under-CC) copies off the caller's thread."""
+
+    def __init__(self, device: torch.device, nthreads: int) -> None:
+        self.device = device
+        self._q: queue.Queue = queue.Queue()
+        self._threads = []
+        for i in range(nthreads):
+            t = threading.Thread(
+                target=self._run,
+                name=f"memcpy2-cuda{device.index}-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+    def _run(self) -> None:
+        # Pin this thread to the pool's device (a fresh thread defaults to cuda:0,
+        # which is wrong for TP ranks > 0) and give it a private stream.
+        torch.cuda.set_device(self.device)
+        stream = torch.cuda.Stream(device=self.device)
+        while True:
+            dst, src, evt, handle = self._q.get()
+            try:
+                # execute_model runs under torch.inference_mode(); re-enter it here
+                # (thread-local) so the inplace copy_ into the persistent inference
+                # buffer is permitted.
+                with torch.inference_mode(), torch.cuda.stream(stream):
+                    if evt is not None:
+                        # Order the write after the in-flight forward's read of the
+                        # reused buffer (write-after-read safety).
+                        stream.wait_event(evt)
+                    dst.copy_(src, non_blocking=True)
+                # Under CC copy_ is already host-synchronous; this also guarantees
+                # the device memory is final for any reader once wait() returns.
+                stream.synchronize()
+            except BaseException as e:  # noqa: BLE001 - propagate via handle
+                handle._err = e
+            finally:
+                handle._done.set()
+
+    def submit(
+        self,
+        dst: "torch.Tensor",
+        src: "torch.Tensor",
+        evt: "torch.cuda.Event | None",
+    ) -> _Memcpy2Handle:
+        h = _Memcpy2Handle()
+        self._q.put((dst, src, evt, h))
+        return h
+
+
+_MEMCPY2_POOLS: dict[int, _Memcpy2Pool] = {}
+_MEMCPY2_POOLS_LOCK = threading.Lock()
+_MEMCPY2_PENDING = threading.local()
+
+# Ring of reusable ordering events per device. Creating a torch.cuda.Event and
+# recording it for the first time triggers cudaEventCreateWithFlags, which under
+# CC takes a driver write-lock (pthread_rwlock_wrlock) and blocks ~8ms -- so a
+# fresh event per copy would dwarf the copy it orders. We pre-create the ring
+# once (paying creation at init) and only RE-RECORD in the hot path. Reuse is
+# safe: cudaStreamWaitEvent captures the event's recorded value at call time, so
+# re-recording a ring slot before an earlier waiter consumed it can only make
+# that waiter order after a *later* compute position (over-sync), never earlier
+# -- correctness is preserved. The ring is sized well above the max in-flight
+# copies per step (drained every step), so over-sync effectively never happens.
+_MEMCPY2_EVENT_POOL: dict[int, list["torch.cuda.Event"]] = {}
+_MEMCPY2_EVENT_RR: dict[int, int] = {}
+_MEMCPY2_EVENT_POOL_SIZE = 128
+
+
+def _memcpy2_order_event(device: torch.device) -> "torch.cuda.Event":
+    """Return the next reusable ordering event (round-robin), recorded on the
+    current (compute) stream. Amortizes the ~8ms-under-CC cudaEventCreate."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    pool = _MEMCPY2_EVENT_POOL.get(idx)
+    if pool is None:
+        pool = [torch.cuda.Event() for _ in range(_MEMCPY2_EVENT_POOL_SIZE)]
+        # Force the underlying cudaEvent to be created now (first record), so the
+        # per-event cudaEventCreate cost is paid here, not in the hot path.
+        cur = torch.cuda.current_stream(device)
+        for e in pool:
+            e.record(cur)
+        cur.synchronize()
+        _MEMCPY2_EVENT_POOL[idx] = pool
+        _MEMCPY2_EVENT_RR[idx] = 0
+    i = _MEMCPY2_EVENT_RR[idx]
+    _MEMCPY2_EVENT_RR[idx] = (i + 1) % len(pool)
+    e = pool[i]
+    e.record(torch.cuda.current_stream(device))
+    return e
+
+
+def _memcpy2_pool(device: torch.device) -> _Memcpy2Pool:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    p = _MEMCPY2_POOLS.get(idx)
+    if p is None:
+        with _MEMCPY2_POOLS_LOCK:
+            p = _MEMCPY2_POOLS.get(idx)
+            if p is None:
+                import os
+
+                nthreads = int(os.getenv("VLLM_MEMCPY2_THREADS", "4"))
+                p = _Memcpy2Pool(torch.device(f"cuda:{idx}"), nthreads)
+                _MEMCPY2_POOLS[idx] = p
+    return p
+
+
+def _memcpy2_pending() -> list:
+    lst = getattr(_MEMCPY2_PENDING, "lst", None)
+    if lst is None:
+        lst = []
+        _MEMCPY2_PENDING.lst = lst
+    return lst
+
+
+def memcpy_async2(
+    gpu_dst: "torch.Tensor",
+    cpu_src: "torch.Tensor",
+    *,
+    order_after_compute: bool = True,
+) -> "torch.Tensor":
+    """Thread-offloaded stand-in for ``gpu_dst.copy_(cpu_src)`` that does not block
+    the caller under CC. The copy is performed on a background worker; the caller
+    must call ``drain_async_copies2()`` before ``gpu_dst`` is read.
+
+    order_after_compute: when True (default) the worker orders its write after the
+    compute stream's current position, so it cannot clobber a buffer the in-flight
+    forward is still reading. Set False only for freshly-allocated destinations.
+    """
+    evt: "torch.cuda.Event | None" = None
+    if order_after_compute:
+        # Reused ring event (see _memcpy2_order_event) -- avoids the ~8ms-under-CC
+        # cudaEventCreate that a fresh event per copy would incur.
+        evt = _memcpy2_order_event(gpu_dst.device)
+    handle = _memcpy2_pool(gpu_dst.device).submit(gpu_dst, cpu_src, evt)
+    _memcpy2_pending().append(handle)
+    return gpu_dst
+
+
+def drain_async_copies2() -> None:
+    """Wait for all copies submitted via ``memcpy_async2`` on this thread. Call at
+    the point the engine would otherwise sync, before the destinations are read."""
+    lst = _memcpy2_pending()
+    if not lst:
+        return
+    try:
+        for h in lst:
+            h.wait()
+    finally:
+        lst.clear()
+
+
+# --- Background H2D copy worker ---------------------------------------------
+# Under Confidential Computing a pinned H2D cudaMemcpyAsync is host-SYNCHRONOUS:
+# the driver will not inject the encrypted copy while a forward is in flight, so
+# the CALLING THREAD blocks until the in-flight forward drains (observed ~30ms
+# per copy in prefill attention-metadata build, while the GPU copy engine itself
+# is idle -- i.e. it is a pure host-side wait, not copy execution or engine
+# contention). Because the stall is host-thread-local, moving the copy to a
+# different CUDA stream does NOT help (streams only reorder GPU-side work); the
+# only way to keep the engine's prepare/launch thread unblocked is to perform the
+# blocking copy on a SEPARATE thread. This worker does exactly that: the caller
+# eagerly allocates the destination (non-blocking) and submits the copy; the
+# daemon thread performs the (blocking-under-CC) copy on its own stream and
+# signals a host event. The caller calls handle.wait() only right before the
+# destination is read -- since the copy is host-synchronous under CC and the
+# worker synchronizes its stream before signalling, the data is fully resident
+# and safe to read from any stream once wait() returns. The forward-gated wait is
+# absorbed on the worker thread in parallel with the forward that is running
+# anyway, so the engine thread proceeds instead of blocking.
+
+
+class _AsyncH2DHandle:
+    """Handle to an in-flight background H2D copy. ``wait()`` blocks until the
+    destination tensor is fully resident on the device, then returns it."""
+
+    __slots__ = ("_dst", "_done", "_err")
+
+    def __init__(self, done: threading.Event):
+        self._dst: "torch.Tensor | None" = None
+        self._done = done
+        self._err: BaseException | None = None
+
+    def wait(self) -> "torch.Tensor":
+        self._done.wait()
+        if self._err is not None:
+            raise self._err
+        # Standard cross-stream producer/consumer handoff: the block was produced
+        # on the worker stream; tell the caching allocator that the consuming
+        # (current) stream now uses it, so it is not freed/reused until the
+        # consumer's kernels complete.
+        self._dst.record_stream(torch.cuda.current_stream())
+        return self._dst
+
+
+class AsyncH2DCopyWorker:
+    """Single daemon thread + dedicated stream that performs host->device copies
+    off the caller's thread (see module comment above for the CC rationale)."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._q: queue.Queue = queue.Queue()
+        self._stream = torch.cuda.Stream(device=device)
+        self._thread = threading.Thread(
+            target=self._run, name=f"AsyncH2D-cuda{device.index}", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        # Pin this thread to the worker's device (a fresh thread otherwise
+        # defaults to cuda:0, which is wrong for TP ranks > 0).
+        torch.cuda.set_device(self.device)
+        while True:
+            src, out_dtype, handle, done = self._q.get()
+            try:
+                # execute_model runs under torch.inference_mode(); re-enter it
+                # here (thread-local) so the inplace copy_ into the freshly
+                # allocated inference tensor is permitted.
+                #
+                # Allocate `dst` ON the worker stream: the caching allocator only
+                # guarantees a reused block is safe for the stream it was
+                # allocated for. Allocating on the caller thread (compute stream)
+                # and then writing from this stream races with the block's prior
+                # owner and corrupts the data (-> OOB indexing -> IMA). Allocating
+                # here ties the block to this stream.
+                with torch.inference_mode(), torch.cuda.stream(self._stream):
+                    dst = torch.empty(
+                        src.shape, dtype=out_dtype, device=self.device
+                    )
+                    dst.copy_(src, non_blocking=True)
+                # Block until the copy is actually complete before signalling:
+                # under CC copy_ is already host-synchronous so this is ~instant,
+                # but this also guarantees the device memory is final for any
+                # reader stream once wait() returns.
+                self._stream.synchronize()
+                handle._dst = dst
+            except BaseException as e:  # noqa: BLE001 - propagate to caller via handle
+                handle._err = e
+            finally:
+                done.set()
+
+    def copy(
+        self,
+        data: "list | np.ndarray | torch.Tensor",
+        dtype: "torch.dtype | None" = None,
+    ) -> _AsyncH2DHandle:
+        """Submit an async H2D copy. Returns immediately with a handle; the
+        caller allocates nothing and reads the result via ``handle.wait()``."""
+        import numpy as np
+
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        if isinstance(data, torch.Tensor):
+            src = data.pin_memory() if PIN_MEMORY else data
+        else:
+            src = torch.tensor(
+                data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu"
+            )
+        out_dtype = dtype if dtype is not None else src.dtype
+        done = threading.Event()
+        handle = _AsyncH2DHandle(done)
+        # The destination is allocated on the worker thread/stream (see _run).
+        self._q.put((src, out_dtype, handle, done))
+        return handle
+
+
+_ASYNC_H2D_WORKERS: dict[int, AsyncH2DCopyWorker] = {}
+_ASYNC_H2D_WORKERS_LOCK = threading.Lock()
+
+
+def get_async_h2d_worker(device: torch.device) -> AsyncH2DCopyWorker:
+    """Return the per-device background H2D copy worker, creating it on first use."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    w = _ASYNC_H2D_WORKERS.get(idx)
+    if w is None:
+        with _ASYNC_H2D_WORKERS_LOCK:
+            w = _ASYNC_H2D_WORKERS.get(idx)
+            if w is None:
+                w = AsyncH2DCopyWorker(torch.device(f"cuda:{idx}"))
+                _ASYNC_H2D_WORKERS[idx] = w
+    return w
+
+
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
@@ -124,6 +600,10 @@ class CpuGpuBuffer:
                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
             )
             self.gpu = torch.zeros_like(self.cpu, device=device)
+        # Double-buffered device staging for the CC staged-H2D path (allocated
+        # lazily on first staged copy; see _staged_h2d_enabled).
+        self._stage: list[torch.Tensor] | None = None
+        self._stage_idx: int = 0
         self.np: np.ndarray
         # To keep type hints simple (avoiding generics and subclasses), we
         # only conditionally create the numpy array attribute. This can cause
@@ -137,9 +617,32 @@ class CpuGpuBuffer:
             self.np = self.cpu.numpy()
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+        # Under Confidential Computing, route through the staged path (idle-stream
+        # H2D + async compute-stream D2D) so the engine never blocks on the
+        # in-flight forward. Off-CC / when disabled, plain non-blocking H2D.
+        if self.gpu.is_cuda and _staged_h2d_enabled():
+            return self._copy_to_gpu_staged(n)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
+
+    def _copy_to_gpu_staged(self, n: int | None = None) -> torch.Tensor:
+        cpu_src = self.cpu if n is None else self.cpu[:n]
+        gpu_dst = self.gpu if n is None else self.gpu[:n]
+        if self._stage is None:
+            with torch.inference_mode(False):
+                self._stage = [torch.empty_like(self.gpu) for _ in range(2)]
+        stage = self._stage[self._stage_idx]
+        self._stage_idx ^= 1
+        stage_dst = stage if n is None else stage[:n]
+        # H2D on the dedicated prep stream: immune to the forward queued on the
+        # compute stream, and host-synchronous under CC so `stage_dst` is fully
+        # populated by the time this returns.
+        with torch.cuda.stream(_staged_h2d_stream(self.gpu.device)):
+            stage_dst.copy_(cpu_src, non_blocking=True)
+        # D2D staging->gpu on the current (compute) stream: async under CC and
+        # ordered after the forward's read of the reused buffer.
+        return gpu_dst.copy_(stage_dst, non_blocking=True)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

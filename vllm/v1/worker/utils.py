@@ -195,7 +195,23 @@ class KVBlockZeroer:
             return
         seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+        # Under Confidential Computing a plain non_blocking=True H2D on the
+        # compute stream is forced synchronous and blocks the host until the
+        # in-flight forward on that stream drains (~tens of ms, observed 35ms in
+        # prefill). Issue it on a dedicated idle prep stream instead: the copy is
+        # still host-synchronous under CC (so ``idx`` is fully populated before the
+        # zeroing kernel below is launched on the compute stream -> correct
+        # ordering without a cross-stream event), but it only waits for itself
+        # rather than the whole forward.
+        from vllm.v1.utils import _staged_h2d_enabled, _staged_h2d_stream
+
+        if _staged_h2d_enabled():
+            with torch.cuda.stream(_staged_h2d_stream(self.device)):
+                idx = async_tensor_h2d(
+                    block_ids, device=self.device, dtype=torch.int64
+                )
+        else:
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks * n_segs * max_chunks,)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,

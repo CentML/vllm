@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import queue
 import threading
 import time
 from collections import defaultdict
@@ -19,6 +20,24 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tqdm import tqdm
+
+import os as _os
+
+if _os.getenv("VLLM_TRACE_COPY") == "1" or _os.getenv("VLLM_TRACE_SYNC") == "1":
+    import sys as _sys
+
+    if "/home/nvidia/yubog" not in _sys.path:
+        _sys.path.insert(0, "/home/nvidia/yubog")
+    if _os.getenv("VLLM_TRACE_COPY") == "1":
+        try:
+            import copy_tracer  # noqa: F401
+        except Exception:
+            pass
+    if _os.getenv("VLLM_TRACE_SYNC") == "1":
+        try:
+            import sync_tracer  # noqa: F401
+        except Exception:
+            pass
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
@@ -256,6 +275,86 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+class AsyncD2HCopyWorker:
+    """Runs the per-step result Device->Host readback on a dedicated daemon thread.
+
+    Under NVIDIA Confidential Computing (bounce-buffer CC), a device-to-host
+    ``cudaMemcpyAsync`` is forced synchronous and blocks AT ISSUE (the host
+    destination is staged through an encrypted bounce buffer). Issuing it inline
+    on the scheduler thread stalls the overlap pipeline: the scheduler cannot
+    launch the next step's CUDA graph until the copy returns (~one decode step).
+
+    This worker performs the (still-blocking) copy off the scheduler thread so
+    the scheduler keeps issuing work. It mirrors TensorRT-LLM PR #8463:
+      - the scheduler thread records a CUDA event after the producing work and
+        hands (event, copy_fn, done) here, then returns immediately;
+      - this worker ``cudaEventSynchronize``-s on that event (event-sync, NOT
+        stream-wait, so the blocking copy does not stall the scheduler's CUDA
+        API calls), runs the copy on the dedicated copy stream, blocks until it
+        completes, and sets ``done``;
+      - the scheduler later waits on ``done`` (worker-done => copy-done).
+
+    The copy itself stays synchronous under CC; it is merely non-blocking *to the
+    scheduler thread*, restoring overlap.
+    """
+
+    def __init__(self, device_module, copy_stream, device=None):
+        self.device_module = device_module
+        self.copy_stream = copy_stream
+        self._device = device
+        self._queue: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop, name="vllm-d2h-copy-worker", daemon=True
+        )
+        self._thread.start()
+
+    def submit(
+        self,
+        src_ready: "torch.cuda.Event",
+        copy_fn: Callable[[], None],
+        done: threading.Event,
+    ):
+        """Enqueue a readback. ``src_ready`` must already be recorded on the
+        stream that produces the copy sources; ``copy_fn`` performs the actual
+        ``.to("cpu", ...)`` copies; ``done`` is set when they have completed."""
+        self._queue.put((src_ready, copy_fn, done))
+
+    def _loop(self):
+        # A new thread does not inherit the main thread's CUDA context; set the
+        # device so CUDA runtime calls do not implicitly create one on device 0.
+        if self._device is not None:
+            from vllm.platforms import current_platform
+
+            current_platform.set_device(self._device)
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            src_ready, copy_fn, done = item
+            try:
+                # Wait until the producing forward+sample has materialized the
+                # source tensors. Event-sync (cudaEventSynchronize), not a
+                # stream wait -- see class docstring / TRT-LLM #8463.
+                src_ready.synchronize()
+                # Issue the copies on a dedicated stream owned by this thread.
+                # PyTorch's current stream is thread-local, so this does not
+                # affect the scheduler thread's stream.
+                with self.device_module.stream(self.copy_stream):
+                    copy_fn()
+                self.copy_stream.synchronize()
+            except Exception:
+                logger.exception("AsyncD2HCopyWorker readback failed")
+            finally:
+                done.set()
+
+    def shutdown(self, timeout: float = 2.0):
+        """Signal the worker to stop and join it (best-effort, bounded wait)."""
+        if not self._thread.is_alive():
+            return
+        self._queue.put(None)
+        self._thread.join(timeout=timeout)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -268,6 +367,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
+        async_d2h_copy_worker: "AsyncD2HCopyWorker | None" = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -282,36 +382,84 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
         self._routed_experts = routed_experts
+        self._check_ep_fault = check_ep_fault
         self._has_fault: torch.Tensor | None = None
+        self._async_output_copy_stream = async_output_copy_stream
+        # Read gen length from the device tensor: under the deferred (CC) path
+        # the CPU copy does not exist yet when this is needed.
+        self._max_gen_len = sampled_token_ids.shape[-1]
+        self.sampled_token_ids_cpu: torch.Tensor | None = None
+        self._logprobs_tensors_cpu = None
+        self._routed_experts_cpu = None
+
+        # Under Confidential Computing a D2H cudaMemcpyAsync is forced
+        # SYNCHRONOUS: the copy blocks the issuing thread until it completes, and
+        # since it is ordered after this step's forward+sample it would stall that
+        # thread for ~one forward (~ms). Issuing it here (on the critical-path
+        # worker thread) therefore delays the next step's graph launch and idles
+        # the GPU. Hand the copy to a dedicated AsyncD2HCopyWorker thread, which
+        # event-syncs on the producing work then issues the (still-blocking) copy
+        # off the worker thread; the worker returns immediately. Off-CC the copy
+        # is truly async, so issue inline as before.
+        self._defer_copy = (
+            current_platform.is_confidential_compute()
+            and async_d2h_copy_worker is not None
+        )
+        if self._defer_copy:
+            # Mark forward+sample completion on the (current) forward stream; the
+            # copy worker event-syncs on it before issuing the copy. ``_copy_done``
+            # is set by the worker once the readback has completed.
+            self._src_ready = torch.Event()
+            self._src_ready.record()
+            self._copy_done = threading.Event()
+            async_d2h_copy_worker.submit(
+                self._src_ready, self._issue_copies, self._copy_done
+            )
+            return
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
-            )
-            self._logprobs_tensors_cpu = (
-                self._logprobs_tensors.to_cpu_nonblocking()
-                if self._logprobs_tensors
-                else None
-            )
-            self._routed_experts_cpu = (
-                self._routed_experts.to_cpu_nonblocking()
-                if self._routed_experts is not None
-                else None
-            )
-            if check_ep_fault:
-                has_fault = get_ep_all2all_manager().query_fault()
-                self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.async_copy_ready_event.record()
+            self._issue_copies()
+
+    def _issue_copies(self) -> None:
+        """Issue the non-blocking D2H copies and record the ready event.
+
+        Must run with ``self._async_output_copy_stream`` current and already
+        ordered after the producing forward+sample work.
+        """
+        self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+            "cpu", non_blocking=True
+        )
+        self._logprobs_tensors_cpu = (
+            self._logprobs_tensors.to_cpu_nonblocking()
+            if self._logprobs_tensors
+            else None
+        )
+        self._routed_experts_cpu = (
+            self._routed_experts.to_cpu_nonblocking()
+            if self._routed_experts is not None
+            else None
+        )
+        if self._check_ep_fault:
+            has_fault = get_ep_all2all_manager().query_fault()
+            self._has_fault = has_fault.to("cpu", non_blocking=True)
+        self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        This function blocks until the copy is finished.
+        This function blocks until the copy is finished. Under Confidential
+        Computing it also *issues* the (synchronous) copy here, on the caller's
+        WorkerAsyncOutputCopy thread, rather than on the worker thread.
         """
-        max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        if self._defer_copy:
+            # The AsyncD2HCopyWorker event-synced on the producing work and ran
+            # the (forced-synchronous under CC) copy off the worker thread. Just
+            # wait for it to finish; worker-done => copy-done.
+            self._copy_done.wait()
+        max_gen_len = self._max_gen_len
         self.async_copy_ready_event.synchronize()
 
         # Release the device tensors once the copy has completed.
@@ -777,6 +925,10 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        # Double-buffered device staging for direct (non-CpuGpuBuffer) H2D input
+        # copies under Confidential Computing; keyed by call site. See
+        # _staged_h2d_copy_ and vllm.v1.utils staged-H2D notes.
+        self._h2d_stage_cache: dict = {}
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1172,6 +1324,21 @@ class GPUModelRunner(
             stream = torch.cuda.Stream()
             self.async_output_copy_stream = stream
         return stream
+
+    def _get_or_create_async_d2h_copy_worker(self) -> "AsyncD2HCopyWorker | None":
+        """Lazily create the dedicated D2H copy worker (CC only). Off-CC returns
+        None so the output copy is issued inline as before."""
+        if not current_platform.is_confidential_compute():
+            return None
+        worker = getattr(self, "_async_d2h_copy_worker", None)
+        if worker is None:
+            worker = AsyncD2HCopyWorker(
+                device_module=torch.cuda,
+                copy_stream=torch.cuda.Stream(),
+                device=self.device,
+            )
+            self._async_d2h_copy_worker = worker
+        return worker
 
     def _on_request_state_removed(
         self,
@@ -1799,7 +1966,7 @@ class GPUModelRunner(
         """
 
         if self.input_batch.prev_sampled_token_ids is None:
-            # Normal scheduling case
+            # Normal scheduling case.
             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
@@ -1956,6 +2123,53 @@ class GPUModelRunner(
         encoder_seq_lens_cpu = self.encoder_seq_lens.np[:num_reqs]
 
         return encoder_seq_lens, encoder_seq_lens_cpu
+
+    def _staged_h2d_copy_(
+        self,
+        gpu_base: torch.Tensor,
+        cpu_base: torch.Tensor,
+        n: int | None = None,
+        *,
+        key: str,
+    ) -> torch.Tensor:
+        """Copy ``cpu_base[:n] -> gpu_base[:n]`` using the CC staged-H2D path.
+
+        Mirrors CpuGpuBuffer.copy_to_gpu for direct (non-CpuGpuBuffer) tensors:
+        under Confidential Computing the H2D runs on a dedicated prep stream
+        (immune to the forward queued on the compute stream) and a D2D moves it
+        onto ``gpu_base`` on the current stream (async under CC). Off-CC it is a
+        plain copy. Staging is double-buffered per ``key``.
+        """
+        from vllm.v1.utils import _staged_h2d_enabled, _staged_h2d_stream
+
+        gpu_dst = gpu_base if n is None else gpu_base[:n]
+        cpu_src = cpu_base if n is None else cpu_base[:n]
+        if not _staged_h2d_enabled():
+            return gpu_dst.copy_(cpu_src, non_blocking=True)
+        # NOTE: this buffer (e.g. num_computed_tokens) is consumed by compute-stream
+        # kernels DURING _prepare_inputs (positions -> slot mapping / block table),
+        # so it must use the staged path: its D2D is ordered on the compute stream
+        # ahead of the consumer kernel, which any defer-to-forward scheme would
+        # violate (prep would read stale counts -> out-of-range slots -> IMA).
+        entry = self._h2d_stage_cache.get(key)
+        if entry is None:
+            with torch.inference_mode(False):
+                entry = [
+                    torch.empty_like(gpu_base),
+                    torch.empty_like(gpu_base),
+                    0,
+                ]
+            self._h2d_stage_cache[key] = entry
+        idx = entry[2]
+        entry[2] ^= 1
+        stage_base = entry[idx]
+        stage_dst = stage_base if n is None else stage_base[:n]
+        # H2D on the dedicated prep stream (host-synchronous under CC, so
+        # stage_dst is populated on return); D2D onto gpu_base on the current
+        # (compute) stream is async and ordered after the forward's read.
+        with torch.cuda.stream(_staged_h2d_stream(gpu_base.device)):
+            stage_dst.copy_(cpu_src, non_blocking=True)
+        return gpu_dst.copy_(stage_dst, non_blocking=True)
 
     def _prepare_inputs(
         self,
@@ -2172,9 +2386,11 @@ class GPUModelRunner(
                 cpu_values,
             )
         else:
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
+            self._staged_h2d_copy_(
+                self.num_computed_tokens,
+                self.input_batch.num_computed_tokens_cpu_tensor,
+                num_reqs,
+                key="num_computed_tokens",
             )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
@@ -3866,6 +4082,35 @@ class GPUModelRunner(
             yield
             return
 
+        # Under NVIDIA Confidential Computing every host->device copy is forced
+        # SYNCHRONOUS: the copy blocks the host until it completes, so it has
+        # already finished reading its pinned CPU source by the time the copy call
+        # returns (verified on-box: a pinned H2D -- even on a side stream queued
+        # behind a busy default stream, large or tiny -- does not return until the
+        # transfer is done). Therefore the reused input-staging CPU tensors are
+        # already free for the next step's prep, and the device-side D2D that
+        # writes the persistent CUDA-graph input buffer is ordered after the prior
+        # graph replay on the compute stream (so it cannot clobber a buffer the
+        # prior forward still reads, no matter how far ahead the host runs).
+        #
+        # This host-blocking event sync exists for the *off-CC* async-scheduling
+        # case, where the H2D is truly asynchronous and the prior copy may still be
+        # reading the reused CPU tensor. Under CC it is pure redundant
+        # serialization -- it blocks the worker for ~one forward per step (a real
+        # cudaEventSynchronize), which under tensor parallelism turns the affected
+        # rank into a straggler that the other ranks' in-graph allreduce waits on.
+        # Skip it under CC.
+        if current_platform.is_confidential_compute():
+            if not getattr(self, "_logged_prep_guard", False):
+                self._logged_prep_guard = True
+                logger.info(
+                    "synchronize_input_prep: skipping redundant host event-sync "
+                    "under Confidential Compute (H2D copies are synchronous, so "
+                    "reused CPU staging tensors are already free)."
+                )
+            yield
+            return
+
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
@@ -4806,6 +5051,7 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
+                async_d2h_copy_worker=self._get_or_create_async_d2h_copy_worker(),
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
