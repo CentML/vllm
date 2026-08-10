@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_CONFIDENTIAL_COMPUTE: str | None = None
+    VLLM_STAGED_H2D: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1727,6 +1728,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the async device->host copy worker (and to exercise the CC path in CI /
     # on boxes without NVML).
     "VLLM_CONFIDENTIAL_COMPUTE": lambda: os.getenv("VLLM_CONFIDENTIAL_COMPUTE"),
+    # Set to "0" to disable the staged H2D input-copy path that is otherwise
+    # enabled automatically under NVIDIA Confidential Computing (see
+    # vllm.v1.cc_copy).
+    "VLLM_STAGED_H2D": lambda: os.getenv("VLLM_STAGED_H2D", "1") != "0",
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")

@@ -3991,13 +3991,11 @@ class GPUModelRunner(
         # rank into a straggler that the other ranks' in-graph allreduce waits on.
         # Skip it under CC.
         if current_platform.is_confidential_compute():
-            if not getattr(self, "_logged_prep_guard", False):
-                self._logged_prep_guard = True
-                logger.info(
-                    "synchronize_input_prep: skipping redundant host event-sync "
-                    "under Confidential Compute (H2D copies are synchronous, so "
-                    "reused CPU staging tensors are already free)."
-                )
+            logger.info_once(
+                "synchronize_input_prep: skipping redundant host event-sync "
+                "under Confidential Compute (H2D copies are synchronous, so "
+                "reused CPU staging tensors are already free)."
+            )
             yield
             return
 

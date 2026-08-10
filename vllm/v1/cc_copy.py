@@ -35,58 +35,49 @@ Two mitigations, both no-ops off CC:
 
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from functools import cache
+from itertools import cycle
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-_STAGED_H2D_STREAM_POOL: dict[int, list[torch.cuda.Stream]] = {}
-_STAGED_H2D_POOL_RR: dict[int, int] = {}
 _STAGED_H2D_POOL_SIZE = 16
-_STAGED_H2D_ENABLED: bool | None = None
 
 
+@cache
 def staged_h2d_enabled() -> bool:
     """Whether H2D input copies should take the CC staged path."""
-    global _STAGED_H2D_ENABLED
-    if _STAGED_H2D_ENABLED is None:
-        import os
+    if not envs.VLLM_STAGED_H2D:
+        return False
+    from vllm.platforms import current_platform
 
-        if os.getenv("VLLM_STAGED_H2D", "1") == "0":
-            _STAGED_H2D_ENABLED = False
-        else:
-            try:
-                from vllm.platforms import current_platform
+    enabled = current_platform.is_confidential_compute()
+    if enabled:
+        logger.info(
+            "Staged H2D input copies ENABLED under Confidential Computing "
+            "(H2D on a dedicated prep stream + D2D on the compute stream) to "
+            "avoid blocking the scheduler on the in-flight forward."
+        )
+    return enabled
 
-                _STAGED_H2D_ENABLED = bool(current_platform.is_confidential_compute())
-                if _STAGED_H2D_ENABLED:
-                    logger.info(
-                        "Staged H2D input copies ENABLED under Confidential "
-                        "Computing (H2D on a dedicated prep stream + D2D on the "
-                        "compute stream) to avoid blocking the scheduler on the "
-                        "in-flight forward."
-                    )
-            except Exception:
-                _STAGED_H2D_ENABLED = False
-    return _STAGED_H2D_ENABLED
+
+@cache
+def _staged_h2d_streams(device_index: int) -> Iterator[torch.cuda.Stream]:
+    device = torch.device(f"cuda:{device_index}")
+    return cycle(
+        [torch.cuda.Stream(device=device) for _ in range(_STAGED_H2D_POOL_SIZE)]
+    )
 
 
 def staged_h2d_stream(device: torch.device) -> torch.cuda.Stream:
     """Return the next idle prep stream (round-robin) for this device."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    pool = _STAGED_H2D_STREAM_POOL.get(idx)
-    if pool is None:
-        pool = [
-            torch.cuda.Stream(device=device) for _ in range(_STAGED_H2D_POOL_SIZE)
-        ]
-        _STAGED_H2D_STREAM_POOL[idx] = pool
-        _STAGED_H2D_POOL_RR[idx] = 0
-    i = _STAGED_H2D_POOL_RR[idx]
-    _STAGED_H2D_POOL_RR[idx] = (i + 1) % len(pool)
-    return pool[i]
+    return next(_staged_h2d_streams(idx))
 
 
 class StagedH2DCopier:

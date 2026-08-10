@@ -236,7 +236,8 @@ class Platform:
 
         return cumem_available
 
-    def is_confidential_compute(self) -> bool:
+    @classmethod
+    def is_confidential_compute(cls) -> bool:
         """Whether the device runs in a confidential-computing / memory-encrypted
         mode that forces host<->device copies synchronous. Defaults to False."""
         return False

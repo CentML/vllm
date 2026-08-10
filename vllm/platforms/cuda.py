@@ -190,14 +190,20 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     return wrapper
 
 
+@with_nvml_context
+def _nvml_confidential_compute_enabled() -> bool:
+    state = pynvml.nvmlSystemGetConfComputeState()
+    # ccFeature != 0 means CC is enabled (ON or devtools mode).
+    return int(getattr(state, "ccFeature", 0)) != 0
+
+
 @cache
 def _detect_confidential_compute() -> bool:
     """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
 
     Under bounce-buffer CC, device<->host copies are forced synchronous even
-    with ``non_blocking=True`` (the host destination is staged through an
-    encrypted bounce buffer), which stalls the per-step D2H token readback on
-    the thread that issues it. Detected once via NVML and cached.
+    with ``non_blocking=True``, which stalls the thread that issues them (see
+    vllm.v1.cc_copy). Detected once via NVML and cached.
 
     Returns:
         True if CC is enabled (``ccFeature != 0``). Overridable via
@@ -217,21 +223,15 @@ def _detect_confidential_compute() -> bool:
         logger.info("NVIDIA Confidential Computing not detected: CUDA unavailable")
         return False
     try:
-        pynvml.nvmlInit()
-        try:
-            state = pynvml.nvmlSystemGetConfComputeState()
-            # ccFeature != 0 means CC is enabled (ON or devtools mode).
-            enabled = int(getattr(state, "ccFeature", 0)) != 0
-            logger.info(
-                "NVIDIA Confidential Computing %s via NVML",
-                "detected" if enabled else "not detected",
-            )
-            return enabled
-        finally:
-            pynvml.nvmlShutdown()
+        enabled = _nvml_confidential_compute_enabled()
     except Exception as e:
         logger.info("NVIDIA Confidential Computing not detected: NVML failed: %r", e)
         return False
+    logger.info(
+        "NVIDIA Confidential Computing %s via NVML",
+        "detected" if enabled else "not detected",
+    )
+    return enabled
 
 
 @cache
@@ -261,7 +261,8 @@ class CudaPlatformBase(Platform):
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     ]
 
-    def is_confidential_compute(self) -> bool:
+    @classmethod
+    def is_confidential_compute(cls) -> bool:
         return _detect_confidential_compute()
 
     @classmethod
