@@ -32,6 +32,7 @@ from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_mes
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.cc_copy import staged_h2d_enabled, staged_h2d_stream
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -107,85 +108,6 @@ class ConstantList(Generic[T], Sequence):
         return self._x.copy()
 
 
-# ---------------------------------------------------------------------------
-# Corrected staged H2D under NVIDIA Confidential Computing (CC).
-#
-# Under CC a host->device cudaMemcpyAsync is forced SYNCHRONOUS: the issuing
-# thread blocks until the copy completes, and because a synchronous copy also
-# waits for everything already queued on its stream, an H2D issued on the
-# compute stream (which still has the in-flight decode forward queued) blocks
-# the scheduler for ~one forward (~ms). The per-step _prepare_inputs H2D copies
-# do exactly this, starving the GPU (measured 4-5ms stalls; see
-# cc_sync_stream_probe.py).
-#
-# Fix (measured 5.1x less scheduler block; see cc_staged_copy_probe.py):
-#   * H2D cpu->staging on a DEDICATED prep stream that has NO forward queued, so
-#     it only pays its own (host-synchronous) transfer (~tens of us) instead of
-#     the forward-drain wait.
-#   * D2D staging->gpu on the CURRENT (compute) stream. A D2D is genuinely async
-#     under CC (it does not block the host for prior stream work), so it merely
-#     enqueues and runs after the forward has finished reading the reused
-#     graph-input buffer -> no host block and no write-after-read race.
-#
-# Correctness relies on the same CC invariant vLLM already assumes elsewhere
-# (see GPUModelRunner.synchronize_input_prep): a pinned H2D is synchronous, so
-# `staging` is fully populated by the time the H2D call returns and the
-# subsequently-enqueued D2D reads valid data even though it is on another stream.
-# Staging is double-buffered so the next step's H2D->staging cannot overwrite a
-# staging buffer whose D2D->gpu has not yet drained on the compute stream.
-# A POOL of idle prep streams per device: each prepare_inputs copy takes the
-# next stream (round-robin) so no copy is queued behind the forward on the
-# compute stream OR behind another copy on a shared prep stream -- none of them
-# block. The D2D leg still goes on the compute stream (see copy_to_gpu) so the
-# graph-input write is ordered after the forward's read.
-_STAGED_H2D_STREAM_POOL: dict[int, list["torch.cuda.Stream"]] = {}
-_STAGED_H2D_POOL_RR: dict[int, int] = {}
-_STAGED_H2D_POOL_SIZE = 16
-_STAGED_H2D_ENABLED: bool | None = None
-
-
-def _staged_h2d_enabled() -> bool:
-    global _STAGED_H2D_ENABLED
-    if _STAGED_H2D_ENABLED is None:
-        import os
-
-        if os.getenv("VLLM_STAGED_H2D", "1") == "0":
-            _STAGED_H2D_ENABLED = False
-        else:
-            try:
-                from vllm.platforms import current_platform
-
-                _STAGED_H2D_ENABLED = bool(
-                    current_platform.is_confidential_compute()
-                )
-                if _STAGED_H2D_ENABLED:
-                    logger.info(
-                        "Staged H2D input copies ENABLED under Confidential "
-                        "Computing (H2D on a dedicated prep stream + D2D on the "
-                        "compute stream) to avoid blocking the scheduler on the "
-                        "in-flight forward."
-                    )
-            except Exception:
-                _STAGED_H2D_ENABLED = False
-    return _STAGED_H2D_ENABLED
-
-
-def _staged_h2d_stream(device: torch.device) -> "torch.cuda.Stream":
-    """Return the next idle prep stream (round-robin) for this device, so each
-    copy inside prepare_inputs gets its own idle stream and none block."""
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    pool = _STAGED_H2D_STREAM_POOL.get(idx)
-    if pool is None:
-        pool = [
-            torch.cuda.Stream(device=device) for _ in range(_STAGED_H2D_POOL_SIZE)
-        ]
-        _STAGED_H2D_STREAM_POOL[idx] = pool
-        _STAGED_H2D_POOL_RR[idx] = 0
-    i = _STAGED_H2D_POOL_RR[idx]
-    _STAGED_H2D_POOL_RR[idx] = (i + 1) % len(pool)
-    return pool[i]
-
-
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
@@ -204,7 +126,7 @@ class CpuGpuBuffer:
             )
             self.gpu = torch.zeros_like(self.cpu, device=device)
         # Double-buffered device staging for the CC staged-H2D path (allocated
-        # lazily on first staged copy; see _staged_h2d_enabled).
+        # lazily on first staged copy; see vllm.v1.cc_copy).
         self._stage: list[torch.Tensor] | None = None
         self._stage_idx: int = 0
         self.np: np.ndarray
@@ -223,7 +145,7 @@ class CpuGpuBuffer:
         # Under Confidential Computing, route through the staged path (idle-stream
         # H2D + async compute-stream D2D) so the engine never blocks on the
         # in-flight forward. Off-CC / when disabled, plain non-blocking H2D.
-        if self.gpu.is_cuda and _staged_h2d_enabled():
+        if self.gpu.is_cuda and staged_h2d_enabled():
             return self._copy_to_gpu_staged(n)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
@@ -241,7 +163,7 @@ class CpuGpuBuffer:
         # H2D on the dedicated prep stream: immune to the forward queued on the
         # compute stream, and host-synchronous under CC so `stage_dst` is fully
         # populated by the time this returns.
-        with torch.cuda.stream(_staged_h2d_stream(self.gpu.device)):
+        with torch.cuda.stream(staged_h2d_stream(self.gpu.device)):
             stage_dst.copy_(cpu_src, non_blocking=True)
         # D2D staging->gpu on the current (compute) stream: async under CC and
         # ordered after the forward's read of the reused buffer.

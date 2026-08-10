@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
+from vllm.v1.cc_copy import staged_h2d_enabled, staged_h2d_stream
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -203,10 +204,8 @@ class KVBlockZeroer:
         # zeroing kernel below is launched on the compute stream -> correct
         # ordering without a cross-stream event), but it only waits for itself
         # rather than the whole forward.
-        from vllm.v1.utils import _staged_h2d_enabled, _staged_h2d_stream
-
-        if _staged_h2d_enabled():
-            with torch.cuda.stream(_staged_h2d_stream(self.device)):
+        if staged_h2d_enabled():
+            with torch.cuda.stream(staged_h2d_stream(self.device)):
                 idx = async_tensor_h2d(
                     block_ids, device=self.device, dtype=torch.int64
                 )

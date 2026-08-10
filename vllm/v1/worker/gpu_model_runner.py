@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import queue
 import threading
 import time
 from collections import defaultdict
@@ -152,6 +151,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.cc_copy import (
+    AsyncD2HCopyWorker,
+    staged_h2d_enabled,
+    staged_h2d_stream,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -255,86 +259,6 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
-
-
-class AsyncD2HCopyWorker:
-    """Runs the per-step result Device->Host readback on a dedicated daemon thread.
-
-    Under NVIDIA Confidential Computing (bounce-buffer CC), a device-to-host
-    ``cudaMemcpyAsync`` is forced synchronous and blocks AT ISSUE (the host
-    destination is staged through an encrypted bounce buffer). Issuing it inline
-    on the scheduler thread stalls the overlap pipeline: the scheduler cannot
-    launch the next step's CUDA graph until the copy returns (~one decode step).
-
-    This worker performs the (still-blocking) copy off the scheduler thread so
-    the scheduler keeps issuing work. It mirrors TensorRT-LLM PR #8463:
-      - the scheduler thread records a CUDA event after the producing work and
-        hands (event, copy_fn, done) here, then returns immediately;
-      - this worker ``cudaEventSynchronize``-s on that event (event-sync, NOT
-        stream-wait, so the blocking copy does not stall the scheduler's CUDA
-        API calls), runs the copy on the dedicated copy stream, blocks until it
-        completes, and sets ``done``;
-      - the scheduler later waits on ``done`` (worker-done => copy-done).
-
-    The copy itself stays synchronous under CC; it is merely non-blocking *to the
-    scheduler thread*, restoring overlap.
-    """
-
-    def __init__(self, device_module, copy_stream, device=None):
-        self.device_module = device_module
-        self.copy_stream = copy_stream
-        self._device = device
-        self._queue: "queue.Queue" = queue.Queue()
-        self._thread = threading.Thread(
-            target=self._loop, name="vllm-d2h-copy-worker", daemon=True
-        )
-        self._thread.start()
-
-    def submit(
-        self,
-        src_ready: "torch.cuda.Event",
-        copy_fn: Callable[[], None],
-        done: threading.Event,
-    ):
-        """Enqueue a readback. ``src_ready`` must already be recorded on the
-        stream that produces the copy sources; ``copy_fn`` performs the actual
-        ``.to("cpu", ...)`` copies; ``done`` is set when they have completed."""
-        self._queue.put((src_ready, copy_fn, done))
-
-    def _loop(self):
-        # A new thread does not inherit the main thread's CUDA context; set the
-        # device so CUDA runtime calls do not implicitly create one on device 0.
-        if self._device is not None:
-            from vllm.platforms import current_platform
-
-            current_platform.set_device(self._device)
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            src_ready, copy_fn, done = item
-            try:
-                # Wait until the producing forward+sample has materialized the
-                # source tensors. Event-sync (cudaEventSynchronize), not a
-                # stream wait -- see class docstring / TRT-LLM #8463.
-                src_ready.synchronize()
-                # Issue the copies on a dedicated stream owned by this thread.
-                # PyTorch's current stream is thread-local, so this does not
-                # affect the scheduler thread's stream.
-                with self.device_module.stream(self.copy_stream):
-                    copy_fn()
-                self.copy_stream.synchronize()
-            except Exception:
-                logger.exception("AsyncD2HCopyWorker readback failed")
-            finally:
-                done.set()
-
-    def shutdown(self, timeout: float = 2.0):
-        """Signal the worker to stop and join it (best-effort, bounded wait)."""
-        if not self._thread.is_alive():
-            return
-        self._queue.put(None)
-        self._thread.join(timeout=timeout)
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -909,7 +833,7 @@ class GPUModelRunner(
         )
         # Double-buffered device staging for direct (non-CpuGpuBuffer) H2D input
         # copies under Confidential Computing; keyed by call site. See
-        # _staged_h2d_copy_ and vllm.v1.utils staged-H2D notes.
+        # _staged_h2d_copy_ and vllm.v1.cc_copy.
         self._h2d_stage_cache: dict = {}
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
@@ -2122,11 +2046,9 @@ class GPUModelRunner(
         onto ``gpu_base`` on the current stream (async under CC). Off-CC it is a
         plain copy. Staging is double-buffered per ``key``.
         """
-        from vllm.v1.utils import _staged_h2d_enabled, _staged_h2d_stream
-
         gpu_dst = gpu_base if n is None else gpu_base[:n]
         cpu_src = cpu_base if n is None else cpu_base[:n]
-        if not _staged_h2d_enabled():
+        if not staged_h2d_enabled():
             return gpu_dst.copy_(cpu_src, non_blocking=True)
         # NOTE: this buffer (e.g. num_computed_tokens) is consumed by compute-stream
         # kernels DURING _prepare_inputs (positions -> slot mapping / block table),
@@ -2149,7 +2071,7 @@ class GPUModelRunner(
         # H2D on the dedicated prep stream (host-synchronous under CC, so
         # stage_dst is populated on return); D2D onto gpu_base on the current
         # (compute) stream is async and ordered after the forward's read.
-        with torch.cuda.stream(_staged_h2d_stream(gpu_base.device)):
+        with torch.cuda.stream(staged_h2d_stream(gpu_base.device)):
             stage_dst.copy_(cpu_src, non_blocking=True)
         return gpu_dst.copy_(stage_dst, non_blocking=True)
 
