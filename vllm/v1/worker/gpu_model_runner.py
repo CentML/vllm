@@ -3968,34 +3968,14 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        if self.prepare_inputs_event is None:
-            yield
-            return
-
-        # Under NVIDIA Confidential Computing every host->device copy is forced
-        # SYNCHRONOUS: the copy blocks the host until it completes, so it has
-        # already finished reading its pinned CPU source by the time the copy call
-        # returns (verified on-box: a pinned H2D -- even on a side stream queued
-        # behind a busy default stream, large or tiny -- does not return until the
-        # transfer is done). Therefore the reused input-staging CPU tensors are
-        # already free for the next step's prep, and the device-side D2D that
-        # writes the persistent CUDA-graph input buffer is ordered after the prior
-        # graph replay on the compute stream (so it cannot clobber a buffer the
-        # prior forward still reads, no matter how far ahead the host runs).
-        #
-        # This host-blocking event sync exists for the *off-CC* async-scheduling
-        # case, where the H2D is truly asynchronous and the prior copy may still be
-        # reading the reused CPU tensor. Under CC it is pure redundant
-        # serialization -- it blocks the worker for ~one forward per step (a real
-        # cudaEventSynchronize), which under tensor parallelism turns the affected
-        # rank into a straggler that the other ranks' in-graph allreduce waits on.
-        # Skip it under CC.
-        if current_platform.is_confidential_compute():
-            logger.info_once(
-                "synchronize_input_prep: skipping redundant host event-sync "
-                "under Confidential Compute (H2D copies are synchronous, so "
-                "reused CPU staging tensors are already free)."
-            )
+        # Skip under Confidential Computing: H2D copies are host-synchronous
+        # there (see vllm.v1.cc_copy), so the prior step has already finished
+        # reading the reused CPU tensors by the time its copy call returned,
+        # and this event-sync would only serialize the worker on the in-flight
+        # forward (making the rank a straggler under tensor parallelism).
+        if self.prepare_inputs_event is None or (
+            current_platform.is_confidential_compute()
+        ):
             yield
             return
 

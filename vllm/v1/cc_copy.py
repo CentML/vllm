@@ -36,6 +36,7 @@ Two mitigations, both no-ops off CC:
 import queue
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 from functools import cache
 from itertools import cycle
 
@@ -78,6 +79,20 @@ def staged_h2d_stream(device: torch.device) -> torch.cuda.Stream:
     """Return the next idle prep stream (round-robin) for this device."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
     return next(_staged_h2d_streams(idx))
+
+
+def prep_stream_ctx(device: torch.device) -> AbstractContextManager:
+    """Make an idle prep stream current while the CC staged path is enabled;
+    no-op otherwise.
+
+    Use around an H2D whose result is consumed immediately on the issuing
+    thread: under CC the copy is host-synchronous, so it is complete on return
+    regardless of stream, and the prep stream only waits for its own transfer
+    instead of the forward queued on the compute stream.
+    """
+    if not staged_h2d_enabled():
+        return nullcontext()
+    return torch.cuda.stream(staged_h2d_stream(device))
 
 
 class StagedH2DCopier:
