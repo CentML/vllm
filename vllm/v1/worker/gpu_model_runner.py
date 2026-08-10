@@ -153,8 +153,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.cc_copy import (
     AsyncD2HCopyWorker,
+    StagedH2DCopier,
     staged_h2d_enabled,
-    staged_h2d_stream,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -831,10 +831,10 @@ class GPUModelRunner(
         self.num_computed_tokens = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
-        # Double-buffered device staging for direct (non-CpuGpuBuffer) H2D input
-        # copies under Confidential Computing; keyed by call site. See
+        # Staged-copy helpers for direct (non-CpuGpuBuffer) H2D input copies
+        # under Confidential Computing; keyed by call site. See
         # _staged_h2d_copy_ and vllm.v1.cc_copy.
-        self._h2d_stage_cache: dict = {}
+        self._h2d_stage_cache: dict[str, StagedH2DCopier] = {}
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -2046,34 +2046,20 @@ class GPUModelRunner(
         onto ``gpu_base`` on the current stream (async under CC). Off-CC it is a
         plain copy. Staging is double-buffered per ``key``.
         """
-        gpu_dst = gpu_base if n is None else gpu_base[:n]
-        cpu_src = cpu_base if n is None else cpu_base[:n]
         if not staged_h2d_enabled():
+            gpu_dst = gpu_base if n is None else gpu_base[:n]
+            cpu_src = cpu_base if n is None else cpu_base[:n]
             return gpu_dst.copy_(cpu_src, non_blocking=True)
         # NOTE: this buffer (e.g. num_computed_tokens) is consumed by compute-stream
         # kernels DURING _prepare_inputs (positions -> slot mapping / block table),
         # so it must use the staged path: its D2D is ordered on the compute stream
         # ahead of the consumer kernel, which any defer-to-forward scheme would
         # violate (prep would read stale counts -> out-of-range slots -> IMA).
-        entry = self._h2d_stage_cache.get(key)
-        if entry is None:
-            with torch.inference_mode(False):
-                entry = [
-                    torch.empty_like(gpu_base),
-                    torch.empty_like(gpu_base),
-                    0,
-                ]
-            self._h2d_stage_cache[key] = entry
-        idx = entry[2]
-        entry[2] ^= 1
-        stage_base = entry[idx]
-        stage_dst = stage_base if n is None else stage_base[:n]
-        # H2D on the dedicated prep stream (host-synchronous under CC, so
-        # stage_dst is populated on return); D2D onto gpu_base on the current
-        # (compute) stream is async and ordered after the forward's read.
-        with torch.cuda.stream(staged_h2d_stream(gpu_base.device)):
-            stage_dst.copy_(cpu_src, non_blocking=True)
-        return gpu_dst.copy_(stage_dst, non_blocking=True)
+        copier = self._h2d_stage_cache.get(key)
+        if copier is None:
+            copier = StagedH2DCopier(gpu_base)
+            self._h2d_stage_cache[key] = copier
+        return copier.copy_(cpu_base, n)
 
     def _prepare_inputs(
         self,

@@ -32,7 +32,7 @@ from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_mes
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.cc_copy import staged_h2d_enabled, staged_h2d_stream
+from vllm.v1.cc_copy import StagedH2DCopier, staged_h2d_enabled
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -125,10 +125,9 @@ class CpuGpuBuffer:
                 *size, dtype=dtype, device="cpu", pin_memory=pin_memory
             )
             self.gpu = torch.zeros_like(self.cpu, device=device)
-        # Double-buffered device staging for the CC staged-H2D path (allocated
-        # lazily on first staged copy; see vllm.v1.cc_copy).
-        self._stage: list[torch.Tensor] | None = None
-        self._stage_idx: int = 0
+        # Staged-copy helper for the CC staged-H2D path (created lazily on
+        # first staged copy; see vllm.v1.cc_copy).
+        self._staged_copier: StagedH2DCopier | None = None
         self.np: np.ndarray
         # To keep type hints simple (avoiding generics and subclasses), we
         # only conditionally create the numpy array attribute. This can cause
@@ -146,28 +145,12 @@ class CpuGpuBuffer:
         # H2D + async compute-stream D2D) so the engine never blocks on the
         # in-flight forward. Off-CC / when disabled, plain non-blocking H2D.
         if self.gpu.is_cuda and staged_h2d_enabled():
-            return self._copy_to_gpu_staged(n)
+            if self._staged_copier is None:
+                self._staged_copier = StagedH2DCopier(self.gpu)
+            return self._staged_copier.copy_(self.cpu, n)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
-
-    def _copy_to_gpu_staged(self, n: int | None = None) -> torch.Tensor:
-        cpu_src = self.cpu if n is None else self.cpu[:n]
-        gpu_dst = self.gpu if n is None else self.gpu[:n]
-        if self._stage is None:
-            with torch.inference_mode(False):
-                self._stage = [torch.empty_like(self.gpu) for _ in range(2)]
-        stage = self._stage[self._stage_idx]
-        self._stage_idx ^= 1
-        stage_dst = stage if n is None else stage[:n]
-        # H2D on the dedicated prep stream: immune to the forward queued on the
-        # compute stream, and host-synchronous under CC so `stage_dst` is fully
-        # populated by the time this returns.
-        with torch.cuda.stream(staged_h2d_stream(self.gpu.device)):
-            stage_dst.copy_(cpu_src, non_blocking=True)
-        # D2D staging->gpu on the current (compute) stream: async under CC and
-        # ordered after the forward's read of the reused buffer.
-        return gpu_dst.copy_(stage_dst, non_blocking=True)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

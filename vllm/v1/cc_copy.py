@@ -89,6 +89,36 @@ def staged_h2d_stream(device: torch.device) -> torch.cuda.Stream:
     return pool[i]
 
 
+class StagedH2DCopier:
+    """Double-buffered staged H2D into a persistent GPU tensor.
+
+    One instance per destination tensor. Callers must only use this when
+    ``staged_h2d_enabled()`` is true; off CC the cross-stream handoff would
+    race (see module docstring).
+    """
+
+    def __init__(self, gpu_base: torch.Tensor):
+        self._gpu = gpu_base
+        # Staging is mutable runtime state, not inference data.
+        with torch.inference_mode(False):
+            self._stage = [torch.empty_like(gpu_base) for _ in range(2)]
+        self._idx = 0
+
+    def copy_(self, cpu_base: torch.Tensor, n: int | None = None) -> torch.Tensor:
+        """Copy ``cpu_base[:n]`` into the GPU tensor via the staged path."""
+        gpu_dst = self._gpu if n is None else self._gpu[:n]
+        cpu_src = cpu_base if n is None else cpu_base[:n]
+        stage = self._stage[self._idx]
+        self._idx ^= 1
+        stage_dst = stage if n is None else stage[:n]
+        # H2D on the prep stream is host-synchronous under CC, so stage_dst is
+        # populated on return; the D2D on the current (compute) stream is async
+        # and ordered after the forward's read of the reused buffer.
+        with torch.cuda.stream(staged_h2d_stream(self._gpu.device)):
+            stage_dst.copy_(cpu_src, non_blocking=True)
+        return gpu_dst.copy_(stage_dst, non_blocking=True)
+
+
 class AsyncD2HCopyWorker:
     """Runs the per-step result D2H readback on a dedicated daemon thread.
 
