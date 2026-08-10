@@ -273,7 +273,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
         check_ep_fault: bool = False,
-        async_d2h_copy_worker: "AsyncD2HCopyWorker | None" = None,
+        async_d2h_copy_worker: AsyncD2HCopyWorker | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -298,30 +298,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._logprobs_tensors_cpu = None
         self._routed_experts_cpu = None
 
-        # Under Confidential Computing a D2H cudaMemcpyAsync is forced
-        # SYNCHRONOUS: the copy blocks the issuing thread until it completes, and
-        # since it is ordered after this step's forward+sample it would stall that
-        # thread for ~one forward (~ms). Issuing it here (on the critical-path
-        # worker thread) therefore delays the next step's graph launch and idles
-        # the GPU. Hand the copy to a dedicated AsyncD2HCopyWorker thread, which
-        # event-syncs on the producing work then issues the (still-blocking) copy
-        # off the worker thread; the worker returns immediately. Off-CC the copy
-        # is truly async, so issue inline as before.
-        self._defer_copy = (
-            current_platform.is_confidential_compute()
-            and async_d2h_copy_worker is not None
-        )
-        if self._defer_copy:
-            # Mark forward+sample completion on the (current) forward stream; the
-            # copy worker event-syncs on it before issuing the copy. ``_copy_done``
-            # is set by the worker once the readback has completed.
-            self._src_ready = torch.Event()
-            self._src_ready.record()
-            self._copy_done = threading.Event()
-            async_d2h_copy_worker.submit(
-                self._src_ready, self._issue_copies, self._copy_done
-            )
+        if async_d2h_copy_worker is not None:
+            # Under CC a D2H copy is host-synchronous and, ordered after this
+            # step's forward+sample, would stall this thread for ~one forward
+            # and delay the next step's graph launch. Hand it to the dedicated
+            # copy worker (see vllm.v1.cc_copy); off-CC the copy is truly
+            # async, so issue inline below.
+            self._copy_done = async_d2h_copy_worker.submit(self._issue_copies)
             return
+        self._copy_done = threading.Event()
+        self._copy_done.set()
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -356,15 +342,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
-        This function blocks until the copy is finished. Under Confidential
-        Computing it also *issues* the (synchronous) copy here, on the caller's
-        WorkerAsyncOutputCopy thread, rather than on the worker thread.
+        This function blocks until the copy is finished.
         """
-        if self._defer_copy:
-            # The AsyncD2HCopyWorker event-synced on the producing work and ran
-            # the (forced-synchronous under CC) copy off the worker thread. Just
-            # wait for it to finish; worker-done => copy-done.
-            self._copy_done.wait()
+        # Already set unless the copy was handed to the CC copy worker.
+        self._copy_done.wait()
         max_gen_len = self._max_gen_len
         self.async_copy_ready_event.synchronize()
 
@@ -835,6 +816,7 @@ class GPUModelRunner(
         # under Confidential Computing; keyed by call site. See
         # _staged_h2d_copy_ and vllm.v1.cc_copy.
         self._h2d_stage_cache: dict[str, StagedH2DCopier] = {}
+        self._async_d2h_copy_worker: AsyncD2HCopyWorker | None = None
         self.prev_num_draft_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
@@ -1231,20 +1213,18 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
-    def _get_or_create_async_d2h_copy_worker(self) -> "AsyncD2HCopyWorker | None":
+    def _get_or_create_async_d2h_copy_worker(self) -> AsyncD2HCopyWorker | None:
         """Lazily create the dedicated D2H copy worker (CC only). Off-CC returns
         None so the output copy is issued inline as before."""
         if not current_platform.is_confidential_compute():
             return None
-        worker = getattr(self, "_async_d2h_copy_worker", None)
-        if worker is None:
-            worker = AsyncD2HCopyWorker(
+        if self._async_d2h_copy_worker is None:
+            self._async_d2h_copy_worker = AsyncD2HCopyWorker(
                 device_module=torch.cuda,
                 copy_stream=torch.cuda.Stream(),
                 device=self.device,
             )
-            self._async_d2h_copy_worker = worker
-        return worker
+        return self._async_d2h_copy_worker
 
     def _on_request_state_removed(
         self,

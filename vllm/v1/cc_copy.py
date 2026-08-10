@@ -128,12 +128,12 @@ class StagedH2DCopier:
 class AsyncD2HCopyWorker:
     """Runs the per-step result D2H readback on a dedicated daemon thread.
 
-    The scheduler thread records a CUDA event after the producing work and
-    hands ``(event, copy_fn, done)`` here, then returns immediately. This
-    worker ``cudaEventSynchronize``-s on that event (event-sync, NOT
-    stream-wait, so the blocking copy does not stall the scheduler's CUDA API
-    calls), runs the copy on the dedicated copy stream, blocks until it
-    completes, and sets ``done``. The scheduler later waits on ``done``
+    ``submit(copy_fn)`` records a CUDA event on the caller's current stream
+    (after the producing forward+sample) and returns immediately with a
+    ``threading.Event``. This worker ``cudaEventSynchronize``-s on the CUDA
+    event (event-sync, NOT stream-wait, so the blocking copy does not stall
+    the scheduler's CUDA API calls), runs the copy on the dedicated copy
+    stream, blocks until it completes, and sets the returned event
     (worker-done => copy-done). See the module docstring for the CC rationale.
     """
 
@@ -147,16 +147,16 @@ class AsyncD2HCopyWorker:
         )
         self._thread.start()
 
-    def submit(
-        self,
-        src_ready: torch.cuda.Event,
-        copy_fn: Callable[[], None],
-        done: threading.Event,
-    ):
-        """Enqueue a readback. ``src_ready`` must already be recorded on the
-        stream that produces the copy sources; ``copy_fn`` performs the actual
-        ``.to("cpu", ...)`` copies; ``done`` is set when they have completed."""
+    def submit(self, copy_fn: Callable[[], None]) -> threading.Event:
+        """Enqueue a readback ordered after the work currently queued on the
+        caller's current stream. ``copy_fn`` performs the actual
+        ``.to("cpu", ...)`` copies; the returned event is set once they have
+        completed."""
+        src_ready = torch.Event()
+        src_ready.record()
+        done = threading.Event()
         self._queue.put((src_ready, copy_fn, done))
+        return done
 
     def _loop(self):
         # A new thread does not inherit the main thread's CUDA context; set the
