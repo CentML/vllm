@@ -151,11 +151,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.cc_copy import (
-    AsyncD2HCopyWorker,
-    StagedH2DCopier,
-    staged_h2d_enabled,
-)
+from vllm.v1.cc_copy import AsyncD2HCopyWorker, StagedH2DCopier
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -2039,7 +2035,7 @@ class GPUModelRunner(
         the H2D runs on a dedicated prep stream (immune to the forward queued
         on the compute stream) and a D2D moves it onto ``gpu_base`` on the
         current stream (async under CC). Staging is double-buffered per
-        ``key``. Callers must check ``staged_h2d_enabled()``.
+        ``key``. Callers must check ``is_confidential_compute()``.
         """
         # NOTE: this buffer (e.g. num_computed_tokens) is consumed by compute-stream
         # kernels DURING _prepare_inputs (positions -> slot mapping / block table),
@@ -2266,7 +2262,7 @@ class GPUModelRunner(
                 self.prev_num_draft_tokens.gpu,
                 cpu_values,
             )
-        elif staged_h2d_enabled():
+        elif current_platform.is_confidential_compute():
             self._staged_h2d_copy_(
                 self.num_computed_tokens,
                 self.input_batch.num_computed_tokens_cpu_tensor,

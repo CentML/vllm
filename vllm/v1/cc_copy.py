@@ -11,10 +11,11 @@ already queued on its stream -- completes. Two consequences for the engine:
 * The per-step D2H token readback blocks the thread that issues it, delaying
   the next step's CUDA graph launch by ~one decode step.
 
-Two mitigations, both no-ops off CC:
+Two mitigations, both gated on ``confidential_compute_enabled()`` and no-ops
+off CC:
 
-* Staged H2D (``staged_h2d_enabled`` / ``staged_h2d_stream``): issue the H2D
-  into a device staging buffer on an idle prep stream, so it only pays its own
+* Staged H2D (``StagedH2DCopier`` / ``prep_stream_ctx``): issue the H2D into
+  a device staging buffer on an idle prep stream, so it only pays its own
   transfer (~tens of us) instead of the forward drain; then a D2D
   staging->dst on the compute stream. The D2D is genuinely async under CC and
   is ordered after the forward's read of the reused graph-input buffer, so
@@ -42,7 +43,6 @@ from itertools import cycle
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -51,56 +51,55 @@ _STAGED_H2D_POOL_SIZE = 16
 
 
 @cache
-def staged_h2d_enabled() -> bool:
-    """Whether H2D input copies should take the CC staged path."""
-    if not envs.VLLM_STAGED_H2D:
-        return False
+def confidential_compute_enabled() -> bool:
+    """Whether NVIDIA Confidential Computing is active on this platform.
+
+    The single gate for every copy path in this module.
+    """
     from vllm.platforms import current_platform
 
-    enabled = current_platform.is_confidential_compute()
-    if enabled:
-        logger.info(
-            "Staged H2D input copies ENABLED under Confidential Computing "
-            "(H2D on a dedicated prep stream + D2D on the compute stream) to "
-            "avoid blocking the scheduler on the in-flight forward."
-        )
-    return enabled
+    return current_platform.is_confidential_compute()
 
 
 @cache
 def _staged_h2d_streams(device_index: int) -> Iterator[torch.cuda.Stream]:
+    logger.info_once(
+        "Using staged H2D input copies under Confidential Computing "
+        "(H2D on a dedicated prep stream + D2D on the compute stream) to "
+        "avoid blocking the scheduler on the in-flight forward."
+    )
     device = torch.device(f"cuda:{device_index}")
     return cycle(
         [torch.cuda.Stream(device=device) for _ in range(_STAGED_H2D_POOL_SIZE)]
     )
 
 
-def staged_h2d_stream(device: torch.device) -> torch.cuda.Stream:
+def _staged_h2d_stream(device: torch.device) -> torch.cuda.Stream:
     """Return the next idle prep stream (round-robin) for this device."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
     return next(_staged_h2d_streams(idx))
 
 
 def prep_stream_ctx(device: torch.device) -> AbstractContextManager:
-    """Make an idle prep stream current while the CC staged path is enabled;
-    no-op otherwise.
+    """Make an idle prep stream current under Confidential Computing; no-op
+    otherwise.
 
     Use around an H2D whose result is consumed immediately on the issuing
     thread: under CC the copy is host-synchronous, so it is complete on return
     regardless of stream, and the prep stream only waits for its own transfer
     instead of the forward queued on the compute stream.
     """
-    if not staged_h2d_enabled():
+    if not confidential_compute_enabled():
         return nullcontext()
-    return torch.cuda.stream(staged_h2d_stream(device))
+    return torch.cuda.stream(_staged_h2d_stream(device))
 
 
 class StagedH2DCopier:
     """Double-buffered staged H2D into a persistent GPU tensor.
 
     One instance per destination tensor. Callers must only use this when
-    ``staged_h2d_enabled()`` is true; off CC the cross-stream handoff would
-    race (see module docstring).
+    ``confidential_compute_enabled()`` is true; off CC the cross-stream
+    handoff would race (see module docstring).
     """
 
     def __init__(self, gpu_base: torch.Tensor):
@@ -120,7 +119,7 @@ class StagedH2DCopier:
         # H2D on the prep stream is host-synchronous under CC, so stage_dst is
         # populated on return; the D2D on the current (compute) stream is async
         # and ordered after the forward's read of the reused buffer.
-        with torch.cuda.stream(staged_h2d_stream(self._gpu.device)):
+        with torch.cuda.stream(_staged_h2d_stream(self._gpu.device)):
             stage_dst.copy_(cpu_src, non_blocking=True)
         return gpu_dst.copy_(stage_dst, non_blocking=True)
 

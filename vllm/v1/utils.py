@@ -32,7 +32,7 @@ from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_mes
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.cc_copy import StagedH2DCopier, staged_h2d_enabled
+from vllm.v1.cc_copy import StagedH2DCopier, confidential_compute_enabled
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -143,8 +143,8 @@ class CpuGpuBuffer:
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         # Under Confidential Computing, route through the staged path (idle-stream
         # H2D + async compute-stream D2D) so the engine never blocks on the
-        # in-flight forward. Off-CC / when disabled, plain non-blocking H2D.
-        if self.gpu.is_cuda and staged_h2d_enabled():
+        # in-flight forward. Off-CC, plain non-blocking H2D.
+        if self.gpu.is_cuda and confidential_compute_enabled():
             if self._staged_copier is None:
                 self._staged_copier = StagedH2DCopier(self.gpu)
             return self._staged_copier.copy_(self.cpu, n)
