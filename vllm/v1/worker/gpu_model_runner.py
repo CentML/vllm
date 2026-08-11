@@ -151,7 +151,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.cc_copy import AsyncD2HCopyWorker, StagedH2DCopier
+from vllm.v1.conf_compute_utils import AsyncD2HCopyWorker, StagedH2DCopier
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -286,15 +286,16 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._routed_experts = routed_experts
         self._has_fault: torch.Tensor | None = None
 
-        # Set only on the CC path: the copy worker signals it once the
-        # deferred readback has completed.
+        # Set only under Confidential Computing: the copy worker signals it
+        # once the deferred readback has completed.
         self._copy_done: threading.Event | None = None
         if async_d2h_copy_worker is not None:
-            # Under CC a D2H copy is host-synchronous and, ordered after this
-            # step's forward+sample, would stall this thread for ~one forward
-            # and delay the next step's graph launch. Hand it to the dedicated
-            # copy worker (see vllm.v1.cc_copy); off-CC the copy is truly
-            # async, so issue inline below.
+            # Under Confidential Computing a D2H copy is host-synchronous and,
+            # ordered after this step's forward+sample, would stall this
+            # thread for ~one forward and delay the next step's graph launch.
+            # Hand it to the dedicated copy worker (see
+            # vllm.v1.conf_compute_utils); otherwise the copy is truly async,
+            # so issue inline below.
             self._check_ep_fault = check_ep_fault
             self.sampled_token_ids_cpu: torch.Tensor | None = None
             self._logprobs_tensors_cpu = None
@@ -325,7 +326,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             self.async_copy_ready_event.record()
 
     def _issue_copies(self) -> None:
-        """CC only: issue the D2H copies and record the ready event.
+        """Confidential Computing only: issue the D2H copies and record the
+        ready event.
 
         Runs on the AsyncD2HCopyWorker's thread and stream, already ordered
         after the producing forward+sample work.
@@ -354,8 +356,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         if self._copy_done is not None:
-            # CC: wait for the copy worker's deferred readback (see
-            # vllm.v1.cc_copy); worker-done => copy-done.
+            # Confidential Computing: wait for the copy worker's deferred
+            # readback (see vllm.v1.conf_compute_utils); worker-done =>
+            # copy-done.
             self._copy_done.wait()
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
@@ -825,7 +828,7 @@ class GPUModelRunner(
         )
         # Staged-copy helpers for direct (non-CpuGpuBuffer) H2D input copies
         # under Confidential Computing; keyed by call site. See
-        # _staged_h2d_copy_ and vllm.v1.cc_copy.
+        # _staged_h2d_copy_ and vllm.v1.conf_compute_utils.
         self._h2d_stage_cache: dict[str, StagedH2DCopier] = {}
         self._async_d2h_copy_worker: AsyncD2HCopyWorker | None = None
         self.prev_num_draft_tokens = self._make_buffer(
@@ -1225,8 +1228,9 @@ class GPUModelRunner(
         return stream
 
     def _get_or_create_async_d2h_copy_worker(self) -> AsyncD2HCopyWorker | None:
-        """Lazily create the dedicated D2H copy worker (CC only). Off-CC returns
-        None so the output copy is issued inline as before."""
+        """Lazily create the dedicated D2H copy worker (Confidential Computing
+        only). Otherwise returns None so the output copy is issued inline as
+        before."""
         if not current_platform.is_confidential_compute():
             return None
         if self._async_d2h_copy_worker is None:
@@ -2029,13 +2033,15 @@ class GPUModelRunner(
         *,
         key: str,
     ) -> torch.Tensor:
-        """CC only: copy ``cpu_base[:n] -> gpu_base[:n]`` via the staged path.
+        """Confidential Computing only: copy ``cpu_base[:n] -> gpu_base[:n]``
+        via the staged path.
 
-        Mirrors CpuGpuBuffer.copy_to_gpu for direct (non-CpuGpuBuffer) tensors:
-        the H2D runs on a dedicated prep stream (immune to the forward queued
-        on the compute stream) and a D2D moves it onto ``gpu_base`` on the
-        current stream (async under CC). Staging is double-buffered per
-        ``key``. Callers must check ``is_confidential_compute()``.
+        Mirrors CpuGpuBuffer.copy_to_gpu for direct (non-CpuGpuBuffer)
+        tensors: the H2D runs on a dedicated prep stream (immune to the
+        forward queued on the compute stream) and a D2D moves it onto
+        ``gpu_base`` on the current stream (asynchronous under Confidential
+        Computing). Staging is double-buffered per ``key``. Callers must
+        check ``is_confidential_compute()``.
         """
         # NOTE: this buffer (e.g. num_computed_tokens) is consumed by compute-stream
         # kernels DURING _prepare_inputs (positions -> slot mapping / block table),
@@ -3965,11 +3971,12 @@ class GPUModelRunner(
             return
 
         if current_platform.is_confidential_compute():
-            # H2D copies are host-synchronous under CC (see vllm.v1.cc_copy):
-            # the prior step has already finished reading the reused CPU
-            # tensors by the time its copy call returned, so this event-sync
-            # would only serialize the worker on the in-flight forward (making
-            # the rank a straggler under tensor parallelism).
+            # H2D copies are host-synchronous under Confidential Computing
+            # (see vllm.v1.conf_compute_utils): the prior step has already
+            # finished reading the reused CPU tensors by the time its copy
+            # call returned, so this event-sync would only serialize the
+            # worker on the in-flight forward (making the rank a straggler
+            # under tensor parallelism).
             yield
             return
 

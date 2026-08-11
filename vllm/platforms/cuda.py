@@ -193,21 +193,24 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
 @with_nvml_context
 def _nvml_confidential_compute_enabled() -> bool:
     state = pynvml.nvmlSystemGetConfComputeState()
-    # ccFeature != 0 means CC is enabled (ON or devtools mode).
+    # ccFeature != 0 means Confidential Computing is enabled (ON or devtools
+    # mode).
     return int(getattr(state, "ccFeature", 0)) != 0
 
 
 @cache
 def _detect_confidential_compute() -> bool:
-    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+    """Whether the GPU is running in NVIDIA Confidential Computing mode.
 
-    Under bounce-buffer CC, device<->host copies are forced synchronous even
-    with ``non_blocking=True``, which stalls the thread that issues them (see
-    vllm.v1.cc_copy). Detected once via NVML and cached.
+    Under bounce-buffer Confidential Computing, device<->host copies are
+    forced synchronous even with ``non_blocking=True``, which stalls the
+    thread that issues them (see vllm.v1.conf_compute_utils). Detected once
+    via NVML and cached.
 
     Returns:
-        True if CC is enabled (``ccFeature != 0``). Overridable via
-        ``VLLM_CONFIDENTIAL_COMPUTE=1/0``; on any NVML failure, returns False.
+        True if Confidential Computing is enabled (``ccFeature != 0``).
+        Overridable via ``VLLM_CONFIDENTIAL_COMPUTE=1/0``; on any NVML
+        failure, returns False.
     """
     forced = envs.VLLM_CONFIDENTIAL_COMPUTE
     if forced is not None:

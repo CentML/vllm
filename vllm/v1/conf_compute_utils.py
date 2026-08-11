@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Copy helpers for NVIDIA Confidential Computing (CC).
+"""Copy helpers for NVIDIA Confidential Computing.
 
-Under bounce-buffer CC a host<->device ``cudaMemcpyAsync`` is forced
-host-SYNCHRONOUS: the issuing thread blocks until the copy -- and everything
-already queued on its stream -- completes. Two consequences for the engine:
+Under bounce-buffer Confidential Computing a host<->device
+``cudaMemcpyAsync`` is forced host-SYNCHRONOUS: the issuing thread blocks
+until the copy -- and everything already queued on its stream -- completes.
+Two consequences for the engine:
 
 * An H2D issued on the compute stream (which has the in-flight forward
   queued) blocks the scheduler for ~one forward per copy, starving the GPU.
@@ -12,15 +13,16 @@ already queued on its stream -- completes. Two consequences for the engine:
   the next step's CUDA graph launch by ~one decode step.
 
 Two mitigations, both gated on ``confidential_compute_enabled()`` and no-ops
-off CC:
+outside Confidential Computing:
 
 * Staged H2D (``StagedH2DCopier`` / ``prep_stream_ctx``): issue the H2D into
   a device staging buffer on an idle prep stream, so it only pays its own
   transfer (~tens of us) instead of the forward drain; then a D2D
-  staging->dst on the compute stream. The D2D is genuinely async under CC and
-  is ordered after the forward's read of the reused graph-input buffer, so
-  there is no host block and no write-after-read race. Correctness relies on
-  the pinned H2D being host-synchronous under CC: staging is fully populated
+  staging->dst on the compute stream. The D2D is genuinely asynchronous under
+  Confidential Computing and is ordered after the forward's read of the
+  reused graph-input buffer, so there is no host block and no
+  write-after-read race. Correctness relies on the pinned H2D being
+  host-synchronous under Confidential Computing: staging is fully populated
   by the time the copy call returns, so the D2D enqueued on another stream
   reads valid data without a cross-stream event. Callers double-buffer the
   staging tensor so the next step's H2D cannot overwrite a staging buffer
@@ -30,8 +32,9 @@ off CC:
 
 * ``AsyncD2HCopyWorker``: run the (still-blocking) result readback on a
   dedicated daemon thread so the scheduler keeps issuing work (mirrors
-  TensorRT-LLM PR #8463). The copy stays synchronous under CC; it is merely
-  non-blocking *to the scheduler thread*, restoring overlap.
+  TensorRT-LLM PR #8463). The copy stays synchronous under Confidential
+  Computing; it is merely non-blocking *to the scheduler thread*, restoring
+  overlap.
 """
 
 import queue
@@ -85,9 +88,10 @@ def prep_stream_ctx(device: torch.device) -> AbstractContextManager:
     otherwise.
 
     Use around an H2D whose result is consumed immediately on the issuing
-    thread: under CC the copy is host-synchronous, so it is complete on return
-    regardless of stream, and the prep stream only waits for its own transfer
-    instead of the forward queued on the compute stream.
+    thread: under Confidential Computing the copy is host-synchronous, so it
+    is complete on return regardless of stream, and the prep stream only
+    waits for its own transfer instead of the forward queued on the compute
+    stream.
     """
     if not confidential_compute_enabled():
         return nullcontext()
@@ -98,8 +102,8 @@ class StagedH2DCopier:
     """Double-buffered staged H2D into a persistent GPU tensor.
 
     One instance per destination tensor. Callers must only use this when
-    ``confidential_compute_enabled()`` is true; off CC the cross-stream
-    handoff would race (see module docstring).
+    ``confidential_compute_enabled()`` is true; outside Confidential
+    Computing the cross-stream handoff would race (see module docstring).
     """
 
     def __init__(self, gpu_base: torch.Tensor):
@@ -116,9 +120,10 @@ class StagedH2DCopier:
         stage = self._stage[self._idx]
         self._idx ^= 1
         stage_dst = stage if n is None else stage[:n]
-        # H2D on the prep stream is host-synchronous under CC, so stage_dst is
-        # populated on return; the D2D on the current (compute) stream is async
-        # and ordered after the forward's read of the reused buffer.
+        # The H2D on the prep stream is host-synchronous under Confidential
+        # Computing, so stage_dst is populated on return; the D2D on the
+        # current (compute) stream is asynchronous and ordered after the
+        # forward's read of the reused buffer.
         with torch.cuda.stream(_staged_h2d_stream(self._gpu.device)):
             stage_dst.copy_(cpu_src, non_blocking=True)
         return gpu_dst.copy_(stage_dst, non_blocking=True)
@@ -133,7 +138,8 @@ class AsyncD2HCopyWorker:
     event (event-sync, NOT stream-wait, so the blocking copy does not stall
     the scheduler's CUDA API calls), runs the copy on the dedicated copy
     stream, blocks until it completes, and sets the returned event
-    (worker-done => copy-done). See the module docstring for the CC rationale.
+    (worker-done => copy-done). See the module docstring for the Confidential
+    Computing rationale.
     """
 
     def __init__(self, device_module, copy_stream, device=None):
