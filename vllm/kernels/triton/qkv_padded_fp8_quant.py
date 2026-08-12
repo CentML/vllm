@@ -37,6 +37,7 @@ def _quantize_pad_fp8_kernel(
     fp8_min: tl.constexpr,
     fp8_max: tl.constexpr,
     SKIP_SCALE: tl.constexpr,
+    PRE_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -65,6 +66,10 @@ def _quantize_pad_fp8_kernel(
     else:
         scale = tl.load(scale_ptr)
         x_q = x / scale
+    # Fold a compile-time scalar (e.g. attn_scale * log2(e)) into the quantized
+    # output so the downstream attention softmax scalar can be 1.0. constexpr so
+    # it stays fp32 (no fp64->fp8 inductor lowering under torch.compile).
+    x_q = x_q * PRE_SCALE
     x_q = tl.clamp(x_q, fp8_min, fp8_max).to(y_ptr.dtype.element_ty)
 
     y_ptrs = (
@@ -88,6 +93,7 @@ def quantize_fp8_pad_head_dim_triton(
     tensor: torch.Tensor,
     scale: torch.Tensor,
     skip_scale: bool = False,
+    pre_scale: float = 1.0,
     block_m: int | None = None,
     block_n: int | None = None,
     num_warps: int | None = None,
@@ -143,6 +149,7 @@ def quantize_fp8_pad_head_dim_triton(
         _FP8_MIN,
         _FP8_MAX,
         SKIP_SCALE=skip_scale,
+        PRE_SCALE=pre_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=num_warps,
@@ -156,6 +163,7 @@ def quantize_fp8_maybe_pad_head_dim(
     scale: torch.Tensor,
     fp8_quant: QuantFP8,
     skip_scale: bool = False,
+    pre_scale: float = 1.0,
 ) -> torch.Tensor:
     """Quantize a 3D/4D tensor to FP8, padding head_dim to a multiple of 16
     only when needed.
@@ -164,17 +172,28 @@ def quantize_fp8_maybe_pad_head_dim(
     :class:`QuantFP8` CustomOp) when head_dim is already aligned to 16
     (no padding); otherwise falls back to a stride-aware Triton kernel
     that pads head_dim to a multiple of 16.
+
+    ``pre_scale`` is a compile-time constant folded into the quantized output
+    (used to move the attention softmax scalar onto the quantize kernel so the
+    downstream SDPA softmax scalar can be 1.0).
     """
     head_dim = tensor.shape[-1]
     if head_dim % 16 != 0:
-        return quantize_fp8_pad_head_dim_triton(tensor, scale, skip_scale=skip_scale)
+        return quantize_fp8_pad_head_dim_triton(
+            tensor, scale, skip_scale=skip_scale, pre_scale=pre_scale
+        )
 
     if skip_scale:
-        return tensor.to(current_platform.fp8_dtype())
+        out = tensor.to(current_platform.fp8_dtype())
+        return out if pre_scale == 1.0 else (tensor * pre_scale).to(
+            current_platform.fp8_dtype()
+        )
 
     # QuantFP8 expects 2D: flatten all dims except (H, D).
     orig_shape = tensor.shape
     total_tokens = tensor.numel() // (orig_shape[-1] * orig_shape[-2])
     tensor_2d = tensor.reshape(total_tokens, -1)
+    if pre_scale != 1.0:
+        tensor_2d = tensor_2d * pre_scale
     fp8_tensor, _ = fp8_quant(tensor_2d, scale=scale)
     return fp8_tensor.reshape(orig_shape)

@@ -3,6 +3,8 @@
 
 import functools
 import json
+import math
+import os
 
 import numpy as np
 import torch
@@ -390,6 +392,12 @@ class MMEncoderAttention(CustomOp):
         self.skip_scale_q = False
         self.skip_scale_k = False
         self.skip_scale_v = False
+        # Fold attn_scale * log2(e) into the Q fp8 quantize so the cuDNN SDPA
+        # softmax scalar becomes 1.0, moving the base-2 log2(e) score MUL off
+        # the attention kernel. Identity transform; gated by env for A/B.
+        self._softmax_prescale = (
+            os.environ.get("VLLM_VIT_FP8_SOFTMAX_PRESCALE", "0") == "1"
+        )
 
         mm_cfg = get_multimodal_config()
         if mm_cfg is None or mm_cfg.mm_encoder_attn_dtype != "fp8":
@@ -674,17 +682,22 @@ class MMEncoderAttention(CustomOp):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        q_pre_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.fp8_quant is not None
 
         if self._fp8_dynamic_scale:
             self._record_amax_and_update_scales(query, key, value)
 
+        # Fold attn_scale * log2(e) into Q only (K/V unchanged); identity
+        # transform that lets the SDPA softmax scalar be 1.0. See
+        # _softmax_prescale.
         query = quantize_fp8_maybe_pad_head_dim(
             query,
             self._fp8_q_scale,
             skip_scale=self.skip_scale_q,
             fp8_quant=self.fp8_quant,
+            pre_scale=q_pre_scale,
         )
         key = quantize_fp8_maybe_pad_head_dim(
             key,
@@ -710,14 +723,29 @@ class MMEncoderAttention(CustomOp):
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
+        # See _softmax_prescale: fold attn_scale*log2(e) into Q and set the SDPA
+        # softmax scalar to ln(2) so that ln(2)*log2(e) = 1 collapses cuDNN's
+        # internal base-2 score scaling to a no-op (identity transform).
+        q_pre_scale = (
+            self.scale * math.log2(math.e)
+            if (self.fp8_enabled and self._softmax_prescale)
+            else 1.0
+        )
         if self.fp8_enabled:
-            query, key, value = self._quantize_qkv_fp8(query, key, value)
+            query, key, value = self._quantize_qkv_fp8(
+                query, key, value, q_pre_scale=q_pre_scale
+            )
 
+        softmax_scale = (
+            math.log(2.0)
+            if (self.fp8_enabled and self._softmax_prescale)
+            else self.scale
+        )
         output = vit_flashinfer_wrapper(
             q=query,
             k=key,
             v=value,
-            scale=self.scale,
+            scale=softmax_scale,
             workspace_buffer=_get_flashinfer_workspace_buffer(),
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
