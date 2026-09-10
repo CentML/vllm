@@ -759,7 +759,8 @@ WORKDIR /vllm-workspace
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
-# Install Python and system dependencies
+# Install Python and system dependencies. Rubin's Quack compatibility pin is a
+# VCS requirement, so its uv installs also need the Git client.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         software-properties-common \
@@ -769,6 +770,9 @@ RUN apt-get update -y \
         libsm6 \
         libxext6 \
         libgl1 \
+    && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
+        apt-get install -y --no-install-recommends git; \
+    fi \
     && if [ ! -z ${DEADSNAKES_MIRROR_URL} ] ; then \
         if [ ! -z "${DEADSNAKES_GPGKEY_URL}" ] ; then \
             mkdir -p -m 0755 /etc/apt/keyrings ; \
