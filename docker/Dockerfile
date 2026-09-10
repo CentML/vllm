@@ -232,6 +232,8 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing Rubin prerelease requirements..." \
         && /opt/venv/bin/python3 use_existing_torch.py --prefix \
+        && sed -Ei '/^[[:space:]]*(nvidia-cutlass-dsl\[cu13\]|quack-kernels)[[:space:]]*==/Id' \
+            requirements/cuda.txt \
         && uv pip install --python /opt/venv/bin/python3 \
             --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
@@ -645,7 +647,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 use_existing_torch.py --prefix; \
     fi \
     && if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
-        sed -Ei '/^[[:space:]]*(flashinfer-python|nvidia-cutlass-dsl\[cu13\])[[:space:]]*==/Id' \
+        sed -Ei '/^[[:space:]]*(flashinfer-python|nvidia-cutlass-dsl\[cu13\]|quack-kernels)[[:space:]]*==/Id' \
             requirements/cuda.txt; \
     fi
 
@@ -950,7 +952,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         uv pip install --system \
             --prerelease=allow --index-strategy unsafe-first-match \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
-        && sed -Ei '/^[[:space:]]*(torch|torchvision|torchaudio)[[:space:]]*==/Id' \
+        && sed -Ei '/^[[:space:]]*(torch|torchvision|torchaudio|nvidia-cutlass-dsl\[cu13\]|quack-kernels)[[:space:]]*==/Id' \
             /tmp/requirements-cuda.txt \
         && uv pip install --system -r /tmp/requirements-cuda.txt \
         && uv pip install --system \

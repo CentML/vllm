@@ -16,6 +16,9 @@ torchaudio==2.11.0.dev20260902+cu134
 # Keep the Rubin dependency set explicit because docker/Dockerfile installs it
 # after the regular CUDA and KV-connector requirements.
 nvidia-cutlass-dsl[cu13]==4.8.0.dev0
+# Quack 0.6.4 pins CUTLASS DSL 4.6.2. This public post-release commit carries
+# the tested CUTLASS DSL 4.8 compatibility work until the next Quack release.
+quack-kernels[cu13] @ git+https://github.com/Dao-AILab/quack.git@14b0b7122e252a4df40a0b762c7ffd0f8b67a015
 flashinfer-python==0.6.18.post1
 flashinfer-jit-cache==0.6.18.post1+cu134
 flashinfer-cubin==0.6.18.post1
