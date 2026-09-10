@@ -119,7 +119,7 @@ ARG SCCACHE_S3_NO_CREDENTIALS=0
 ENV UV_HTTP_TIMEOUT=500
 # Parallel stages share UV_CACHE_DIR; large Rubin wheels can hold a cache lock
 # longer than uv's five-minute default.
-ENV UV_LOCK_TIMEOUT=1800
+ARG UV_LOCK_TIMEOUT=1800
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/uv/cache
@@ -867,7 +867,7 @@ RUN python3 -m pip install uv
 ENV UV_HTTP_TIMEOUT=500
 # Parallel stages share UV_CACHE_DIR; large Rubin wheels can hold a cache lock
 # longer than uv's five-minute default.
-ENV UV_LOCK_TIMEOUT=1800
+ARG UV_LOCK_TIMEOUT=1800
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 ENV UV_LINK_MODE=copy
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
