@@ -712,7 +712,24 @@ def copy_slice(
 
     Returns the sliced target tensor.
     """
+    if to_tensor.is_cuda and confidential_compute_enabled():
+        # Under Confidential Computing a pinned H2D on the compute stream is
+        # host-synchronous behind the in-flight forward; stage it instead.
+        return _copy_slice_staged_copier(to_tensor).copy_(from_tensor, length)
     return to_tensor[:length].copy_(from_tensor[:length], non_blocking=True)
+
+
+_COPY_SLICE_STAGED_COPIERS: dict[tuple[int, tuple[int, ...], torch.dtype],
+                                StagedH2DCopier] = {}
+
+
+def _copy_slice_staged_copier(to_tensor: torch.Tensor) -> StagedH2DCopier:
+    """Return the staged copier for a persistent GPU destination tensor."""
+    key = (to_tensor.data_ptr(), tuple(to_tensor.shape), to_tensor.dtype)
+    copier = _COPY_SLICE_STAGED_COPIERS.get(key)
+    if copier is None:
+        copier = _COPY_SLICE_STAGED_COPIERS[key] = StagedH2DCopier(to_tensor)
+    return copier
 
 
 def report_usage_stats(
