@@ -114,8 +114,8 @@ ARG SCCACHE_S3_NO_CREDENTIALS=0
 # build time hardlinks back to /root/.local/share/uv/python and
 # descendants of this stage (`build`, `dev`, `csrc-build`,
 # `extensions-build`) inherit a root-owned, non-root-unreadable layout.
-# See #15174, #15359, #31959. Child stages inherit these via Dockerfile
-# `ENV` unless they override them explicitly.
+# See #15174, #15359, #31959. Child stages inherit these Dockerfile `ENV` and
+# `ARG` settings unless they override them explicitly.
 ENV UV_HTTP_TIMEOUT=500
 # Parallel stages share UV_CACHE_DIR; large Rubin wheels can hold a cache lock
 # longer than uv's five-minute default.
