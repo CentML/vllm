@@ -75,6 +75,23 @@ class TestSingleWriterShmObjectStorage(unittest.TestCase):
         # Verify result
         self.assertEqual(result, value)
 
+    def test_acknowledge_without_deserializing(self):
+        key = "covered_item"
+        value = _dummy_item({"field": 10})
+        address, monotonic_id = self.storage.put(key, value)
+
+        def fail_deserialize(_):
+            raise AssertionError("covered SHM object must not be deserialized")
+
+        self.storage.ser_de.deserialize = fail_deserialize
+        self.storage.acknowledge(address, monotonic_id)
+
+        with self.storage.ring_buffer.access_buf(address) as (data_view, _):
+            reader_count = self.storage.ring_buffer.byte2int(
+                data_view[: self.storage.flag_bytes]
+            )
+        self.assertEqual(reader_count, 1)
+
     def test_put_same_key_twice(self):
         """Test behavior when putting the same key multiple times."""
         key = "duplicate_key"

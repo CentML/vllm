@@ -364,7 +364,9 @@ class WorkerWrapperBase:
 
         for req_data in scheduler_output.scheduled_new_reqs:
             req_data.mm_features = mm_cache.get_and_update_features(
-                req_data.mm_features
+                req_data.mm_features,
+                num_computed_tokens=req_data.num_computed_tokens,
+                uses_mrope=self.model_config.uses_mrope,
             )
 
     def execute_model(

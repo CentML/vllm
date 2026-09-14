@@ -661,6 +661,9 @@ class BaseMultiModalReceiverCache(
     def get_and_update_features(
         self,
         mm_features: list["MultiModalFeatureSpec"],
+        *,
+        num_computed_tokens: int = 0,
+        uses_mrope: bool = False,
     ) -> list["MultiModalFeatureSpec"]:
         """
         Update multimodal features with cached encoder outputs.
@@ -670,6 +673,8 @@ class BaseMultiModalReceiverCache(
         Uses mm_hash for cache key to share across LoRAs (falls back to
         identifier for backward compatibility).
         """
+        del num_computed_tokens, uses_mrope
+
         for feature in mm_features:
             cache_key = feature.mm_hash or feature.identifier
             self.touch_receiver_cache_item(cache_key, feature.data)
@@ -796,14 +801,46 @@ class ShmObjectStoreReceiverCache(BaseMultiModalReceiverCache):
 
     @override
     def get_and_update_features(
-        self, mm_features: list["MultiModalFeatureSpec"]
+        self,
+        mm_features: list["MultiModalFeatureSpec"],
+        *,
+        num_computed_tokens: int = 0,
+        uses_mrope: bool = False,
     ) -> list["MultiModalFeatureSpec"]:
-        # strip_covered_mm_data preserves address items, so None here represents
-        # a stripped uncached payload and has no SHM reference to acknowledge.
         features_with_data = [
             feature for feature in mm_features if feature.data is not None
         ]
-        super().get_and_update_features(features_with_data)
+        # Match the sender's pre-touch pass before acknowledging or resolving
+        # any object, so FIFO eviction cannot invalidate a later item.
+        for feature in features_with_data:
+            data = feature.data
+            assert data is not None
+            cache_key = feature.mm_hash or feature.identifier
+            self.touch_receiver_cache_item(cache_key, data)
+
+        for feature in mm_features:
+            data = feature.data
+            is_fully_covered = (
+                num_computed_tokens > 0
+                and feature.mm_position.offset + feature.mm_position.length
+                <= num_computed_tokens
+            )
+            if (
+                not uses_mrope
+                and is_fully_covered
+                and data is not None
+                and "address" in data
+            ):
+                address = cast(int, data["address"].data)
+                monotonic_id = cast(int, data["monotonic_id"].data)
+                self._shm_cache.acknowledge(address, monotonic_id)
+                feature.data = None
+                continue
+
+            if data is not None:
+                cache_key = feature.mm_hash or feature.identifier
+                feature.data = self.get_and_update_item(data, cache_key)
+
         return mm_features
 
     @override

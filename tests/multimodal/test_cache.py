@@ -718,6 +718,62 @@ def test_cache_eviction_shm_cache():
     _run_test_cache_eviction_shm(sender_cache, receiver_cache, base_item_size=MiB_bytes)
 
 
+def test_shm_cache_skips_deserialize_for_prefix_covered_feature(monkeypatch):
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
+            mm_processor_cache_type="shm",
+            mm_shm_cache_max_object_size_mb=6,
+            mm_processor_cache_gb=15.2 * MiB_bytes / GiB_bytes,
+        ),
+    )
+    sender_cache = ShmObjectStoreSenderCache(vllm_config)
+    receiver_cache = ShmObjectStoreReceiverCache(vllm_config, mp.Lock())
+    item = _dummy_item({"pixels": 1024})
+    address_item, _ = sender_cache.get_and_update_item((item, []), "image")
+    assert address_item is not None
+    feature = MultiModalFeatureSpec(
+        data=address_item,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=0, length=100),
+    )
+
+    def fail_get(*_args):
+        raise AssertionError("covered SHM object must not be deserialized")
+
+    monkeypatch.setattr(receiver_cache._shm_cache, "get", fail_get)
+    receiver_cache.get_and_update_features(
+        [feature], num_computed_tokens=100, uses_mrope=False
+    )
+
+    assert feature.data is None
+
+    # A cache hit advances both the sender touch and get references. The
+    # deserialize-free path must mirror both reader acknowledgements.
+    sender_cache.touch_sender_cache_item("image")
+    second_address_item, _ = sender_cache.get_and_update_item(None, "image")
+    assert second_address_item is not None
+    second_feature = MultiModalFeatureSpec(
+        data=second_address_item,
+        modality="image",
+        identifier="image",
+        mm_position=PlaceholderRange(offset=0, length=100),
+    )
+    receiver_cache.get_and_update_features(
+        [second_feature], num_computed_tokens=100, uses_mrope=False
+    )
+
+    address = second_address_item["address"].data
+    monotonic_id = second_address_item["monotonic_id"].data
+    assert sender_cache._shm_cache.writer_flag[monotonic_id] == 3
+    with sender_cache._shm_cache.ring_buffer.access_buf(address) as (data_view, _):
+        reader_count = sender_cache._shm_cache.ring_buffer.byte2int(
+            data_view[: sender_cache._shm_cache.flag_bytes]
+        )
+    assert reader_count == 3
+
+
 def test_processor_cache_shared_across_loras():
     """Test that processor cache uses mm_hash to share data across LoRAs."""
     model_config = ModelConfig(

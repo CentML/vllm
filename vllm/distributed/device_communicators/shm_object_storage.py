@@ -633,6 +633,25 @@ class SingleWriterShmObjectStorage:
 
         return obj
 
+    def acknowledge(self, address: int, monotonic_id: int) -> None:
+        """Acknowledge an object without deserializing its payload.
+
+        This is used when a reader must participate in reference counting but
+        already knows that it will not consume the stored object.
+        """
+        with self.ring_buffer.access_buf(address) as (data_view, buf_metadata):
+            if buf_metadata[0] != monotonic_id:
+                raise ValueError(
+                    f"Data for address:id '{address}:{monotonic_id}'"
+                    " has been modified or is invalid."
+                )
+
+            if self._reader_lock is not None:
+                with self._reader_lock:
+                    self.increment_reader_flag(data_view[: self.flag_bytes])
+            else:
+                assert self.is_writer
+
     def touch(
         self,
         key: str,
