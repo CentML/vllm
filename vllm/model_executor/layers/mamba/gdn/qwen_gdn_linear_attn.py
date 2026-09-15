@@ -39,6 +39,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
+    gather_initial_states,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -196,7 +199,12 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    g_is_exp: bool = False,
+    output: torch.Tensor | None = None,
 ):
+    """``g_is_exp``: ``g`` already holds ``exp(g)``. ``output``: optional
+    contiguous ``[T, Hv, V]`` buffer the kernel writes into directly.
+    """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
@@ -221,11 +229,12 @@ def fi_chunk_gated_delta_rule(
         q=q,
         k=k,
         v=v,
-        g=torch.exp(fi_g),
+        g=fi_g if g_is_exp else torch.exp(fi_g),
         beta=fi_beta,
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=output,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -260,6 +269,15 @@ class ChunkGatedDeltaRule(CustomOp):
         else:
             self._forward_method = self.forward_native
 
+        # FlashInfer takes exp(g) and an fp32 initial state, and can write its
+        # output into a caller-provided buffer. Callers use these to skip the
+        # per-layer exp/cast/copy glue launches.
+        self.gate_is_exp = active_backend == "flashinfer"
+        self.initial_state_dtype = (
+            torch.float32 if active_backend == "flashinfer" else None
+        )
+        self.inplace_output = active_backend == "flashinfer"
+
     def forward_cuda(
         self,
         q: torch.Tensor,
@@ -275,6 +293,12 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
     ):
+        direct = (
+            core_attn_out is not None
+            and core_attn_out.is_contiguous()
+            and core_attn_out.shape == v.shape[1:]
+            and core_attn_out.dtype == v.dtype
+        )
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -285,8 +309,10 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            g_is_exp=self.gate_is_exp,
+            output=core_attn_out if direct else None,
         )
-        if core_attn_out is not None:
+        if core_attn_out is not None and not direct:
             o_flat = o.squeeze(0).reshape(-1)
             co_flat = core_attn_out.reshape(-1)
             co_flat[: o_flat.numel()].copy_(o_flat)
@@ -1123,7 +1149,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=self.chunk_gated_delta_rule.gate_is_exp,
         )
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
@@ -1446,7 +1472,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=False,
+                output_g_exp=self.chunk_gated_delta_rule.gate_is_exp,
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
@@ -1521,8 +1547,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            initial_state = gather_initial_states(
+                ssm_state,
+                prefill_state_indices,
+                prefill_has_initial_state,
+                dtype=self.chunk_gated_delta_rule.initial_state_dtype,
+            )
+            # Let the kernel write the prefill outputs straight into their
+            # slot of core_attn_out (after any peeled decodes), skipping the
+            # stitch and final copy below.
+            prefill_out = None
+            if (
+                self.chunk_gated_delta_rule.inplace_output
+                and spec_sequence_masks is None
+            ):
+                prefill_start = num_decode_tokens if split_non_spec else 0
+                prefill_out = core_attn_out[prefill_start:num_actual_tokens]
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1538,9 +1578,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=prefill_out,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+
+            if prefill_out is not None:
+                if split_non_spec:
+                    core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+                return
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill

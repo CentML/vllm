@@ -46,8 +46,13 @@ def gather_initial_states(
     state: torch.Tensor,
     indices: torch.Tensor,
     has_initial_state: torch.Tensor,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Gather dense state rows, replacing uninitialized rows with zeros."""
+    """Gather dense state rows, replacing uninitialized rows with zeros.
+
+    ``dtype`` selects the output dtype (defaults to ``state.dtype``); the cast
+    happens in the gather kernel so no separate conversion pass is needed.
+    """
     assert state.ndim >= 2
     assert state.is_cuda or state.is_xpu
     assert indices.ndim == 1 and has_initial_state.ndim == 1
@@ -62,7 +67,7 @@ def gather_initial_states(
     assert state[0].is_contiguous()
     output = torch.empty(
         (indices.numel(), *state.shape[1:]),
-        dtype=state.dtype,
+        dtype=dtype or state.dtype,
         device=state.device,
     )
     block_size = min(triton.next_power_of_2(row_size), 1024)
