@@ -110,8 +110,15 @@ class StagedH2DCopier:
 
     def __init__(self, gpu_base: torch.Tensor):
         self._gpu = gpu_base
-        # Staging is mutable runtime state, not inference data.
-        with torch.inference_mode(False):
+        # Staging is mutable runtime state, not inference data. Allocate it on
+        # the prep stream: the caching allocator only recycles blocks within
+        # the stream they were freed on, so a compute-stream allocation could
+        # hand back memory a still-running compute kernel just released, and
+        # the prep stream's H2D would overwrite it immediately.
+        with (
+            torch.inference_mode(False),
+            torch.cuda.stream(_prep_stream(gpu_base.device)),
+        ):
             self._stage = [torch.empty_like(gpu_base) for _ in range(2)]
         self._idx = 0
 
