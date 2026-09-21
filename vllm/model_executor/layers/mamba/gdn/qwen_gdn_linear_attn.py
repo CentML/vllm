@@ -93,7 +93,7 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "flashinfer_sm107", "cutedsl"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -103,6 +103,9 @@ def _resolve_gdn_prefill_backend(
       - Hopper (SM90) - no further constraints;
       - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``;
       - Blackwell (SM12.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+
+    Native Rubin GDN is opt-in via "flashinfer_sm107" and requires SM107,
+    ``head_k_dim == 128``, CUDA 13+, and a FlashInfer build with that backend.
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
@@ -143,6 +146,12 @@ def _resolve_gdn_prefill_backend(
         # The in-tree CuteDSL kernel targets SM100 only, so it stays off here.
         supports_flashinfer = True
 
+    if (
+        backend == "flashinfer_sm107"
+        and current_platform.is_device_capability(107)
+        and supports_flashinfer
+    ):
+        return backend, "flashinfer_sm107"
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
@@ -170,6 +179,7 @@ def _log_gdn_backend_decision(
 
     chosen = {
         "flashinfer": "FlashInfer",
+        "flashinfer_sm107": "FlashInfer SM107",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
     }[active_backend]
@@ -196,6 +206,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    backend: Literal["sm107"] | None = None,
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -217,6 +228,7 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
+    backend_kwargs = {"backend": backend, "use_cp": False} if backend else {}
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -226,6 +238,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        **backend_kwargs,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -245,7 +258,10 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if (
+            backend in ("flashinfer", "flashinfer_sm107", "cutedsl")
+            and active_backend != backend
+        ):
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -253,7 +269,7 @@ class ChunkGatedDeltaRule(CustomOp):
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
-        if active_backend == "flashinfer":
+        if active_backend in ("flashinfer", "flashinfer_sm107"):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
@@ -285,6 +301,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            backend="sm107" if self.gdn_prefill_backend == "flashinfer_sm107" else None,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
