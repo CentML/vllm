@@ -1200,6 +1200,9 @@ RUN mv vllm src/vllm
 #################### OPENAI API SERVER ####################
 # base openai image with additional requirements, for any subsequent openai-style images
 FROM vllm-base AS vllm-openai-base
+# Optional source-built FlashInfer wheel staged under requirements/.
+ARG FLASHINFER_WHEEL
+ARG FLASHINFER_WHEEL_SHA256
 ARG TARGETPLATFORM
 ARG INSTALL_KV_CONNECTORS=false
 ARG INSTALL_RUBIN_PRERELEASE
@@ -1263,6 +1266,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         echo "Installing Rubin prerelease requirements..." \
         && uv pip install --system \
             -r /tmp/vllm-requirements/rubin-prerelease.txt; \
+    fi && \
+    if [ -n "${FLASHINFER_WHEEL}" ]; then \
+        test -n "${FLASHINFER_WHEEL_SHA256}" \
+        && printf '%s  %s\n' "${FLASHINFER_WHEEL_SHA256}" \
+            "/tmp/vllm-requirements/${FLASHINFER_WHEEL}" | sha256sum -c - \
+        && uv pip install --system --no-deps \
+            "/tmp/vllm-requirements/${FLASHINFER_WHEEL}"; \
     fi
 
 # Install source-built Triton last so dependency resolution cannot restore the
