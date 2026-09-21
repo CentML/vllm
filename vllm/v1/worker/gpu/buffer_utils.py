@@ -83,18 +83,35 @@ class UvaBufferPool:
         self._curr = 0
 
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
+        buf = self._next_buffer(len(x))
+        # CPU-to-CPU copy
+        dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+        dst[: len(x)] = x
+        return buf.uva(len(x))
+
+    def copy_tensor_chunks_to_uva(self, chunks: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Copy CPU tensor chunks into one pooled UVA buffer."""
+        assert chunks
+        assert all(chunk.device.type == "cpu" and chunk.ndim == 1 for chunk in chunks)
+        n = sum(chunk.numel() for chunk in chunks)
+        buf = self._next_buffer(n)
+        assert buf.cpu.ndim == 1
+        offset = 0
+        for chunk in chunks:
+            end = offset + chunk.numel()
+            buf.np[offset:end] = chunk.detach().numpy()
+            offset = end
+        return buf.uva(n)
+
+    def _next_buffer(self, n: int) -> UvaBuffer | NonUvaBuffer:
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
         buf = self._uva_bufs[self._curr]
-        n = len(x)
         if n > buf.cpu.shape[0]:
             capacity = 1 << (n - 1).bit_length()
             buf = self._buffer_cls((capacity, *buf.cpu.shape[1:]), self.dtype)
             self._uva_bufs[self._curr] = buf
-        # CPU-to-CPU copy
-        dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
-        dst[:n] = x
-        return buf.uva(n)
+        return buf
 
     def copy_to_gpu(
         self,
@@ -165,6 +182,7 @@ class StagedWriteTensor:
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
         self._staged_write_contents: list[int | float] = []
+        self._staged_write_tensor_contents: list[torch.Tensor] | None = None
         self._staged_write_cu_lens: list[int] = []
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
@@ -181,13 +199,49 @@ class StagedWriteTensor:
         assert start >= 0
         if not x:
             return
+        if self._staged_write_tensor_contents is not None:
+            self._stage_write_tensor(
+                index, start, torch.tensor(list(x), dtype=self.dtype)
+            )
+            return
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
         self._staged_write_contents.extend(x)
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
+    def stage_write_tensor(self, index: int, start: int, x: torch.Tensor) -> None:
+        """Stage a flat CPU tensor without converting it to Python scalars."""
+        assert self.write_contents is not None
+        assert x.device.type == "cpu"
+        assert x.ndim == 1
+        assert index >= 0
+        assert start >= 0
+        if x.numel() == 0:
+            return
+        if self._staged_write_tensor_contents is None:
+            self._staged_write_tensor_contents = []
+            if self._staged_write_contents:
+                self._staged_write_tensor_contents.append(
+                    torch.tensor(self._staged_write_contents, dtype=self.dtype)
+                )
+                self._staged_write_contents.clear()
+        self._stage_write_tensor(index, start, x)
+
+    def _stage_write_tensor(self, index: int, start: int, x: torch.Tensor) -> None:
+        assert self._staged_write_tensor_contents is not None
+        self._staged_write_indices.append(index)
+        self._staged_write_starts.append(start)
+        self._staged_write_tensor_contents.append(x)
+        self._staged_write_cu_lens.append(
+            (self._staged_write_cu_lens[-1] if self._staged_write_cu_lens else 0)
+            + x.numel()
+        )
+
     def stage_write_elem(self, index: int, x: int) -> None:
         assert index >= 0
+        if self._staged_write_tensor_contents is not None:
+            self._stage_write_tensor(index, 0, torch.tensor([x], dtype=self.dtype))
+            return
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(0)
         self._staged_write_contents.append(x)
@@ -205,6 +259,10 @@ class StagedWriteTensor:
         if self.write_contents is None:
             write_contents = async_tensor_h2d(
                 self._staged_write_contents, device=self.device, dtype=self.dtype
+            )
+        elif self._staged_write_tensor_contents is not None:
+            write_contents = self.write_contents.copy_tensor_chunks_to_uva(
+                self._staged_write_tensor_contents
             )
         else:
             write_contents = self.write_contents.copy_to_uva(
@@ -230,6 +288,7 @@ class StagedWriteTensor:
         self._staged_write_indices.clear()
         self._staged_write_starts.clear()
         self._staged_write_contents.clear()
+        self._staged_write_tensor_contents = None
         self._staged_write_cu_lens.clear()
 
 
@@ -270,7 +329,10 @@ class FusedStagedWriter:
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
             content_base = len(contents)
-            contents.extend(t._staged_write_contents)
+            if t._staged_write_tensor_contents is None:
+                contents.extend(t._staged_write_contents)
+            else:
+                contents.extend(torch.cat(t._staged_write_tensor_contents).tolist())
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
 
         if not group_ids:

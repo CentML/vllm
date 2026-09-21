@@ -7,7 +7,8 @@ import torch
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.worker.gpu import buffer_utils
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+from vllm.v1.worker.gpu.buffer_utils import FusedStagedWriter, StagedWriteTensor
+from vllm.v1.worker.gpu.mm.rope import RopeState
 
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
@@ -200,3 +201,149 @@ def test_staged_write_inflight(uva_target, dtype):
         for event, snapshot, reference in pending:
             event.synchronize()
             torch.testing.assert_close(snapshot.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+def test_staged_write_tensor_chunks_inflight():
+    """Keep large CPU position tensors valid across pooled-slot reuse."""
+    device = torch.device("cuda:0")
+    with torch.accelerator.device_index(device.index):
+        state = StagedWriteTensor(
+            (6, 131072),
+            torch.int32,
+            device,
+            max_concurrency=2,
+            uva_instead_of_gpu=True,
+        )
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        pending: list[tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]] = []
+        expected = torch.zeros((6, 131072), dtype=torch.int32, device="cpu")
+        for step in range(24):
+            if len(pending) == 2:
+                event, snapshot, reference = pending.pop(0)
+                event.synchronize()
+                torch.testing.assert_close(snapshot.cpu(), reference, rtol=0, atol=0)
+            length = [16384, 65536, 131072, 65536][step % 4]
+            base = torch.arange(length, dtype=torch.long) + step * 1_000_000
+            positions = (
+                base.unsqueeze(0).expand(3, -1)
+                if step % 2
+                else torch.stack((base, base * 2 + 1, base * 3 + 2))
+            )
+            row = (step % 2) * 3
+            expected[row : row + 3, :length] = positions.to(torch.int32)
+            with torch.cuda.stream(stream):
+                for axis in range(3):
+                    state.stage_write_tensor(row + axis, 0, positions[axis])
+                state.apply_write()
+                snapshot = state.gpu.clone()
+                event = torch.cuda.Event()
+                event.record(stream)
+            pending.append((event, snapshot, expected.clone()))
+        for event, snapshot, reference in pending:
+            event.synchronize()
+            torch.testing.assert_close(snapshot.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+def test_fused_staged_writer_materializes_tensor_chunks():
+    """Fused writes preserve tensor-staged chunks across staging modes."""
+    device = torch.device("cuda:0")
+    states = [
+        StagedWriteTensor(
+            (1, 64),
+            torch.int32,
+            device,
+            max_concurrency=2,
+            uva_instead_of_gpu=True,
+        )
+        for _ in range(2)
+    ]
+    states[0].stage_write(0, 0, [7])
+    states[0].stage_write_tensor(0, 1, torch.tensor([8, 9], dtype=torch.int64))
+    states[1].stage_write_tensor(0, 0, torch.tensor([10, 11], dtype=torch.int64))
+    writer = FusedStagedWriter(device, max_writes=2)
+    output_ptrs = torch.tensor(
+        [state.gpu.data_ptr() for state in states], dtype=torch.uint64, device=device
+    )
+    output_strides = torch.tensor(
+        [state.gpu.stride(0) for state in states], dtype=torch.int64, device=device
+    )
+    writer.apply(states, output_ptrs, output_strides)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        states[0].gpu[0, :3].cpu(), torch.tensor([7, 8, 9], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        states[1].gpu[0, :2].cpu(), torch.tensor([10, 11], dtype=torch.int32)
+    )
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+def test_rope_cpu_positions_use_uva_tensor_staging(monkeypatch):
+    """CPU M-RoPE positions use typed staging when their UVA path is available."""
+
+    class CpuMRoPE(torch.nn.Module):
+        def get_mrope_input_positions(self, token_ids, mm_features):
+            base = torch.tensor(token_ids, dtype=torch.long)
+            return torch.stack((base, base * 2 + 1, base * 3 + 2)), 0
+
+    state = RopeState(3, 2, 8192, 8192, torch.device("cuda:0"))
+    assert state.prefill_positions.write_contents is not None
+
+    def fail_list_staging(*args, **kwargs):
+        pytest.fail("CPU M-RoPE positions must use tensor-backed UVA staging")
+
+    monkeypatch.setattr(state.prefill_positions, "stage_write", fail_list_staging)
+    first_ids = list(range(1027))
+    second_ids = list(range(4099, 8192))
+    model = CpuMRoPE()
+    first, _ = model.get_mrope_input_positions(first_ids, [])
+    second, _ = model.get_mrope_input_positions(second_ids, [])
+    state.init_prefill_positions(0, model, first_ids, [])
+    state.init_prefill_positions(1, model, second_ids, [])
+    state.apply_staged_writes()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        state.read_prefill_positions(0, len(first_ids)).cpu(),
+        first.to(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state.read_prefill_positions(1, len(second_ids)).cpu(),
+        second.to(torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA is required.")
+def test_rope_cpu_positions_falls_back_without_uva(monkeypatch):
+    """CPU M-RoPE positions retain the list path when UVA staging is disabled."""
+
+    class CpuMRoPE(torch.nn.Module):
+        def get_mrope_input_positions(self, token_ids, mm_features):
+            positions = torch.stack(
+                (
+                    torch.arange(len(token_ids), dtype=torch.long),
+                    torch.arange(len(token_ids), dtype=torch.long) * 2 + 1,
+                    torch.arange(len(token_ids), dtype=torch.long) * 3 + 2,
+                )
+            )
+            return positions, 0
+
+    monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: False)
+    positions, _ = CpuMRoPE().get_mrope_input_positions(list(range(64)), [])
+    state = RopeState(3, 1, 64, 64, torch.device("cuda:0"))
+    assert state.prefill_positions.write_contents is None
+    state.init_prefill_positions(0, CpuMRoPE(), list(range(64)), [])
+    state.apply_staged_writes()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        state.read_prefill_positions(0, 64).cpu(),
+        positions.to(torch.int32),
+        rtol=0,
+        atol=0,
+    )

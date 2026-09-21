@@ -69,8 +69,18 @@ class RopeState:
         self.prefill_delta.np[req_idx] = delta
 
         for i in range(self.num_dims):
-            pos = prefill_positions[i].tolist()
-            self.prefill_positions.stage_write(self.num_dims * req_idx + i, 0, pos)
+            pos = prefill_positions[i]
+            if (
+                pos.device.type == "cpu"
+                and self.prefill_positions.write_contents is not None
+            ):
+                self.prefill_positions.stage_write_tensor(
+                    self.num_dims * req_idx + i, 0, pos
+                )
+            else:
+                self.prefill_positions.stage_write(
+                    self.num_dims * req_idx + i, 0, pos.tolist()
+                )
 
     def apply_staged_writes(self) -> None:
         self.prefill_positions.apply_write()
