@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
+from vllm.v1.conf_compute_utils import prep_stream_ctx
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
@@ -195,16 +196,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         assert prefill_query_start_loc_cpu is not None
-        return (
-            async_tensor_h2d(
+        # Under Confidential Computing an H2D on the compute stream blocks the
+        # host on the in-flight forward; issue these on the prep stream and
+        # keep the allocator from recycling them under the consuming kernels.
+        with prep_stream_ctx(device):
+            chunk_indices = async_tensor_h2d(
                 prepare_chunk_indices(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
                 device=device,
-            ),
-            async_tensor_h2d(
+            )
+            chunk_offsets = async_tensor_h2d(
                 prepare_chunk_offsets(prefill_query_start_loc_cpu, FLA_CHUNK_SIZE),
                 device=device,
-            ),
-        )
+            )
+        if chunk_indices.is_cuda:
+            stream = torch.cuda.current_stream(device)
+            chunk_indices.record_stream(stream)
+            chunk_offsets.record_stream(stream)
+        return chunk_indices, chunk_offsets
 
     def build(  # type: ignore[override]
         self,
