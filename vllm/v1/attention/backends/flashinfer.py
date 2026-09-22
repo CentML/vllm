@@ -19,7 +19,11 @@ from flashinfer import (
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
-from flashinfer.utils import FP4Tensor
+from flashinfer.utils import (
+    FP4Tensor,
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+)
 from typing_extensions import override
 
 from vllm import _custom_ops as custom_ops
@@ -109,6 +113,31 @@ def _get_trtllm_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_workspace_buffer
+
+
+trtllm_multi_ctas_kv_counter_buffer = None
+
+
+def _get_trtllm_multi_ctas_kv_counter_buffer(
+    batch_size: int, num_qo_heads: int, device: torch.device
+) -> torch.Tensor:
+    """Persistent multi-CTA KV counter buffer for the trtllm-gen kernels.
+
+    Without a caller-owned buffer FlashInfer allocates and zeroes a fresh one
+    on every call, i.e. per attention layer per step. The kernel resets the
+    counters at the end of each launch, so one zeroed buffer sized for the
+    largest batch can be shared by every layer on the same stream.
+    """
+    global trtllm_multi_ctas_kv_counter_buffer
+    needed = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, get_device_sm_count(device)
+    )
+    buf = trtllm_multi_ctas_kv_counter_buffer
+    if buf is None or buf.numel() < needed or buf.device != device:
+        trtllm_multi_ctas_kv_counter_buffer = buf = torch.zeros(
+            needed, dtype=torch.uint8, device=device
+        )
+    return buf
 
 
 def _pack_draft_block_bool_mask(
@@ -1847,6 +1876,10 @@ class FlashInferImpl(AttentionImpl):
         vllm_config = get_current_vllm_config_or_none()
         # The layout is resolved after model construction, so read it lazily.
         self.cache_config = vllm_config.cache_config if vllm_config else None
+        # Upper bound on the per-call batch size for the trtllm-gen counter buffer.
+        self._max_num_seqs = (
+            vllm_config.scheduler_config.max_num_seqs if vllm_config else 256
+        )
         # Query pre-quantization needs a single dtype for the whole query tensor.
         # SM90 XQA needs BF16/FP16-Q for decode and FP8 for prefill,
         # so only enable this for SM100 trtllm-gen where both use FP8-Q.
@@ -2341,6 +2374,11 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
+                    multi_ctas_kv_counter_buffer=(
+                        _get_trtllm_multi_ctas_kv_counter_buffer(
+                            self._max_num_seqs, self.num_heads, prefill_query.device
+                        )
+                    ),
                 )
 
                 if needs_fp8_out:
@@ -2562,6 +2600,11 @@ class FlashInferImpl(AttentionImpl):
                     cum_seq_lens_q=q_cu_seq_lens,
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                    ),
+                    multi_ctas_kv_counter_buffer=(
+                        _get_trtllm_multi_ctas_kv_counter_buffer(
+                            self._max_num_seqs, self.num_heads, decode_query.device
+                        )
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
