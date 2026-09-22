@@ -313,26 +313,26 @@ class TestAnnotateProfile:
     def test_simple_format_mixed(self):
         assert self._annotate(detailed=False) == (
             "execute_context_1(4)_generation_1(1)"
-            "_ctx_prev_kv_length=[0]_gen_prev_kv_length=[10]"
+            "_ctx_prev_kv_length=0.00_gen_prev_kv_length=10.00"
         )
 
     def test_detailed_format_mixed(self):
         # ctx1: sq=4, sk=4, sqsq=16, sqsk=16 | gen1: sq=1, sk=11, sqsq=1, sqsk=11 | bs=5
         assert self._annotate(detailed=True) == (
             "execute_5_context_1(sq4sk4sqsq16sqsk16)_generation_1(sq1sk11sqsq1sqsk11)"
-            "_ctx_prev_kv_length=[0]_gen_prev_kv_length=[10]"
+            "_ctx_prev_kv_length=0.00_gen_prev_kv_length=10.00"
         )
 
     @pytest.mark.parametrize("detailed", [False, True])
-    def test_previous_kv_lengths_are_per_scheduled_request(self, detailed):
-        """Exclude new/MTP query tokens and requests not executing this iteration."""
+    def test_previous_kv_lengths_are_means_over_scheduled_requests(self, detailed):
+        """Average requests equally, excluding new/MTP tokens and unscheduled work."""
         sched = SchedulerOutput.make_empty()
         sched.scheduled_new_reqs = [
             MagicMock(req_id="prefix_hit", num_computed_tokens=2048)
         ]
         cached = sched.scheduled_cached_reqs
         cached.req_ids = ["unscheduled", "gen2", "chunked_prefill", "gen1"]
-        cached.num_computed_tokens = [99999, 16384, 4096, 8192]
+        cached.num_computed_tokens = [99999, 16385, 4097, 8192]
         cached.num_output_tokens = [10, 20, 0, 30]
         cached.resumed_req_ids = {"gen2"}
         sched.num_scheduled_tokens = {
@@ -346,15 +346,15 @@ class TestAnnotateProfile:
         annotation = self._annotate(detailed, sched)
 
         assert annotation.endswith(
-            "_ctx_prev_kv_length=[2048, 4096]_gen_prev_kv_length=[8192, 16384]"
+            "_ctx_prev_kv_length=3072.50_gen_prev_kv_length=12288.50"
         )
-        assert cached.num_computed_tokens == [99999, 16384, 4096, 8192]
+        assert cached.num_computed_tokens == [99999, 16385, 4097, 8192]
 
     @pytest.mark.parametrize("detailed", [False, True])
-    def test_empty_iteration_has_empty_previous_kv_lengths(self, detailed):
+    def test_empty_iteration_has_zero_previous_kv_means(self, detailed):
         annotation = self._annotate(detailed, SchedulerOutput.make_empty())
 
-        assert annotation.endswith("_ctx_prev_kv_length=[]_gen_prev_kv_length=[]")
+        assert annotation.endswith("_ctx_prev_kv_length=0.00_gen_prev_kv_length=0.00")
 
     def test_skips_annotation_work_after_profiler_stops(self):
         worker = MagicMock()

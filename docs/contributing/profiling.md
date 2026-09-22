@@ -240,25 +240,28 @@ Each profiled worker iteration includes `ctx_prev_kv_length` and
 annotation modes. For example:
 
 ```text
-execute_context_1(16)_generation_2(8)_ctx_prev_kv_length=[2048]_gen_prev_kv_length=[16384, 32768]
+execute_context_1(16)_generation_2(8)_ctx_prev_kv_length=2048.00_gen_prev_kv_length=24576.00
 ```
 
 Here one context request schedules 16 new tokens with 2,048 previous tokens of
 history. Two generation requests schedule eight query tokens in total and have
-16,384 and 32,768 previous tokens respectively. With speculative decoding,
+16,384 and 32,768 previous tokens respectively, giving a mean of 24,576.
+With speculative decoding,
 scheduled query tokens include draft tokens; they are not accepted output counts.
 
 | Field | Meaning |
 | --- | --- |
-| `ctx_prev_kv_length` | Per-request history lengths for the context requests scheduled in this iteration, including continued chunked prefills. |
-| `gen_prev_kv_length` | Per-request history lengths for the generation requests scheduled in this iteration. |
+| `ctx_prev_kv_length` | Mean history length across the context requests scheduled in this iteration, including continued chunked prefills. |
+| `gen_prev_kv_length` | Mean history length across the generation requests scheduled in this iteration. |
 
 Lengths are in **tokens**, using the scheduler's `num_computed_tokens` before
-adding this iteration's scheduled tokens. Entries follow scheduled-request order
-within each phase; they are lists, not sums or means. An absent phase has `[]`,
-and a cold context request can have length `0`. Phase classification is the same
-as the existing request counts: new requests and cached requests with no output
-tokens are context; other cached requests are generation.
+adding this iteration's scheduled tokens. Each value is the arithmetic mean over
+requests in that phase, displayed to two decimal places; it is not weighted by
+scheduled query tokens. A phase with no requests reports `0.00` (its existing
+request count is zero), and cold context requests contribute zero history.
+Phase classification is the same as the existing request counts: new requests
+and cached requests with no output tokens are context; other cached requests
+are generation.
 
 Previous history can come from a prefix-cache hit, an earlier prefill chunk,
 prior decoding, or restored KV. These fields do not measure cache-hit tokens,

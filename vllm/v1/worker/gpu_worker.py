@@ -1050,18 +1050,24 @@ class Worker(WorkerBase):
                 scheduler_output.scheduled_cached_reqs.num_computed_tokens,
             )
         )
-        ctx_prev_kv_length: list[int] = []
-        gen_prev_kv_length: list[int] = []
+        ctx_prev_kv_length_sum = 0
+        gen_prev_kv_length_sum = 0
         for req_id in scheduler_output.num_scheduled_tokens:
             # Scheduler-visible history before this iteration's query tokens.
             # Async speculative decoding can correct these lengths later.
-            lengths = (
-                ctx_prev_kv_length
-                if scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+            if (
+                scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
                 or req_id in new_req_ids
-                else gen_prev_kv_length
-            )
-            lengths.append(num_computed_tokens_ids[req_id])
+            ):
+                ctx_prev_kv_length_sum += num_computed_tokens_ids[req_id]
+            else:
+                gen_prev_kv_length_sum += num_computed_tokens_ids[req_id]
+        ctx_prev_kv_length = ctx_prev_kv_length_sum / max(
+            iteration_details.num_ctx_requests, 1
+        )
+        gen_prev_kv_length = gen_prev_kv_length_sum / max(
+            iteration_details.num_generation_requests, 1
+        )
 
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
@@ -1148,8 +1154,8 @@ class Worker(WorkerBase):
                 ]
             )
         annotation += (
-            f"_ctx_prev_kv_length={ctx_prev_kv_length}"
-            f"_gen_prev_kv_length={gen_prev_kv_length}"
+            f"_ctx_prev_kv_length={ctx_prev_kv_length:.2f}"
+            f"_gen_prev_kv_length={gen_prev_kv_length:.2f}"
         )
         return self.profiler.annotate_context_manager(annotation)
 

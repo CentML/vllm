@@ -110,7 +110,7 @@ class ProfilerConfig:
     """If `True`, uses detailed annotations with roofline metrics (sk, sqsq,
     sqsk) in profiler trace events. If `False`, uses simple annotations with
     context/generation request counts and token counts. Both formats include
-    per-request scheduler-visible previous KV lengths in tokens.
+    mean scheduler-visible previous KV lengths in tokens for each phase.
     Disabled by default."""
 
     ignore_frontend: bool = False
