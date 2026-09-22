@@ -300,3 +300,86 @@ def test_forward_core_split_matches_unified(
         atol = rtol = 6e-2
     torch.testing.assert_close(out_split, out_unified, atol=atol, rtol=rtol)
     torch.testing.assert_close(ssm_state_split, ssm_state_unified, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("num_decodes,prefill_lens", [(0, [512, 300]), (3, [64, 5])])
+@pytest.mark.parametrize("fresh_prefill", [False, True])
+def test_forward_core_inplace_state_matches_gather(
+    num_decodes: int,
+    prefill_lens: list[int],
+    fresh_prefill: bool,
+) -> None:
+    """The FlashInfer state_indices path (pool read/written in place) must match
+    the gather-into-packed-buffer / scatter-back path on the same inputs.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    vllm_config = _make_vllm_config()
+    vllm_config.additional_config = {"gdn_prefill_backend": "flashinfer"}
+    decode_seq_lens = [64] * num_decodes
+    prefill_seq_lens = [
+        pl if (fresh_prefill and i == 0) else pl + 37
+        for i, pl in enumerate(prefill_lens)
+    ]
+    batch = BatchSpec(
+        seq_lens=decode_seq_lens + prefill_seq_lens,
+        query_lens=[1] * num_decodes + list(prefill_lens),
+    )
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=MambaSpec(  # type: ignore[arg-type]
+            block_size=BLOCK_SIZE, shapes=((16, 64),), dtypes=(torch.float16,)
+        ),
+        layer_names=[PREFIX],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    if builder.gdn_prefill_backend != "flashinfer":
+        pytest.skip("FlashInfer GDN prefill backend unavailable")
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    with set_current_vllm_config(vllm_config):
+        meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
+    num_tokens = sum(batch.query_lens)
+    assert meta.non_spec_state_indices_tensor is not None
+    pool_size = int(meta.non_spec_state_indices_tensor.max().item()) + 1
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, num_spec=0
+        )
+    )
+    conv_state0 = (
+        torch.randn(pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device)
+        * 0.05
+    )
+    ssm_state0 = (
+        torch.randn(
+            pool_size, *temporal_state_shape, dtype=torch.float32, device=device
+        )
+        * 0.05
+    )
+    A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    conv_weight = (
+        torch.randn(CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    conv_bias = torch.randn(CONV_DIM, dtype=torch.bfloat16, device=device) * 0.1
+    mixed_qkv = (
+        torch.randn(num_tokens, CONV_DIM, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    a = torch.randn(num_tokens, HV, dtype=torch.bfloat16, device=device) * 0.1
+    b = torch.randn(num_tokens, HV, dtype=torch.bfloat16, device=device) * 0.1
+
+    outs, states = [], []
+    for inplace in (False, True):
+        conv_state = conv_state0.clone()
+        ssm_state = ssm_state0.clone()
+        layer = _build_layer(
+            vllm_config, conv_state, ssm_state, A_log, dt_bias, conv_weight, conv_bias
+        )
+        layer.chunk_gated_delta_rule.inplace_state = inplace
+        outs.append(_run_forward_core(layer, meta, mixed_qkv, b, a, num_tokens))
+        states.append(ssm_state)
+    # Same kernel and same math; only the state addressing differs.
+    torch.testing.assert_close(outs[0], outs[1], atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(states[0], states[1], atol=1e-3, rtol=1e-3)

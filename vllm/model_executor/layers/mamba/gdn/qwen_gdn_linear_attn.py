@@ -41,6 +41,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 )
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
+    zero_uninitialized_states,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -202,9 +203,13 @@ def fi_chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = True,
     g_is_exp: bool = False,
     output: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ):
     """``g_is_exp``: ``g`` already holds ``exp(g)``. ``output``: optional
     contiguous ``[T, Hv, V]`` buffer the kernel writes into directly.
+    ``state_indices``: when given, ``initial_state`` is the whole state pool;
+    sequence ``i`` reads row ``state_indices[i]`` and its final state is
+    written back to that row in place.
     """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -221,7 +226,11 @@ def fi_chunk_gated_delta_rule(
 
     g = g.squeeze(0).contiguous()
     beta = beta.squeeze(0).contiguous()
-    fi_state = initial_state.to(torch.float32)
+    # With state_indices the pool is read and written in place, so it must keep
+    # its own dtype; the SM100 kernel accepts fp32/bf16/fp16/fp8 pools.
+    fi_state = (
+        initial_state if state_indices is not None else initial_state.to(torch.float32)
+    )
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
@@ -229,8 +238,11 @@ def fi_chunk_gated_delta_rule(
     # FlashInfer's CP delta-rule path trades one kernel per layer for four to
     # gain parallelism at small batch. Under Confidential Computing the prefill
     # step is host-bound on kernel launches, so the extra launches cost more
-    # than the parallelism returns; keep the single-kernel path there.
-    use_cp: Literal["auto"] | bool = False if confidential_compute_enabled() else "auto"
+    # than the parallelism returns; keep the single-kernel path there. The
+    # state_indices path is only implemented by the non-CP kernel.
+    use_cp: Literal["auto"] | bool = (
+        False if confidential_compute_enabled() or state_indices is not None else "auto"
+    )
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -242,6 +254,8 @@ def fi_chunk_gated_delta_rule(
         cu_seqlens=cu_seqlens,
         output=output,
         use_cp=use_cp,
+        state_indices=state_indices,
+        output_state=fi_state if state_indices is not None else None,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -284,6 +298,15 @@ class ChunkGatedDeltaRule(CustomOp):
             torch.float32 if active_backend == "flashinfer" else None
         )
         self.inplace_output = active_backend == "flashinfer"
+        # FlashInfer's non-CP SM100 kernel can read each sequence's initial
+        # state from the state pool through state_indices and write the final
+        # state back in place, skipping the gather and the scatter. We only
+        # force the non-CP kernel under Confidential Computing.
+        self.inplace_state = (
+            active_backend == "flashinfer"
+            and confidential_compute_enabled()
+            and current_platform.is_device_capability_family(100)
+        )
 
     def forward_cuda(
         self,
@@ -299,6 +322,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ):
         direct = (
             core_attn_out is not None
@@ -318,6 +342,7 @@ class ChunkGatedDeltaRule(CustomOp):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             g_is_exp=self.gate_is_exp,
             output=core_attn_out if direct else None,
+            state_indices=state_indices,
         )
         if core_attn_out is not None and not direct:
             o_flat = o.squeeze(0).reshape(-1)
@@ -339,7 +364,9 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ):
+        assert state_indices is None, "in-place state is FlashInfer-only"
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -369,6 +396,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ):
         from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
             chunk_gated_delta_rule_cutedsl,
@@ -1554,12 +1582,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = gather_initial_states(
-                ssm_state,
-                prefill_state_indices,
-                prefill_has_initial_state,
-                dtype=self.chunk_gated_delta_rule.initial_state_dtype,
+            inplace_state = (
+                self.chunk_gated_delta_rule.inplace_state
+                and spec_sequence_masks is None
+                and ssm_state.dtype == torch.float32
             )
+            if inplace_state:
+                # The kernel reads and writes the pool rows named by
+                # prefill_state_indices; rows without an initial state must
+                # start from zero.
+                zero_uninitialized_states(
+                    ssm_state, prefill_state_indices, prefill_has_initial_state
+                )
+                initial_state = ssm_state
+                state_indices = prefill_state_indices.to(torch.int32)
+            else:
+                initial_state = gather_initial_states(
+                    ssm_state,
+                    prefill_state_indices,
+                    prefill_has_initial_state,
+                    dtype=self.chunk_gated_delta_rule.initial_state_dtype,
+                )
+                state_indices = None
             # Let the kernel write the prefill outputs straight into their
             # slot of core_attn_out (after any peeled decodes), skipping the
             # stitch and final copy below.
@@ -1586,9 +1630,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
                 core_attn_out=prefill_out,
+                state_indices=state_indices,
             )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            # Init cache (already written in place when state_indices is set)
+            if not inplace_state:
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if prefill_out is not None:
                 if split_non_spec:

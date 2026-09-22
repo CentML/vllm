@@ -86,3 +86,71 @@ def gather_initial_states(
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return output
+
+
+@triton.jit
+def _zero_uninitialized_states_kernel(
+    state_ptr,
+    indices_ptr,
+    has_initial_state_ptr,
+    stride_state_batch,
+    stride_indices,
+    stride_has_initial_state,
+    row_size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    block_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_size
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    has_initial_state = tl.load(
+        has_initial_state_ptr + batch_idx * stride_has_initial_state
+    ).to(tl.int1)
+    state_idx = tl.load(indices_ptr + batch_idx * stride_indices).to(tl.int64)
+    zeros = tl.zeros((BLOCK_SIZE,), dtype=state_ptr.dtype.element_ty)
+    tl.store(
+        state_ptr + state_idx * stride_state_batch + offsets,
+        zeros,
+        mask=mask & (not has_initial_state),
+    )
+
+
+def zero_uninitialized_states(
+    state: torch.Tensor,
+    indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> None:
+    """Zero ``state[indices[i]]`` in place for every ``i`` without an initial
+    state, so a kernel that reads the state pool through ``indices`` starts
+    those sequences from zero without gathering into a packed buffer.
+    """
+    assert state.ndim >= 2
+    assert state.is_cuda or state.is_xpu
+    assert indices.ndim == 1 and has_initial_state.ndim == 1
+    assert indices.shape == has_initial_state.shape
+    assert indices.device == state.device
+    assert has_initial_state.device == state.device
+    assert indices.dtype in (torch.int32, torch.int64)
+    assert has_initial_state.dtype == torch.bool
+    row_size = state[0].numel()
+    assert state[0].is_contiguous()
+    if indices.numel() == 0:
+        return
+    block_size = min(triton.next_power_of_2(row_size), 1024)
+    grid = (triton.cdiv(row_size, block_size), indices.numel())
+    _zero_uninitialized_states_kernel[grid](
+        state,
+        indices,
+        has_initial_state,
+        state.stride(0),
+        indices.stride(0),
+        has_initial_state.stride(0),
+        row_size=row_size,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+    )
