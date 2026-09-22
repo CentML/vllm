@@ -138,6 +138,9 @@ class KVCacheUsageTracker:
             self.affected_requests.discard(request_id)
 
     def reset(self) -> None:
+        # A successful pool reset requires all non-null blocks to be free.
+        # Count physical cached blocks once, even when they have hash aliases.
+        self._delta.invalidated_blocks += len(self.inactive_cached)
         self.inactive_cached.clear()
         self.evicted.clear()
         self.intervals.clear()

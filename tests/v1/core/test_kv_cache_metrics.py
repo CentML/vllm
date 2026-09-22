@@ -408,3 +408,22 @@ def test_checkpoint_invalidation_is_not_capacity_eviction():
     stats = tracker.snapshot(2, pool.get_num_free_blocks())
     assert stats.invalidated_blocks == 1 and stats.evicted_blocks == 0
     assert not tracker.evicted
+
+
+def test_pool_reset_counts_inactive_physical_blocks_not_hash_aliases():
+    pool = BlockPool(4, enable_caching=True, hash_block_size=16)
+    tracker = pool.usage_tracker = KVCacheUsageTracker(1024, 4)
+    first, second = pool.get_new_blocks(2)
+    for key, block in ((b"a", first), (b"alias", first), (b"b", second)):
+        pool._insert_block_hash(BlockHashWithGroupId(key), block, num_tokens=16)
+    # A rejected reset must not invalidate blocks still held by a request.
+    assert not pool.reset_prefix_cache()
+    assert tracker.snapshot(3, pool.get_num_free_blocks()).invalidated_blocks == 0
+    pool.free_blocks([first, second])
+    assert pool.reset_prefix_cache()
+    stats = tracker.snapshot(3, pool.get_num_free_blocks())
+    assert stats.invalidated_blocks == 2
+    assert stats.evicted_blocks == stats.inactive_cached_blocks == 0
+    assert stats.free_uncached_blocks == 3
+    assert pool.reset_prefix_cache()
+    assert tracker.snapshot(3, pool.get_num_free_blocks()).invalidated_blocks == 0
