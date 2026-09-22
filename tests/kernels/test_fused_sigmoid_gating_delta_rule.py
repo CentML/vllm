@@ -56,8 +56,10 @@ def test_fused_sigmoid_gating_delta_rule_update_non_spec(
 
     A_log = torch.rand(num_v_heads // tp_size, dtype=dtype)
     dt_bias = torch.rand(num_v_heads // tp_size, dtype=dtype)
-    a = torch.rand(num_tokens, num_v_heads, dtype=dtype)
-    b = torch.rand(num_tokens, num_v_heads, dtype=dtype)
+    # Column slices of a packed [T, 2*HV] buffer, as the layer passes them:
+    # the kernel must handle a token stride larger than the head count.
+    ba = torch.rand(num_tokens, 2 * num_v_heads, dtype=dtype)
+    b, a = ba[:, :num_v_heads], ba[:, num_v_heads:]
     # Entry 0 is reserved as NULL_BLOCK_ID (CUDA graph padding), so valid
     # state indices start at 1.
     ssm_state = torch.rand(
@@ -144,8 +146,10 @@ def test_fused_sigmoid_gating_delta_rule_update_spec(
 
     A_log = torch.rand(num_v_heads // tp_size, dtype=dtype)
     dt_bias = torch.rand(num_v_heads // tp_size, dtype=dtype)
-    a = torch.rand(num_tokens, num_v_heads, dtype=dtype)
-    b = torch.rand(num_tokens, num_v_heads, dtype=dtype)
+    # Column slices of a packed [T, 2*HV] buffer, as the layer passes them:
+    # the kernel must handle a token stride larger than the head count.
+    ba = torch.rand(num_tokens, 2 * num_v_heads, dtype=dtype)
+    b, a = ba[:, :num_v_heads], ba[:, num_v_heads:]
     # Entry 0 is reserved as NULL_BLOCK_ID (CUDA graph padding), so valid
     # state indices start at 1.
     ssm_state = torch.rand(
