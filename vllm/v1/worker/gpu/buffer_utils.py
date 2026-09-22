@@ -97,10 +97,11 @@ class UvaBufferPool:
         buf = self._next_buffer(n)
         assert buf.cpu.ndim == 1
         offset = 0
-        for chunk in chunks:
-            end = offset + chunk.numel()
-            buf.np[offset:end] = chunk.detach().numpy()
-            offset = end
+        with torch.no_grad():
+            for chunk in chunks:
+                end = offset + chunk.numel()
+                buf.cpu[offset:end].copy_(chunk)
+                offset = end
         return buf.uva(n)
 
     def _next_buffer(self, n: int) -> UvaBuffer | NonUvaBuffer:
@@ -210,13 +211,14 @@ class StagedWriteTensor:
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
     def stage_write_tensor(self, index: int, start: int, x: torch.Tensor) -> None:
-        """Stage a flat CPU tensor without converting it to Python scalars."""
-        assert self.write_contents is not None
-        assert x.device.type == "cpu"
+        """Stage a flat tensor, avoiding scalar conversion for CPU tensors."""
         assert x.ndim == 1
         assert index >= 0
         assert start >= 0
         if x.numel() == 0:
+            return
+        if x.device.type != "cpu":
+            self.stage_write(index, start, x.tolist())
             return
         if self._staged_write_tensor_contents is None:
             self._staged_write_tensor_contents = []
@@ -256,13 +258,20 @@ class StagedWriteTensor:
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
-        if self.write_contents is None:
+        if self._staged_write_tensor_contents is not None:
+            if self.write_contents is None:
+                write_contents = async_tensor_h2d(
+                    torch.cat(self._staged_write_tensor_contents),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            else:
+                write_contents = self.write_contents.copy_tensor_chunks_to_uva(
+                    self._staged_write_tensor_contents
+                )
+        elif self.write_contents is None:
             write_contents = async_tensor_h2d(
                 self._staged_write_contents, device=self.device, dtype=self.dtype
-            )
-        elif self._staged_write_tensor_contents is not None:
-            write_contents = self.write_contents.copy_tensor_chunks_to_uva(
-                self._staged_write_tensor_contents
             )
         else:
             write_contents = self.write_contents.copy_to_uva(
@@ -332,6 +341,7 @@ class FusedStagedWriter:
             if t._staged_write_tensor_contents is None:
                 contents.extend(t._staged_write_contents)
             else:
+                # Compatibility fallback; fused tensor chunks are not optimized.
                 contents.extend(torch.cat(t._staged_write_tensor_contents).tolist())
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
 

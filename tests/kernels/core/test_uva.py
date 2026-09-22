@@ -204,8 +204,9 @@ def test_staged_write_inflight(uva_target, dtype):
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
-def test_staged_write_tensor_chunks_inflight():
-    """Keep large CPU position tensors valid across pooled-slot reuse."""
+@pytest.mark.parametrize("uva_target", [False, True])
+def test_staged_write_tensor_chunks_inflight(uva_target):
+    """Preserve CPU tensor chunks across asynchronous writes to either target."""
     device = torch.device("cuda:0")
     with torch.accelerator.device_index(device.index):
         state = StagedWriteTensor(
@@ -213,7 +214,7 @@ def test_staged_write_tensor_chunks_inflight():
             torch.int32,
             device,
             max_concurrency=2,
-            uva_instead_of_gpu=True,
+            uva_instead_of_gpu=uva_target,
         )
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -281,24 +282,21 @@ def test_fused_staged_writer_materializes_tensor_chunks():
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
-def test_rope_cpu_positions_use_uva_tensor_staging(monkeypatch):
-    """CPU M-RoPE positions use typed staging when their UVA path is available."""
+@pytest.mark.parametrize("positions_device", ["cpu", "cuda"])
+def test_rope_positions_tensor_staging(positions_device):
+    """M-RoPE positions from either device remain correct with UVA staging."""
 
-    class CpuMRoPE(torch.nn.Module):
+    class MRoPE(torch.nn.Module):
         def get_mrope_input_positions(self, token_ids, mm_features):
-            base = torch.tensor(token_ids, dtype=torch.long)
+            base = torch.tensor(token_ids, dtype=torch.long, device=positions_device)
             return torch.stack((base, base * 2 + 1, base * 3 + 2)), 0
 
     state = RopeState(3, 2, 8192, 8192, torch.device("cuda:0"))
     assert state.prefill_positions.write_contents is not None
 
-    def fail_list_staging(*args, **kwargs):
-        pytest.fail("CPU M-RoPE positions must use tensor-backed UVA staging")
-
-    monkeypatch.setattr(state.prefill_positions, "stage_write", fail_list_staging)
     first_ids = list(range(1027))
     second_ids = list(range(4099, 8192))
-    model = CpuMRoPE()
+    model = MRoPE()
     first, _ = model.get_mrope_input_positions(first_ids, [])
     second, _ = model.get_mrope_input_positions(second_ids, [])
     state.init_prefill_positions(0, model, first_ids, [])
@@ -307,23 +305,24 @@ def test_rope_cpu_positions_use_uva_tensor_staging(monkeypatch):
     torch.accelerator.synchronize()
     torch.testing.assert_close(
         state.read_prefill_positions(0, len(first_ids)).cpu(),
-        first.to(torch.int32),
+        first.to(device="cpu", dtype=torch.int32),
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
         state.read_prefill_positions(1, len(second_ids)).cpu(),
-        second.to(torch.int32),
+        second.to(device="cpu", dtype=torch.int32),
         rtol=0,
         atol=0,
     )
 
 
 @pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA is required.")
-def test_rope_cpu_positions_falls_back_without_uva(monkeypatch):
-    """CPU M-RoPE positions retain the list path when UVA staging is disabled."""
+@pytest.mark.parametrize("positions_device", ["cpu", "cuda"])
+def test_rope_positions_without_uva(monkeypatch, positions_device):
+    """M-RoPE positions from either device remain correct without UVA staging."""
 
-    class CpuMRoPE(torch.nn.Module):
+    class MRoPE(torch.nn.Module):
         def get_mrope_input_positions(self, token_ids, mm_features):
             positions = torch.stack(
                 (
@@ -332,18 +331,18 @@ def test_rope_cpu_positions_falls_back_without_uva(monkeypatch):
                     torch.arange(len(token_ids), dtype=torch.long) * 3 + 2,
                 )
             )
-            return positions, 0
+            return positions.to(positions_device), 0
 
     monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: False)
-    positions, _ = CpuMRoPE().get_mrope_input_positions(list(range(64)), [])
+    positions, _ = MRoPE().get_mrope_input_positions(list(range(64)), [])
     state = RopeState(3, 1, 64, 64, torch.device("cuda:0"))
     assert state.prefill_positions.write_contents is None
-    state.init_prefill_positions(0, CpuMRoPE(), list(range(64)), [])
+    state.init_prefill_positions(0, MRoPE(), list(range(64)), [])
     state.apply_staged_writes()
     torch.accelerator.synchronize()
     torch.testing.assert_close(
         state.read_prefill_positions(0, 64).cpu(),
-        positions.to(torch.int32),
+        positions.to(device="cpu", dtype=torch.int32),
         rtol=0,
         atol=0,
     )
