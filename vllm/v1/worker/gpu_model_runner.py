@@ -151,7 +151,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.conf_compute_utils import confidential_compute_enabled
+from vllm.v1.conf_compute_utils import (
+    confidential_compute_enabled,
+    prep_stream_ctx,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -1923,12 +1926,20 @@ class GPUModelRunner(
             )
             return
         # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
-        ).to(self.device, non_blocking=True)
+        # Under Confidential Computing a pinned H2D on the compute stream blocks the
+        # host on the in-flight forward, so issue them on the prep stream and keep
+        # the allocator from recycling them under the scatter.
+        with prep_stream_ctx(self.device):
+            sampled_tokens_index_tensor = torch.tensor(
+                sample_flattened_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
+            ).to(self.device, non_blocking=True)
+            prev_common_req_indices_tensor = torch.tensor(
+                prev_indices, dtype=torch.int64, pin_memory=PIN_MEMORY
+            ).to(self.device, non_blocking=True)
+        if confidential_compute_enabled():
+            stream = torch.cuda.current_stream(self.device)
+            sampled_tokens_index_tensor.record_stream(stream)
+            prev_common_req_indices_tensor.record_stream(stream)
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
