@@ -16,6 +16,8 @@ from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels.linear import (
     AiterInt8ScaledMMLinearKernel,
     CPUInt8ScaledMMLinearKernel,
+    FlashInferCutedslMxfp8LinearKernel,
+    FlashInferCutedslSm107Mxfp8LinearKernel,
     HummingFP8ScaledMMLinearKernel,
     Int8ScaledMMLinearKernel,
     Int8ScaledMMLinearLayerConfig,
@@ -24,6 +26,7 @@ from vllm.model_executor.kernels.linear import (
     _resolve_backend_kernels,
     init_fp8_linear_kernel,
     init_int8_linear_kernel,
+    init_mxfp8_linear_kernel,
     register_linear_kernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -197,3 +200,35 @@ def test_register_oot_linear_kernel(platform_mock):
     assert isinstance(kernel, OOTInt8ScaledMMLinearKernel), (
         "init_int8_linear_kernel should return an instance of the registered kernel"
     )
+
+
+@pytest.mark.parametrize(
+    "backend,native_supported,expected",
+    [
+        ("auto", True, FlashInferCutedslMxfp8LinearKernel),
+        ("flashinfer_cutedsl_sm107", True, FlashInferCutedslSm107Mxfp8LinearKernel),
+        ("flashinfer_cutedsl_sm107", False, None),
+    ],
+)
+@patch.object(
+    FlashInferCutedslSm107Mxfp8LinearKernel, "is_supported", return_value=(True, None)
+)
+@patch.object(
+    FlashInferCutedslMxfp8LinearKernel, "is_supported", return_value=(True, None)
+)
+@patch("vllm.model_executor.kernels.linear.current_platform")
+def test_mxfp8_sm107_requires_explicit_backend(
+    platform_mock, _, native_support, backend, native_supported, expected
+):
+    """Native support must not change automatic selection for existing users."""
+    platform_mock._enum = PlatformEnum.CUDA
+    native_support.return_value = (native_supported, "native SM107 unavailable")
+    config = VllmConfig(
+        kernel_config=KernelConfig(linear_backend_per_quant={"mxfp8": backend})
+    )
+    with set_current_vllm_config(config):
+        if expected is None:
+            with pytest.raises(ValueError, match="native SM107 unavailable"):
+                init_mxfp8_linear_kernel()
+        else:
+            assert type(init_mxfp8_linear_kernel()) is expected

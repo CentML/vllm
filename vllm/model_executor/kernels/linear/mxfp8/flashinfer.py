@@ -187,20 +187,56 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                 x.view(-1, K), is_sf_swizzled_layout=True
             )
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight,
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cute-dsl",
-        )
+        output = self._gemm(input_mxfp8, weight, input_scale, weight_scale, out_dtype)
 
         if bias is not None:
             output = output + bias
 
         output_shape = (*input_shape[:-1], N)
         return output.view(output_shape)
+
+    def _gemm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return vllm_flashinfer.mm_mxfp8(
+            a, b, a_scale, b_scale, out_dtype=out_dtype, backend="cute-dsl"
+        )
+
+
+class FlashInferCutedslSm107Mxfp8LinearKernel(FlashInferCutedslMxfp8LinearKernel):
+    """Opt-in native SM107 MXFP8 GEMM with the existing scale/weight layout."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not (
+            current_platform.is_cuda() and current_platform.is_device_capability(107)
+        ):
+            return False, "requires sm_107"
+        if not has_flashinfer_cutedsl():
+            return False, "requires FlashInfer CuTe-DSL module"
+        from .flashinfer_sm107 import sm107_mxfp8_support_reason
+
+        reason = sm107_mxfp8_support_reason()
+        return reason is None, reason
+
+    def _gemm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        from .flashinfer_sm107 import mm_mxfp8_sm107
+
+        return mm_mxfp8_sm107(a, b, a_scale, b_scale, out_dtype)
 
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):

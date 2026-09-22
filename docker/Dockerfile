@@ -930,6 +930,7 @@ COPY requirements/common.txt /tmp/common.txt
 COPY requirements/cuda.txt /tmp/requirements-cuda.txt
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+    --mount=type=bind,source=tools/install_flashinfer_sm107.py,target=/tmp/install_flashinfer_sm107.py,ro \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ] && \
         [ ! -f /tmp/vllm-requirements/rubin-prerelease.txt ]; then \
         echo "INSTALL_RUBIN_PRERELEASE=true requires requirements/rubin-prerelease.txt" >&2; \
@@ -947,6 +948,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         && uv pip install --system -r /tmp/requirements-cuda.txt \
         && uv pip install --system \
             -r /tmp/vllm-requirements/rubin-prerelease.txt \
+        && python3 /tmp/install_flashinfer_sm107.py \
         && printf '%s\n' \
             "/usr/local/lib/python${PYTHON_VERSION}/dist-packages/nvpl/lib" \
             > /etc/ld.so.conf.d/vllm-rubin-python.conf \
@@ -1259,10 +1261,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # after the public vLLM and KV connector dependency pins installed above.
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements,target=/tmp/vllm-requirements,ro \
+    --mount=type=bind,source=tools/install_flashinfer_sm107.py,target=/tmp/install_flashinfer_sm107.py,ro \
     if [ "${INSTALL_RUBIN_PRERELEASE}" = "true" ]; then \
         echo "Installing Rubin prerelease requirements..." \
         && uv pip install --system \
-            -r /tmp/vllm-requirements/rubin-prerelease.txt; \
+            -r /tmp/vllm-requirements/rubin-prerelease.txt \
+        && python3 /tmp/install_flashinfer_sm107.py; \
     fi
 
 # Install source-built Triton last so dependency resolution cannot restore the
