@@ -892,6 +892,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def rearrange_mixed_qkv_views(self, mixed_qkv):
+        """Split packed qkv into ``(1, seq, heads, dim)`` views without copying.
+
+        Only for consumers that walk tokens with an explicit stride (the fused
+        recurrent decode kernel); each token's ``[heads, dim]`` block is
+        contiguous within the packed row, which is all it needs.
+        """
+        if mixed_qkv is None:
+            return None, None, None
+        q_dim = self.key_dim // self.tp_size
+        k_dim = self.key_dim // self.tp_size
+        v_dim = self.value_dim // self.tp_size
+        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+        seq_len = mixed_qkv.shape[0]
+        query = query.view(seq_len, -1, self.head_k_dim).unsqueeze(0)
+        key = key.view(seq_len, -1, self.head_k_dim).unsqueeze(0)
+        value = value.view(seq_len, -1, self.head_v_dim).unsqueeze(0)
+        return query, key, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1461,7 +1480,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv_views(
+            mixed_qkv_spec
+        )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1550,7 +1571,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process non-spec-decode part
         if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv_views(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(

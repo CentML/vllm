@@ -51,6 +51,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_q_tok: tl.constexpr,
+    stride_k_tok: tl.constexpr,
+    stride_v_tok: tl.constexpr,
+    stride_a_tok: tl.constexpr,
+    stride_b_tok: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -80,19 +85,19 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
+    p_q = q + bos * stride_q_tok + i_h * K + o_k
+    p_k = k + bos * stride_k_tok + i_h * K + o_k
+    p_v = v + bos * stride_v_tok + i_hv * V + o_v
 
     p_A_log = A_log + i_hv
     if not IS_KDA:
-        p_a = a + bos * HV + i_hv
+        p_a = a + bos * stride_a_tok + i_hv
         p_dt_bias = dt_bias + i_hv
     else:
-        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_a = a + bos * stride_a_tok + i_hv * K + o_k
         p_dt_bias = dt_bias + i_hv * K + o_k
 
-    p_b = b + bos * HV + i_hv
+    p_b = b + bos * stride_b_tok + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -170,12 +175,31 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
         # Update pointers for next timestep
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q_tok
+        p_k += stride_k_tok
         p_o += HV * V
-        p_v += HV * V
-        p_b += HV
-        p_a += HV
+        p_v += stride_v_tok
+        p_b += stride_b_tok
+        p_a += stride_a_tok
+
+
+def _token_strided(x: torch.Tensor, block_dims: int) -> tuple[torch.Tensor, int]:
+    """Return ``x`` and its token stride. ``x`` is ``[..., T, *block]`` with
+    ``block_dims`` trailing dims forming one contiguous block per token; any
+    leading dims must be laid out as a flat run of tokens. Otherwise return a
+    contiguous copy."""
+    tok = x.ndim - block_dims - 1
+    ok = tok >= 0 and x.stride(-1) == 1
+    expected = 1
+    for d in range(1, block_dims):
+        expected *= x.shape[-d]
+        ok = ok and x.stride(-d - 1) == expected
+    for d in range(tok):
+        ok = ok and (x.shape[d] == 1 or x.stride(d) == x.shape[d + 1] * x.stride(d + 1))
+    if not ok:
+        x = x.contiguous()
+        tok = x.ndim - block_dims - 1
+    return x, x.stride(tok)
 
 
 def fused_sigmoid_gating_delta_rule_update(
@@ -238,17 +262,25 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    # The kernel walks tokens with an explicit stride, so column slices of a
+    # packed [T, ...] projection can be passed as views as long as the per-token
+    # block is contiguous; anything else is made contiguous here.
+    q, stride_q_tok = _token_strided(q, 2)
+    k, stride_k_tok = _token_strided(k, 2)
+    v, stride_v_tok = _token_strided(v, 2)
+    a, stride_a_tok = _token_strided(a, 2 if is_kda else 1)
+    b, stride_b_tok = _token_strided(b, 1)
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=a,
+        b=b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
+        q=q,
+        k=k,
+        v=v,
         o=o,
         h0=initial_state,
         ht=final_state,
@@ -269,6 +301,11 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_q_tok=stride_q_tok,
+        stride_k_tok=stride_k_tok,
+        stride_v_tok=stride_v_tok,
+        stride_a_tok=stride_a_tok,
+        stride_b_tok=stride_b_tok,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,

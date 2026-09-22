@@ -125,6 +125,7 @@ def _build_layer(
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
     for name in (
         "rearrange_mixed_qkv",
+        "rearrange_mixed_qkv_views",
         "_forward_core",
     ):
         setattr(
