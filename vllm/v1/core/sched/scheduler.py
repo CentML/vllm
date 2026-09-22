@@ -303,6 +303,14 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        if self.observability_config.kv_cache_usage_metrics:
+            if not self.log_stats:
+                raise ValueError("--kv-cache-usage-metrics requires log stats")
+            self.kv_cache_manager.enable_usage_metrics(
+                self.observability_config.kv_cache_eviction_history_size,
+                attribution=self.connector is None,
+            )
+        self.kv_usage_tracker = self.kv_cache_manager.usage_tracker
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -1516,8 +1524,20 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if self.kv_usage_tracker is not None:
+            scheduler_output.kv_cache_work = {}
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if self.kv_usage_tracker is not None:
+                work = self.kv_usage_tracker.scheduled_work(
+                    req_id,
+                    request.num_computed_tokens,
+                    num_scheduled_token,
+                    request.num_prompt_tokens,
+                )
+                if work[0]:
+                    assert scheduler_output.kv_cache_work is not None
+                    scheduler_output.kv_cache_work[req_id] = work
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -1899,6 +1919,12 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+
+        if self.kv_usage_tracker is not None and scheduler_output.kv_cache_work:
+            for req_id, work in scheduler_output.kv_cache_work.items():
+                self.kv_usage_tracker.completed_work(
+                    req_id, work, succeeded=req_id not in failed_kv_load_req_ids
+                )
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -2561,6 +2587,8 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        if self.kv_usage_tracker is not None:
+            self.kv_usage_tracker.finish_request(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
@@ -2783,6 +2811,14 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_usage_stats=(
+                self.kv_usage_tracker.snapshot(
+                    self.kv_cache_manager.block_pool.num_gpu_blocks - 1,
+                    self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                )
+                if self.kv_usage_tracker is not None
+                else None
+            ),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

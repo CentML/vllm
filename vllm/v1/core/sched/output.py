@@ -304,6 +304,9 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Scheduler observation carried until the corresponding model output returns.
+    kv_cache_work: dict[str, tuple[int, int]] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
