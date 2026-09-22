@@ -109,7 +109,8 @@ class ProfilerConfig:
     detailed_trace_annotation: bool = False
     """If `True`, uses detailed annotations with roofline metrics (sk, sqsq,
     sqsk) in profiler trace events. If `False`, uses simple annotations with
-    only context/generation request counts and token counts.
+    context/generation request counts and token counts. Both formats include
+    per-request scheduler-visible previous KV lengths in tokens.
     Disabled by default."""
 
     ignore_frontend: bool = False
