@@ -21,6 +21,7 @@ from vllm.config.cache import _layout_from_name
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
+from vllm.v1.conf_compute_utils import confidential_compute_enabled, prep_stream_ctx
 from vllm.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec, MambaSpec
 
 if TYPE_CHECKING:
@@ -1050,7 +1051,10 @@ def compute_causal_conv1d_metadata(
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
         nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = np_to_pinned_tensor(np.repeat(np.arange(len(nums)), nums))
+        # int32 so the H2D below is a plain memcpy (no device-side cast).
+        mlist = np_to_pinned_tensor(
+            np.repeat(np.arange(len(nums), dtype=np.int32), nums)
+        )
         nums_dict[BLOCK_M]["mlist"] = mlist
         mlist_len = len(nums_dict[BLOCK_M]["mlist"])
         nums_dict[BLOCK_M]["mlist_len"] = mlist_len
@@ -1061,24 +1065,32 @@ def compute_causal_conv1d_metadata(
         offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=PIN_MEMORY)
         nums_dict[BLOCK_M]["offsetlist"] = offsetlist
 
-        if batch_ptr is None:
-            # Update default value after class definition
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                assert token_chunk_offset_ptr is not None
-                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
+        # Under Confidential Computing a pinned H2D on the compute stream blocks
+        # the host on the in-flight forward; allocate and fill these on the prep
+        # stream and keep the allocator from recycling them under the kernel.
+        with prep_stream_ctx(device):
+            if batch_ptr is None:
+                # Update default value after class definition
+                batch_ptr = torch.full(
+                    (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+                )
+                token_chunk_offset_ptr = torch.full(
+                    (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+                )
+            else:
+                if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
+                    batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
+                    assert token_chunk_offset_ptr is not None
+                    token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
 
-        assert batch_ptr is not None
-        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
-        assert token_chunk_offset_ptr is not None
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)
+            assert batch_ptr is not None
+            batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
+            assert token_chunk_offset_ptr is not None
+            token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)
+        if batch_ptr.is_cuda and confidential_compute_enabled():
+            stream = torch.cuda.current_stream(device)
+            batch_ptr.record_stream(stream)
+            token_chunk_offset_ptr.record_stream(stream)
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
 
