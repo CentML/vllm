@@ -70,6 +70,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.conf_compute_utils import confidential_compute_enabled
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -225,6 +226,11 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
+    # FlashInfer's CP delta-rule path trades one kernel per layer for four to
+    # gain parallelism at small batch. Under Confidential Computing the prefill
+    # step is host-bound on kernel launches, so the extra launches cost more
+    # than the parallelism returns; keep the single-kernel path there.
+    use_cp: Literal["auto"] | bool = False if confidential_compute_enabled() else "auto"
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -235,6 +241,7 @@ def fi_chunk_gated_delta_rule(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         output=output,
+        use_cp=use_cp,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
