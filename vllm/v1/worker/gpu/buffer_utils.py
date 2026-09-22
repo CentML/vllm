@@ -211,15 +211,14 @@ class StagedWriteTensor:
         self._staged_write_cu_lens.append(len(self._staged_write_contents))
 
     def stage_write_tensor(self, index: int, start: int, x: torch.Tensor) -> None:
-        """Stage a flat tensor, avoiding scalar conversion for CPU tensors."""
+        """Stage a flat tensor without converting it to Python scalars."""
         assert x.ndim == 1
         assert index >= 0
         assert start >= 0
         if x.numel() == 0:
             return
         if x.device.type != "cpu":
-            self.stage_write(index, start, x.tolist())
-            return
+            x = x.cpu()
         if self._staged_write_tensor_contents is None:
             self._staged_write_tensor_contents = []
             if self._staged_write_contents:
