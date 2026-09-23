@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
+    PIN_MEMORY,
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
@@ -104,6 +105,63 @@ class UvaBufferPool:
         uva = self.copy_to_uva(x)
         # CPU-to-GPU copy
         return uva.clone() if out is None else out.copy_(uva, non_blocking=True)
+
+
+class PooledPinnedBuffer:
+    """Reuse fixed-size 1-D H2D staging buffers on the current CUDA stream.
+
+    Callers must serialize copies on that stream. A slot event retires its
+    prior H2D before the host overwrites the pinned source.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        max_concurrency: int | None = None,
+    ):
+        if max_concurrency is None:
+            max_concurrency = _DEFAULT_MAX_CONCURRENCY
+        self._cpu_bufs = [
+            torch.empty(size, dtype=dtype, device="cpu", pin_memory=PIN_MEMORY)
+            for _ in range(max_concurrency)
+        ]
+        self._np_bufs = [buf.numpy() for buf in self._cpu_bufs]
+        self._events = [torch.Event(blocking=True) for _ in range(max_concurrency)]
+        self._curr = 0
+
+    def copy_to_gpu(
+        self,
+        x: torch.Tensor | np.ndarray,
+        out: torch.Tensor | None = None,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        if x.ndim != 1:
+            raise ValueError("PooledPinnedBuffer only supports 1-D inputs")
+        n = len(x)
+        if n > self._cpu_bufs[0].numel():
+            raise ValueError(f"Input length {n} exceeds staging capacity")
+        self._curr = (self._curr + 1) % len(self._cpu_bufs)
+        event = self._events[self._curr]
+        if not event.query():
+            event.synchronize()
+
+        cpu = self._cpu_bufs[self._curr]
+        cpu_view = cpu[:n]
+        dst = cpu if isinstance(x, torch.Tensor) else self._np_bufs[self._curr]
+        dst[:n] = x
+        if out is None:
+            assert device is not None
+            out = torch.empty_like(cpu_view, device=device)
+        else:
+            if out.ndim != 1:
+                raise ValueError("PooledPinnedBuffer only supports 1-D outputs")
+            if out.numel() < n:
+                raise ValueError(f"Output capacity {out.numel()} is smaller than input")
+            out = out[:n]
+        out.copy_(cpu_view, non_blocking=True)
+        event.record()
+        return out
 
 
 class UvaBackedTensor:
