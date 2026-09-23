@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupRole,
     KVCacheGroupSpec,
     KVCacheSpecKind,
+    KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -4645,7 +4646,8 @@ def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary():
     assert [len(blocks) for blocks in computed_blocks.blocks] == [2, 8]
 
 
-def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
+@pytest.mark.parametrize("usage_metrics", [False, True])
+def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt(usage_metrics):
     """An identical resend and a longer sibling resume at DIFFERENT positions.
 
     How far a lookup matches depends on who is asking. A resend of the same
@@ -4696,6 +4698,17 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
         use_eagle=True,
     )
 
+    if usage_metrics:
+        manager.kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(
+                size=100 * 1024,
+                layers=["full", "mamba_mtp"],
+                layer_stride=512,
+                block_stride=1024,
+            )
+        ]
+        manager.enable_usage_metrics(history_size=100, attribution=True)
+
     # 128 tokens, an exact multiple of the 32-token alignment. A longer sibling
     # matches 128 and drops to 96; this prompt's own resend caps at 127, matches
     # 96 and drops to 64. Both states must survive retention.
@@ -4741,6 +4754,28 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
     longer = make_request("2", token_ids + [9] * block_size, block_size, sha256)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(longer)
     assert num_computed_tokens == 3 * block_size
+
+    if usage_metrics:
+        tracker = manager.usage_tracker
+        assert tracker.attribution_supported
+        assert tracker.intervals["1"] == (64, 64)
+        assert tracker.intervals["2"] == (96, 96)
+        # Reallocate the whole free pool: real capacity evictions, not a reset.
+        # The shadow lookup must preserve the original hybrid/MTP hit length.
+        allocated = pool.get_new_blocks(pool.get_num_free_blocks())
+        pool.free_blocks(allocated)
+        before = pool.get_num_free_blocks()
+        _, hit, _ = manager.get_computed_blocks(req1)
+        assert hit == 0
+        assert tracker.intervals["1"] == (0, 64)
+        _, hit, _ = manager.get_computed_blocks(longer)
+        assert hit == 0
+        assert tracker.intervals["2"] == (0, 96)
+        assert pool.get_num_free_blocks() == before
+        stats = tracker.snapshot(pool.num_gpu_blocks - 1, before)
+        assert stats.active_blocks == stats.inactive_cached_blocks == 0
+        assert stats.evicted_blocks > 0
+        assert stats.recompute_tokens == 0  # A lookup alone performs no work.
 
 
 def test_block_lookup_cache_single_block_per_key():

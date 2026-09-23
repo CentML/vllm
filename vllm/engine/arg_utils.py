@@ -679,6 +679,10 @@ class EngineArgs:
     per_request_spec_decode_metrics: Literal["none", "summary", "detailed"] = (
         ObservabilityConfig.per_request_spec_decode_metrics
     )
+    kv_cache_usage_metrics: bool = ObservabilityConfig.kv_cache_usage_metrics
+    kv_cache_eviction_history_size: int = get_field(
+        ObservabilityConfig, "kv_cache_eviction_history_size"
+    )
     kv_cache_metrics: bool = ObservabilityConfig.kv_cache_metrics
     kv_cache_metrics_sample: float = get_field(
         ObservabilityConfig, "kv_cache_metrics_sample"
@@ -1539,6 +1543,13 @@ class EngineArgs:
             **observability_kwargs["per_request_spec_decode_metrics"],
         )
         observability_group.add_argument(
+            "--kv-cache-usage-metrics", **observability_kwargs["kv_cache_usage_metrics"]
+        )
+        observability_group.add_argument(
+            "--kv-cache-eviction-history-size",
+            **observability_kwargs["kv_cache_eviction_history_size"],
+        )
+        observability_group.add_argument(
             "--kv-cache-metrics", **observability_kwargs["kv_cache_metrics"]
         )
         observability_group.add_argument(
@@ -2025,6 +2036,8 @@ class EngineArgs:
             otlp_traces_endpoint=self.otlp_traces_endpoint,
             collect_detailed_traces=self.collect_detailed_traces,
             per_request_spec_decode_metrics=self.per_request_spec_decode_metrics,
+            kv_cache_usage_metrics=self.kv_cache_usage_metrics,
+            kv_cache_eviction_history_size=self.kv_cache_eviction_history_size,
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,

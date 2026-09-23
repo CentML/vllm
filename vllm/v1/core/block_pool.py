@@ -12,6 +12,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_usage_metrics import KVCacheUsageTracker
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -189,6 +190,7 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.usage_tracker: KVCacheUsageTracker | None = None
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
@@ -507,6 +509,8 @@ class BlockPool:
         )
         if replace_existing_hashes:
             removed_hashes = self._remove_cached_block_hashes(block)
+            if removed_hashes and self.usage_tracker is not None:
+                self.usage_tracker.on_evicted([], capacity=False)
             self._emit_block_removed_events(removed_hashes)
             already_cached = False
         elif (
@@ -516,6 +520,8 @@ class BlockPool:
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
             removed_hashes = self._remove_cached_block_hashes(block)
+            if removed_hashes and self.usage_tracker is not None:
+                self.usage_tracker.on_evicted([], capacity=False)
             self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
             block_hash_with_group_id,
@@ -600,6 +606,8 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        if self.usage_tracker is not None:
+            self.usage_tracker.on_removed(block, removed_hashes)
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -638,6 +646,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.usage_tracker is not None:
+            self.usage_tracker.on_cached(block, block_hash_with_group_id)
 
     def move_block_hashes(
         self,
@@ -680,7 +690,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block, capacity=True)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -716,16 +726,21 @@ class BlockPool:
             assert block.ref_cnt > 0 and not block.is_null
             block.ref_cnt -= 1
             self._reuse_watchers[block.block_id] = on_reuse
+            if self.usage_tracker is not None:
+                self.usage_tracker.on_released(block)
             if block.ref_cnt == 0:
                 released.append(block)
         self.free_block_queue.append_n(released)
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(
+        self, block: KVCacheBlock, *, capacity: bool = False
+    ) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
 
         Args:
             block: The block to evict.
+            capacity: Whether allocation pressure caused this eviction.
 
         Returns:
             True if the block is evicted, False otherwise.
@@ -740,6 +755,13 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        if self.usage_tracker is not None:
+            lost_keys = [
+                key
+                for key in evicted_hashes
+                if self.cached_block_hash_to_block.get_one_block(key) is None
+            ]
+            self.usage_tracker.on_evicted(lost_keys, capacity)
         self._emit_block_removed_events(evicted_hashes)
         return True
 
@@ -758,6 +780,8 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if self.usage_tracker is not None:
+                self.usage_tracker.on_acquired(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -783,6 +807,8 @@ class BlockPool:
                 other_pools.setdefault(block.pool, []).append(block)
                 continue
             block.ref_cnt -= 1
+            if self.usage_tracker is not None:
+                self.usage_tracker.on_released(block)
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
@@ -816,7 +842,7 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+            self._maybe_evict_cached_block(block, capacity=False)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -851,6 +877,8 @@ class BlockPool:
 
         if self.metrics_collector:
             self.metrics_collector.reset()
+        if self.usage_tracker is not None:
+            self.usage_tracker.reset()
 
         logger.info("Successfully reset prefix cache")
 
