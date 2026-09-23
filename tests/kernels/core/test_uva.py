@@ -157,19 +157,9 @@ def test_uva_pool_copy_to_gpu_preserves_shape_and_out(use_out, input_type):
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
-@pytest.mark.parametrize(
-    ("uva_target", "dtype", "tensor_chunks"),
-    [
-        (False, torch.int32, False),
-        (True, torch.int32, False),
-        (False, torch.int64, False),
-        (True, torch.int64, False),
-        (False, torch.float32, False),
-        (True, torch.float32, False),
-        (False, torch.int32, True),
-        (True, torch.int32, True),
-    ],
-)
+@pytest.mark.parametrize("uva_target", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+@pytest.mark.parametrize("tensor_chunks", [False, True])
 def test_staged_write_inflight(uva_target, dtype, tensor_chunks):
     """Preserve every generation until its consumer finishes before slot reuse."""
     device = torch.device("cuda:0")
