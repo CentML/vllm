@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import inspect
 import os
 from typing import Literal
 
@@ -151,6 +152,23 @@ def _resolve_gdn_prefill_backend(
         and current_platform.is_device_capability(107)
         and supports_flashinfer
     ):
+        dependency_error = (
+            "flashinfer_sm107 requires a source-built FlashInfer with the native "
+            "SM107 GDN backend. Install the compatible wheel or select "
+            "gdn_prefill_backend='flashinfer'."
+        )
+        try:
+            from flashinfer.gdn_kernels.rubin.gated_delta_net_chunked import (
+                RubinGatedDeltaNetChunkedKernel,
+            )
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        except ImportError as exc:
+            raise RuntimeError(dependency_error) from exc
+        if (
+            RubinGatedDeltaNetChunkedKernel.arch != "sm_107"
+            or "backend" not in inspect.signature(chunk_gated_delta_rule).parameters
+        ):
+            raise RuntimeError(dependency_error)
         return backend, "flashinfer_sm107"
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"

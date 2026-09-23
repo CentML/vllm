@@ -77,9 +77,19 @@ def test_flashinfer_gdn_prefill_preserves_metadata(monkeypatch, backend):
         (107, 128, 12, "flashinfer_sm107", "triton"),
     ],
 )
+@pytest.mark.parametrize(
+    "native_dependency", ["available", "missing_api", "missing_kernel"]
+)
 def test_gdn_prefill_backend_is_explicit_and_arch_specific(
-    monkeypatch, capability, head_dim, cuda_major, requested, expected
+    monkeypatch,
+    capability,
+    head_dim,
+    cuda_major,
+    requested,
+    expected,
+    native_dependency,
 ):
+    import sys
     from types import SimpleNamespace
     from unittest.mock import Mock
 
@@ -97,10 +107,33 @@ def test_gdn_prefill_backend_is_explicit_and_arch_specific(
         lambda cc: cc // 10 == capability // 10,
     )
     monkeypatch.setattr(current_platform, "get_cuda_runtime_major", lambda: cuda_major)
+
+    def native_api(*, backend: str = "auto") -> None:
+        pass
+
+    def legacy_api() -> None:
+        pass
+
+    monkeypatch.setattr(
+        flashinfer.gdn_prefill,
+        "chunk_gated_delta_rule",
+        native_api if native_dependency != "missing_api" else legacy_api,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.gdn_kernels.rubin.gated_delta_net_chunked",
+        SimpleNamespace(RubinGatedDeltaNetChunkedKernel=SimpleNamespace(arch="sm_107"))
+        if native_dependency != "missing_kernel"
+        else None,
+    )
     config = Mock(
         additional_config={"gdn_prefill_backend": requested},
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(linear_key_head_dim=head_dim)
         ),
     )
-    assert _resolve_gdn_prefill_backend(config) == (requested, expected)
+    if expected == "flashinfer_sm107" and native_dependency != "available":
+        with pytest.raises(RuntimeError, match="source-built FlashInfer"):
+            _resolve_gdn_prefill_backend(config)
+    else:
+        assert _resolve_gdn_prefill_backend(config) == (requested, expected)
