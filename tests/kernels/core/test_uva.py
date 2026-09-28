@@ -7,7 +7,7 @@ import torch
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.worker.gpu import buffer_utils
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+from vllm.v1.worker.gpu.buffer_utils import PooledPinnedBuffer, StagedWriteTensor
 
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
@@ -154,6 +154,61 @@ def test_uva_pool_copy_to_gpu_preserves_shape_and_out(use_out, input_type):
         if use_out:
             assert result is out
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pooled_pinned_buffer_retains_inflight_h2d_sources_after_ring_wrap():
+    """A wrapped source slot waits until the earlier H2D transfer finishes."""
+    device = torch.device("cuda:0")
+    pool = PooledPinnedBuffer(8, torch.int32, max_concurrency=2)
+    values = [
+        np.array([11, 12, 13], dtype=np.int32),
+        np.array([21, 22, 23, 24, 25], dtype=np.int32),
+        np.array([31, 32], dtype=np.int32),
+    ]
+    expected_values = [value.copy() for value in values]
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        # Keep both DMA transfers pending until the third copy wraps to slot one.
+        torch.cuda._sleep(200_000_000)
+        outputs = []
+        for value in values:
+            outputs.append(pool.copy_to_gpu(value, device=device))
+            value.fill(-1)
+    stream.synchronize()
+
+    for output, expected in zip(outputs, expected_values):
+        torch.testing.assert_close(
+            output.cpu(), torch.from_numpy(expected), rtol=0, atol=0
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pooled_pinned_buffer_updates_fixed_output_without_reallocating():
+    """The graph-owned query-start output remains stable as batch size changes."""
+    device = torch.device("cuda:0")
+    pool = PooledPinnedBuffer(8, torch.int32, max_concurrency=2)
+    output = torch.empty(8, dtype=torch.int32, device=device)
+    output_ptr = output.data_ptr()
+
+    for values in (
+        np.array([0, 3, 7, 9, 9], dtype=np.int32),
+        np.array([0, 2, 6, 12, 15, 16, 16], dtype=np.int32),
+        np.array([0, 1, 1], dtype=np.int32),
+    ):
+        result = pool.copy_to_gpu(values, out=output)
+        torch.accelerator.synchronize()
+        assert result.data_ptr() == output_ptr
+        assert output.data_ptr() == output_ptr
+        torch.testing.assert_close(
+            result.cpu(), torch.from_numpy(values), rtol=0, atol=0
+        )
+
+    with pytest.raises(ValueError, match="exceeds staging capacity"):
+        pool.copy_to_gpu(np.zeros(9, dtype=np.int32), device=device)
+
+    with pytest.raises(ValueError, match="Output capacity"):
+        pool.copy_to_gpu(np.zeros(5, dtype=np.int32), out=output[:4])
 
 
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
