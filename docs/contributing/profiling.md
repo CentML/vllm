@@ -233,6 +233,49 @@ vllm bench serve \
 
 With `--profile`, vLLM will capture a profile for each run of `vllm bench serve`. Once the server is killed, the profiles will all be saved.
 
+#### Iteration KV-history annotations
+
+Each profiled worker iteration includes `ctx_prev_kv_length` and
+`gen_prev_kv_length` in its `execute_...` range, in both simple and detailed
+annotation modes. For example:
+
+```text
+execute_context_1(16)_generation_2(8)_ctx_prev_kv_length=2048.00_gen_prev_kv_length=24576.00
+```
+
+Here one context request schedules 16 new tokens with 2,048 previous tokens of
+history. Two generation requests schedule eight query tokens in total and have
+16,384 and 32,768 previous tokens respectively, giving a mean of 24,576.
+With speculative decoding,
+scheduled query tokens include draft tokens; they are not accepted output counts.
+
+| Field | Meaning |
+| --- | --- |
+| `ctx_prev_kv_length` | Mean history length across the context requests scheduled in this iteration, including continued chunked prefills. |
+| `gen_prev_kv_length` | Mean history length across the generation requests scheduled in this iteration. |
+
+Lengths are in **tokens**, using the scheduler's `num_computed_tokens` before
+adding this iteration's scheduled tokens. Each value is the arithmetic mean over
+requests in that phase, displayed to two decimal places; it is not weighted by
+scheduled query tokens. A phase with no requests reports `0.00` (its existing
+request count is zero), and cold context requests contribute zero history.
+Phase classification is the same as the existing request counts: new requests
+and cached requests with no output tokens are context; other cached requests
+are generation.
+
+Previous history can come from a prefix-cache hit, an earlier prefill chunk,
+prior decoding, or restored KV. These fields do not measure cache-hit tokens,
+inactive retained prefixes, unique physical blocks, or GPU memory usage. For
+hybrid recurrent/sliding-window models, logical token history is not the number
+of token positions physically retained by every layer.
+
+With asynchronous speculative decoding, scheduler-visible lengths can still
+include optimistic positions that the worker corrects after draft verification.
+The annotations do not synchronize the GPU to obtain corrected accepted lengths.
+They are built only when the worker profiler annotates an iteration; no cache
+metrics instrumentation or extra profiling flag is required. Existing traces
+must be recaptured with this code to include these fields.
+
 #### Analysis
 
 You can view these profiles either as summaries in the CLI, using `nsys stats [profile-file]`, or in the GUI by installing Nsight [locally following the directions here](https://developer.nvidia.com/nsight-systems/get-started).

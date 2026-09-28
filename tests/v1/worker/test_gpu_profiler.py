@@ -18,7 +18,7 @@ from vllm.config import (
 from vllm.config.profiler import _is_uri_path
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import ProtonProfilerWrapper, WorkerProfiler
-from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -281,29 +281,31 @@ class TestIsUriPath:
         assert _is_uri_path(path) == expected
 
 
+@pytest.mark.skip_global_cleanup  # Only scheduler metadata and a mocked worker.
 class TestAnnotateProfile:
     """Tests for Worker.annotate_profile() annotation string formatting."""
 
-    def _annotate(self, detailed: bool) -> str:
+    def _annotate(self, detailed: bool, sched=None) -> str:
         worker = MagicMock()
         worker.vllm_config.profiler_config.detailed_trace_annotation = detailed
         worker.profiler = MagicMock()
 
-        ctx_req = MagicMock(req_id="ctx1", num_computed_tokens=0)
-        cached = CachedRequestData(
-            req_ids=["gen1"],
-            resumed_req_ids=set(),
-            new_token_ids=[],
-            all_token_ids={},
-            new_block_ids=[],
-            num_computed_tokens=[10],
-            num_output_tokens=[1],
-        )
-        sched = MagicMock(
-            scheduled_new_reqs=[ctx_req],
-            scheduled_cached_reqs=cached,
-            num_scheduled_tokens={"ctx1": 4, "gen1": 1},
-        )
+        if sched is None:
+            ctx_req = MagicMock(req_id="ctx1", num_computed_tokens=0)
+            cached = CachedRequestData(
+                req_ids=["gen1"],
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[],
+                num_computed_tokens=[10],
+                num_output_tokens=[1],
+            )
+            sched = MagicMock(
+                scheduled_new_reqs=[ctx_req],
+                scheduled_cached_reqs=cached,
+                num_scheduled_tokens={"ctx1": 4, "gen1": 1},
+            )
 
         Worker.annotate_profile(worker, sched)
         return worker.profiler.annotate_context_manager.call_args[0][0]
@@ -311,13 +313,48 @@ class TestAnnotateProfile:
     def test_simple_format_mixed(self):
         assert self._annotate(detailed=False) == (
             "execute_context_1(4)_generation_1(1)"
+            "_ctx_prev_kv_length=0.00_gen_prev_kv_length=10.00"
         )
 
     def test_detailed_format_mixed(self):
         # ctx1: sq=4, sk=4, sqsq=16, sqsk=16 | gen1: sq=1, sk=11, sqsq=1, sqsk=11 | bs=5
         assert self._annotate(detailed=True) == (
             "execute_5_context_1(sq4sk4sqsq16sqsk16)_generation_1(sq1sk11sqsq1sqsk11)"
+            "_ctx_prev_kv_length=0.00_gen_prev_kv_length=10.00"
         )
+
+    @pytest.mark.parametrize("detailed", [False, True])
+    def test_previous_kv_lengths_are_means_over_scheduled_requests(self, detailed):
+        """Average requests equally, excluding new/MTP tokens and unscheduled work."""
+        sched = SchedulerOutput.make_empty()
+        sched.scheduled_new_reqs = [
+            MagicMock(req_id="prefix_hit", num_computed_tokens=2048)
+        ]
+        cached = sched.scheduled_cached_reqs
+        cached.req_ids = ["unscheduled", "gen2", "chunked_prefill", "gen1"]
+        cached.num_computed_tokens = [99999, 16385, 4097, 8192]
+        cached.num_output_tokens = [10, 20, 0, 30]
+        cached.resumed_req_ids = {"gen2"}
+        sched.num_scheduled_tokens = {
+            "gen1": 4,
+            "prefix_hit": 16,
+            "chunked_prefill": 32,
+            "gen2": 1,
+        }
+        sched.scheduled_spec_decode_tokens = {"gen1": [100, 101, 102]}
+
+        annotation = self._annotate(detailed, sched)
+
+        assert annotation.endswith(
+            "_ctx_prev_kv_length=3072.50_gen_prev_kv_length=12288.50"
+        )
+        assert cached.num_computed_tokens == [99999, 16385, 4097, 8192]
+
+    @pytest.mark.parametrize("detailed", [False, True])
+    def test_empty_iteration_has_zero_previous_kv_means(self, detailed):
+        annotation = self._annotate(detailed, SchedulerOutput.make_empty())
+
+        assert annotation.endswith("_ctx_prev_kv_length=0.00_gen_prev_kv_length=0.00")
 
     def test_skips_annotation_work_after_profiler_stops(self):
         worker = MagicMock()

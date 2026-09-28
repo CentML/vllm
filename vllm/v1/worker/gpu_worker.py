@@ -1037,6 +1037,38 @@ class Worker(WorkerBase):
 
         iteration_details = compute_iteration_details(scheduler_output)
 
+        new_req_ids = {
+            new_req.req_id for new_req in scheduler_output.scheduled_new_reqs
+        }
+        num_computed_tokens_ids = {
+            new_req.req_id: new_req.num_computed_tokens
+            for new_req in scheduler_output.scheduled_new_reqs
+        }
+        num_computed_tokens_ids.update(
+            zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            )
+        )
+        ctx_prev_kv_length_sum = 0
+        gen_prev_kv_length_sum = 0
+        for req_id in scheduler_output.num_scheduled_tokens:
+            # Scheduler-visible history before this iteration's query tokens.
+            # Async speculative decoding can correct these lengths later.
+            if (
+                scheduler_output.scheduled_cached_reqs.is_context_phase(req_id)
+                or req_id in new_req_ids
+            ):
+                ctx_prev_kv_length_sum += num_computed_tokens_ids[req_id]
+            else:
+                gen_prev_kv_length_sum += num_computed_tokens_ids[req_id]
+        ctx_prev_kv_length = ctx_prev_kv_length_sum / max(
+            iteration_details.num_ctx_requests, 1
+        )
+        gen_prev_kv_length = gen_prev_kv_length_sum / max(
+            iteration_details.num_generation_requests, 1
+        )
+
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
             # (context vs generation). These help estimate compute and
@@ -1062,20 +1094,6 @@ class Worker(WorkerBase):
             gen_qq_compute = 0
             gen_qk_compute = 0
             total_scheduled_tokens = 0
-
-            # Build a map of req_id -> num_computed_tokens for all requests
-            new_req_ids = {
-                new_req.req_id for new_req in scheduler_output.scheduled_new_reqs
-            }
-            num_computed_tokens_ids = {
-                new_req.req_id: new_req.num_computed_tokens
-                for new_req in scheduler_output.scheduled_new_reqs
-            }
-            for req_id, num_computed_tokens in zip(
-                scheduler_output.scheduled_cached_reqs.req_ids,
-                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
-            ):
-                num_computed_tokens_ids[req_id] = num_computed_tokens
 
             # Accumulate per-phase metrics
             for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
@@ -1135,6 +1153,10 @@ class Worker(WorkerBase):
                     ")",
                 ]
             )
+        annotation += (
+            f"_ctx_prev_kv_length={ctx_prev_kv_length:.2f}"
+            f"_gen_prev_kv_length={gen_prev_kv_length:.2f}"
+        )
         return self.profiler.annotate_context_manager(annotation)
 
     @torch.inference_mode()
