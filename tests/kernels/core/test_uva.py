@@ -7,7 +7,7 @@ import torch
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from vllm.v1.worker.gpu import buffer_utils
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+from vllm.v1.worker.gpu.buffer_utils import FusedStagedWriter, StagedWriteTensor
 
 CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
@@ -159,12 +159,15 @@ def test_uva_pool_copy_to_gpu_preserves_shape_and_out(use_out, input_type):
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
 @pytest.mark.parametrize("uva_target", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
-def test_staged_write_inflight(uva_target, dtype):
+@pytest.mark.parametrize("tensor_chunks", [False, True])
+def test_staged_write_inflight(uva_target, dtype, tensor_chunks):
     """Preserve every generation until its consumer finishes before slot reuse."""
     device = torch.device("cuda:0")
+    max_length = 131072 if tensor_chunks else 4096
+    lengths = [16384, 65536, 131072, 65536] if tensor_chunks else [3, 17, 1500, 4090]
     with torch.accelerator.device_index(device.index):
         state = StagedWriteTensor(
-            (4, 4096),
+            (4, max_length),
             dtype,
             device,
             max_concurrency=2,
@@ -174,22 +177,36 @@ def test_staged_write_inflight(uva_target, dtype):
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         pending: list[tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]] = []
-        expected = torch.zeros((4, 4096), dtype=dtype, device="cpu")
+        expected = torch.zeros((4, max_length), dtype=dtype, device="cpu")
         for step in range(24):
             if len(pending) == 2:
                 event, snapshot, reference = pending.pop(0)
                 event.synchronize()
                 torch.testing.assert_close(snapshot.cpu(), reference, rtol=0, atol=0)
             # Growing and shrinking lengths exercise reallocation and reuse.
-            length = [3, 17, 1500, 4090][step % 4]
+            length = lengths[step % len(lengths)]
             row = step % 3
-            values = torch.arange(length, dtype=dtype, device="cpu") + step * 8192
-            if dtype == torch.float32:
-                values += 0.25
-            expected[row, 2 : 2 + length] = values
+            if tensor_chunks:
+                # Exercise non-contiguous and expanded int64 CPU chunks.
+                noncontiguous = (
+                    torch.arange(2 * length, dtype=torch.int64, device="cpu")
+                    + step * 8192
+                )[::2]
+                expanded = torch.tensor([step * 8192 + 7], dtype=torch.int64).expand(
+                    length
+                )
+                state.stage_write_tensor(0, 0, noncontiguous)
+                state.stage_write_tensor(1, 0, expanded)
+                expected[0, :length] = noncontiguous.to(dtype)
+                expected[1, :length] = expanded.to(dtype)
+            else:
+                values = torch.arange(length, dtype=dtype, device="cpu") + step * 8192
+                if dtype == torch.float32:
+                    values += 0.25
+                state.stage_write(row, 2, values.tolist())
+                expected[row, 2 : 2 + length] = values
             expected[3, 1:4] = step
             with torch.cuda.stream(stream):
-                state.stage_write(row, 2, values.tolist())
                 state.stage_write(3, 1, [step] * 3)
                 state.apply_write()
                 # A GPU consumer observes this generation before the next update.
@@ -200,3 +217,37 @@ def test_staged_write_inflight(uva_target, dtype):
         for event, snapshot, reference in pending:
             event.synchronize()
             torch.testing.assert_close(snapshot.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
+def test_fused_staged_writer_materializes_tensor_chunks():
+    """Fused writes preserve tensor-staged chunks across staging modes."""
+    device = torch.device("cuda:0")
+    states = [
+        StagedWriteTensor(
+            (1, 64),
+            torch.int32,
+            device,
+            max_concurrency=2,
+            uva_instead_of_gpu=True,
+        )
+        for _ in range(2)
+    ]
+    states[0].stage_write(0, 0, [7])
+    states[0].stage_write_tensor(0, 1, torch.tensor([8, 9], dtype=torch.int64))
+    states[1].stage_write_tensor(0, 0, torch.tensor([10, 11], dtype=torch.int64))
+    writer = FusedStagedWriter(device, max_writes=2)
+    output_ptrs = torch.tensor(
+        [state.gpu.data_ptr() for state in states], dtype=torch.uint64, device=device
+    )
+    output_strides = torch.tensor(
+        [state.gpu.stride(0) for state in states], dtype=torch.int64, device=device
+    )
+    writer.apply(states, output_ptrs, output_strides)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        states[0].gpu[0, :3].cpu(), torch.tensor([7, 8, 9], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        states[1].gpu[0, :2].cpu(), torch.tensor([10, 11], dtype=torch.int32)
+    )
