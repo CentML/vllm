@@ -65,6 +65,15 @@ class ObservabilityConfig:
     kv_cache_metrics_sample: float = Field(default=0.01, gt=0, le=1)
     """Sampling rate for KV cache metrics (0.0, 1.0]. Default 0.01 = 1% of blocks."""
 
+    kv_cache_usage_metrics: bool = False
+    """Report active, inactive-cached and uncached-free physical cache bytes,
+    capacity evictions and bounded re-prefill attribution. Requires log stats.
+    Observational only: does not change retention, routing or scheduling."""
+
+    kv_cache_eviction_history_size: int = Field(default=100_000, ge=0)
+    """Maximum evicted prefix/group keys retained for attribution per engine.
+    Zero disables history. Dropped keys make attribution a lower bound."""
+
     cudagraph_metrics: bool = False
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
     dispatch modes, and their observed frequencies at every logging interval)."""

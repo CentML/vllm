@@ -11,9 +11,15 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
+    KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_usage_metrics import (
+    KVCacheUsageTracker,
+    cache_block_bytes,
+    retained_prefix_coordinator,
+)
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
@@ -195,6 +201,8 @@ class KVCacheManager:
                     manager.fine_grained_prefix_cache = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.usage_tracker: KVCacheUsageTracker | None = None
+        self.retained_coordinator: KVCacheCoordinator | None = None
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -245,6 +253,32 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    def enable_usage_metrics(self, history_size: int, attribution: bool) -> None:
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+        config = self.kv_cache_config
+        if any(group.host_resident for group in config.kv_cache_groups):
+            raise ValueError(
+                "KV cache usage metrics do not support host-resident pools"
+            )
+        self.usage_tracker = tracker = KVCacheUsageTracker(
+            cache_block_bytes(config), history_size
+        )
+        self.block_pool.usage_tracker = tracker
+        # Other cache types still expose occupancy, but not attribution.
+        tracker.attribution_supported = (
+            attribution
+            and self.enable_caching
+            and all(
+                type(group.kv_cache_spec) in (FullAttentionSpec, MambaSpec)
+                for group in config.kv_cache_groups
+            )
+        )
+        if tracker.attribution_supported:
+            self.retained_coordinator = retained_prefix_coordinator(
+                self.coordinator, tracker
+            )
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
@@ -298,6 +332,15 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        if self.retained_coordinator is not None:
+            _, retained_hit, _ = self.retained_coordinator.find_longest_cache_hit(
+                request.block_hashes, max_cache_hit_length
+            )
+            assert self.usage_tracker is not None
+            self.usage_tracker.record_lookup(
+                request.request_id, num_new_computed_tokens, retained_hit
+            )
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers

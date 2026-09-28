@@ -912,6 +912,80 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_prefill_kv_computed_request, per_engine_labelvalues
         )
 
+        # Exact physical occupancy; bounded, metadata-only eviction attribution.
+        self.cache_usage_gauges = {}
+        self.cache_usage_counters = {}
+        if vllm_config.observability_config.kv_cache_usage_metrics:
+            for name, description in {
+                "active_bytes": "Physical cache bytes held by outstanding references.",
+                "inactive_cached_bytes": (
+                    "Reclaimable bytes retaining valid prefixes; future reuse unknown."
+                ),
+                "free_uncached_bytes": (
+                    "Free physical cache bytes without a valid prefix."
+                ),
+                "capacity_bytes": (
+                    "Usable physical GPU cache pool bytes, excluding the null block."
+                ),
+                "eviction_history_entries": (
+                    "Remembered capacity-evicted prefix/group keys."
+                ),
+                "eviction_attribution_supported": (
+                    "1 when eviction attribution supports this configuration; else 0."
+                ),
+            }.items():
+                metric = self._gauge_cls(
+                    name="vllm:kv_cache_" + name,
+                    documentation=description,
+                    multiprocess_mode="mostrecent",
+                    labelnames=labelnames,
+                )
+                self.cache_usage_gauges[name] = create_metric_per_engine(
+                    metric, per_engine_labelvalues
+                )
+            for name, description in {
+                "evicted_blocks": (
+                    "Valid physical cache blocks discarded on capacity reuse, "
+                    "including duplicate copies."
+                ),
+                "evicted_bytes": (
+                    "Physical cache bytes discarded on capacity reuse, including "
+                    "padding."
+                ),
+                "invalidated_blocks": (
+                    "Valid physical cache blocks explicitly invalidated, not "
+                    "capacity evictions."
+                ),
+                "evicted_prefixes": (
+                    "Prefix/group keys losing their last cached copy on capacity "
+                    "eviction."
+                ),
+                "eviction_history_dropped": (
+                    "Evicted keys forgotten due to the history bound; attribution "
+                    "may undercount."
+                ),
+                "eviction_recompute_requests": (
+                    "Requests with completed prefill work attributable to remembered "
+                    "evictions."
+                ),
+                "eviction_recompute_tokens": (
+                    "Completed prompt tokens beyond the actual hit but within the "
+                    "retained-history counterfactual hit."
+                ),
+                "prefill_computed_tokens": (
+                    "Prompt tokens in completed model steps, including repeated "
+                    "prefill; excludes decode."
+                ),
+            }.items():
+                metric = self._counter_cls(
+                    name="vllm:kv_cache_" + name,
+                    documentation=description,
+                    labelnames=labelnames,
+                )
+                self.cache_usage_counters[name] = create_metric_per_engine(
+                    metric, per_engine_labelvalues
+                )
+
         #
         # KV Cache residency metrics
         #
@@ -1039,6 +1113,30 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            usage = scheduler_stats.kv_cache_usage_stats
+            if usage is not None and self.cache_usage_gauges:
+                for name, value in {
+                    "active_bytes": usage.active_blocks * usage.block_bytes,
+                    "inactive_cached_bytes": usage.inactive_cached_blocks
+                    * usage.block_bytes,
+                    "free_uncached_bytes": usage.free_uncached_blocks
+                    * usage.block_bytes,
+                    "capacity_bytes": usage.capacity_blocks * usage.block_bytes,
+                    "eviction_history_entries": usage.history_entries,
+                    "eviction_attribution_supported": int(usage.attribution_supported),
+                }.items():
+                    self.cache_usage_gauges[name][engine_idx].set(value)
+                for name, value in {
+                    "evicted_blocks": usage.evicted_blocks,
+                    "evicted_bytes": usage.evicted_blocks * usage.block_bytes,
+                    "invalidated_blocks": usage.invalidated_blocks,
+                    "evicted_prefixes": usage.evicted_prefixes,
+                    "eviction_history_dropped": usage.history_dropped,
+                    "eviction_recompute_requests": usage.recompute_requests,
+                    "eviction_recompute_tokens": usage.recompute_tokens,
+                    "prefill_computed_tokens": usage.prefill_tokens,
+                }.items():
+                    self.cache_usage_counters[name][engine_idx].inc(value)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
