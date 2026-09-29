@@ -153,17 +153,20 @@ def _warm_gated_rms_norm_kernel(
         warmup_layer_norm_fwd,
     )
 
-    warmup_layer_norm_fwd(
-        max_num_tokens=max_num_tokens,
-        rows_per_token=config.hv,
-        group_size=config.v,
-        x_dtype=x_dtype,
-        weight_dtype=config.norm_weight_dtype,
-        device=device,
-        norm_before_gate=config.norm_before_gate,
-        is_rms_norm=True,
-        activation=config.norm_activation,
-    )
+    # Decode-only batches normalize T * HV rows of V; batches with prefill
+    # normalize T rows of HV * V (one group per head).
+    for rows_per_token in (config.hv, 1):
+        warmup_layer_norm_fwd(
+            max_num_tokens=max_num_tokens,
+            rows_per_token=rows_per_token,
+            group_size=config.v,
+            x_dtype=x_dtype,
+            weight_dtype=config.norm_weight_dtype,
+            device=device,
+            norm_before_gate=config.norm_before_gate,
+            is_rms_norm=True,
+            activation=config.norm_activation,
+        )
 
 
 def _warm_causal_conv1d_fwd_kernel(
