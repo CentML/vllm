@@ -130,6 +130,7 @@ def _build_layer(
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
         "_rms_norm_gated_cuda",
+        "_rms_norm_gated_strided_gate_cuda",
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
         "split_ba",
