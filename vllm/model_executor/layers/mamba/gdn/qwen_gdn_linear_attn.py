@@ -196,7 +196,15 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    g_is_exp: bool = False,
+    output: torch.Tensor | None = None,
 ):
+    """FlashInfer chunked GDN prefill.
+
+    ``g_is_exp``: ``g`` already holds exp(g) (``fused_post_conv_prep`` with
+    ``output_g_exp=True``). ``output``: contiguous buffer with ``v.numel()``
+    elements that FlashInfer writes into instead of allocating.
+    """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
@@ -221,11 +229,12 @@ def fi_chunk_gated_delta_rule(
         q=q,
         k=k,
         v=v,
-        g=torch.exp(fi_g),
+        g=fi_g if g_is_exp else torch.exp(fi_g),
         beta=fi_beta,
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=None if output is None else output.view(v.shape),
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -244,6 +253,9 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        # Callers of the FlashInfer path pass exp(g), computed in
+        # fused_post_conv_prep, instead of g.
+        self.expects_exp_g = active_backend == "flashinfer"
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -285,11 +297,9 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            g_is_exp=self.expects_exp_g,
+            output=core_attn_out,
         )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
     def forward_native(
@@ -1123,7 +1133,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
         )
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
@@ -1310,6 +1320,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
+        # When the builder found the spec and non-spec tokens in two contiguous
+        # blocks, slice instead of gathering and let the recurrent kernels write
+        # their outputs into core_attn_out in place.
+        spec_slice: slice | None = None
+        non_spec_slice: slice | None = None
+        if attn_metadata.spec_token_start is not None:
+            assert attn_metadata.non_spec_token_start is not None
+            spec_start = attn_metadata.spec_token_start
+            non_spec_start = attn_metadata.non_spec_token_start
+            spec_slice = slice(
+                spec_start, spec_start + attn_metadata.num_spec_decode_tokens
+            )
+            non_spec_slice = slice(
+                non_spec_start,
+                non_spec_start
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens,
+            )
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
@@ -1339,6 +1367,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_slice is not None:
+                mixed_qkv_spec = mixed_qkv[spec_slice]
+                a_spec = a[spec_slice]
+                b_spec = b[spec_slice]
+                mixed_qkv_non_spec = mixed_qkv[non_spec_slice]
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 a_spec = a.index_select(0, spec_token_indx)
@@ -1414,7 +1447,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
+            if non_spec_slice is not None:
+                a_non_spec = a[non_spec_slice]
+                b_non_spec = b[non_spec_slice]
+            elif spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
@@ -1446,7 +1482,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=False,
+                output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
@@ -1482,6 +1518,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    out=None if spec_slice is None else core_attn_out[spec_slice],
                 )
             )
         else:
@@ -1521,8 +1558,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            if attn_metadata.prefill_state_indices_i64 is not None:
+                # int64 indices, inverted mask and FlashInfer cu_seqlens were
+                # converted once per step by the metadata builder.
+                prefill_state_indices = attn_metadata.prefill_state_indices_i64
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[attn_metadata.prefill_no_initial_state, ...] = 0
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
+            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+            if attn_metadata.prefill_query_start_loc_i64 is not None:
+                prefill_query_start_loc = attn_metadata.prefill_query_start_loc_i64
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1534,10 +1581,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
+                cu_seqlens=prefill_query_start_loc,
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=(
+                    None if non_spec_slice is None else core_attn_out[non_spec_slice]
+                ),
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1573,10 +1623,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
-            core_attn_out.index_copy_(
-                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
-            )
+            # With spec_slice set, both blocks were written in place above.
+            if spec_slice is None:
+                core_attn_out.index_copy_(
+                    0, spec_token_indx, core_attn_out_spec.squeeze(0)
+                )
+                core_attn_out.index_copy_(
+                    0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+                )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
@@ -1865,6 +1919,45 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=self.norm.activation,
         )
 
+    def _rms_norm_gated_strided_gate_cuda(
+        self,
+        x: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> None:
+        """In-place ``_rms_norm_gated_cuda(x, output_gate, x)`` for [T, HV, V].
+
+        Normalizes T rows of HV * V columns with one group per head (group size
+        V), so every (token, head) sees the same math as the [T * HV, V] launch.
+        The output gate, a row-strided view of mixed_qkvz, is read in place
+        instead of first being copied into a compact [T * HV, V] tensor. The
+        kernel indexes the weight per group, so it gets norm.weight tiled across
+        heads (8 KiB, rebuilt per call so weight reloads are always honored).
+        """
+        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+            layer_norm_fwd,
+        )
+
+        num_tokens, num_heads, head_dim = x.shape
+        assert output_gate.shape == x.shape
+        x_2d = x.view(num_tokens, num_heads * head_dim)
+        # view, not reshape: merging (HV, V) of the gate must not copy.
+        output_gate_2d = output_gate.view(num_tokens, num_heads * head_dim)
+        assert output_gate_2d.stride(-1) == 1
+        layer_norm_fwd(
+            x_2d,
+            self.norm.weight.repeat(num_heads),
+            self.norm.bias,
+            self.norm.eps,
+            z=output_gate_2d,
+            out=x_2d,
+            group_size=(
+                head_dim if self.norm.group_size is None else self.norm.group_size
+            ),
+            norm_before_gate=self.norm.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.norm.activation,
+        )
+
     def _forward_core_fused_norm(
         self,
         mixed_qkv: torch.Tensor,
@@ -1903,11 +1996,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         num_actual_tokens = attn_metadata.num_actual_tokens
-        self._rms_norm_gated_cuda(
-            core_attn_out[:num_actual_tokens],
-            output_gate[:num_actual_tokens],
-            core_attn_out[:num_actual_tokens],
-        )
+        if attn_metadata.num_prefills > 0:
+            # Read the strided output gate in place instead of copying it
+            # compact. Decode-only batches (FULL graphs) keep the [T*HV, V]
+            # launch.
+            self._rms_norm_gated_strided_gate_cuda(
+                core_attn_out[:num_actual_tokens],
+                output_gate[:num_actual_tokens],
+            )
+        else:
+            self._rms_norm_gated_cuda(
+                core_attn_out[:num_actual_tokens],
+                output_gate[:num_actual_tokens],
+                core_attn_out[:num_actual_tokens],
+            )
 
 
 @eager_break_during_capture

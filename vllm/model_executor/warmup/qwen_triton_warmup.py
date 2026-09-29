@@ -45,6 +45,8 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    # The FlashInfer prefill path makes the post-conv kernel emit exp(g).
+    post_conv_output_g_exp: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -134,6 +136,13 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            post_conv_output_g_exp=bool(
+                getattr(
+                    getattr(layer, "chunk_gated_delta_rule", None),
+                    "expects_exp_g",
+                    False,
+                )
+            ),
         )
 
     if found_layer:
@@ -153,17 +162,20 @@ def _warm_gated_rms_norm_kernel(
         warmup_layer_norm_fwd,
     )
 
-    warmup_layer_norm_fwd(
-        max_num_tokens=max_num_tokens,
-        rows_per_token=config.hv,
-        group_size=config.v,
-        x_dtype=x_dtype,
-        weight_dtype=config.norm_weight_dtype,
-        device=device,
-        norm_before_gate=config.norm_before_gate,
-        is_rms_norm=True,
-        activation=config.norm_activation,
-    )
+    # Decode-only batches normalize T * HV rows of V; batches with prefill
+    # normalize T rows of HV * V (one group per head).
+    for rows_per_token in (config.hv, 1):
+        warmup_layer_norm_fwd(
+            max_num_tokens=max_num_tokens,
+            rows_per_token=rows_per_token,
+            group_size=config.v,
+            x_dtype=x_dtype,
+            weight_dtype=config.norm_weight_dtype,
+            device=device,
+            norm_before_gate=config.norm_before_gate,
+            is_rms_norm=True,
+            activation=config.norm_activation,
+        )
 
 
 def _warm_causal_conv1d_fwd_kernel(
@@ -228,7 +240,7 @@ def _warm_fused_post_conv_kernel(
             config.k,
             config.v,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=config.post_conv_output_g_exp,
         )
 
 
