@@ -857,6 +857,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.use_xqa = (
             self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
         )
+        # One draft decode build can serve every autoregressive draft step only
+        # on the XQA/trtllm-gen path: see update_draft_decode_metadata(). The
+        # native decode path plans on the host from the sequence lengths, and
+        # DCP reads rank-local lengths that the draft loop does not advance.
+        self.supports_draft_decode_metadata_update = (
+            self.use_trtllm_decode_attention and not self.use_dcp
+        )
         # Adaptive verification trims drafts on device, so decode query lengths
         # must come from the device qo_indptr; only trtllm-gen supports that
         # (the selector already rejects the other configurations).
@@ -1769,6 +1776,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
+
+    def update_draft_decode_metadata(self, metadata: FlashInferMetadata) -> None:
+        # Nothing to refresh. Between draft steps only the positions change, and
+        # a pure-decode batch on the XQA/trtllm-gen path reads everything that
+        # depends on them from persistent device buffers that the draft loop
+        # advances in place: seq_lens (a view of the input buffer), block_tables
+        # and slot_mapping (the block-table buffers). The remaining fields
+        # (token and request counts, max_seq_len, q_len_per_req and the query
+        # offsets or mask derived from it) depend only on the query layout, which
+        # is identical across draft steps. Prefill, cascade and native decode
+        # metadata hold host-planned or freshly computed state instead.
+        assert self.supports_draft_decode_metadata_update
+        assert metadata.num_prefills == 0 and not metadata.use_cascade
+        assert isinstance(metadata.decode, FlashInferTrtllmAPIDecode)
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:
