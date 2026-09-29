@@ -196,7 +196,13 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    output: torch.Tensor | None = None,
 ):
+    """FlashInfer chunked GDN prefill.
+
+    ``output``: contiguous buffer with ``v.numel()`` elements that FlashInfer
+    writes into instead of allocating.
+    """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
@@ -226,6 +232,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=None if output is None else output.view(v.shape),
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -285,11 +292,8 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=core_attn_out,
         )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
     def forward_native(
@@ -1310,6 +1314,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
+        # When the builder found the spec and non-spec tokens in two contiguous
+        # blocks, slice instead of gathering and let the recurrent kernels write
+        # their outputs into core_attn_out in place.
+        spec_slice: slice | None = None
+        non_spec_slice: slice | None = None
+        if attn_metadata.spec_token_start is not None:
+            assert attn_metadata.non_spec_token_start is not None
+            spec_start = attn_metadata.spec_token_start
+            non_spec_start = attn_metadata.non_spec_token_start
+            spec_slice = slice(
+                spec_start, spec_start + attn_metadata.num_spec_decode_tokens
+            )
+            non_spec_slice = slice(
+                non_spec_start,
+                non_spec_start
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens,
+            )
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
@@ -1339,6 +1361,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_slice is not None:
+                mixed_qkv_spec = mixed_qkv[spec_slice]
+                a_spec = a[spec_slice]
+                b_spec = b[spec_slice]
+                mixed_qkv_non_spec = mixed_qkv[non_spec_slice]
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 a_spec = a.index_select(0, spec_token_indx)
@@ -1414,7 +1441,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
+            if non_spec_slice is not None:
+                a_non_spec = a[non_spec_slice]
+                b_non_spec = b[non_spec_slice]
+            elif spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
@@ -1482,6 +1512,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    out=None if spec_slice is None else core_attn_out[spec_slice],
                 )
             )
         else:
@@ -1538,6 +1569,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=(
+                    None if non_spec_slice is None else core_attn_out[non_spec_slice]
+                ),
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
@@ -1573,10 +1607,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
-            core_attn_out.index_copy_(
-                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
-            )
+            # With spec_slice set, both blocks were written in place above.
+            if spec_slice is None:
+                core_attn_out.index_copy_(
+                    0, spec_token_indx, core_attn_out_spec.squeeze(0)
+                )
+                core_attn_out.index_copy_(
+                    0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+                )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
