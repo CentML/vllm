@@ -78,6 +78,13 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # Per-step copies shared by every GDN layer so no layer re-derives them
+    # (set when num_prefills > 0): int64 state indices (ATen indexing converts
+    # int32 per call), the inverted initial-state mask, and (FlashInfer
+    # backend) int64 cu_seqlens as fi_chunk_gated_delta_rule wants.
+    prefill_state_indices_i64: torch.Tensor | None = None
+    prefill_no_initial_state: torch.Tensor | None = None
+    prefill_query_start_loc_i64: torch.Tensor | None = None
     # When the spec and non-spec tokens of a mixed batch form two contiguous
     # blocks (checked on the CPU), their start rows; the forward then slices
     # instead of gathering by spec/non_spec_token_indx.
@@ -434,6 +441,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             has_initial_state = None
 
+        prefill_state_indices_i64: torch.Tensor | None = None
+        prefill_no_initial_state: torch.Tensor | None = None
+        prefill_query_start_loc_i64: torch.Tensor | None = None
+        if num_prefills > 0:
+            assert prefill_state_indices is not None
+            assert prefill_has_initial_state is not None
+            assert prefill_query_start_loc is not None
+            prefill_state_indices_i64 = prefill_state_indices.to(torch.int64)
+            prefill_no_initial_state = ~prefill_has_initial_state
+            if self.gdn_prefill_backend == "flashinfer":
+                prefill_query_start_loc_i64 = prefill_query_start_loc.to(torch.int64)
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -537,6 +556,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            prefill_state_indices_i64=prefill_state_indices_i64,
+            prefill_no_initial_state=prefill_no_initial_state,
+            prefill_query_start_loc_i64=prefill_query_start_loc_i64,
             spec_token_start=spec_token_start,
             non_spec_token_start=non_spec_token_start,
         )

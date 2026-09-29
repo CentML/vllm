@@ -196,12 +196,14 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    g_is_exp: bool = False,
     output: torch.Tensor | None = None,
 ):
     """FlashInfer chunked GDN prefill.
 
-    ``output``: contiguous buffer with ``v.numel()`` elements that FlashInfer
-    writes into instead of allocating.
+    ``g_is_exp``: ``g`` already holds exp(g) (``fused_post_conv_prep`` with
+    ``output_g_exp=True``). ``output``: contiguous buffer with ``v.numel()``
+    elements that FlashInfer writes into instead of allocating.
     """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -227,7 +229,7 @@ def fi_chunk_gated_delta_rule(
         q=q,
         k=k,
         v=v,
-        g=torch.exp(fi_g),
+        g=fi_g if g_is_exp else torch.exp(fi_g),
         beta=fi_beta,
         initial_state=fi_state,
         output_final_state=output_final_state,
@@ -251,6 +253,9 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        # Callers of the FlashInfer path pass exp(g), computed in
+        # fused_post_conv_prep, instead of g.
+        self.expects_exp_g = active_backend == "flashinfer"
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -292,6 +297,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            g_is_exp=self.expects_exp_g,
             output=core_attn_out,
         )
         return o, final_state
@@ -1127,7 +1133,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
         )
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
@@ -1476,7 +1482,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=False,
+                output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
@@ -1552,8 +1558,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
+            if attn_metadata.prefill_state_indices_i64 is not None:
+                # int64 indices, inverted mask and FlashInfer cu_seqlens were
+                # converted once per step by the metadata builder.
+                prefill_state_indices = attn_metadata.prefill_state_indices_i64
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[attn_metadata.prefill_no_initial_state, ...] = 0
+            else:
+                initial_state = ssm_state[prefill_state_indices]
+                initial_state[~prefill_has_initial_state, ...] = 0
+            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+            if attn_metadata.prefill_query_start_loc_i64 is not None:
+                prefill_query_start_loc = attn_metadata.prefill_query_start_loc_i64
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1565,7 +1581,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
+                cu_seqlens=prefill_query_start_loc,
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,

@@ -45,6 +45,8 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    # The FlashInfer prefill path makes the post-conv kernel emit exp(g).
+    post_conv_output_g_exp: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -134,6 +136,13 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            post_conv_output_g_exp=bool(
+                getattr(
+                    getattr(layer, "chunk_gated_delta_rule", None),
+                    "expects_exp_g",
+                    False,
+                )
+            ),
         )
 
     if found_layer:
@@ -231,7 +240,7 @@ def _warm_fused_post_conv_kernel(
             config.k,
             config.v,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=config.post_conv_output_g_exp,
         )
 
 
