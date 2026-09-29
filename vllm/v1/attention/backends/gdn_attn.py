@@ -78,6 +78,12 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # When the spec and non-spec tokens of a mixed batch form two contiguous
+    # blocks (checked on the CPU), their start rows; the forward then slices
+    # instead of gathering by spec/non_spec_token_indx.
+    spec_token_start: int | None = None
+    non_spec_token_start: int | None = None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -226,6 +232,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.vllm_config.cache_config.mamba_cache_mode,
         )
 
+        spec_token_start: int | None = None
+        non_spec_token_start: int | None = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
@@ -323,6 +331,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
+
+                # Spec and non-spec tokens are two contiguous blocks iff the
+                # spec mask of the non-empty requests flips exactly once. The
+                # V2 runner orders draft carriers first, so this normally
+                # holds. CPU-only; otherwise the forward keeps the index path.
+                active_spec_mask = spec_sequence_masks_cpu[query_lens_cpu > 0]
+                num_flips = (active_spec_mask[1:] != active_spec_mask[:-1]).sum()
+                if num_flips.item() == 1:
+                    spec_first = bool(active_spec_mask[0].item())
+                    spec_token_start = 0 if spec_first else num_non_spec_tokens
+                    non_spec_token_start = num_spec_decode_tokens if spec_first else 0
 
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks_cpu, : self.num_spec + 1
@@ -518,6 +537,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            spec_token_start=spec_token_start,
+            non_spec_token_start=non_spec_token_start,
         )
         return attn_metadata
 
