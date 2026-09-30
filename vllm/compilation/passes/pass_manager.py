@@ -192,6 +192,15 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                     ]
                 self.passes += [RMSNormQuantFusionPass(config)]
 
+            if current_platform.is_cuda():
+                # Only rewrites (add +) RMSNorm -> swizzled vllm::mxfp8_quantize
+                # chains; graphs without them are left unchanged.
+                from .fusion.rms_norm_mxfp8_fusion import (
+                    RMSNormMxfp8QuantFusionPass,
+                )
+
+                self.passes += [RMSNormMxfp8QuantFusionPass(config)]
+
             if self.pass_config.fuse_act_quant:
                 self.passes += [ActivationQuantFusionPass(config)]
                 if (
