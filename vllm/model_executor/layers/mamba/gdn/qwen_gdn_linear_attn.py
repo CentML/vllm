@@ -30,6 +30,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+    gdn_norm_launch_config,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -1932,6 +1935,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         instead of first being copied into a compact [T * HV, V] tensor. The
         kernel indexes the weight per group, so it gets norm.weight tiled across
         heads (8 KiB, rebuilt per call so weight reloads are always honored).
+        The launch uses more rows and warps per CTA than the heuristic for
+        [T * HV, V] rows once T is large (``gdn_norm_launch_config``).
         """
         from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
             layer_norm_fwd,
@@ -1943,6 +1948,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # view, not reshape: merging (HV, V) of the gate must not copy.
         output_gate_2d = output_gate.view(num_tokens, num_heads * head_dim)
         assert output_gate_2d.stride(-1) == 1
+        rows_per_block, num_warps = gdn_norm_launch_config(num_tokens, x.device)
         layer_norm_fwd(
             x_2d,
             self.norm.weight.repeat(num_heads),
@@ -1956,6 +1962,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             norm_before_gate=self.norm.norm_before_gate,
             is_rms_norm=True,
             activation=self.norm.activation,
+            rows_per_block=rows_per_block,
+            num_warps=num_warps,
         )
 
     def _forward_core_fused_norm(

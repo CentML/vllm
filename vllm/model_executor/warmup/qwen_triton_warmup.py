@@ -3,6 +3,7 @@
 """Warm up Qwen Triton kernels from the loaded model's compile keys."""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -158,13 +159,20 @@ def _warm_gated_rms_norm_kernel(
     max_num_tokens: int,
     x_dtype: torch.dtype,
 ) -> None:
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_norm_launch_config,
+    )
     from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
         warmup_layer_norm_fwd,
     )
 
     # Decode-only batches normalize T * HV rows of V; batches with prefill
-    # normalize T rows of HV * V (one group per head).
+    # normalize T rows of HV * V (one group per head), with the layer's launch
+    # config.
     for rows_per_token in (config.hv, 1):
+        launch_config = None
+        if rows_per_token == 1:
+            launch_config = partial(gdn_norm_launch_config, device=device)
         warmup_layer_norm_fwd(
             max_num_tokens=max_num_tokens,
             rows_per_token=rows_per_token,
@@ -175,6 +183,7 @@ def _warm_gated_rms_norm_kernel(
             norm_before_gate=config.norm_before_gate,
             is_rms_norm=True,
             activation=config.norm_activation,
+            launch_config=launch_config,
         )
 
 
