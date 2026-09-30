@@ -31,6 +31,12 @@ _GDN_STATE_COMMIT_DEFERRED = (
     os.environ.get("GDN_STATE_COMMIT", "0") == "1"
     and os.environ.get("GDN_STATE_COMMIT_LAYOUT_ONLY", "0") != "1"
 )
+# Load-time guard of the deferred GDN state commit (both modes; see
+# gdn_state_commit.check_num_speculative_tokens).
+_GDN_STATE_COMMIT_GUARD = (
+    os.environ.get("GDN_STATE_COMMIT", "0") == "1"
+    and os.environ.get("GDN_STATE_COMMIT_GUARD", "1") != "0"
+)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -180,6 +186,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        if _GDN_STATE_COMMIT_GUARD:
+            # the deferred state commit's decode kernel holds at most MAX_T
+            # tokens per spec row: refuse to start on a wider row
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            gdn_state_commit.check_num_speculative_tokens(
+                self.num_spec, "GDNAttentionMetadataBuilder"
+            )
 
     def _build_chunk_metadata(
         self,

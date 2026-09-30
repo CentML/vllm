@@ -114,6 +114,18 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        if os.environ.get("GDN_STATE_COMMIT", "0") == "1":
+            # Deferred GDN state commit: refuse to start before the model loads
+            # if its decode kernel cannot hold 1 + num_speculative_tokens tokens.
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            if gdn_state_commit.guard_enabled():
+                spec = vllm_config.speculative_config
+                gdn_state_commit.check_num_speculative_tokens(
+                    spec.num_speculative_tokens if spec is not None else 0,
+                    "EngineCore",
+                )
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
