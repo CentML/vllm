@@ -590,7 +590,9 @@ def build_plan(layer, md, raw):
             gt = _TABLES[key] = _GroupTable(layers, gsc)
         if MAT:
             _materialize_rows(md, layers, gt)
-        if ZERO and p.slots.numel() > 0:
+        if md.__dict__.get("_step_plan_zeroed"):
+            p.zero_done = True  # done by the GDN layer-graph builder step
+        elif ZERO and p.slots.numel() > 0:
             _gdn_zero_state_slots_layers_kernel[(p.slots.numel(), gt.hv, gt.n)](
                 gt.ptrs,
                 p.slots,
@@ -947,7 +949,7 @@ def fill_lazy(md) -> None:
 # GGM_MDREUSE: GDN metadata of the other KV-cache groups derived from the first
 # ----------------------------------------------------------------------------
 _MDTPL: list = [None]
-_FLAG_KEYS = ("_step_plan", "_gsc_done")
+_FLAG_KEYS = ("_step_plan", "_gsc_done", "_step_plan_graph", "_step_plan_zeroed")
 
 
 def _base(t):

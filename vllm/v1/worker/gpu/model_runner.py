@@ -43,6 +43,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1950,11 +1951,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
+            cg_mode = batch_desc.cg_mode
+            if gdn_layer_graphs.ENABLED:
+                # GDN layer graphs: PIECEWISE steps whose GDN metadata was not
+                # packed for the graphs run eagerly
+                cg_mode = gdn_layer_graphs.forward_context_mode(attn_metadata, cg_mode)
             with set_forward_context(
                 attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
+                cudagraph_runtime_mode=cg_mode,
                 num_tokens_across_dp=(
                     dp_sync.num_tokens_across_dp if dp_sync is not None else None
                 ),

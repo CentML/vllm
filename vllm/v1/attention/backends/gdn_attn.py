@@ -9,7 +9,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs, gdn_step_plan
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -248,7 +248,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if gdn_step_plan.MDREUSE:
             # GGM_MDREUSE=1: derive the metadata of the other GDN KV-cache groups
             # of a step from the first group's full build (see gdn_step_plan)
-            return gdn_step_plan.mdreuse_build(
+            md = gdn_step_plan.mdreuse_build(
                 self,
                 self._build_full,
                 common_prefix_len,
@@ -257,13 +257,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_draft_tokens_cpu,
                 fast_build,
             )
-        return self._build_full(
-            common_prefix_len,
-            common_attn_metadata,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            fast_build,
-        )
+        else:
+            md = self._build_full(
+                common_prefix_len,
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                fast_build,
+            )
+        if gdn_layer_graphs.ENABLED:
+            # VLLM_GDN_LAYER_GRAPHS=1: pack the step into the graphs' static
+            # buffers (see gdn_layer_graphs)
+            gdn_layer_graphs.after_build(self, md)
+        return md
 
     def _build_full(
         self,

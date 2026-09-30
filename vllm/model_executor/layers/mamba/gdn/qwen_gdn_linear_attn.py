@@ -31,7 +31,11 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc, gdn_step_plan
+from vllm.model_executor.layers.mamba.gdn import (
+    gdn_layer_graphs,
+    gdn_out_alloc,
+    gdn_step_plan,
+)
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -343,6 +347,7 @@ if _GDN_STATE_COMMIT and _GDN_MIXED_SPEC_TRITON:
 # Per-step plan / host trims of the mixed-step GDN core (GGM, GGM_OG2), see
 # gdn_step_plan.
 gdn_step_plan.check_config(_GDN_STATE_COMMIT, norm_quant.NQF)
+gdn_layer_graphs.check_config()
 
 
 @triton.jit
@@ -2488,6 +2493,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba: torch.Tensor,
         core_attn_out: torch.Tensor,
     ) -> None:
+        if gdn_layer_graphs.ENABLED and gdn_layer_graphs.forward_packed(
+            self, mixed_qkvz, ba, core_attn_out
+        ):
+            # VLLM_GDN_LAYER_GRAPHS=1: served by this layer's CUDA graph
+            return
         if norm_quant.NQF and norm_quant.gdn_packed_enabled(self, core_attn_out):
             # NQF=1: run the core with the gated RMSNorm writing out_proj's
             # MXFP8 input into static buffers, quantize the remaining rows and
