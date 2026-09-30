@@ -28,7 +28,11 @@ Runtime (opaque custom op ``torch.ops.seg.fold_moe``, CUDA-graph safe):
   finalize sums the routed and the gated shared expert outputs.
 When the runner is marked ``_nqf_defer`` (a fused residual-add + norm
 consumer takes the (shared, routed) pair instead of their sum), the folded
-forward returns (moe_out, zeros[:M]); adding 0 is exact.
+forward returns (moe_out, zeros[:M]); adding 0 is exact. With QGF_FIN=1 it
+uses ``torch.ops.seg.fold_moe_nf`` instead: the trtllm MoE skips its finalize
+kernel (do_finalize=False) and returns a placeholder [M, H] tensor; the
+unfinalized outputs are registered under its address and the next fused
+pre-norm does the finalize gather-reduce inside its kernel (bit-identical).
 
 Eligible blocks: TP = DP = EP = 1, no sequence parallelism, no routed
 input/output transforms, routed scaling factor 1.0, no EPLB,
@@ -52,6 +56,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.shared_expert_kernels import (
     seg_route_fold,
 )
+from vllm.model_executor.layers.fusion import norm_quant
 
 logger = init_logger(__name__)
 
@@ -82,6 +87,18 @@ def stash_shared_expert_weight(layer: torch.nn.Module) -> None:
 
 # ------------------------------------------------------------- 2. custom op
 def _fold_moe(x: torch.Tensor, layer_name) -> torch.Tensor:
+    return _fold_moe_impl(x, layer_name, False)
+
+
+def _fold_moe_nf(x: torch.Tensor, layer_name) -> torch.Tensor:
+    """Same MoE, but trtllm skips its finalize kernel (do_finalize=False).
+    Returns a placeholder [M, H] tensor; (gemm2_out, weights,
+    expanded_idx_to_permuted_idx) are registered under its address and the
+    next fused pre-norm does the finalize gather-reduce (bit-identical)."""
+    return _fold_moe_impl(x, layer_name, True)
+
+
+def _fold_moe_impl(x: torch.Tensor, layer_name, no_finalize: bool) -> torch.Tensor:
     from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 
     L = mr.get_layer_from_name(mr._resolve_layer_name(layer_name))
@@ -135,8 +152,14 @@ def _fold_moe(x: torch.Tensor, layer_name) -> torch.Tensor:
         tune_max_num_tokens=st["tune_max"],
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=flashinfer.ActivationType.Swiglu.value,
+        do_finalize=not no_finalize,
     )
-    return o[0] if isinstance(o, (list, tuple)) else o
+    if not no_finalize:
+        return o[0] if isinstance(o, (list, tuple)) else o
+    g2, w_used, idx = o[0], o[1], o[2]
+    handle = torch.empty_like(x)
+    norm_quant.fin_produce(handle, g2, w_used, idx)
+    return handle
 
 
 def _fold_moe_fake(x: torch.Tensor, layer_name) -> torch.Tensor:
@@ -161,6 +184,15 @@ def register_op() -> None:
     direct_register_custom_op(
         "fold_moe",
         _fold_moe,
+        mutates_args=[],
+        fake_impl=_fold_moe_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+    _fold_moe_nf.__annotations__["layer_name"] = mr._layer_name_type
+    direct_register_custom_op(
+        "fold_moe_nf",
+        _fold_moe_nf,
         mutates_args=[],
         fake_impl=_fold_moe_fake,
         target_lib=_LIB,
