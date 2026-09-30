@@ -23,6 +23,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -31,6 +32,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+    gdn_gated_norm_mxfp8,
+    gdn_mxfp8_scale_numel,
     gdn_norm_launch_config,
 )
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
@@ -46,6 +49,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -92,6 +96,27 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
+    """Whether ``linear`` takes a pre-quantized MXFP8 activation with FlashInfer's
+    F8_128x4 swizzled scales, the layout ``gdn_gated_norm_mxfp8`` writes.
+    """
+    if not current_platform.is_cuda():
+        return False
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    kernel = getattr(getattr(linear, "quant_method", None), "kernel", None)
+    return (
+        isinstance(
+            kernel,
+            (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel),
+        )
+        and kernel.input_quant_key() == kMxfp8Dynamic
+    )
 
 
 def _resolve_gdn_prefill_backend(
@@ -539,6 +564,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        # The fused core op also emits out_proj's swizzled MXFP8 activation
+        # when out_proj is a FlashInfer MXFP8 linear that consumes it.
+        self.gdn_out_mxfp8 = self.enable_fused_gdn_decode and _consumes_swizzled_mxfp8(
+            self.out_proj
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -928,17 +958,50 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_decode:
+            layer_name = _encode_layer_name(self.prefix)
             # The core op writes or zeroes every row itself.
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+            if self.gdn_out_mxfp8:
+                # The core op writes out_proj's e4m3 activation and swizzled
+                # scales; core_attn_out is only its bf16 scratch.
+                hidden = core_attn_out.shape[1] * core_attn_out.shape[2]
+                out_q = torch.empty(
+                    (num_tokens, hidden),
+                    dtype=torch.float8_e4m3fn,
+                    device=hidden_states.device,
+                )
+                out_scale = torch.empty(
+                    gdn_mxfp8_scale_numel(num_tokens, hidden),
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+                torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                    mixed_qkvz,
+                    ba,
+                    core_attn_out,
+                    layer_name=layer_name,
+                    out_q=out_q,
+                    out_scale=out_scale,
+                )
+                output, _ = self.out_proj(
+                    QuantizedActivation(
+                        out_q,
+                        out_scale,
+                        hidden_states.dtype,
+                        out_q.shape,
+                        kMxfp8Dynamic,
+                    )
+                )
+                return output
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
                 mixed_qkvz,
                 ba,
                 core_attn_out,
-                layer_name=_encode_layer_name(self.prefix),
+                layer_name=layer_name,
             )
             output, _ = self.out_proj(core_attn_out.flatten(-2))
             return output
@@ -1853,6 +1916,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,
         core_attn_out: torch.Tensor,
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1862,9 +1927,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
-            # The output is uninitialized; hand out_proj the zeros it would
-            # have been allocated with.
-            core_attn_out.zero_()
+            # The outputs are uninitialized; hand out_proj the zeros they
+            # would have been allocated with.
+            if out_q is not None:
+                assert out_scale is not None
+                out_q.zero_()
+                out_scale.zero_()
+            else:
+                core_attn_out.zero_()
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1881,6 +1951,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             output_gate=output_gate,
             core_attn_out=core_attn_out,
+            out_q=out_q,
+            out_scale=out_scale,
         )
 
     def _can_use_fused_gdn_mtp_decode(
@@ -1978,6 +2050,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_warps=num_warps,
         )
 
+    def _gated_norm_mxfp8(
+        self,
+        core_attn_out: torch.Tensor,
+        output_gate: torch.Tensor,
+        out_q: torch.Tensor,
+        out_scale: torch.Tensor,
+        norm_rows: tuple[int, int],
+        num_valid: int | torch.Tensor,
+    ) -> None:
+        """Gated RMSNorm of ``norm_rows`` plus out_proj's MXFP8 activation of
+        every valid row; rows ``>= num_valid`` are zero-filled unread.
+        """
+        assert self.norm.bias is None and self.norm.norm_before_gate
+        assert self.norm.group_size in (None, self.head_v_dim)
+        gdn_gated_norm_mxfp8(
+            core_attn_out,
+            output_gate,
+            self.norm.weight,
+            self.norm.eps,
+            self.norm.activation,
+            out_q,
+            out_scale,
+            norm_rows,
+            num_valid,
+        )
+
     def _forward_core_fused_norm(
         self,
         mixed_qkv: torch.Tensor,
@@ -1985,9 +2083,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ) -> None:
-        """Core + gated RMSNorm into ``core_attn_out``, which is uninitialized:
-        every row is either written by the kernels or zeroed here.
+        """Core + gated RMSNorm into ``core_attn_out``, or, when ``out_q`` and
+        ``out_scale`` are given, into out_proj's swizzled MXFP8 activation, with
+        ``core_attn_out`` as bf16 scratch. The outputs are uninitialized: every
+        row is either written by the kernels or zeroed here.
         """
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1999,12 +2101,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        quantize = out_q is not None
+        assert quantize == (out_scale is not None)
         if (
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
         ):
-            # The MTP kernel skips FULL-graph padding requests.
-            core_attn_out.zero_()
+            if not quantize:
+                # The MTP kernel skips FULL-graph padding requests.
+                core_attn_out.zero_()
             self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -2013,6 +2118,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
+            if quantize:
+                # Only the MTP rows of real requests are valid; their count is
+                # on the device (FULL-graph replay pads the requests).
+                num_spec = attn_metadata.num_spec_decodes
+                assert attn_metadata.spec_query_start_loc is not None
+                self._gated_norm_mxfp8(
+                    core_attn_out,
+                    output_gate,
+                    out_q,  # type: ignore[arg-type]
+                    out_scale,  # type: ignore[arg-type]
+                    norm_rows=(0, 0),
+                    num_valid=attn_metadata.spec_query_start_loc[
+                        num_spec : num_spec + 1
+                    ],
+                )
             return
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -2028,7 +2148,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # these kernels are not known to write: zero first.
             core_attn_out.zero_()
             num_written = num_actual_tokens
-        norm_rows = slice(0, num_written)
+        norm_rows = (0, num_written)
         if (
             attn_metadata.num_prefills > 0
             and attn_metadata.spec_token_start is not None
@@ -2058,7 +2178,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 spec_done=True,
             )
             non_spec_start = attn_metadata.non_spec_token_start
-            norm_rows = slice(
+            norm_rows = (
                 non_spec_start,
                 non_spec_start
                 + attn_metadata.num_prefill_tokens
@@ -2071,13 +2191,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a=a.contiguous(),
                 core_attn_out=core_attn_out,
             )
+        if quantize:
+            self._gated_norm_mxfp8(
+                core_attn_out,
+                output_gate,
+                out_q,  # type: ignore[arg-type]
+                out_scale,  # type: ignore[arg-type]
+                norm_rows=norm_rows,
+                num_valid=num_written,
+            )
+            return
+        norm_lo, norm_hi = norm_rows
         if attn_metadata.num_prefills > 0:
             # Read the strided output gate in place instead of copying it
             # compact. Decode-only batches (FULL graphs) keep the [T*HV, V]
             # launch.
             self._rms_norm_gated_strided_gate_cuda(
-                core_attn_out[norm_rows],
-                output_gate[norm_rows],
+                core_attn_out[norm_lo:norm_hi],
+                output_gate[norm_lo:norm_hi],
             )
             # Only the piecewise-graph padding rows are left to zero.
             core_attn_out[num_written:].zero_()
@@ -2143,7 +2274,13 @@ def qwen_gdn_attention_core_fused_norm_packed(
     ba: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
+    out_q: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> None:
+    """``out_q``/``out_scale``: out_proj's e4m3 activation and flat swizzled
+    UE8M0 scales, written instead of the normed bf16 output (``core_attn_out``
+    is then scratch).
+    """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
@@ -2151,13 +2288,15 @@ def qwen_gdn_attention_core_fused_norm_packed(
         mixed_qkvz=mixed_qkvz,
         ba=ba,
         core_attn_out=core_attn_out,
+        out_q=out_q,
+        out_scale=out_scale,
     )
 
 
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed",
     op_func=qwen_gdn_attention_core_fused_norm_packed,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "out_q", "out_scale"],
 )
 
 

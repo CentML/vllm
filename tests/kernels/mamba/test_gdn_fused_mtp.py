@@ -196,6 +196,7 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_fused_gdn_decode=True,
+        gdn_out_mxfp8=False,
         norm=types.SimpleNamespace(
             weight=torch.empty(V, dtype=torch.bfloat16, device=device)
         ),
