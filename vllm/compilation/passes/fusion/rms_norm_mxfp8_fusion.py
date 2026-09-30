@@ -9,6 +9,9 @@ Before vLLM IR lowering, a chain
     q, sf = vllm.mxfp8_quantize(view(y), is_sf_swizzled_layout=True)
 
 becomes one ``vllm.add_rms_norm_mxfp8_quant(a, b, residual, w, eps, 1.0, ...)``.
+When one summand is the deferred Qwen shared-expert gate
+``apply_shared_expert_gate(g, shared)``, the gate chain is absorbed as well
+and the op receives ``shared`` and ``g``.
 Its e4m3 values and swizzled scales are bit-identical to what
 ``mxfp8_quantize`` produces from the fused op's own bf16 output, so every
 swizzled MXFP8 consumer is unaffected. ``y`` is still written when anything
@@ -25,13 +28,19 @@ from typing import Any
 import torch
 from torch import fx
 from torch._guards import detect_fake_mode
+from torch._inductor.pattern_matcher import fwd_only
 from torch._ops import OpOverload
 from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.fx.passes.utils.matcher_utils import SubgraphMatcher
 
 import vllm.model_executor.layers.quantization.utils.mxfp8_utils  # noqa: F401
 from vllm import ir
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import MXFP8_BLOCK
+from vllm.model_executor.layers.fusion.shared_expert_gate import (
+    apply_shared_expert_gate,
+)
 
 from ..vllm_inductor_pass import VllmInductorPass
 
@@ -147,13 +156,39 @@ def _gemma_weight(weight: fx.Node) -> fx.Node | None:
     return cast.args[0]
 
 
+def _shared_gate_matcher() -> SubgraphMatcher:
+    """Matcher for ``apply_shared_expert_gate(g, s)`` in a post-grad graph.
+
+    The pattern is traced from the helper the MoE runner emits, with the same
+    decompositions, so the two stay in sync.
+    """
+    example = [
+        torch.empty(8, 1, dtype=torch.bfloat16),
+        torch.empty(8, 64, dtype=torch.bfloat16),
+    ]
+    pattern = fwd_only(apply_shared_expert_gate, example).graph
+    pattern.eliminate_dead_code()
+    return SubgraphMatcher(
+        pattern,
+        match_output=False,
+        match_placeholder=False,
+        remove_overlapping_matches=True,
+        ignore_literals=False,
+    )
+
+
 class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
     """Replace (add +) RMSNorm -> swizzled mxfp8_quantize with one fused op."""
+
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config)
+        self._gate_matcher = _shared_gate_matcher()
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = 0
         self._erased: set[fx.Node] = set()
+        self._gates = self._find_shared_gates(graph)
         for quant in list(graph.find_nodes(op="call_function", target=_QUANT)):
             if quant not in self._erased and self._fuse(graph, quant):
                 self.matched_count += 1
@@ -162,6 +197,32 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
             self.pass_name,
             self.matched_count,
         )
+
+    def _find_shared_gates(
+        self, graph: fx.Graph
+    ) -> dict[fx.Node, tuple[fx.Node, fx.Node, list[fx.Node]]]:
+        """Map each gated shared-expert output to (shared, gate logits, chain)."""
+        gates = {}
+        for match in self._gate_matcher.match(graph):
+            (out,) = match.returning_nodes
+            gate, shared = match.placeholder_nodes
+            chain = [
+                node
+                for pattern_node, node in match.nodes_map.items()
+                if pattern_node.op not in ("placeholder", "output")
+            ]
+            g_val = _val(gate)
+            if (
+                len(out.users) == 1
+                and _is_bf16_2d(shared)
+                and isinstance(g_val, torch.Tensor)
+                and g_val.dtype == torch.bfloat16
+                and g_val.dim() == 2
+                and statically_known_true(g_val.shape[1] == 1)
+                and statically_known_true(g_val.shape[0] == _val(shared).shape[0])
+            ):
+                gates[out] = (shared, gate, chain)
+        return gates
 
     def _erase(self, graph: fx.Graph, node: fx.Node) -> None:
         graph.erase_node(node)
@@ -203,9 +264,12 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
             return False
 
         # Absorb a single-use add feeding the norm (the MoE shared + routed
-        # combine), which Inductor would otherwise fuse into the norm.
+        # combine), which Inductor would otherwise fuse into the norm. When the
+        # shared summand is the deferred shared-expert gate, the kernel applies
+        # the gate as well.
         x_src, x_views = _through_views(x)
-        add, x2 = None, None
+        add, x2, gate = None, None, None
+        gate_chain: list[fx.Node] = []
         if (
             x_src.op == "call_function"
             and x_src.target is aten.add.Tensor
@@ -217,7 +281,12 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
             a, b = (_through_views(arg)[0] for arg in x_src.args)
             if all(_is_bf16_2d(t) and _same_shape(t, x) for t in (a, b)):
                 add, x_src, x2 = x_src, a, b
-        if not all(_materialized(t) for t in (x_src, x2) if t is not None):
+                for summand, other in ((a, b), (b, a)):
+                    matched = self._gates.get(summand)
+                    if matched is not None and _same_shape(matched[0], x):
+                        x_src, (x2, gate, gate_chain) = other, matched
+                        break
+        if not all(_materialized(t) for t in (x_src, x2, gate) if t is not None):
             return False
         if not (_is_bf16_2d(x_src) and _same_shape(x_src, x)):
             return False
@@ -258,9 +327,9 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
                 else:
                     store_normed = True
 
-        args = (x_src, x2, residual, weight, eps, weight_offset, store_normed)
+        args = (x_src, x2, residual, weight, eps, weight_offset, store_normed, gate)
         fake_mode = detect_fake_mode(
-            [_val(n) for n in (x_src, x2, residual, weight) if n is not None]
+            [_val(n) for n in (x_src, x2, residual, weight, gate) if n is not None]
         )
         if fake_mode is None:
             return False
@@ -291,6 +360,7 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
         dead += [*norm_items.values(), norm, *x_views]
         if add is not None:
             dead.append(add)
+        dead += sorted(gate_chain, key=order.__getitem__, reverse=True)
         for node in dict.fromkeys(dead):
             if node not in self._erased and not node.users:
                 self._erase(graph, node)

@@ -18,6 +18,9 @@ from vllm.config import CompilationConfig, CompilationMode, VllmConfig
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     add_rms_norm_mxfp8_quant,
 )
+from vllm.model_executor.layers.fusion.shared_expert_gate import (
+    apply_shared_expert_gate,
+)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 
@@ -74,6 +77,26 @@ class PlainNorm(torch.nn.Module):
         return _quant(vllm.ir.ops.rms_norm(x, self.weight, EPS))
 
 
+class GatedCombine(torch.nn.Module):
+    """Deferred shared-expert gate + routed combine -> input norm -> quant."""
+
+    def __init__(self, gate_reused: bool) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(HIDDEN, device="cuda").bfloat16())
+        self.gate_reused = gate_reused
+
+    def forward(self, g, shared, routed, residual):
+        gated = apply_shared_expert_gate(g, shared)
+        x = (gated + routed).view(-1, HIDDEN)
+        y, residual = vllm.ir.ops.fused_add_rms_norm(
+            x, residual, self.weight.float() + 1.0, EPS
+        )
+        q, s = _quant(y)
+        if self.gate_reused:  # the gated tensor is needed elsewhere
+            return q, s, residual, gated
+        return q, s, residual
+
+
 @pytest.fixture
 def vllm_config():
     config = VllmConfig(
@@ -113,7 +136,7 @@ def test_gemma_add_norm_fused(vllm_config, bf16_consumer: bool) -> None:
     assert node.args[5] == 1.0  # Gemma w.float() + 1 absorbed
     assert node.args[6] is bf16_consumer  # bf16 output only when read
 
-    normed, res_k, q_k, s_k = add_rms_norm_mxfp8_quant(
+    normed, res_k, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
         a, b, residual, model.weight, EPS, 1.0, True
     )
     assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
@@ -130,7 +153,7 @@ def test_fp32_weight_norm_fused(vllm_config) -> None:
 
     assert fusion.matched_count == 1
     assert backend.op_count(QUANT) == 0
-    _, _, q_k, s_k = add_rms_norm_mxfp8_quant(
+    _, _, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
         x, None, None, model.weight, EPS, 0.0, False
     )
     assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
@@ -158,3 +181,36 @@ def test_norm_not_fused(vllm_config, dtype: torch.dtype, embed: bool) -> None:
     assert fusion.matched_count == 0
     assert backend.op_count(QUANT) == 1
     assert backend.op_count(FUSED) == 0
+
+
+@pytest.mark.parametrize("gate_reused", [False, True])
+@torch.inference_mode()
+def test_shared_expert_gate_absorbed(vllm_config, gate_reused: bool) -> None:
+    model = GatedCombine(gate_reused)
+    g = (torch.randn(M, 1, device="cuda") * 3).bfloat16()
+    shared, routed = (torch.randn(M, HIDDEN, device="cuda").bfloat16() for _ in "ab")
+    residual = (torch.randn(M, HIDDEN, device="cuda") * 4).bfloat16()
+    fusion, backend, out = _compile(
+        vllm_config, model, g, shared, routed, residual, dynamic=True
+    )
+
+    sigmoid = torch.ops.aten.sigmoid.default
+    # The eager gate: bf16 sigmoid, bf16 broadcast product.
+    pre_gated = torch.sigmoid(g) * shared
+    if gate_reused:
+        # The gated tensor is not materialized for the norm alone, so the
+        # chain is left to Inductor and the gate keeps its eager rounding.
+        assert fusion.matched_count == 0
+        assert backend.op_count(sigmoid) == 1
+        assert _bitwise(out[3], pre_gated)
+        return
+
+    assert fusion.matched_count == 1
+    assert backend.op_count(sigmoid) == 0
+    (node,) = backend.graph_post_pass.find_nodes(op="call_function", target=FUSED)
+    assert node.args[7] is not None  # the gate logits
+    _, res_k, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
+        routed, pre_gated, residual, model.weight, EPS, 1.0, False
+    )
+    assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
+    assert torch.equal(out[2], res_k)
