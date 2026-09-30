@@ -34,6 +34,12 @@ from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
 from vllm.model_executor.warmup.mamba_triton_warmup import mamba_triton_warmup
+from vllm.model_executor.warmup.pinned_autotune_cache import (
+    PINNED_AUTOTUNE_RO,
+    check_no_startup_tuning,
+    log_read_only_enabled,
+    verify_pinned_autotune_file,
+)
 from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
     qwen4_exp_qsa_triton_warmup,
 )
@@ -422,9 +428,16 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if is_leader and cache_path.exists():
         with open(cache_path, "rb") as f:
             cached_results = f.read()
+    if PINNED_AUTOTUNE_RO:
+        log_read_only_enabled()
     cached_results = world.broadcast_object(cached_results, src=0)
     if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: verify the bytes just read instead of
+            # writing them back.
+            verify_pinned_autotune_file(cache_path, cached_results)
+        else:
+            write_flashinfer_autotune_cache(cache_path, cached_results)
         world.barrier()
         tuner.load_configs(str(cache_path))
 
@@ -451,4 +464,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if world.world_size > 1:
         world.barrier()
     if is_leader:
-        tuner.save_configs(str(cache_path))
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: do not save; fail if anything had to be
+            # tuned at start-up.
+            check_no_startup_tuning(tuner, str(cache_path))
+        else:
+            tuner.save_configs(str(cache_path))
