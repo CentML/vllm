@@ -17,6 +17,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.kernels.linear import Mxfp8LinearKernel
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -46,7 +47,10 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    kMxfp8Dynamic,
+)
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -401,6 +405,19 @@ class Qwen3NextAttention(nn.Module):
             and query_quant.group_shape == GroupShape.PER_TENSOR
             and current_platform.fp8_dtype() == torch.float8_e4m3fn
         )
+        # The attention gate is read in place from the QKV output when
+        # AttnGateMxfp8QuantFusionPass fuses attn * sigmoid(gate) into o_proj's
+        # MXFP8 quant: o_proj takes FlashInfer's swizzled MXFP8 activation
+        # (MLPerf submission path; specialized for Qwen3.6-35B-A3B). The fused
+        # producer reads the strided gate at full speed; Inductor's gate kernel
+        # reads it about 2.5x slower than a contiguous copy, so everywhere else
+        # the qk-norm-RoPE kernel copies the gate.
+        o_proj_kernel = getattr(self.o_proj.quant_method, "kernel", None)
+        self.attn_gate_mxfp8 = (
+            self.use_qk_norm_rope_tokens
+            and isinstance(o_proj_kernel, Mxfp8LinearKernel)
+            and o_proj_kernel.input_quant_key() == kMxfp8Dynamic
+        )
 
     def _project_qkv_gate(
         self,
@@ -471,8 +488,10 @@ class Qwen3NextAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Like the fused ``_project_qkv_gate`` path, via the token-tile kernel.
 
-        ``q`` is FP8 (quantized with ``attn._q_scale``) when
-        ``qk_norm_rope_fp8_q``.
+        With ``attn_gate_mxfp8`` the gate is not copied: ``gate`` is a strided
+        ``[tokens, heads, head_dim]`` view of ``qkv`` that the fused gate ->
+        MXFP8 producer reads in place. ``q`` is FP8 (quantized with
+        ``attn._q_scale``) when ``qk_norm_rope_fp8_q``.
         """
         q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
         mrope_section = getattr(self.rotary_emb, "mrope_section", None)
@@ -493,8 +512,10 @@ class Qwen3NextAttention(nn.Module):
             self.rotary_emb.rotary_dim,
             list(mrope_section) if positions.ndim == 2 else None,
             1.0,
-            True,
+            not self.attn_gate_mxfp8,
         )
+        if self.attn_gate_mxfp8:
+            gate = q_gate.view(-1, self.num_heads, 2, self.head_dim)[:, :, 1]
         return q, k, v, gate
 
     def forward(
