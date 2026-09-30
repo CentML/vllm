@@ -40,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
+from vllm.v1.worker import fused_kv_block_copy
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
@@ -749,6 +750,26 @@ def _fused_copy_rows(blocks: torch.Tensor, src: torch.Tensor, dst: torch.Tensor)
 
 
 def copy_kv_cache_blocks_inplace(
+    kv_caches: Iterable[torch.Tensor],
+    num_blocks: int,
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+) -> None:
+    if fused_kv_block_copy.ENABLED:
+        # VLLM_FUSED_KV_BLOCK_COPY_MULTI=1: all storages in one launch when the
+        # copies provably commute; otherwise the per-storage path below
+        fused_kv_block_copy.copy_kv_cache_blocks_inplace(
+            kv_caches,
+            num_blocks,
+            kv_cache_block_copies,
+            _copy_kv_cache_blocks_inplace_per_storage,
+        )
+        return
+    _copy_kv_cache_blocks_inplace_per_storage(
+        kv_caches, num_blocks, kv_cache_block_copies
+    )
+
+
+def _copy_kv_cache_blocks_inplace_per_storage(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
