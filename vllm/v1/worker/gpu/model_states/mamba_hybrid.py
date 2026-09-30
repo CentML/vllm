@@ -345,23 +345,16 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
+        # For tensor num_sampled the model runner's post_update has already
+        # written max(num_sampled, 1) into num_accepted_tokens_gpu.
         num_reqs = idx_mapping.shape[0]
-        if num_reqs:
-            if not isinstance(num_sampled, int):
-                # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
-                # kernel skips them rather than scattering with a host-side gather.
-                _scatter_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    num_sampled,
-                    self.num_accepted_tokens_gpu,
-                )
-            else:
-                # Fill with single value.
-                _fill_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    self.num_accepted_tokens_gpu,
-                    max(num_sampled, 1),
-                )
+        if num_reqs and isinstance(num_sampled, int):
+            # Fill with single value.
+            _fill_num_accepted_kernel[(num_reqs,)](
+                idx_mapping,
+                self.num_accepted_tokens_gpu,
+                max(num_sampled, 1),
+            )
 
         if self.recoverssm is not None:
             self.recoverssm.commit_step(
@@ -390,20 +383,6 @@ class MambaHybridModelState(DefaultModelState):
                 num_computed_tokens,
                 idx_mapping,
             )
-
-
-@triton.jit
-def _scatter_num_accepted_kernel(
-    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
-    num_sampled_ptr,  # [num_reqs]
-    num_accepted_ptr,  # [max_num_reqs]
-):
-    row = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + row)
-    if req_state_idx < 0:
-        return
-    num_sampled = tl.load(num_sampled_ptr + row)
-    tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
 
 
 @triton.jit

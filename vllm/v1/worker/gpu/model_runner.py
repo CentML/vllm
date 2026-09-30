@@ -1592,6 +1592,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        # Mamba hybrids: post_update also writes max(num_sampled, 1) into the
+        # per-request num_accepted_tokens, so postprocess_state needs no scatter.
+        num_accepted = getattr(self.model_state, "num_accepted_tokens_gpu", None)
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1603,6 +1606,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            num_accepted=num_accepted,
         )
 
         self.model_state.postprocess_state(
@@ -2155,10 +2159,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+            if input_batch.has_structured_output_reqs:
+                step_draft_tokens = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
+            else:
+                # set_draft_tokens reads only the draft width without structured
+                # outputs; skip the per-request gather.
+                step_draft_tokens = self.req_states.draft_tokens
+            self.draft_tokens_handler.set_draft_tokens(input_batch, step_draft_tokens)
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch

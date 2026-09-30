@@ -8,6 +8,10 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+from vllm.v1.worker.gpu.sample.spec_topk_topp import (
+    MAX_TOP_K,
+    apply_spec_top_k_top_p,
+)
 
 NO_LOGPROBS = -1
 _NP_INT64_MIN = np.iinfo(np.int64).min
@@ -106,6 +110,20 @@ class SamplingStates:
         expanded_idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
     ) -> torch.Tensor:
+        top_k_np = self.top_k.np[idx_mapping_np]
+        # Full-GPU exact path when every row has 1 <= top_k <= MAX_TOP_K
+        # (disabled top-k is stored as vocab_size); otherwise Qrita below.
+        max_top_k = int(top_k_np.max()) if top_k_np.size else 0
+        if 0 < max_top_k <= MAX_TOP_K:
+            use_top_p = bool(np.any(self.top_p.np[idx_mapping_np] != 1.0))
+            return apply_spec_top_k_top_p(
+                logits,
+                expanded_idx_mapping,
+                self.top_k.gpu,
+                self.top_p.gpu,
+                max_top_k,
+                use_top_p,
+            )
         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
         if top_k is None and top_p is None:
             return logits
