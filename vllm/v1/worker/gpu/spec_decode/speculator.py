@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
+from vllm.v1.worker.gpu.spec_decode.split_argmax import split_argmax
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -453,7 +454,8 @@ class DraftModelSpeculator(BaseSpeculator):
             return self.model.get_top_tokens(hidden_states)
         else:
             logits = self.model.compute_logits(hidden_states)
-            sampled = logits.argmax(dim=-1)
+            # Bitwise equal to logits.argmax(dim=-1), split across the vocab.
+            sampled = split_argmax(logits)
         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
         return sampled
 
