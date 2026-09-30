@@ -185,9 +185,13 @@ class GemmaRMSNorm(CustomOp):
                 )
                 return out, (x, residual)
             # Unflagged norms (e.g. the final norm) may still receive deferred
-            # pairs: materialize them with the ops of the unfused graph.
+            # pairs: materialize them with the ops of the unfused graph. With
+            # QGF_FIN, x[0] may be a deferred-finalize placeholder; this code is
+            # traced by Dynamo, so the lookup must run inside an opaque op.
             if isinstance(x, tuple):
-                x = x[0] + x[1]
+                x = (
+                    torch.ops.nqf.fin_mat(x[0]) if norm_quant.QGF_FIN else x[0]
+                ) + x[1]
             if isinstance(residual, tuple):
                 residual = (
                     residual[0].to(torch.float32) + residual[1].to(torch.float32)
