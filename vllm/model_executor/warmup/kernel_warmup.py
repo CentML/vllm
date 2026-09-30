@@ -16,6 +16,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.engine_jit_warmup import (
+    EWARM_ENABLED,
+    log_engine_warmup_done,
+    register_engine_warmups,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
@@ -174,7 +179,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             registry = (
                 worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
             )
+            # EWARM=1: extra registrations (top-k/top-p, recorded Triton keys,
+            # FlashInfer GDN chunked prefill) compiled by this warmup pass.
+            ewarm_t0 = register_engine_warmups(registry) if EWARM_ENABLED else None
             registry.warmup()
+            if ewarm_t0 is not None:
+                log_engine_warmup_done(ewarm_t0)
         except Exception:
             logger.exception(
                 "JIT kernel warmup failed after %.2fs.",
