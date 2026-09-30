@@ -1282,6 +1282,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        spec_done: bool = False,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1290,6 +1291,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b: beta gating vector                   (num_tokens, num_heads)
             a: alpha gating vector                  (num_tokens, num_heads)
             core_attn_out: Pre-allocated output buffer for attention results.
+            spec_done: the caller already ran the spec rows of this mixed
+                batch (contiguous spec block only); process the rest.
 
         """
         forward_context = get_forward_context()
@@ -1342,6 +1345,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 + attn_metadata.num_prefill_tokens
                 + attn_metadata.num_decode_tokens,
             )
+        assert not spec_done or (
+            spec_slice is not None and attn_metadata.num_prefills > 0
+        )
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
@@ -1386,7 +1392,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and not spec_done:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -1437,7 +1443,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+            None if spec_done else mixed_qkv_spec
+        )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1503,7 +1511,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and not spec_done:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -2020,19 +2028,56 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # these kernels are not known to write: zero first.
             core_attn_out.zero_()
             num_written = num_actual_tokens
-        self._forward_core(
-            mixed_qkv=mixed_qkv,
-            b=b.contiguous(),
-            a=a.contiguous(),
-            core_attn_out=core_attn_out,
-        )
+        norm_rows = slice(0, num_written)
+        if (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.spec_token_start is not None
+            and self._can_use_fused_gdn_mtp_decode(attn_metadata)
+        ):
+            # The contiguous spec block goes through the fused CUDA MTP kernel
+            # (gating, recurrence and gated norm, as in decode-only batches);
+            # the rest through the prefill path, with b/a read strided.
+            assert attn_metadata.non_spec_token_start is not None
+            spec_start = attn_metadata.spec_token_start
+            spec_rows = slice(
+                spec_start, spec_start + attn_metadata.num_spec_decode_tokens
+            )
+            self._forward_core_decode_spec_fused_norm(
+                mixed_qkv=mixed_qkv[spec_rows],
+                b=b[spec_rows],
+                a=a[spec_rows],
+                output_gate=output_gate[spec_rows],
+                core_attn_out=core_attn_out[spec_rows],
+                attn_metadata=attn_metadata,
+            )
+            self._forward_core(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                spec_done=True,
+            )
+            non_spec_start = attn_metadata.non_spec_token_start
+            norm_rows = slice(
+                non_spec_start,
+                non_spec_start
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens,
+            )
+        else:
+            self._forward_core(
+                mixed_qkv=mixed_qkv,
+                b=b.contiguous(),
+                a=a.contiguous(),
+                core_attn_out=core_attn_out,
+            )
         if attn_metadata.num_prefills > 0:
             # Read the strided output gate in place instead of copying it
             # compact. Decode-only batches (FULL graphs) keep the [T*HV, V]
             # launch.
             self._rms_norm_gated_strided_gate_cuda(
-                core_attn_out[:num_written],
-                output_gate[:num_written],
+                core_attn_out[norm_rows],
+                output_gate[norm_rows],
             )
             # Only the piecewise-graph padding rows are left to zero.
             core_attn_out[num_written:].zero_()

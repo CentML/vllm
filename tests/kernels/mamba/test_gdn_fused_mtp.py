@@ -245,8 +245,15 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
             [128, 96],
             [SPEC_TOKENS, 64],
             [NUM_SPEC, -1],
+            1,
+            id="mixed-mtp",
+        ),
+        pytest.param(
+            [128, 96, 128],
+            [SPEC_TOKENS, 64, SPEC_TOKENS],
+            [NUM_SPEC, -1, NUM_SPEC],
             0,
-            id="mixed-mtp-falls-back",
+            id="mixed-interleaved-falls-back",
         ),
         pytest.param([96], [64], [-1], 0, id="pure-prefill"),
         pytest.param([128], [1], [-1], 0, id="pure-decode"),
@@ -261,7 +268,9 @@ def test_fused_model_path_matches_reference(
     expected_fused_calls: int,
     output_gate_activation: str,
 ) -> None:
-    """Fused MTP and its mixed/prefill/decode fallbacks match the reference."""
+    """Fused MTP (decode-only batches and the contiguous spec block of mixed
+    batches) and its interleaved/prefill/decode fallbacks match the reference.
+    """
     torch.manual_seed(1)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
