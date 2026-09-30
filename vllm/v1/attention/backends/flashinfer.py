@@ -68,6 +68,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends import draft_prefill_pruning
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
@@ -1867,6 +1868,9 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        # Set (to the layer name) on MTP draft attention layers when draft
+        # prefill pruning is enabled; see draft_prefill_pruning.py.
+        self.draft_prefill_pruning_layer: str | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -1988,6 +1992,26 @@ class FlashInferImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
 
         """
+        if (
+            self.draft_prefill_pruning_layer is not None
+            and draft_prefill_pruning.CTX.active
+        ):
+            # Opt-in: compute only the draft prefill rows that are sampled.
+            pruned = draft_prefill_pruning.pruned_forward(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+            if pruned is not None:
+                return pruned
+
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
