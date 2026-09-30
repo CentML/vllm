@@ -1,0 +1,512 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Fused (residual adds) + Gemma RMSNorm + MXFP8 activation quant for the
+Qwen3.5 MoE decoder layer (online MXFP8, FlashInfer CuTe-DSL dense GEMMs +
+trtllm MoE).
+
+Dataflow per decoder layer when a layer is eligible (configure_decoder_layer):
+  post_attention_layernorm(attn_out, res) -> torch.ops.nqf.post_norm
+      (opaque custom op) writes the bf16 normed output (router gate /
+      shared_expert_gate still read it), fp8 data, 128x4-swizzled scales
+      (shared-expert gate_up) and linear scales (routed-MoE input); the
+      residual is returned lazily as the pair (attn_out, res), exactly like
+      Inductor, which never materializes it.
+  MoE (MoERunner.forward) returns the pair (shared_out, routed_out) instead
+      of their sum.
+  next input_layernorm((shared, routed), (attn_out, res)) ->
+      torch.ops.nqf.pre_norm: x = (shared + routed) + (attn_out + res) in
+      fp32 (Inductor's order), stores the bf16 residual, the bf16 normed
+      output (in_proj_ba reads it), fp8 data + swizzled scales for
+      in_proj_qkvz / qkv_proj.
+Consumer: vllm.mxfp8_quantize (the op every MXFP8 activation quant goes
+through) first looks its input up in a one-entry stash keyed by
+(data_ptr, shape, stride); on a hit it returns the pre-computed
+(fp8, scales), which are bit-identical to what FlashInfer computes; on a
+miss it runs the FlashInfer quant. The stash holds strong references, so the
+looked-up memory cannot be recycled for another tensor. Producers and the
+consumer are opaque custom ops, so Inductor cannot split or reorder them, and
+the lookup runs at CUDA-graph capture time (Python), so replays use fixed
+addresses.
+Also fused into the same MXFP8 epilogue: the shared expert SiLU*mul (its
+down_proj input), the full-attention sigmoid gate multiply (o_proj input)
+and the GDN gated RMSNorm (GDN out_proj input, static buffers, see
+gdn_forward_core_fused_norm_packed).
+
+Env:
+  NQF=1 enables (default off; any value other than "0" enables).
+  VLLM_NORM_QUANT_FUSION_EMIT=0 keeps the fused norm ops but disables the
+      quant epilogue / stash (default 1).
+  VLLM_NORM_QUANT_FUSION_SILU=0 disables the shared-expert SiLU*mul fusion
+      (default 1).
+  VLLM_NORM_QUANT_FUSION_OUT_PROJ=0 disables the o_proj / GDN out_proj input
+      fusions (default 1).
+Numerics: bit-exact vs Inductor norm + FlashInfer mxfp8_quantize, as long
+as the Inductor reduction config matches norm_quant_kernels.CONFIG.
+"""
+
+import os
+
+import torch
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion import norm_quant_kernels as K
+
+logger = init_logger(__name__)
+
+NQF = os.environ.get("NQF", "0") != "0"
+EMIT = os.environ.get("VLLM_NORM_QUANT_FUSION_EMIT", "1") != "0"
+_SILU_ENV = os.environ.get("VLLM_NORM_QUANT_FUSION_SILU", "1")
+_OUT_PROJ_ENV = os.environ.get("VLLM_NORM_QUANT_FUSION_OUT_PROJ", "1")
+_H_OK = (2048,)
+STATS = {"hit_swz": 0, "hit_lin": 0, "miss": 0, "pre": 0, "post": 0}
+
+# --------------------------------------------------------------------- stash
+_STASH: dict = {"key": None, "src": None, "q": None, "swz": None, "lin": None}
+
+
+def _key(t):
+    return (t.data_ptr(), tuple(t.shape), tuple(t.stride()))
+
+
+def _stash_set(src, q, swz, lin):
+    _STASH.update(key=_key(src), src=src, q=q, swz=swz, lin=lin)
+
+
+def lookup(x, is_sf_swizzled_layout, alignment):
+    k = _STASH["key"]
+    if (
+        k is None
+        or alignment not in (0, 32)
+        or not isinstance(x, torch.Tensor)
+        or x.dim() != 2
+    ):
+        return None
+    if _key(x) != k:
+        return None
+    if is_sf_swizzled_layout:
+        sf = _STASH["swz"]
+        if sf is None:
+            return None
+        STATS["hit_swz"] += 1
+        return _STASH["q"], sf
+    sf = _STASH["lin"]
+    if sf is None:
+        return None
+    STATS["hit_lin"] += 1
+    return _STASH["q"], sf.view(x.size(0), -1)
+
+
+def consume_stash(x, is_sf_swizzled_layout=False, alignment=0):
+    """Called first by the vllm.mxfp8_quantize implementation when NQF=1:
+    the pre-computed (fp8, scales) of x, or None (then the stock quant runs)."""
+    hit = lookup(x, is_sf_swizzled_layout, alignment)
+    if hit is None:
+        STATS["miss"] += 1
+    return hit
+
+
+# ----------------------------------------------------------------------- ops
+def _post_norm(
+    a: torch.Tensor, r: torch.Tensor, w: torch.Tensor, eps: float, emit: bool
+) -> torch.Tensor:
+    out, _, q, swz, lin = K.norm_quant(
+        a, r, w, eps, emit_q=emit, emit_swz=True, emit_lin=True
+    )
+    if emit:
+        _stash_set(out, q, swz, lin)
+    STATS["post"] += 1
+    return out
+
+
+def _post_norm_fake(
+    a: torch.Tensor, r: torch.Tensor, w: torch.Tensor, eps: float, emit: bool
+) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+def _pre_norm(
+    s: torch.Tensor,
+    f: torch.Tensor,
+    a: torch.Tensor,
+    r: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    emit: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out, res, q, swz, _ = K.norm_quant(
+        a, r, w, eps, s=s, f=f, emit_q=emit, emit_swz=True, emit_lin=False
+    )
+    if emit:
+        _stash_set(out, q, swz, None)
+    STATS["pre"] += 1
+    return out, res
+
+
+def _pre_norm_fake(
+    s: torch.Tensor,
+    f: torch.Tensor,
+    a: torch.Tensor,
+    r: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    emit: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(a), torch.empty_like(a)
+
+
+def _silu_mul_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    STATS["silu"] = STATS.get("silu", 0) + 1
+    return K.silu_mul_quant(x)
+
+
+def _silu_mul_mxfp8_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    M, I = x.shape[0], x.shape[1] // 2
+    nsf = I // 32
+    padded_m = (M + 127) // 128 * 128
+    return (
+        x.new_empty((M, I), dtype=torch.float8_e4m3fn),
+        x.new_empty((padded_m * ((nsf + 3) // 4 * 4),), dtype=torch.uint8),
+    )
+
+
+def _gate_mul_mxfp8(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    out, q, sf = K.gate_mul_quant(a, g)
+    _stash_set(out, q, sf, None)
+    STATS["gate"] = STATS.get("gate", 0) + 1
+    return out
+
+
+def _gate_mul_mxfp8_fake(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+_LIB = None
+
+
+def register_ops() -> None:
+    """Register the nqf:: custom ops (once)."""
+    global _LIB
+    if _LIB is not None:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    _LIB = torch.library.Library("nqf", "FRAGMENT")
+    direct_register_custom_op(
+        "post_norm",
+        _post_norm,
+        mutates_args=[],
+        fake_impl=_post_norm_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+    direct_register_custom_op(
+        "pre_norm",
+        _pre_norm,
+        mutates_args=[],
+        fake_impl=_pre_norm_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+    direct_register_custom_op(
+        "gate_mul_mxfp8",
+        _gate_mul_mxfp8,
+        mutates_args=[],
+        fake_impl=_gate_mul_mxfp8_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+    direct_register_custom_op(
+        "silu_mul_mxfp8",
+        _silu_mul_mxfp8,
+        mutates_args=[],
+        fake_impl=_silu_mul_mxfp8_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+
+
+# -------------------------------------------------------- shared-expert SiLU
+class _SiluMulMxfp8(torch.nn.Module):
+    """Shared expert act_fn: SiLU*mul + MXFP8 quant in one kernel. Returns a
+    QuantizedActivation that down_proj's FlashInfer MXFP8 kernel consumes, so
+    Qwen2MoeMLP.forward itself is unchanged."""
+
+    def __init__(self, orig_act):
+        super().__init__()
+        self.orig_act = orig_act
+
+    def forward(self, gate_up):
+        if (
+            EMIT
+            and isinstance(gate_up, torch.Tensor)
+            and gate_up.dim() == 2
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.stride(-1) == 1
+            and gate_up.shape[-1] == 1024
+        ):
+            from vllm.model_executor.layers.fusion.quant_activation import (
+                QuantizedActivation,
+            )
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                kMxfp8Dynamic,
+            )
+
+            q, sf = torch.ops.nqf.silu_mul_mxfp8(gate_up)
+            return QuantizedActivation(
+                data=q,
+                scale=sf,
+                orig_dtype=gate_up.dtype,
+                orig_shape=q.shape,
+                quant_key=kMxfp8Dynamic,
+            )
+        return self.orig_act(gate_up)
+
+
+# ------------------------------------------------------------ norm producers
+def is_fusable(t) -> bool:
+    """Input accepted by the fused pre/post norm ops."""
+    return (
+        isinstance(t, torch.Tensor)
+        and t.is_cuda
+        and t.dtype == torch.bfloat16
+        and t.dim() == 2
+        and t.shape[-1] in _H_OK
+        and t.stride(-1) == 1
+    )
+
+
+# ---------------------------------------------------------- layer selection
+def _dense_is_cutedsl_mxfp8(linear) -> bool:
+    k = getattr(getattr(linear, "quant_method", None), "kernel", None)
+    # MRO check: subclasses of the CuTe-DSL MXFP8 linear kernel consume the same
+    # 128x4-swizzled activations through vllm.mxfp8_quantize / QuantizedActivation.
+    return any(
+        c.__name__ == "FlashInferCutedslMxfp8LinearKernel" for c in type(k).__mro__
+    )
+
+
+_MAX_TOKENS = [0]
+
+
+def _set_max_tokens(vllm_config) -> None:
+    if _MAX_TOKENS[0]:
+        return
+    try:
+        mnbt = vllm_config.scheduler_config.max_num_batched_tokens
+        caps = vllm_config.compilation_config.cudagraph_capture_sizes or [0]
+        _MAX_TOKENS[0] = (max(mnbt, max(caps)) + 127) // 128 * 128
+    except Exception:  # leave 0: the GDN out_proj fusion then stays off
+        pass
+
+
+def configure_decoder_layer(layer: torch.nn.Module, vllm_config) -> None:
+    """Called at the end of Qwen3_5DecoderLayer.__init__ when NQF=1: flag the
+    norms / MoE runner / attention of an eligible layer."""
+    try:
+        from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
+
+        if not isinstance(getattr(layer, "mlp", None), Qwen3NextSparseMoeBlock):
+            return
+        if getattr(layer, "layer_scale", False) or getattr(
+            layer, "use_attn_reduce_scatter_for_moe", False
+        ):
+            return
+        dense = (
+            layer.linear_attn.in_proj_qkvz
+            if layer.layer_type == "linear_attention"
+            else layer.self_attn.qkv_proj
+        )
+        se = layer.mlp.shared_expert
+        if (
+            se is None
+            or not _dense_is_cutedsl_mxfp8(dense)
+            or not _dense_is_cutedsl_mxfp8(se.gate_up_proj)
+        ):
+            logger.debug(
+                "norm_quant_fusion: layer not eligible (%s)",
+                type(getattr(getattr(dense, "quant_method", None), "kernel", None)),
+            )
+            return
+        layer.input_layernorm._nqf_role = "pre"
+        layer.post_attention_layernorm._nqf_role = "post"
+        layer.mlp.experts._nqf_defer = True
+        if (
+            _dense_is_cutedsl_mxfp8(se.down_proj)
+            and _SILU_ENV != "0"
+            and type(se.act_fn).__name__ == "SiluAndMul"
+        ):
+            se.act_fn = _SiluMulMxfp8(se.act_fn)
+        _set_max_tokens(vllm_config)
+        if _OUT_PROJ_ENV != "0":
+            if layer.layer_type == "full_attention" and _dense_is_cutedsl_mxfp8(
+                layer.self_attn.o_proj
+            ):
+                layer.self_attn._nqf_gate = True
+            if layer.layer_type == "linear_attention" and _dense_is_cutedsl_mxfp8(
+                layer.linear_attn.out_proj
+            ):
+                layer.linear_attn._nqf_gdn = True
+    except Exception as e:  # never break model construction; stock path stays
+        logger.warning("norm_quant_fusion: decoder layer not configured: %r", e)
+
+
+# ---------------------------------------------------- attention o_proj input
+def gate_mul_fusable(attn: torch.nn.Module, attn_output, gate) -> bool:
+    """Full-attention sigmoid(gate) * attn_output fused with the o_proj
+    MXFP8 input quant (torch.ops.nqf.gate_mul_mxfp8)."""
+    return (
+        EMIT
+        and getattr(attn, "_nqf_gate", False)
+        and attn_output.dim() == 2
+        and attn_output.dtype == torch.bfloat16
+        and attn_output.shape[-1] % 1024 == 0
+        and gate.numel() == attn_output.numel()
+        and gate.is_contiguous()
+        and attn_output.is_contiguous()
+    )
+
+
+# ---------------------------------------------------------- GDN out_proj input
+# The GDN core op (qwen_gdn_attention_core_fused_norm_packed) runs eagerly
+# between CUDA-graph pieces, so its fp8/scale outputs go to STATIC buffers
+# (fixed addresses; one set shared by all GDN layers since out_proj consumes
+# them before the next GDN layer runs). Every core-op call fills all rows
+# (prefill rows fused into the gated RMSNorm epilogue, the rest - MTP-decode
+# rows written by the CUDA kernel, padding - by a row quant kernel), so a
+# consumer captured as a stash hit is always valid at replay.
+_GDN_TGT: list = [None]
+_GDN_BUF: dict = {}
+
+
+def _gdn_bufs(K_, dev):
+    key = (K_, dev)
+    if key not in _GDN_BUF:
+        n = _MAX_TOKENS[0]
+        psc = (K_ // 32 + 3) // 4 * 4
+        _GDN_BUF[key] = (
+            torch.empty((n, K_), dtype=torch.float8_e4m3fn, device=dev),
+            torch.empty((n * psc,), dtype=torch.uint8, device=dev),
+            psc,
+        )
+    return _GDN_BUF[key]
+
+
+def gdn_gated_rmsnorm_into_target(x, z, weight, eps, activation) -> bool:
+    """Called first by qwen_gdn_linear_attn.gdn_gated_rmsnorm_ when NQF=1.
+    If x is a row range of the core_attn_out of the GDN layer currently
+    inside gdn_forward_core_fused_norm_packed, run the gated RMSNorm with the
+    MXFP8 epilogue into the static buffers, record the rows as covered and
+    return True; otherwise return False (the stock kernel runs)."""
+    t = _GDN_TGT[0]
+    if (
+        t is not None
+        and x.dim() == 3
+        and x.is_contiguous()
+        and x.shape[1] * x.shape[2] == t["K"]
+        and x.dtype == torch.bfloat16
+        and x.untyped_storage().data_ptr() == t["storage"]
+    ):
+        off = x.data_ptr() - t["base"]
+        rb = t["K"] * x.element_size()
+        if off % rb == 0 and z.stride(2) == 1 and z.stride(1) == x.shape[2]:
+            r0 = off // rb
+            K.gdn_gated_rmsnorm_quant_(
+                x, z, weight, eps, activation, t["q"], t["sf"], r0, t["psc"]
+            )
+            t["covered"].append((r0, r0 + x.shape[0]))
+            return True
+    return False
+
+
+def gdn_packed_enabled(layer: torch.nn.Module, core_attn_out: torch.Tensor) -> bool:
+    """Enable predicate of the GDN out_proj input fusion for one core-op call."""
+    T = core_attn_out.shape[0]
+    K_ = (
+        core_attn_out.shape[1] * core_attn_out.shape[2]
+        if core_attn_out.dim() == 3
+        else 0
+    )
+    return not (
+        not (EMIT and getattr(layer, "_nqf_gdn", False))
+        or K_ % 128
+        or not _MAX_TOKENS[0]
+        or T > _MAX_TOKENS[0]
+        or core_attn_out.dtype != torch.bfloat16
+        or not core_attn_out.is_contiguous()
+    )
+
+
+def gdn_uncovered_row_ranges(covered, pm: int) -> list[tuple[int, int]]:
+    """Row ranges [lo, hi) of [0, pm) not written by the fused gated RMSNorm,
+    in launch order (possibly empty ranges, which quant_rows skips)."""
+    ranges = []
+    lo = 0
+    for a, b in sorted(covered):
+        ranges.append((lo, a))
+        lo = max(lo, b)
+    ranges.append((lo, pm))
+    return ranges
+
+
+def gdn_quant_uncovered_rows(x2, q, sf, ranges, T: int, psc: int) -> None:
+    """Plain MXFP8 row quant of the uncovered ranges, one launch per range."""
+    for lo, hi in ranges:
+        K.quant_rows(x2, q, sf, lo, hi, T, psc)
+
+
+def gdn_forward_core_fused_norm_packed(
+    layer: torch.nn.Module, core_fn, mixed_qkvz, ba, core_attn_out
+) -> None:
+    """The GDN core op with its out_proj MXFP8 input produced into static
+    buffers: core_fn (the stock packed core) runs with this layer as the
+    gated-RMSNorm target, then the rows the fused norm did not cover are
+    quantized and the result is stashed for out_proj's vllm.mxfp8_quantize.
+    Only called when gdn_packed_enabled(layer, core_attn_out)."""
+    T = core_attn_out.shape[0]
+    K_ = (
+        core_attn_out.shape[1] * core_attn_out.shape[2]
+        if core_attn_out.dim() == 3
+        else 0
+    )
+    q, sf, psc = _gdn_bufs(K_, core_attn_out.device)
+    t = {
+        "K": K_,
+        "base": core_attn_out.data_ptr(),
+        "storage": core_attn_out.untyped_storage().data_ptr(),
+        "q": q,
+        "sf": sf,
+        "psc": psc,
+        "covered": [],
+    }
+    _GDN_TGT[0] = t
+    try:
+        core_fn(mixed_qkvz, ba, core_attn_out)
+    finally:
+        _GDN_TGT[0] = None
+    x2 = core_attn_out.view(T, K_)
+    pm = (T + 127) // 128 * 128
+    if not t["covered"]:
+        # decode-only / warmup: exactly the stock FlashInfer kernel, into the
+        # static buffers
+        K.fi_quant_into(x2, q[:T], sf[: pm * psc])
+    else:
+        gdn_quant_uncovered_rows(
+            x2, q, sf, gdn_uncovered_row_ranges(t["covered"], pm), T, psc
+        )
+    _stash_set(x2, q[:T], sf[: pm * psc], None)
+    STATS["gdn"] = STATS.get("gdn", 0) + 1
+    STATS["gdn_fused_rows"] = STATS.get("gdn_fused_rows", 0) + sum(
+        b - a for a, b in t["covered"]
+    )
+
+
+# ------------------------------------------------------------ compile cache
+def compile_hash_factor() -> str:
+    """AOT compile-cache salt: the key does not include the traced sources,
+    so a cache from the unfused graph would silently bypass these rewrites."""
+    return f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}"
+
+
+if NQF:
+    register_ops()
+    logger.info("norm_quant_fusion enabled (emit=%s)", EMIT)

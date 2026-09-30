@@ -45,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.fusion import norm_quant
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     _USE_LAYERNAME,
@@ -249,6 +250,10 @@ class MoERunner(MoERunnerInterface):
     # Set per instance by shared_expert_fold.fold_block (SEG_FOLD=1) when the
     # shared expert was folded into the routed experts after weight loading.
     _seg_fold_on: bool = False
+    # Set per instance by norm_quant.configure_decoder_layer (NQF=1): return
+    # the (shared, routed) pair instead of their sum; the next fused
+    # residual-add + norm consumes it.
+    _nqf_defer: bool = False
 
     def __init__(
         self,
@@ -681,6 +686,63 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    def _nqf_can_defer(self) -> bool:
+        mc = self.moe_config
+        return (
+            self._nqf_defer
+            and self._shared_experts is not None
+            and mc.tp_size == 1
+            and mc.dp_size == 1
+            and mc.ep_size == 1
+            and getattr(mc, "pcp_size", 1) == 1
+            and not mc.is_sequence_parallel
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not isinstance(self.router, ZeroExpertRouter)
+        )
+
+    def _forward_deferred_shared_add(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """forward() without the final shared + routed add (NQF=1): returns
+        (shared_output, fused_output) for the next fused residual-add + norm.
+        Falls back to the sum when padding or a missing shared output make
+        the pair unusable."""
+        hidden_states, shared_experts_input = self.apply_routed_input_transform(
+            hidden_states
+        )
+        hidden_states, og_pre, og_post = self._maybe_pad_hidden_states(
+            shared_experts_input, hidden_states
+        )
+        result = self._forward_entry(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            self._encode_layer_name(),
+            self.moe_config.hidden_dim_unpadded
+            if self._quant_method.has_unpadded_output
+            else 0,
+        )
+        shared_output, fused_output = _unpack(result)
+        if og_pre is not None:
+            fused_output = fused_output[..., :og_pre]
+        if og_post is not None or shared_output is None:
+            out = (
+                fused_output
+                if shared_output is None
+                else shared_output + fused_output
+            )
+            return self._maybe_reduce_final_output(
+                out, og_post, self._fused_output_is_reduced
+            )
+        # deferred add: consumed by the next input_layernorm
+        return (shared_output, fused_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -718,6 +780,15 @@ class MoERunner(MoERunnerInterface):
                 zeros = self._seg_zeros[: hidden_states.shape[0]]
                 return (out, zeros)  # type: ignore[return-value]
             return out
+
+        if (
+            norm_quant.NQF
+            and self._nqf_can_defer()
+            and shared_experts_input is None
+        ):
+            return self._forward_deferred_shared_add(  # type: ignore[return-value]
+                hidden_states, router_logits, input_ids
+            )
 
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
