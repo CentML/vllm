@@ -928,7 +928,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_decode:
-            core_attn_out = torch.zeros(
+            # The core op writes or zeroes every row itself.
+            core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
@@ -1853,6 +1854,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
+            # The output is uninitialized; hand out_proj the zeros it would
+            # have been allocated with.
+            core_attn_out.zero_()
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1974,6 +1978,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
     ) -> None:
+        """Core + gated RMSNorm into ``core_attn_out``, which is uninitialized:
+        every row is either written by the kernels or zeroed here.
+        """
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         attn_metadata = None
@@ -1988,6 +1995,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
         ):
+            # The MTP kernel skips FULL-graph padding requests.
+            core_attn_out.zero_()
             self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -1997,21 +2006,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
             )
             return
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if attn_metadata.num_prefills > 0:
+            # Mixed batches run eagerly and the core writes every token row.
+            num_written = (
+                attn_metadata.num_spec_decode_tokens
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens
+            )
+        else:
+            # Decode-only batches may replay FULL graphs, whose padding rows
+            # these kernels are not known to write: zero first.
+            core_attn_out.zero_()
+            num_written = num_actual_tokens
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b.contiguous(),
             a=a.contiguous(),
             core_attn_out=core_attn_out,
         )
-        num_actual_tokens = attn_metadata.num_actual_tokens
         if attn_metadata.num_prefills > 0:
             # Read the strided output gate in place instead of copying it
             # compact. Decode-only batches (FULL graphs) keep the [T*HV, V]
             # launch.
             self._rms_norm_gated_strided_gate_cuda(
-                core_attn_out[:num_actual_tokens],
-                output_gate[:num_actual_tokens],
+                core_attn_out[:num_written],
+                output_gate[:num_written],
             )
+            # Only the piecewise-graph padding rows are left to zero.
+            core_attn_out[num_written:].zero_()
         else:
             self._rms_norm_gated_cuda(
                 core_attn_out[:num_actual_tokens],
