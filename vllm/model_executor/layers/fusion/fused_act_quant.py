@@ -30,6 +30,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -191,6 +192,17 @@ if current_platform.is_cuda_alike():
 # Add NVFP4 if supported (requires SM100+)
 if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant"):
     _FUSED_ACT_QUANT[(SiluAndMul, kNvfp4Dynamic)] = _silu_and_mul_nvfp4_dynamic
+
+# SiluAndMul -> swizzled MXFP8 for linears whose kernel consumes FlashInfer's
+# MXFP8 input layout (MLPerf submission path; specialized for Qwen3.6-35B-A3B).
+if current_platform.is_cuda():
+    from vllm.model_executor.layers.fusion.silu_mul_mxfp8_quant import (
+        silu_and_mul_mxfp8_dynamic,
+        silu_mul_mxfp8_supported,
+    )
+
+    _FUSED_ACT_QUANT[(SiluAndMul, kMxfp8Dynamic)] = silu_and_mul_mxfp8_dynamic
+    _FUSED_ACT_QUANT_SUPPORT[(SiluAndMul, kMxfp8Dynamic)] = silu_mul_mxfp8_supported
 
 
 def maybe_fused_act_quant(
