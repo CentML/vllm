@@ -48,6 +48,8 @@ class _QwenGDNWarmupConfig:
     state_dtype: torch.dtype
     # The FlashInfer prefill path makes the post-conv kernel emit exp(g).
     post_conv_output_g_exp: bool = False
+    # out_proj consumes the MXFP8 activation written by the core op.
+    gdn_out_mxfp8: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -144,6 +146,7 @@ def _qwen_gdn_warmup_config(
                     False,
                 )
             ),
+            gdn_out_mxfp8=bool(getattr(layer, "gdn_out_mxfp8", False)),
         )
 
     if found_layer:
@@ -185,6 +188,43 @@ def _warm_gated_rms_norm_kernel(
             activation=config.norm_activation,
             launch_config=launch_config,
         )
+
+
+def _warm_gdn_gated_norm_mxfp8_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig, x_dtype: torch.dtype
+) -> None:
+    if not config.gdn_out_mxfp8:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_gated_norm_mxfp8,
+        gdn_mxfp8_scale_numel,
+    )
+
+    hidden = config.hv * config.v
+    weight = torch.ones(config.v, dtype=config.norm_weight_dtype, device=device)
+    # Both num_warps classes, with the valid row count as a host int (mixed
+    # batches) and as a device scalar (decode-only batches).
+    for num_rows in (1, 1024):
+        x = torch.zeros((num_rows, config.hv, config.v), dtype=x_dtype, device=device)
+        q = torch.empty((num_rows, hidden), dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty(
+            gdn_mxfp8_scale_numel(num_rows, hidden), dtype=torch.uint8, device=device
+        )
+        for num_valid in (
+            num_rows,
+            torch.full((1,), num_rows, dtype=torch.int32, device=device),
+        ):
+            gdn_gated_norm_mxfp8(
+                x,
+                x,
+                weight,
+                1e-6,
+                config.norm_activation,
+                q,
+                scale,
+                (0, num_rows),
+                num_valid,
+            )
 
 
 def _warm_causal_conv1d_fwd_kernel(
@@ -322,6 +362,7 @@ def qwen_triton_warmup(
 
     max_num_tokens = max(1, int(runner.max_num_tokens))
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
+    _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
