@@ -38,6 +38,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.mamba.ops import gdn_state_commit
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -325,6 +326,17 @@ _GDN_FUSED_CONV_V2_BT = int(os.environ.get("VLLM_GDN_FUSED_CONV_V2_BT", "32"))
 _GDN_FUSED_CONV_V2_ST = int(os.environ.get("VLLM_GDN_FUSED_CONV_V2_ST", "32"))
 _GDN_FUSED_CONV_V2_WARPS = int(os.environ.get("VLLM_GDN_FUSED_CONV_V2_WARPS", "4"))
 _GDN_FUSED_CONV_V2_STAGES = int(os.environ.get("VLLM_GDN_FUSED_CONV_V2_STAGES", "1"))
+
+# Deferred GDN state commit (GDN_STATE_COMMIT=1), see
+# vllm/model_executor/layers/mamba/ops/gdn_state_commit. _DEFERRED is off in the
+# layout-only control mode (same page layout, stock kernels).
+_GDN_STATE_COMMIT = gdn_state_commit.enabled()
+_GDN_STATE_COMMIT_DEFERRED = _GDN_STATE_COMMIT and not gdn_state_commit.layout_only()
+if _GDN_STATE_COMMIT and _GDN_MIXED_SPEC_TRITON:
+    raise RuntimeError(
+        "gdn_state_commit requires VLLM_GDN_MIXED_SPEC_TRITON=0 (the FLA spec "
+        "kernel writes per-token state slots)"
+    )
 
 
 @triton.jit
@@ -1023,6 +1035,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        dtypes = super().get_state_dtype()
+        if _GDN_STATE_COMMIT:
+            # Layer-level consumers unpack get_state_dtype() into (conv, ssm); the
+            # token-log dtype is added by MambaBase.get_kv_cache_spec and the page
+            # size comes from the model-class calculator, which includes the log.
+            return tuple(dtypes)[:2]
+        return dtypes
 
     def __init__(
         self,
@@ -1939,6 +1960,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if _GDN_STATE_COMMIT_DEFERRED:
+            # commit pending token logs of the non-spec slots before they are read
+            gdn_state_commit.forward_core_prologue(self, attn_metadata)
 
         if (
             self.enable_packed_recurrent_decode
@@ -2917,6 +2941,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if _GDN_STATE_COMMIT_DEFERRED and gdn_state_commit.fused_norm_prologue(
+            self, attn_metadata, mixed_qkv, b, a, output_gate, core_attn_out
+        ):
+            # spec rows were not a token prefix: handled on a spec-first permutation
+            return
         if (
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
