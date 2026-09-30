@@ -934,6 +934,15 @@ def _insert_resampled_kernel(
     # [max_num_reqs]
     temp_ptr,
     PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
+    # Optional fused get_num_sampled_and_rejected (all four set or all None).
+    # [num_reqs]
+    num_rejected_ptr=None,
+    # [num_reqs]
+    seq_lens_ptr=None,
+    # [num_reqs]
+    idx_mapping_ptr=None,
+    # [max_num_reqs]
+    prefill_len_ptr=None,
 ):
     req_idx = tl.program_id(0)
     num_sampled = tl.load(num_sampled_ptr + req_idx)
@@ -943,7 +952,22 @@ def _insert_resampled_kernel(
     req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx)
 
     # Increment the number of sampled tokens.
-    tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
+    if num_rejected_ptr is not None:
+        # Same as _get_num_sampled_and_rejected_kernel: chunked-prefill
+        # requests sample and reject nothing.
+        batch_req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+        is_chunked_prefilling = tl.load(seq_lens_ptr + req_idx) < tl.load(
+            prefill_len_ptr + batch_req_state_idx
+        )
+        final_num_sampled = tl.where(is_chunked_prefilling, 0, num_sampled + 1)
+        tl.store(num_sampled_ptr + req_idx, final_num_sampled)
+        num_rejected = end_idx - start_idx - final_num_sampled
+        tl.store(
+            num_rejected_ptr + req_idx,
+            tl.where(is_chunked_prefilling, 0, num_rejected),
+        )
+    else:
+        tl.store(num_sampled_ptr + req_idx, num_sampled + 1)
 
     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     is_bonus = resample_token_idx == end_idx - 1
@@ -1009,6 +1033,10 @@ def rejection_sample(
     contexts: torch.Tensor | None = None,
     watermarking: torch.Tensor | None = None,
     watermark_key: int | None = None,
+    # Fused get_num_sampled_and_rejected: [num_reqs] output plus its inputs.
+    num_rejected: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    prefill_len: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
@@ -1279,5 +1307,9 @@ def rejection_sample(
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        num_rejected_ptr=num_rejected,
+        seq_lens_ptr=seq_lens if num_rejected is not None else None,
+        idx_mapping_ptr=idx_mapping if num_rejected is not None else None,
+        prefill_len_ptr=prefill_len if num_rejected is not None else None,
     )
     return sampled, num_sampled
