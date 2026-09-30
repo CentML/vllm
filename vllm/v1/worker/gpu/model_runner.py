@@ -169,6 +169,10 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.gpu.suffix_staging import (
+    SUFFIX_STAGING_ENABLED,
+    get_suffix_staging_start,
+)
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
@@ -1153,12 +1157,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
+            # Opt-in: stage only the token suffix that can still be read.
+            staging_start = (
+                get_suffix_staging_start(new_req_data) if SUFFIX_STAGING_ENABLED else 0
+            )
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                staging_start=staging_start,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
