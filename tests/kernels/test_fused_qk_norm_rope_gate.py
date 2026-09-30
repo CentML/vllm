@@ -116,3 +116,70 @@ def test_fused_qk_norm_rope_gate_matches_reference(
     torch.testing.assert_close(q_out, q_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(k_out, k_ref, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="fused_qk_rmsnorm_rope Triton kernel requires CUDA",
+)
+@pytest.mark.parametrize("num_q_heads,num_kv_heads,mrope_section", ROPE_CASES)
+@pytest.mark.parametrize("num_tokens", [1, 37, 512])
+@torch.inference_mode()
+def test_fused_qk_rmsnorm_rope_matches_gate_kernel_bitwise(
+    default_vllm_config,
+    num_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    mrope_section: tuple[int, int, int] | None,
+) -> None:
+    """The token-tile op keeps the per-head kernel's exact reduction order."""
+    from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    set_random_seed(SEED)
+    # Magnitudes over several decades, so sums of squares round differently
+    # under any other reduction tree.
+    scale = torch.logspace(-3, 2, num_tokens, device=device)[:, None]
+    q_gate = (
+        torch.randn(num_tokens, num_q_heads * 2 * HEAD_DIM, device=device) * scale
+    ).to(DTYPE)
+    k = (torch.randn(num_tokens, num_kv_heads * HEAD_DIM, device=device) * scale).to(
+        DTYPE
+    )
+    q_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
+    k_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
+    cos_sin_cache = torch.randn(4096, ROTARY_DIM, device=device).to(DTYPE)
+    if mrope_section is None:
+        positions = torch.randint(0, 4096, (num_tokens,), device=device)
+    else:
+        positions = torch.randint(0, 4096, (3, num_tokens), device=device)
+    args = (q_gate, k, q_weight, k_weight, cos_sin_cache, positions)
+    geometry = (RMS_NORM_EPS, num_q_heads, num_kv_heads, HEAD_DIM, ROTARY_DIM)
+    sections = list(mrope_section) if mrope_section else None
+
+    q_ref, k_ref, gate_ref = fused_qk_rmsnorm_rope_gate(
+        *args, *geometry, mrope_section=sections, norm_beta=1.0
+    )
+    q_out, k_out, gate_out = fused_qk_rmsnorm_rope(
+        *args, None, *geometry, mrope_section=sections, norm_beta=1.0, store_gate=True
+    )
+    torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
+    torch.testing.assert_close(q_out, q_ref, atol=0, rtol=0)
+    torch.testing.assert_close(k_out, k_ref, atol=0, rtol=0)
+    gate = q_gate.view(num_tokens, num_q_heads, 2, HEAD_DIM)[:, :, 1]
+    torch.testing.assert_close(gate.reshape(num_tokens, -1), gate_ref, atol=0, rtol=0)
+
+    # FP8 q equals the attention layer's static per-tensor query quant as
+    # Inductor compiles it.
+    query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
+    quant = torch.compile(query_quant.forward_native, fullgraph=True)
+    for s in (1.0, 0.7, 0.01):
+        q_scale = torch.tensor(s, dtype=torch.float32, device=device)
+        q_fp8, k_fp8, _ = fused_qk_rmsnorm_rope(
+            *args, q_scale, *geometry, mrope_section=sections, norm_beta=1.0
+        )
+        q_fp8_ref, _ = quant(q_ref, q_scale)
+        assert torch.equal(q_fp8.view(torch.uint8), q_fp8_ref.view(torch.uint8))
+        torch.testing.assert_close(k_fp8, k_ref, atol=0, rtol=0)
