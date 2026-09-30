@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,6 +23,13 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+# Deferred GDN state commit (GDN_STATE_COMMIT=1, not in the layout-only control
+# mode), see vllm/model_executor/layers/mamba/ops/gdn_state_commit.
+_GDN_STATE_COMMIT_DEFERRED = (
+    os.environ.get("GDN_STATE_COMMIT", "0") == "1"
+    and os.environ.get("GDN_STATE_COMMIT_LAYOUT_ONLY", "0") != "1"
+)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -223,6 +231,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        # the deferred state commit post-step below uses the caller's arguments
+        gsc_args = (
+            (num_accepted_tokens, num_decode_draft_tokens_cpu)
+            if _GDN_STATE_COMMIT_DEFERRED
+            else None
+        )
         spec_tokens_are_prefix = False
 
         query_start_loc = m.query_start_loc
@@ -538,6 +552,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if gsc_args is not None:
+            # single state slot per request: broadcast spec_state_indices to width
+            # 1 + num_spec and record the accepted counts of non-spec readers
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            gdn_state_commit.postprocess_metadata(self, attn_metadata, *gsc_args)
         return attn_metadata
 
     def build_for_cudagraph_capture(
