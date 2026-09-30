@@ -28,6 +28,17 @@ kernels with the same arguments in the same order. Also:
   GGM_VSDIRECT=1: after the V-split adapter compiled its kernel for this
       step's key, the other layers call the cached compiled object directly
       with one workspace per step.
+  GGM_LAZY=1: the GDN metadata builder defers the FLA chunk metadata and the
+      Triton causal-conv1d metadata, which only the fallback paths read (pure
+      functions of CPU query_start_loc tensors); fill_lazy() computes them
+      before any fallback path runs.
+  GGM_MDREUSE=1: the GDN builder runs once per GDN KV-cache group with
+      identical inputs except the block table; the 2nd/3rd group's metadata of
+      a step with prefills is derived from the first one (shallow copy, only
+      the block-table-derived state indices recomputed as the builder does).
+      Reuse is keyed on the identity of the step's input objects.
+      GGM_MDCHECK=N: also run the full build for the first N derived builds and
+      compare every field (mismatch -> warning, the full build is used).
   VLLM_GDN_STEP_PLAN_LOG=1 (default) / VLLM_GDN_STEP_PLAN_LOG_EVERY=2000:
       log the plan counters every N fast-path plans.
 Whatever the plan cannot prove identical (verify mode, gather/scatter CP path,
@@ -52,6 +63,7 @@ conv -> zero -> chunk); the batched launches run the same per-(item, head,
 layer) / per-row code on the same inputs.
 """
 
+import copy
 import math
 import os
 
@@ -70,6 +82,9 @@ MAT = os.environ.get("VLLM_GDN_STEP_PLAN_MAT", "1") == "1"
 ZERO = os.environ.get("VLLM_GDN_STEP_PLAN_ZERO", "1") == "1"
 BUFS = os.environ.get("VLLM_GDN_STEP_PLAN_BUFS", "1") == "1"
 VSDIRECT = os.environ.get("GGM_VSDIRECT", "0") == "1"
+LAZY = ENABLED and os.environ.get("GGM_LAZY", "0") == "1"
+MDREUSE = ENABLED and os.environ.get("GGM_MDREUSE", "0") == "1"
+MDCHECK = [int(os.environ.get("GGM_MDCHECK", "0"))]
 LOG = os.environ.get("VLLM_GDN_STEP_PLAN_LOG", "1") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_GDN_STEP_PLAN_LOG_EVERY", "2000"))
 
@@ -137,11 +152,14 @@ def check_config(state_commit: bool, norm_quant_fusion: bool) -> None:
                 "state commit)"
             )
         logger.info(
-            "GDN step plan enabled: MAT=%d ZERO=%d BUFS=%d VSDIRECT=%d",
+            "GDN step plan enabled: MAT=%d ZERO=%d BUFS=%d LAZY=%d VSDIRECT=%d "
+            "MDREUSE=%d",
             int(MAT),
             int(ZERO),
             int(BUFS),
+            int(LAZY),
             int(VSDIRECT),
+            int(MDREUSE),
         )
     if GROUP_MATERIALIZE and state_commit:
         logger.info("GDN state materialize: one launch per KV group enabled")
@@ -822,6 +840,193 @@ def forward_core_fused_norm(
     if p is None:
         p = d["_step_plan"] = build_plan(layer, md, raw)
     if p is False:
+        if LAZY:
+            fill_lazy(md)
         return False
     run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out)
     return True
+
+
+# ----------------------------------------------------------------------------
+# GGM_LAZY: deferred fallback-only GDN metadata
+# ----------------------------------------------------------------------------
+def defer_metadata(md, pending) -> None:
+    """Builder side: attach the deferred (fn, kind, args, kwargs) calls to md."""
+    md.__dict__["_step_plan_lazy"] = pending
+    STATS["lazy_deferred"] = STATS.get("lazy_deferred", 0) + 1
+
+
+def fill_lazy(md) -> None:
+    """Compute the deferred metadata of md (no-op if none is pending)."""
+    if md is None:
+        return
+    lz = md.__dict__.pop("_step_plan_lazy", None)
+    if not lz:
+        return
+    STATS["lazy_filled"] = STATS.get("lazy_filled", 0) + 1
+    for fn, kind, a, k in lz:
+        if kind == "chunk":
+            md.chunk_indices, md.chunk_offsets = fn(*a, **k)
+        else:
+            md.nums_dict, md.batch_ptr, md.token_chunk_offset_ptr = fn(*a, **k)
+
+
+# ----------------------------------------------------------------------------
+# GGM_MDREUSE: GDN metadata of the other KV-cache groups derived from the first
+# ----------------------------------------------------------------------------
+_MDTPL: list = [None]
+_FLAG_KEYS = ("_step_plan", "_gsc_done")
+
+
+def _base(t):
+    if t is None:
+        return None
+    return t._base if t._base is not None else t
+
+
+def _md_equal(a, b):
+    bad = []
+    for k in set(a.__dict__) | set(b.__dict__):
+        if k.startswith("_step_plan") or k.startswith("_gsc"):
+            continue
+        x, y = a.__dict__.get(k), b.__dict__.get(k)
+        if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
+            if (
+                not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor))
+                or x.shape != y.shape
+                or x.dtype != y.dtype
+                or x.device != y.device
+                or not torch.equal(x, y)
+            ):
+                bad.append(k)
+        elif k == "nums_dict":
+            continue  # CPU-tensor dict (fallback-only), same CPU inputs
+        elif x != y:
+            bad.append(k)
+    return bad
+
+
+def _derive(builder, t, m, ndd):
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    md = copy.copy(t["md"])
+    d = md.__dict__
+    if "_step_plan_lazy" in d:
+        d["_step_plan_lazy"] = list(d["_step_plan_lazy"])
+    bt = mamba_get_block_table_tensor(
+        m.block_table_tensor,
+        m.seq_lens,
+        builder.kv_cache_spec,
+        builder.vllm_config.cache_config.mamba_cache_mode,
+    )
+    if md.spec_sequence_masks is None:
+        ns = bt[:, 0]
+        md.non_spec_state_indices_tensor = ns
+        md.prefill_state_indices = ns[md.num_decodes :] if md.num_decodes > 0 else ns
+    else:
+        mask = ndd >= 0
+        si = bt[mask, : builder.num_spec + 1]
+        w = builder.num_spec + 1
+        if si.size(1) < w:  # deferred state commit: broadcast the single base slot
+            si = si[:, :1].expand(si.size(0), w)
+        ns = bt[~mask, 0]
+        md.spec_state_indices_tensor = si
+        md.non_spec_state_indices_tensor = ns
+        md.prefill_state_indices = ns
+    return md
+
+
+def mdreuse_build(
+    builder,
+    full_build,
+    common_prefix_len,
+    common_attn_metadata,
+    num_accepted_tokens=None,
+    num_decode_draft_tokens_cpu=None,
+    fast_build=False,
+):
+    """GDNAttentionMetadataBuilder.build with GGM_MDREUSE=1 (full_build = the
+    builder's full build, incl. the deferred-commit post-step and GGM_LAZY).
+    """
+    m = common_attn_metadata
+    t = _MDTPL[0]
+    mode = builder.vllm_config.cache_config.mamba_cache_mode
+    why = None
+    if t is None:
+        STATS["md_tpl_none"] = STATS.get("md_tpl_none", 0) + 1
+    else:
+        checks = (
+            ("builder", t["builder"] is not builder),
+            ("qsl_cpu", t["qsl_cpu"] is m.query_start_loc_cpu),
+            ("qsl", t["qsl"] is m.query_start_loc),
+            ("seq_lens", t["seq_lens"] is m.seq_lens),
+            ("nacc", t["nacc"] is _base(num_accepted_tokens)),
+            ("ndd", t["ndd"] is _base(num_decode_draft_tokens_cpu)),
+            ("nreq", t["nreq"] == m.num_reqs),
+            ("nat", t["nat"] == m.num_actual_tokens),
+            ("num_spec", t["num_spec"] == builder.num_spec),
+            ("bs", t["bs"] == builder.kv_cache_spec.block_size),
+            ("nsb", t["nsb"] == builder.kv_cache_spec.num_speculative_blocks),
+            ("mode", t["mode"] == mode),
+            ("cpl", common_prefix_len == t["cpl"]),
+            ("fast", fast_build == t["fast"]),
+        )
+        why = next((n for n, ok in checks if not ok), None)
+        if why is not None:
+            d = STATS.setdefault("md_reuse_miss", {})
+            d[why] = d.get(why, 0) + 1
+    if t is not None and why is None:
+        md = _derive(builder, t, m, num_decode_draft_tokens_cpu)
+        STATS["md_reused"] = STATS.get("md_reused", 0) + 1
+        if MDCHECK[0] > 0:
+            MDCHECK[0] -= 1
+            full = full_build(
+                common_prefix_len,
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                fast_build,
+            )
+            bad = _md_equal(md, full)
+            STATS["md_checked"] = STATS.get("md_checked", 0) + 1
+            if bad:
+                STATS["md_check_fail"] = STATS.get("md_check_fail", 0) + 1
+                logger.warning(
+                    "GDN metadata reuse check mismatch fields=%s; using the full build",
+                    bad,
+                )
+                return full
+        return md
+    md = full_build(
+        common_prefix_len,
+        common_attn_metadata,
+        num_accepted_tokens,
+        num_decode_draft_tokens_cpu,
+        fast_build,
+    )
+    if getattr(md, "num_prefills", 0) > 0:
+        tpl = copy.copy(md)
+        for k in _FLAG_KEYS:
+            tpl.__dict__.pop(k, None)
+        if "_step_plan_lazy" in tpl.__dict__:
+            tpl.__dict__["_step_plan_lazy"] = list(tpl.__dict__["_step_plan_lazy"])
+        _MDTPL[0] = dict(
+            md=tpl,
+            builder=builder,
+            qsl_cpu=m.query_start_loc_cpu,
+            qsl=m.query_start_loc,
+            seq_lens=m.seq_lens,
+            nacc=_base(num_accepted_tokens),
+            ndd=_base(num_decode_draft_tokens_cpu),
+            nreq=m.num_reqs,
+            nat=m.num_actual_tokens,
+            num_spec=builder.num_spec,
+            bs=builder.kv_cache_spec.block_size,
+            nsb=builder.kv_cache_spec.num_speculative_blocks,
+            mode=mode,
+            cpl=common_prefix_len,
+            fast=fast_build,
+        )
+    else:
+        _MDTPL[0] = None
+    return md
