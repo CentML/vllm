@@ -113,7 +113,7 @@ def test_gemma_add_norm_fused(vllm_config, bf16_consumer: bool) -> None:
     assert node.args[5] == 1.0  # Gemma w.float() + 1 absorbed
     assert node.args[6] is bf16_consumer  # bf16 output only when read
 
-    normed, res_k, q_k, s_k = add_rms_norm_mxfp8_quant(
+    normed, res_k, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
         a, b, residual, model.weight, EPS, 1.0, True
     )
     assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
@@ -130,7 +130,7 @@ def test_fp32_weight_norm_fused(vllm_config) -> None:
 
     assert fusion.matched_count == 1
     assert backend.op_count(QUANT) == 0
-    _, _, q_k, s_k = add_rms_norm_mxfp8_quant(
+    _, _, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
         x, None, None, model.weight, EPS, 0.0, False
     )
     assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
