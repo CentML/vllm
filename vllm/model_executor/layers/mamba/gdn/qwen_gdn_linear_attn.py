@@ -31,7 +31,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc
+from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc, gdn_step_plan
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -337,6 +337,8 @@ if _GDN_STATE_COMMIT and _GDN_MIXED_SPEC_TRITON:
         "gdn_state_commit requires VLLM_GDN_MIXED_SPEC_TRITON=0 (the FLA spec "
         "kernel writes per-token state slots)"
     )
+# Host trims of the mixed-step GDN core (GGM_OG2), see gdn_step_plan.
+gdn_step_plan.check_config(_GDN_STATE_COMMIT, norm_quant.NQF)
 
 
 @triton.jit
