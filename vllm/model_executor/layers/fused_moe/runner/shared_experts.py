@@ -43,15 +43,23 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        defer_gate: bool = False,
     ):
         super().__init__()
+
+        # With defer_gate, the layer returns (ungated output, gate logits) from
+        # forward_ungated and the runner applies the gate after the MoE op.
+        self.defer_gate = defer_gate
 
         # The SharedExperts need to handle DBO since they can be called from
         # an MK's finalize method.  We keep a list of outputs indexed by current
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
-        self._output: list[torch.Tensor | None] = [None, None]
+        self._output: list[torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None] = [
+            None,
+            None,
+        ]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -119,11 +127,26 @@ class SharedExperts(torch.nn.Module):
         else:
             return SharedExpertsOrder.NO_OVERLAP
 
-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
+    def _run_layer(
+        self, shared_experts_input: torch.Tensor, quantized_input: object | None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.defer_gate:
+            return self._layer.forward_ungated(shared_experts_input, quantized_input)
+        if quantized_input is not None:
+            return self._layer(shared_experts_input, quantized_input)
+        return self._layer(shared_experts_input)
+
+    def maybe_forward_async(
+        self,
+        shared_experts_input: torch.Tensor,
+        quantized_input: object | None = None,
+    ) -> bool:
         """Enqueue shared experts on the aux stream without waiting for them.
 
         Returns true if the shared experts were enqueued, false otherwise. Call
         `wait` to wait for the shared experts to finish if this returns true.
+        ``quantized_input`` is an optional pre-quantized copy of the input for
+        layers whose input linear can consume it.
         """
         if (
             self._determine_shared_experts_order(shared_experts_input)
@@ -136,7 +159,7 @@ class SharedExperts(torch.nn.Module):
         self._input_ready_event[idx].record(current_stream())
         with torch.cuda.stream(self._stream):
             self._input_ready_event[idx].wait(self._stream)
-            self._output[idx] = self._layer(shared_experts_input)
+            self._output[idx] = self._run_layer(shared_experts_input, quantized_input)
             self._output_ready_event[idx].record(self._stream)
         return True
 
@@ -150,7 +173,8 @@ class SharedExperts(torch.nn.Module):
         return dbo_current_ubatch_id() if self.enable_dbo else 0
 
     @property
-    def output(self) -> torch.Tensor:
+    def output(self) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """The layer output; ``(ungated output, gate logits)`` with defer_gate."""
         assert self._output[self._output_idx] is not None
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
@@ -160,6 +184,7 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
+        quantized_input: object | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -168,6 +193,8 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        self._output[self._output_idx] = self._layer(shared_experts_input)
+        self._output[self._output_idx] = self._run_layer(
+            shared_experts_input, quantized_input
+        )
 
         assert self._output[self._output_idx] is not None
