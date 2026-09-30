@@ -241,10 +241,24 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             else None,
         )
 
+        # The decoder layer may hand the MoE input pre-quantized to MXFP8 by
+        # the post-attention norm (MLPerf submission path; specialized for
+        # Qwen3.6-35B-A3B).
+        self.accepts_quantized_input = (
+            getattr(self.experts, "accepts_quantized_input", False)
+            and not self.replicate_shared_expert
+            and not self.is_sequence_parallel
+        )
+        if self.accepts_quantized_input:
+            # Registers vllm::add_rms_norm_mxfp8_quant before any compiled
+            # graph (including one loaded from the compile cache) runs.
+            import vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant  # noqa: F401
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        quantized_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -259,9 +273,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.replicate_shared_expert and self.shared_expert is not None
             else None
         )
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if quantized_input is None:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                quantized_input=quantized_input,
+            )
         if replicated_shared_output is not None:
             final_hidden_states += replicated_shared_output
 
@@ -673,14 +694,38 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self.use_attn_reduce_scatter_for_moe:
+        if self._moe_takes_quantized_input():
+            # The norm also writes the MoE input as MXFP8 (swizzled + linear
+            # scales), so neither the shared expert nor the routed experts
+            # quantize it again.
+            norm = self.post_attention_layernorm
+            hidden_states, residual, act_q, act_sf, act_sf_linear = (
+                torch.ops.vllm.add_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    None,
+                    residual,
+                    norm.weight,
+                    norm.variance_epsilon,
+                    1.0,
+                    True,
+                    None,
+                    True,
+                )
+            )
             hidden_states = self.mlp(
-                hidden_states,
-                already_sequence_parallel=True,
+                hidden_states, quantized_input=(act_q, act_sf, act_sf_linear)
             )
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            if self.use_attn_reduce_scatter_for_moe:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    already_sequence_parallel=True,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -697,6 +742,16 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
 
         return hidden_states, residual
+
+    def _moe_takes_quantized_input(self) -> bool:
+        # The shared expert's input linear takes swizzled MXFP8, and the norm
+        # is the Gemma form the fused producer implements.
+        return (
+            getattr(self.mlp, "accepts_quantized_input", False)
+            and not self.layer_scale
+            and not self.use_attn_reduce_scatter_for_moe
+            and isinstance(self.post_attention_layernorm, Qwen3NextRMSNorm)
+        )
 
 
 @support_torch_compile
