@@ -246,6 +246,10 @@ class MoERunner(MoERunnerInterface):
     for different configurations (e.g., with/without shared experts, gates, etc.).
     """
 
+    # Set per instance by shared_expert_fold.fold_block (SEG_FOLD=1) when the
+    # shared expert was folded into the routed experts after weight loading.
+    _seg_fold_on: bool = False
+
     def __init__(
         self,
         layer_name: str,
@@ -703,6 +707,18 @@ class MoERunner(MoERunnerInterface):
         1. pytorch cannot handle union types in custom op signatures so
            _moe_forward and _moe_forward_shared must be split.
         """
+        if self._seg_fold_on:
+            # Shared expert folded into the routed experts (SEG_FOLD=1, see
+            # shared_expert_fold): router GEMM, fused routing and the routed
+            # MoE (whose finalize adds the gated shared expert) in one op.
+            out = torch.ops.seg.fold_moe(hidden_states, self._encode_layer_name())
+            if getattr(self, "_nqf_defer", False):
+                # The consumer takes the (shared, routed) pair; the shared
+                # part is already in `out`, so pass zeros (x + 0 is exact).
+                zeros = self._seg_zeros[: hidden_states.shape[0]]
+                return (out, zeros)  # type: ignore[return-value]
+            return out
+
         # Apply transform for routed experts (e.g., latent projection for
         # latent MoE). When the caller pre-applies the routed input transform
         # outside the runner (e.g. to overlap it on a separate stream), it

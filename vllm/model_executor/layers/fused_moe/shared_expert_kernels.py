@@ -12,6 +12,11 @@ Qwen3.5 MoE blocks.
       kernel, then as above. Also removes the N=1 gate GEMM. g is not
       bit-equal to cuBLAS (different fp32 summation order): about one bf16
       ulp of g on a few rows.
+  seg_route_fold(logits, E, K)
+      Fused routing for the "shared expert = routed expert E" fold:
+      softmax(logits[:, :E]) -> top-K -> renormalize, then append
+      (E, sigmoid(logits[:, E])). Returns ids int32 [M, K + 1] and weights
+      [M, K + 1].
 
 All launches are CUDA-graph safe (no host sync, no allocation other than
 torch.empty on the current stream).
@@ -104,3 +109,95 @@ def seg_gemv_scale_(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> torc
     _seg_gemv_scale_kernel[(triton.cdiv(M, BM),)](x, w, out, M, x.stride(0), out.stride(0), K=K, N=N, BM=BM,
                                                  BK=min(K, 2048), BN=BN, num_warps=4)
     return out
+
+
+@triton.jit
+def _route_fold_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
+                       E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BT + tl.arange(0, BT)
+    rmask = rows < M
+    cols = tl.arange(0, E)
+    v = tl.load(lg_ptr + rows[:, None] * stride_l + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    mx = tl.max(v, axis=1)
+    kidx = tl.arange(0, KP)
+    sel_v = tl.zeros([BT, KP], dtype=tl.float32)
+    sel_i = tl.zeros([BT, KP], dtype=tl.int32)
+    cur = v
+    for j in tl.static_range(K):
+        m = tl.max(cur, axis=1)
+        # lowest index among ties
+        cand = tl.where(cur == m[:, None], cols[None, :], E)
+        i = tl.min(cand, axis=1)
+        sel_v = tl.where(kidx[None, :] == j, m[:, None], sel_v)
+        sel_i = tl.where(kidx[None, :] == j, i[:, None], sel_i)
+        cur = tl.where(cols[None, :] == i[:, None], float("-inf"), cur)
+    p = tl.where(kidx[None, :] < K, tl.exp(sel_v - mx[:, None]), 0.0)
+    p = p / tl.sum(p, axis=1)[:, None]
+    gs = tl.load(lg_ptr + rows * stride_l + E, mask=rmask, other=0.0).to(tl.float32)
+    s = _ld.div_rn(1.0, 1.0 + _ld.exp(-gs))
+    p = tl.where(kidx[None, :] == K, s[:, None], p)
+    sel_i = tl.where(kidx[None, :] == K, E, sel_i)
+    om = rmask[:, None] & (kidx[None, :] <= K)
+    offs = rows[:, None] * (K + 1) + kidx[None, :]
+    tl.store(ids_ptr + offs, sel_i, mask=om)
+    tl.store(w_ptr + offs, p.to(w_ptr.dtype.element_ty), mask=om)
+
+
+@triton.jit
+def _route_fold_packed_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
+                              E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr):
+    # bf16 logits only: fp32(bf16) has 16 zero low bits, so (order-preserving int32 key | (E-1-idx)) is a unique
+    # sortable key -> one max-reduction per top-k round (ties -> lowest expert index), value recovered from the key.
+    pid = tl.program_id(0)
+    rows = pid * BT + tl.arange(0, BT)
+    rmask = rows < M
+    cols = tl.arange(0, E)
+    v = tl.load(lg_ptr + rows[:, None] * stride_l + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    b = v.to(tl.int32, bitcast=True)
+    key = b ^ ((b >> 31) & 0x7FFFFFFF)
+    key = (key & -65536) | (E - 1 - cols)[None, :]
+    kidx = tl.arange(0, KP)
+    sel_v = tl.zeros([BT, KP], dtype=tl.float32)
+    sel_i = tl.zeros([BT, KP], dtype=tl.int32)
+    for j in tl.static_range(K):
+        kmax = tl.max(key, axis=1)
+        i = (E - 1) - (kmax & 0xFFFF)
+        hb = kmax & -65536
+        vb = (hb ^ ((hb >> 31) & 0x7FFFFFFF)) & -65536
+        val = vb.to(tl.float32, bitcast=True)
+        sel_v = tl.where(kidx[None, :] == j, val[:, None], sel_v)
+        sel_i = tl.where(kidx[None, :] == j, i[:, None], sel_i)
+        key = tl.where(key == kmax[:, None], -2147483647 - 1, key)
+    mx = tl.max(sel_v, axis=1)
+    p = tl.where(kidx[None, :] < K, tl.exp(sel_v - mx[:, None]), 0.0)
+    p = p / tl.sum(p, axis=1)[:, None]
+    gs = tl.load(lg_ptr + rows * stride_l + E, mask=rmask, other=0.0).to(tl.float32)
+    s = _ld.div_rn(1.0, 1.0 + _ld.exp(-gs))
+    p = tl.where(kidx[None, :] == K, s[:, None], p)
+    sel_i = tl.where(kidx[None, :] == K, E, sel_i)
+    om = rmask[:, None] & (kidx[None, :] <= K)
+    offs = rows[:, None] * (K + 1) + kidx[None, :]
+    tl.store(ids_ptr + offs, sel_i, mask=om)
+    tl.store(w_ptr + offs, p.to(w_ptr.dtype.element_ty), mask=om)
+
+
+_ROUTE_PLAIN = False  # tests: force the unpacked reference kernel
+
+
+def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torch.dtype = torch.bfloat16):
+    """logits [M, >=E+1] (bf16/fp32, row stride arbitrary, unit col stride) -> ids int32 [M,K+1], w [M,K+1] (w_dtype:
+    bf16 for the trtllm routed MoE, fp32 for consumers that take fp32 routing weights)."""
+    M = logits.shape[0]
+    ids = torch.empty(M, K + 1, dtype=torch.int32, device=logits.device)
+    w = torch.empty(M, K + 1, dtype=w_dtype, device=logits.device)
+    if M:
+        if logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
+            BT = 8 if M >= 4096 else 4
+            _route_fold_packed_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
+                                                            KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4)
+        else:
+            BT = 4
+            _route_fold_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
+                                                     KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4)
+    return ids, w
