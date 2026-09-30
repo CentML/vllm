@@ -27,7 +27,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -66,6 +66,11 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        QuantizedActivation,
+    )
 
 logger = init_logger(__name__)
 
@@ -109,15 +114,39 @@ class Qwen2MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
 
-    def forward(self, x):
+    def _ungated(self, x: "torch.Tensor | QuantizedActivation") -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
+        return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        quantized_input: "QuantizedActivation | None" = None,
+    ) -> torch.Tensor:
+        """``quantized_input`` optionally carries ``x`` pre-quantized for
+        ``gate_up_proj``; ``x`` itself still feeds the bf16 expert gate.
+        """
+        out = self._ungated(x if quantized_input is None else quantized_input)
 
         if self.expert_gate is not None:
             out = F.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
+
+    def forward_ungated(
+        self,
+        x: torch.Tensor,
+        quantized_input: "QuantizedActivation | None" = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the output before the expert gate and the gate logits.
+
+        The caller applies ``apply_shared_expert_gate(gate_logits, out)``.
+        """
+        assert self.expert_gate is not None
+        out = self._ungated(x if quantized_input is None else quantized_input)
+        return out, self.expert_gate(x)[0]
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
