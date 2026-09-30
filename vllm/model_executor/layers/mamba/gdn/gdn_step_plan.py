@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host-side trims for the eager GDN core of mixed (prefill + MTP spec-decode)
-steps of the Qwen GDN layer.
+"""Per-step plan and host-side trims for the eager GDN core of mixed
+(prefill + MTP spec-decode) steps of the Qwen GDN layer.
 
 In a mixed step every GDN layer runs its core as an eager splitting op, and
 that stretch is host-bound: per layer the GPU work is short while the Python
@@ -9,6 +9,31 @@ around each launch (predicates, slices, small tensor ops, launch binding) is
 repeated for every GDN layer. All GDN layers of one KV-cache group share one
 GDNAttentionMetadata object per step, and each layer only touches its own
 conv / SSM state, which the features below exploit.
+
+GGM=1 (requires GDN_STATE_COMMIT=1): for metadata objects whose step takes
+the zero-copy mixed fast path (spec rows on the deferred-commit decode kernel,
+prefill rows on the fused conv + FlashInfer / V-split chunked kernel with
+in-place state-pool I/O), a plan is built ONCE per metadata object (= once
+per KV-cache group per step) and cached on it: every layer-invariant
+predicate, slice, contiguous / int32 copy, the CP / V-split decision and the
+CUDA conv launch shape. Per layer only the kernel launches remain: the same
+kernels with the same arguments in the same order. Also:
+  VLLM_GDN_STEP_PLAN_MAT=1 (default): one deferred-commit materialize launch
+      for all GDN layers of the group instead of one per layer.
+  VLLM_GDN_STEP_PLAN_ZERO=1 (default): one launch zeroing the fresh prefill
+      state slots of all those layers (prefill slots are disjoint from spec
+      slots and not read before that layer's chunk kernel).
+  VLLM_GDN_STEP_PLAN_BUFS=1 (default): the conv outputs (q, k, v, g, beta)
+      are allocated once per step and reused by every layer (stream-ordered).
+  GGM_VSDIRECT=1: after the V-split adapter compiled its kernel for this
+      step's key, the other layers call the cached compiled object directly
+      with one workspace per step.
+  VLLM_GDN_STEP_PLAN_LOG=1 (default) / VLLM_GDN_STEP_PLAN_LOG_EVERY=2000:
+      log the plan counters every N fast-path plans.
+Whatever the plan cannot prove identical (verify mode, gather/scatter CP path,
+V-split check mode, permuted spec batches, decode-only steps, non-FlashInfer
+prefill backends, CUDA conv / V-split not loaded yet) falls through to the
+unmodified path.
 
 GGM_OG2=1:
   VLLM_GDN_GROUP_MATERIALIZE=1 (default; needs GDN_STATE_COMMIT=1): the
@@ -22,21 +47,32 @@ GGM_OG2=1:
       variant of the row-quant kernel instead of two launches.
 
 Numerics: bit-exact. A layer's state is only touched by that layer's kernels
-and the order of operations on it is unchanged; the batched launches run the
-same per-(item, head, layer) / per-row code on the same inputs.
+and the order of operations on it is unchanged (materialize -> spec decode ->
+conv -> zero -> chunk); the batched launches run the same per-(item, head,
+layer) / per-row code on the same inputs.
 """
 
+import math
 import os
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
 # ----------------------------------------------------------------------------
 # gates (read once per process)
 # ----------------------------------------------------------------------------
+ENABLED = os.environ.get("GGM", "0") == "1"
+MAT = os.environ.get("VLLM_GDN_STEP_PLAN_MAT", "1") == "1"
+ZERO = os.environ.get("VLLM_GDN_STEP_PLAN_ZERO", "1") == "1"
+BUFS = os.environ.get("VLLM_GDN_STEP_PLAN_BUFS", "1") == "1"
+VSDIRECT = os.environ.get("GGM_VSDIRECT", "0") == "1"
+LOG = os.environ.get("VLLM_GDN_STEP_PLAN_LOG", "1") == "1"
+LOG_EVERY = int(os.environ.get("VLLM_GDN_STEP_PLAN_LOG_EVERY", "2000"))
+
 HOST_TRIMS = os.environ.get("GGM_OG2", "0") == "1"
 GROUP_MATERIALIZE = (
     HOST_TRIMS and os.environ.get("VLLM_GDN_GROUP_MATERIALIZE", "1") == "1"
@@ -45,6 +81,15 @@ MERGED_ROW_QUANT = (
     HOST_TRIMS and os.environ.get("VLLM_GDN_MERGED_ROW_QUANT", "1") == "1"
 )
 
+STATS = {
+    "plans": 0,
+    "plans_fast": 0,
+    "layers_fast": 0,
+    "fallback_reasons": {},
+    "mat_launches": 0,
+    "zero_launches": 0,
+    "conv_fallback": 0,
+}
 TRIM_STATS = {
     "gsc_group_launch": 0,
     "gsc_layers_skipped": 0,
@@ -55,6 +100,18 @@ TRIM_STATS = {
 }
 _LOGGED: set = set()
 _MODS: dict = {}
+
+
+def _gdn():
+    """The Qwen GDN layer module (imported lazily: it imports this module at its
+    top). Its flags are read at call time.
+    """
+    m = _MODS.get("gdn")
+    if m is None:
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as m
+
+        _MODS["gdn"] = m
+    return m
 
 
 def _gsc():
@@ -73,6 +130,19 @@ def check_config(state_commit: bool, norm_quant_fusion: bool) -> None:
     """Called once when the Qwen GDN layer module is imported (state_commit:
     GDN_STATE_COMMIT=1; norm_quant_fusion: NQF=1).
     """
+    if ENABLED:
+        if not state_commit:
+            raise RuntimeError(
+                "GGM=1 (GDN step plan) requires GDN_STATE_COMMIT=1 (deferred GDN "
+                "state commit)"
+            )
+        logger.info(
+            "GDN step plan enabled: MAT=%d ZERO=%d BUFS=%d VSDIRECT=%d",
+            int(MAT),
+            int(ZERO),
+            int(BUFS),
+            int(VSDIRECT),
+        )
     if GROUP_MATERIALIZE and state_commit:
         logger.info("GDN state materialize: one launch per KV group enabled")
     if MERGED_ROW_QUANT and norm_quant_fusion:
@@ -175,3 +245,583 @@ def group_materialize_non_spec(layer, md, per_layer) -> None:
     gsc.materialize(0, items, ent["table"], ent["H"], slots[:items], n, has_init=hi)
     done.update(id(L) for L in layers)
     TRIM_STATS["gsc_group_launch"] += 1
+
+
+# ----------------------------------------------------------------------------
+# GGM=1: per-step GDN plan
+# ----------------------------------------------------------------------------
+_TABLES: dict = {}
+
+
+# batched zero-state kernel: state[layer][slot[i], head] = 0 for sequences without
+# an initial state (one launch for all layers of a KV-cache group)
+# fmt: off
+@triton.jit
+def _gdn_zero_state_slots_layers_kernel(ptr_table, slot_ptr, has_init_ptr, stride_slot,
+                                        HEAD_ELEMS: tl.constexpr, BLOCK: tl.constexpr, BF16: tl.constexpr):  # noqa: E501
+    i_seq = tl.program_id(0)
+    i_head = tl.program_id(1)
+    i_layer = tl.program_id(2)
+    has_init = tl.load(has_init_ptr + i_seq)
+    slot = tl.load(slot_ptr + i_seq).to(tl.int64)
+    if (has_init != 0) or (slot < 0):
+        return
+    base_i = tl.load(ptr_table + i_layer)
+    if BF16:
+        base = base_i.to(tl.pointer_type(tl.bfloat16))
+    else:
+        base = base_i.to(tl.pointer_type(tl.float32))
+    base = base + slot * stride_slot + i_head * HEAD_ELEMS
+    offs = tl.arange(0, BLOCK)
+    zeros = tl.zeros([BLOCK], dtype=base.dtype.element_ty)
+    for start in range(0, HEAD_ELEMS, BLOCK):
+        tl.store(base + start + offs, zeros)
+# fmt: on
+
+
+class _GroupTable:
+    """Per metadata-sharing layer group: deferred-commit LayerTable + SSM base
+    pointer table (for the batched zero kernel).
+    """
+
+    def __init__(self, layers, gsc):
+        entries = []
+        for L in layers:
+            gsc._layer_check(L)
+            entries.append((L.kv_cache[1], L.A_log, L.dt_bias, 0))
+        self.gsc_table = gsc.LayerTable(entries, entries[0][0].device)
+        st = entries[0][0]
+        self.ptrs = torch.tensor(
+            [e[0].data_ptr() for e in entries], dtype=torch.int64, device=st.device
+        )
+        self.n = len(entries)
+        self.dtype = st.dtype
+        self.hv = st.size(1)
+        self.head_elems = st.size(2) * st.size(3)
+        self.slot_stride = st.stride(0)
+        for s, _, _, _ in entries:
+            assert (
+                s.dtype == st.dtype
+                and s.stride(0) == st.stride(0)
+                and s.stride(1) == self.head_elems
+            )
+            assert s.stride(3) == 1 and s.size(1) == self.hv
+        self.H = layers[0]._gsc_H
+
+
+class _Plan:
+    __slots__ = (
+        "S",
+        "P",
+        "N",
+        "nr",
+        "conv_si",
+        "nacc",
+        "cu_s",
+        "mql",
+        "dec_si",
+        "dec_direct",
+        "ci",
+        "hi",
+        "cu_ns",
+        "ns",
+        "tph",
+        "rv",
+        "gext",
+        "slots",
+        "has_init",
+        "cu_p",
+        "want_cp",
+        "vsf",
+        "cu_p_i32",
+        "maxlen_kw",
+        "zero_done",
+        "bufs",
+        "vsmod",
+        "scale",
+        "names",
+        "vs_direct",
+    )
+
+
+def _vs_direct(p, q, v, st):
+    """The V-split adapter's cached compiled kernel for exactly the key the
+    adapter used for this step (None if not compiled), a workspace for this
+    step and the current stream.
+    """
+    import cuda.bindings.driver as cuda
+
+    ad = p.vsmod.adapter
+    HQ, HV = q.size(1), v.size(1)
+    devi = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    num_sm = ad._num_sm(devi)
+    key = (
+        devi,
+        num_sm,
+        str(q.dtype),
+        str(st.dtype),
+        HQ,
+        HV,
+        HQ >= HV,
+        True,
+        True,
+        True,
+        str(p.slots.dtype),
+        tuple(st.stride()[1:]),
+        tuple(st.stride()[1:]),
+        int(p.vsf),
+    )
+    c = ad._cache(*key)
+    if "compiled" not in c:
+        return None
+    B = p.cu_p_i32.size(0) - 1
+    ws = torch.empty(
+        ad.GatedDeltaNetChunkedKernel.get_workspace_size(num_sm, B, HQ, HV, True),
+        dtype=torch.int8,
+        device=q.device,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
+    STATS["vs_direct"] = STATS.get("vs_direct", 0) + 1
+    return (c["compiled"], ws, stream, tuple(st.stride()))
+
+
+def _fallback(reason):
+    d = STATS["fallback_reasons"]
+    d[reason] = d.get(reason, 0) + 1
+    return False
+
+
+def _materialize_rows(md, layers, gt):
+    """gdn_state_commit.materialize_non_spec for every layer of the group, in one
+    launch (identical per-slot inputs).
+    """
+    gsc = _gsc()
+    done = md.__dict__.setdefault("_gsc_done", set())
+    todo = [L for L in layers if id(L) not in done]
+    if not todo:
+        return
+    if len(todo) != len(layers):
+        # partially done already (not expected): the missing layers one by one
+        STATS["fallback_reasons"]["mat_partial"] = (
+            STATS["fallback_reasons"].get("mat_partial", 0) + 1
+        )
+        for L in todo:
+            gsc.materialize_non_spec(L, md)
+        return
+    slots = md.non_spec_state_indices_tensor
+    items = md.num_prefills + md.num_decodes
+    for L in layers:
+        done.add(id(L))
+    if slots is None or items <= 0:
+        return
+    items = min(items, slots.size(0))
+    n_src = getattr(md, "gsc_non_spec_num_accepted", None)
+    n = torch.zeros(items, dtype=torch.int32, device=slots.device)
+    if n_src is not None and n_src.numel() > 0:
+        k = min(items, n_src.numel())
+        n[:k] = n_src[:k]
+    has_init = md.has_initial_state
+    hi = None
+    if has_init is not None:
+        hi = torch.zeros(items, dtype=torch.bool, device=slots.device)
+        k = min(items, has_init.numel())
+        hi[:k] = has_init[:k]
+    gsc.materialize(0, items, gt.gsc_table, gt.H, slots[:items], n, has_init=hi)
+    STATS["mat_launches"] += 1
+
+
+def build_plan(layer, md, raw):
+    """The step plan for `md` (built at the first GDN layer of the group that
+    sees it), or False when the step does not take the planned path.
+    """
+    mod = _gdn()
+    gsc = _gsc()
+    STATS["plans"] += 1
+    if not isinstance(md, mod.GDNAttentionMetadata):
+        return _fallback("not_gdn_md")
+    if layer._can_use_fused_gdn_mtp_decode(md) and md.num_prefills == 0:
+        return _fallback("decode_only")
+    if not layer._can_use_mixed_fastpath(md):
+        return _fallback("not_mixed_fastpath")
+    if mod._GDN_VERIFY_LEFT[0] > 0 or mod._GDN_MIXED_SPEC_TRITON:
+        return _fallback("verify_or_spec_triton")
+    if not (mod._GDN_FUSED_CONV and getattr(mod, "_GDN_CONV_CUDA", False)):
+        return _fallback("no_fused_conv_cuda")
+    if not mod._GDN_CONV_CUDA_MOD or mod._GDN_CONV_CUDA_MOD[0] is None:
+        return _fallback("conv_cuda_not_loaded")
+    if layer.gdn_prefill_backend != "flashinfer" or not mod._GDN_FI_STATE_POOL:
+        return _fallback("fi_backend_or_pool")
+    p = _Plan()
+    S = md.num_spec_decode_tokens
+    P = md.num_prefill_tokens
+    p.S, p.P, p.N = S, P, S + P
+    # ---- spec part ----
+    p.nr = md.num_spec_decodes
+    if S > 0:
+        si = md.spec_state_indices_tensor
+        p.conv_si = si[: p.nr, 0]
+        p.nacc = md.num_accepted_tokens[: p.nr]
+        p.cu_s = md.spec_query_start_loc[: p.nr + 1]
+        p.mql = si.size(1)
+        dec = si[: p.nr]
+        # the MTP decode custom op dispatches to the deferred-commit decode kernel:
+        # call its extension directly (same kernel, same arguments)
+        p.dec_direct = gsc.decode_routed()
+        if p.dec_direct and not dec.is_contiguous():
+            dec = dec[:, :1].contiguous()
+        p.dec_si = dec
+    # ---- prefill conv (CUDA fused conv1d + post-conv) ----
+    gcc = mod._GDN_CONV_CUDA_MOD[0]
+    conv_w = layer.conv1d.weight
+    H, K, V = layer.num_k_heads // layer.tp_size, layer.head_k_dim, layer.head_v_dim
+    if K != 128 or V != 128 or conv_w.size(2) != 4:
+        return _fallback("conv_contract")
+    p.gext = gcc.load()
+    ci = md.non_spec_state_indices_tensor.contiguous()
+    p.ci = ci.contiguous()
+    p.hi = md.has_initial_state.contiguous()
+    cu = md.non_spec_query_start_loc
+    if cu.dtype != torch.int32:
+        cu = cu.to(torch.int32)
+    p.cu_ns = cu.contiguous()
+    p.ns = int(md.num_prefills)
+    if mod._GDN_CONV_CUDA_TPH == "auto":
+        p.tph = 4 if P < 1024 * max(p.ns, 1) else 8  # noqa: SIM300
+    else:
+        p.tph = int(mod._GDN_CONV_CUDA_TPH)
+    p.rv = int(gcc.RV)
+    # ---- FlashInfer / V-split chunk ----
+    slots = md.prefill_state_indices
+    has_init = md.prefill_has_initial_state
+    if slots is None or has_init is None or md.prefill_query_start_loc is None:
+        return _fallback("no_prefill_md")
+    p.slots = slots.contiguous()
+    p.has_init = has_init.contiguous()
+    p.cu_p = md.prefill_query_start_loc
+    n = p.cu_p.numel() - 1
+    maxlen = getattr(md, "prefill_max_seqlen", 0)
+    p.want_cp = mod._gdn_fi_want_cp(n, P, maxlen)
+    if p.want_cp and not mod._GDN_FI_CP_POOL:
+        return _fallback("cp_gather_path")
+    p.maxlen_kw = mod._gdn_fi_maxlen_kw(p.want_cp, md)
+    p.vsf = 1
+    p.vsmod = None
+    p.vs_direct = None
+    if mod._GDN_FI_VSPLIT and not p.want_cp:
+        st = mod._GDN_VSPLIT_STATE
+        if mod._GDN_FI_VSPLIT_CHECK:
+            return _fallback("vsplit_check_mode")
+        if not st.get("disabled"):
+            if "mod" not in st:
+                return _fallback("vsplit_not_loaded")
+            vs = st["mod"]
+            HV = layer.num_v_heads // layer.tp_size
+            vsf = vs.choose_vsplit(n, P, int(maxlen), hv=HV)
+            if vsf != 1:
+                ssm = layer.kv_cache[1]
+                if (
+                    ssm.dtype not in (torch.float32, torch.bfloat16)
+                    or ssm.stride(3) != 1
+                ):
+                    return _fallback("vsplit_ineligible")
+                p.vsf = vsf
+                p.vsmod = vs
+                p.cu_p_i32 = p.cu_p.to(torch.int32)
+    p.scale = 1.0 / math.sqrt(K)
+    # ---- per-step buffers ----
+    p.bufs = None
+    if BUFS:
+        HV = layer.num_v_heads // layer.tp_size
+        dev, dt = conv_w.device, conv_w.dtype
+        p.bufs = (
+            torch.empty(P, H, K, dtype=dt, device=dev),
+            torch.empty(P, H, K, dtype=dt, device=dev),
+            torch.empty(P, HV, V, dtype=dt, device=dev),
+            torch.empty(P, HV, dtype=torch.float32, device=dev),
+            torch.empty(P, HV, dtype=torch.float32, device=dev),
+        )
+    # ---- group (all layers sharing this metadata object) ----
+    p.zero_done = False
+    if MAT or ZERO:
+        from vllm.forward_context import get_forward_context
+
+        fc = get_forward_context()
+        names = tuple(k for k, v in raw.items() if v is md)
+        layers = [fc.no_compile_layers.get(k) for k in names]
+        C = mod.QwenGatedDeltaNetAttention
+        if (
+            any(L is None or not isinstance(L, C) for L in layers)
+            or layer.prefix not in names
+        ):
+            return _fallback("group_layers")
+        key = (names, tuple(L.kv_cache[1].data_ptr() for L in layers))
+        gt = _TABLES.get(key)
+        if gt is None:
+            gt = _TABLES[key] = _GroupTable(layers, gsc)
+        if MAT:
+            _materialize_rows(md, layers, gt)
+        if ZERO and p.slots.numel() > 0:
+            _gdn_zero_state_slots_layers_kernel[(p.slots.numel(), gt.hv, gt.n)](
+                gt.ptrs,
+                p.slots,
+                p.has_init,
+                gt.slot_stride,
+                HEAD_ELEMS=gt.head_elems,
+                BLOCK=4096,
+                BF16=gt.dtype == torch.bfloat16,
+                num_warps=4,
+            )
+            STATS["zero_launches"] += 1
+            p.zero_done = True
+    STATS["plans_fast"] += 1
+    # shape histograms (number of prefill seqs, spec requests)
+    hb = STATS.setdefault("ns_hist", {})
+    kb = next(b for b in (1, 2, 4, 8, 16, 32, 64, 128, 256, 1 << 30) if p.ns <= b)
+    hb[kb] = hb.get(kb, 0) + 1
+    hr = STATS.setdefault("nr_hist", {})
+    kr = next(b for b in (0, 32, 64, 128, 192, 256, 1 << 30) if p.nr <= b)
+    hr[kr] = hr.get(kr, 0) + 1
+    STATS["vsf2"] = STATS.get("vsf2", 0) + int(p.vsf == 2)
+    STATS["cp"] = STATS.get("cp", 0) + int(bool(p.want_cp))
+    if LOG and STATS["plans_fast"] % LOG_EVERY == 1:
+        logger.info(
+            "GDN step plan #%d: S=%d P=%d nr=%d ns=%d vsf=%d cp=%s stats=%s",
+            STATS["plans_fast"],
+            S,
+            P,
+            p.nr,
+            p.ns,
+            p.vsf,
+            p.want_cp,
+            {k: v for k, v in STATS.items()},
+        )
+    return p
+
+
+def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
+    """One layer of a planned mixed step: the kernels of the zero-copy mixed
+    path, in its order, with its arguments.
+    """
+    mod = _gdn()
+    gsc = _gsc()
+    S, N = p.S, p.N
+    ssm_state = layer.kv_cache[1]
+    conv_state = (
+        layer.kv_cache[0]
+        if mod.is_conv_state_dim_first()
+        else layer.kv_cache[0].transpose(-1, -2)
+    )
+    conv_weights = layer.conv1d.weight.view(
+        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
+    )
+    if not MAT:
+        gsc._layer_check(layer)
+        gsc.materialize_non_spec(layer, md)
+    if S > 0:
+        mixed_qkv_spec = mod.causal_conv1d_update(
+            mixed_qkv[:S],
+            conv_state,
+            conv_weights,
+            layer.conv1d.bias,
+            layer.activation,
+            conv_state_indices=p.conv_si,
+            num_accepted_tokens=p.nacc,
+            query_start_loc=p.cu_s,
+            max_query_len=p.mql,
+            validate_data=False,
+        )
+        if p.dec_direct:
+            gsc.STATS["decode_calls"] += 1
+            gsc.load().decode(
+                mixed_qkv_spec,
+                a[:S],
+                b[:S],
+                layer.A_log,
+                layer.dt_bias,
+                p.dec_si,
+                p.cu_s,
+                p.nacc,
+                ssm_state,
+                output_gate[:S],
+                layer.norm.weight,
+                core_attn_out[:S],
+                float(layer.head_k_dim**-0.5),
+                float(layer.layer_norm_epsilon),
+                layer.norm.activation == "sigmoid",
+            )
+        else:
+            mod.ops.fused_gdn_decode_post_conv_mtp(
+                mixed_qkv=mixed_qkv_spec,
+                a=a[:S],
+                b=b[:S],
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                state_indices=p.dec_si,
+                cu_seqlens=p.cu_s,
+                num_accepted_tokens=p.nacc,
+                state=ssm_state,
+                output_gate=output_gate[:S],
+                norm_weight=layer.norm.weight,
+                out=core_attn_out[:S],
+                scale=layer.head_k_dim**-0.5,
+                norm_eps=layer.layer_norm_epsilon,
+                output_gate_activation=layer.norm.activation,
+            )
+    # ---- prefill conv + post-conv (CUDA) ----
+    if p.bufs is not None:
+        q, k, v, g, beta = p.bufs
+    else:
+        P = p.P
+        H, HV = layer.num_k_heads // layer.tp_size, layer.A_log.shape[0]
+        x = mixed_qkv
+        q = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
+        k = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
+        v = torch.empty(P, HV, 128, dtype=x.dtype, device=x.device)
+        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+    ok = p.gext.run(
+        mixed_qkv[S:N],
+        conv_weights,
+        conv_state,
+        p.ci,
+        p.hi,
+        p.cu_ns,
+        p.ns,
+        a[S:N],
+        b[S:N],
+        layer.A_log,
+        layer.dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        int(layer.num_k_heads // layer.tp_size),
+        int(p.tph),
+        int(p.rv),
+    )
+    gcc = mod._GDN_CONV_CUDA_MOD[0]
+    if ok:
+        gcc.STATS["calls"] += 1
+    else:
+        # as in the unplanned path: the CUDA kernel refused (no launch) -> Triton kernel
+        gcc.STATS["fallbacks"] += 1
+        STATS["conv_fallback"] += 1
+        q, k, v, g, beta = mod.gdn_fused_conv_post_conv(
+            mixed_qkv[S:N],
+            conv_weights,
+            conv_state,
+            p.ci,
+            p.hi,
+            p.cu_ns,
+            p.ns,
+            a[S:N],
+            b[S:N],
+            layer.A_log,
+            layer.dt_bias,
+            layer.num_k_heads // layer.tp_size,
+            layer.head_k_dim,
+            layer.head_v_dim,
+            use_cuda=False,
+        )
+    out = core_attn_out[S:N]
+    # ---- chunked GDN (state pool in place) ----
+    if not p.zero_done:
+        mod.gdn_zero_state_slots(ssm_state, p.slots, p.has_init)
+    done = False
+    if p.vsf != 1:  # noqa: SIM102 - same structure as the unplanned path
+        if (
+            q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and out.is_contiguous()
+            and g.is_contiguous()
+            and beta.is_contiguous()
+            and q.size(2) == 128
+        ):
+            st = mod._GDN_VSPLIT_STATE
+            d = p.vs_direct
+            if d is not None and d[3] == tuple(ssm_state.stride()):
+                # same compiled object, same arguments as chunk_gated_delta_rule_vsplit
+                d[0](
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    out,
+                    p.cu_p_i32,
+                    ssm_state,
+                    ssm_state,
+                    p.slots,
+                    None,
+                    None,
+                    0,
+                    p.scale,
+                    d[1],
+                    d[2],
+                )
+            else:
+                p.vsmod.chunk_gated_delta_rule_vsplit(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    out,
+                    p.cu_p_i32,
+                    ssm_state,
+                    ssm_state,
+                    p.scale,
+                    state_indices=p.slots,
+                    v_split=p.vsf,
+                )
+                if VSDIRECT:
+                    p.vs_direct = _vs_direct(p, q, v, ssm_state)
+            st["calls"] = st.get("calls", 0) + 1
+            done = True
+    if not done:
+        from flashinfer.gdn_prefill import (
+            chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
+        )
+
+        chunk_gated_delta_rule_fi(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=ssm_state,
+            output_final_state=True,
+            cu_seqlens=p.cu_p,
+            output=out,
+            output_state=ssm_state,
+            use_cp=p.want_cp,
+            state_indices=p.slots,
+            **p.maxlen_kw,
+        )
+    mod.gdn_gated_rmsnorm_(
+        out,
+        output_gate[S:N],
+        layer.norm.weight,
+        layer.layer_norm_epsilon,
+        layer.norm.activation,
+    )
+    STATS["layers_fast"] += 1
+
+
+def forward_core_fused_norm(
+    layer, md, raw, mixed_qkv, b, a, output_gate, core_attn_out
+) -> bool:
+    """Start of QwenGatedDeltaNetAttention._forward_core_fused_norm with GGM=1
+    (md = this layer's metadata, raw = the forward context's metadata dict).
+    Returns True when the layer ran on the step plan (the caller returns).
+    """
+    d = md.__dict__
+    p = d.get("_step_plan")
+    if p is None:
+        p = d["_step_plan"] = build_plan(layer, md, raw)
+    if p is False:
+        return False
+    run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out)
+    return True
