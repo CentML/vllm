@@ -11,6 +11,9 @@
   without being read.
 - ``gdn_norm_launch_config``: launch config of the FLA gated RMSNorm for the
   ``[T, HV * V]`` mixed-batch launch.
+- ``zero_fresh_state_rows``: zeroes the SSM pool rows of prefill sequences
+  without an initial state, on the device, before FlashInfer updates the pool
+  in place through ``state_indices``.
 """
 
 import torch
@@ -202,3 +205,51 @@ def gdn_norm_launch_config(num_rows: int, device: torch.device) -> tuple[int, in
         return 8, 2
     # VR sweep, T = 2144..8192: (64, 8) is fastest or tied (-35..-44% vs default).
     return 64, 8
+
+
+@triton.jit
+def _zero_fresh_state_rows_kernel(
+    pool_ptr,
+    indices_ptr,
+    has_initial_state_ptr,
+    stride_slot,
+    ROW_NUMEL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    seq = tl.program_id(0)
+    if tl.load(has_initial_state_ptr + seq) == 0:
+        slot = tl.load(indices_ptr + seq).to(tl.int64)
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(
+            pool_ptr + slot * stride_slot + offs,
+            tl.zeros((BLOCK,), dtype=pool_ptr.dtype.element_ty),
+            mask=offs < ROW_NUMEL,
+        )
+
+
+def zero_fresh_state_rows(
+    pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> None:
+    """``pool[state_indices[i]] = 0`` where ``not has_initial_state[i]``, with no
+    host sync. Pool rows may be padded (``stride(0)`` larger than a row) but each
+    row must be contiguous.
+    """
+    num_seqs = state_indices.numel()
+    if num_seqs == 0:
+        return
+    assert state_indices.is_contiguous() and has_initial_state.is_contiguous()
+    row_numel = pool[0].numel()
+    assert pool[0].is_contiguous()
+    assert has_initial_state.numel() == num_seqs
+    block = 4096
+    _zero_fresh_state_rows_kernel[(num_seqs, triton.cdiv(row_numel, block))](
+        pool,
+        state_indices,
+        has_initial_state,
+        pool.stride(0),
+        ROW_NUMEL=row_numel,
+        BLOCK=block,
+        num_warps=4,
+    )

@@ -50,6 +50,8 @@ class _QwenGDNWarmupConfig:
     post_conv_output_g_exp: bool = False
     # out_proj consumes the MXFP8 activation written by the core op.
     gdn_out_mxfp8: bool = False
+    # Prefill updates the SSM state pool in place (FlashInfer state_indices).
+    state_in_place: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -147,6 +149,9 @@ def _qwen_gdn_warmup_config(
                 )
             ),
             gdn_out_mxfp8=bool(getattr(layer, "gdn_out_mxfp8", False)),
+            state_in_place=bool(
+                layer.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype)
+            ),
         )
 
     if found_layer:
@@ -225,6 +230,25 @@ def _warm_gdn_gated_norm_mxfp8_kernel(
                 (0, num_rows),
                 num_valid,
             )
+
+
+def _warm_zero_fresh_state_rows_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig
+) -> None:
+    if not config.state_in_place:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+
+    pool = torch.empty(
+        (1, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
+    )
+    zero_fresh_state_rows(
+        pool,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.bool, device=device),
+    )
 
 
 def _warm_causal_conv1d_fwd_kernel(
@@ -363,6 +387,7 @@ def qwen_triton_warmup(
     max_num_tokens = max(1, int(runner.max_num_tokens))
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
     _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
+    _warm_zero_fresh_state_rows_kernel(device, gdn_config)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
