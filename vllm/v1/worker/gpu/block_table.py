@@ -14,6 +14,11 @@ from vllm.v1.worker.gpu.buffer_utils import (
     _load_ptr,
 )
 
+# Up to this many programs per KV-cache group pad the slot mappings (1024
+# tokens each per iteration) instead of one serial loop; same writes.
+_MAX_PAD_PROGRAMS = 32
+
+
 # GB300 lowc2: skip the per-step num_blocks re-copy when no block ids were appended.
 _NUM_BLOCKS_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
 
@@ -231,7 +236,10 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+        num_pad_programs = max(
+            min(_MAX_PAD_PROGRAMS, triton.cdiv(slot_mappings.shape[1], 1024)), 1
+        )
+        _compute_slot_mappings_kernel[(num_groups, num_reqs + num_pad_programs)](
             slot_mappings.shape[1],
             idx_mapping,
             query_start_loc,
@@ -248,6 +256,7 @@ class BlockTables:
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
+            NUM_PAD_PROGRAMS=num_pad_programs,
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -321,19 +330,27 @@ def _compute_slot_mappings_kernel(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    # The last NUM_PAD_PROGRAMS programs along axis 1 pad; the rest are requests.
+    NUM_PAD_PROGRAMS: tl.constexpr,
 ):
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
     slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
 
-    if batch_idx == tl.num_programs(1) - 1:
+    num_reqs = tl.num_programs(1) - NUM_PAD_PROGRAMS
+    if batch_idx >= num_reqs:
         # Pad remaining slots to -1. This is needed for CUDA graphs.
         # Start from actual token count (not padded) to cover the gap
         # between actual tokens and padded tokens that can contain stale
         # valid slot IDs from previous chunks during chunked prefill.
-        actual_num_tokens = tl.load(query_start_loc + batch_idx)
-        for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
+        actual_num_tokens = tl.load(query_start_loc + num_reqs)
+        pad_idx = batch_idx - num_reqs
+        for i in range(
+            actual_num_tokens + pad_idx * TRITON_BLOCK_SIZE,
+            max_num_tokens,
+            NUM_PAD_PROGRAMS * TRITON_BLOCK_SIZE,
+        ):
             offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
             tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
         return
