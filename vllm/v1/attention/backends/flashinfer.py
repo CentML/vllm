@@ -77,6 +77,7 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops import flashinfer_decode_splitkv
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -2540,7 +2541,14 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
+                # Opt-in batch-aware split-KV widening (FI_DECODE_SPLITKV); the
+                # stock FlashInfer entry point otherwise.
+                trtllm_decode = (
+                    flashinfer_decode_splitkv.trtllm_batch_decode_with_kv_cache
+                    if flashinfer_decode_splitkv.ENABLED
+                    else trtllm_batch_decode_with_kv_cache
+                )
+                trtllm_decode(
                     query=decode_query,
                     kv_cache=(
                         nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
