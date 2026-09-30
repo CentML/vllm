@@ -590,6 +590,39 @@ def _gdn_fused_conv_post_conv_kernel_v2(
                                   vch, V, WIDTH, NP2W)
 
 
+# VLLM_GDN_CONV_CUDA=1 routes gdn_fused_conv_post_conv to the CUDA kernel in
+# vllm/model_executor/layers/mamba/ops/gdn_conv_cuda (JIT-built into $GDN_CONV_CUDA_BUILD_DIR). Bit-exact
+# with the Triton v2 kernel (q/k/v/g/beta and conv state); falls back to Triton if the extension cannot be
+# built or loaded, or the layout contract is not met. VLLM_GDN_CONV_CUDA_TPH=auto|4|8|16 (auto: 4 if the
+# mean prefill length is < 1024 tokens else 8).
+_GDN_CONV_CUDA = os.environ.get("VLLM_GDN_CONV_CUDA", "0") == "1"
+_GDN_CONV_CUDA_TPH = os.environ.get("VLLM_GDN_CONV_CUDA_TPH", "auto")
+_GDN_CONV_CUDA_MOD = []
+
+
+def _gdn_conv_cuda_call(x, conv_weights, conv_state, cache_indices, has_initial_state,
+                        cu_seqlens, num_seqs, a, b, A_log, dt_bias, H, K, V):
+    if not _GDN_CONV_CUDA_MOD:
+        try:
+            from vllm.model_executor.layers.mamba.ops import gdn_conv_cuda as _gcc
+
+            _gcc.load()
+            _GDN_CONV_CUDA_MOD.append(_gcc)
+            logger.info("gdn_conv_cuda: CUDA fused conv1d+post-conv enabled")
+        except Exception as e:  # noqa: BLE001
+            _GDN_CONV_CUDA_MOD.append(None)
+            logger.warning("gdn_conv_cuda: CUDA fused conv unavailable (%s); using Triton", e)
+    m = _GDN_CONV_CUDA_MOD[0]
+    if m is None:
+        return None
+    if _GDN_CONV_CUDA_TPH == "auto":
+        tph = 4 if x.shape[0] < 1024 * max(int(num_seqs), 1) else 8
+    else:
+        tph = int(_GDN_CONV_CUDA_TPH)
+    return m.fused_conv_post_conv(x, conv_weights, conv_state, cache_indices, has_initial_state,
+                                  cu_seqlens, num_seqs, a, b, A_log, dt_bias, H, K, V, tph=tph)
+
+
 def gdn_fused_conv_post_conv(
     x: torch.Tensor,  # [P, conv_dim] prefill rows of mixed_qkv (channels contiguous)
     conv_weights: torch.Tensor,  # [conv_dim, width]
@@ -607,6 +640,13 @@ def gdn_fused_conv_post_conv(
     head_v_dim: int,
 ):
     P = x.shape[0]
+    if _GDN_CONV_CUDA:
+        # bit-exact CUDA (sm_107a) version of the v2 Triton kernel below
+        res = _gdn_conv_cuda_call(x, conv_weights, conv_state, cache_indices, has_initial_state,
+                                  cu_seqlens, num_seqs, a, b, A_log, dt_bias, num_k_heads,
+                                  head_k_dim, head_v_dim)
+        if res is not None:
+            return res
     cache_indices = cache_indices.contiguous()
     has_initial_state = has_initial_state.contiguous()
     H, K, V = num_k_heads, head_k_dim, head_v_dim
