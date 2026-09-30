@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.worker.gpu.input_batch import post_update
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
@@ -80,6 +81,40 @@ def test_postprocess_state_scalar_with_int32_mapping(
     torch.testing.assert_close(state.num_accepted_tokens_gpu, expected)
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_post_update_writes_num_accepted_for_tensor_num_sampled() -> None:
+    # The model runner hands mamba's num_accepted_tokens to post_update, which
+    # writes max(num_sampled, 1) per mapped request; postprocess_state does not
+    # scatter tensor num_sampled again.
+    device = "cuda"
+    max_num_reqs = 5
+    idx_mapping = torch.tensor([3, -1, 0, 4], dtype=torch.int32, device=device)
+    num_sampled = torch.tensor([2, 3, 0, 4], dtype=torch.int32, device=device)
+    num_accepted = torch.full((max_num_reqs,), 9, dtype=torch.int32, device=device)
+    post_update(
+        idx_mapping,
+        torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+        torch.zeros(max_num_reqs, dtype=torch.int64, device=device),
+        None,
+        torch.ones(4, 4, dtype=torch.int64, device=device),
+        num_sampled,
+        torch.zeros(4, dtype=torch.int32, device=device),
+        None,
+        torch.zeros(max_num_reqs, 16, dtype=torch.int32, device=device),
+        torch.zeros(max_num_reqs, dtype=torch.int32, device=device),
+        num_accepted=num_accepted,
+    )
+    assert num_accepted.tolist() == [1, 9, 9, 2, 4]
+
+    state = object.__new__(MambaHybridModelState)
+    state.num_accepted_tokens_gpu = num_accepted
+    state._align_mode = False
+    state.recoverssm = None
+    state._mamba_ctx = None
+    state.postprocess_state(idx_mapping, num_sampled)
+    assert num_accepted.tolist() == [1, 9, 9, 2, 4]
+
+
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
     state = RecoverSSMState()
     metadata = Mock(spec=RecoverSSMMetadata)
@@ -113,8 +148,9 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     state._mamba_ctx = None
     state._mamba_state_idx_gpu = torch.full((5,), -1, dtype=torch.int32, device="cuda")
     state.recoverssm = RecoverSSMState()
-    state.num_accepted_tokens_gpu = torch.full(
-        (5,), 9, dtype=torch.int32, device="cuda"
+    # post_update has already written max(num_sampled, 1) for the batch rows.
+    state.num_accepted_tokens_gpu = torch.tensor(
+        [9, 3, 9, 2, 9], dtype=torch.int32, device="cuda"
     )
     metadata = Mock(spec=RecoverSSMMetadata)
     metadata.commit_recoverssm_state.return_value = RecoverSSMPostprocessMetadata(

@@ -563,12 +563,21 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    # Optional [max_num_reqs] mamba num_accepted_tokens.
+    num_accepted_ptr=None,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
         # Filter rows with negative index entries.
         return
+
+    if num_accepted_ptr is not None:
+        # Chunked prefill samples 0 tokens; 1 is mamba's neutral value.
+        tl.store(
+            num_accepted_ptr + req_state_idx,
+            tl.maximum(tl.load(num_sampled_ptr + req_id), 1),
+        )
 
     total_len = tl.load(total_len_ptr + req_state_idx)
     num_sampled = tl.load(num_sampled_ptr + req_id)
@@ -630,6 +639,8 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    # [max_num_reqs] mamba num_accepted_tokens, written as max(num_sampled, 1).
+    num_accepted: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_kernel[(num_reqs,)](
@@ -646,6 +657,7 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        num_accepted,
         num_warps=1,
     )
 
