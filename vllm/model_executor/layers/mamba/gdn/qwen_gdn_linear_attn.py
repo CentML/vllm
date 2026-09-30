@@ -111,12 +111,50 @@ _GDN_FI_CP_MIN_TOKENS = int(os.environ.get("VLLM_GDN_FI_CP_MIN_TOKENS", "6144"))
 _GDN_FI_STATE_POOL = os.environ.get("VLLM_GDN_FI_STATE_POOL", "1") == "1"
 
 
-def _gdn_fi_want_cp(num_seqs: int, num_tokens: int) -> bool:
+# CP routing v2 + CP with in-place state pool (both env-gated, default off = the routing
+# and gather/scatter CP path above). CP also wins for a multi-sequence batch dominated by
+# one long sequence and loses for balanced or short multi-sequence batches.
+#   VLLM_GDN_FI_CP_RULE=v2: CP if 1 seq >= CP_MIN_TOKENS, or n>1 with max_len >= CP_MULTI_MIN_TOKENS [8192]
+#                           and max_len >= CP_MULTI_FRAC [0.8] x total prefill tokens.
+#   VLLM_GDN_FI_CP_POOL=1:  run CP with state_indices= (in-place pool I/O) instead of gather/where/scatter.
+_GDN_FI_CP_RULE = os.environ.get("VLLM_GDN_FI_CP_RULE", "v1").strip().lower()
+_GDN_FI_CP_MULTI_MIN = int(os.environ.get("VLLM_GDN_FI_CP_MULTI_MIN_TOKENS", "8192"))
+_GDN_FI_CP_MULTI_FRAC = float(os.environ.get("VLLM_GDN_FI_CP_MULTI_FRAC", "0.8"))
+_GDN_FI_CP_POOL = os.environ.get("VLLM_GDN_FI_CP_POOL", "0") == "1"
+
+
+_GDN_FI_HAS_MAXLEN = []
+
+
+def _gdn_fi_maxlen_kw(want_cp: bool, attn_metadata) -> dict:
+    """Newer FlashInfer (upstream main GDN files) sizes CP grids from max_seqlen and
+    otherwise assumes a balanced batch (under-launch -> wrong output for imbalanced multi-sequence CP).
+    Pass the exact host-side maximum whenever the API has it."""
+    if not want_cp:
+        return {}
+    if not _GDN_FI_HAS_MAXLEN:
+        import inspect
+
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule as _f
+
+        _GDN_FI_HAS_MAXLEN.append("max_seqlen" in inspect.signature(_f).parameters)
+    m = getattr(attn_metadata, "prefill_max_seqlen", 0)
+    if _GDN_FI_HAS_MAXLEN[0] and m > 0:
+        return {"max_seqlen": int(m)}
+    return {}
+
+
+def _gdn_fi_want_cp(num_seqs: int, num_tokens: int, max_seqlen: int = 0) -> bool:
     if _GDN_FI_USE_CP in ("1", "true"):
         return True
     if _GDN_FI_USE_CP in ("0", "false"):
         return False
-    return num_seqs == 1 and num_tokens >= _GDN_FI_CP_MIN_TOKENS
+    if num_seqs == 1:
+        return num_tokens >= _GDN_FI_CP_MIN_TOKENS
+    if _GDN_FI_CP_RULE == "v2" and max_seqlen > 0:
+        return (max_seqlen >= _GDN_FI_CP_MULTI_MIN
+                and max_seqlen >= _GDN_FI_CP_MULTI_FRAC * num_tokens)
+    return False
 
 
 @triton.jit
@@ -2625,9 +2663,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         has_init = has_init.contiguous()
         cu_seqlens = attn_metadata.prefill_query_start_loc
         assert slots is not None and has_init is not None and cu_seqlens is not None
-        want_cp = _gdn_fi_want_cp(cu_seqlens.numel() - 1, q.size(0))
+        want_cp = _gdn_fi_want_cp(cu_seqlens.numel() - 1, q.size(0),
+                                  getattr(attn_metadata, "prefill_max_seqlen", 0))
 
-        if not want_cp and _GDN_FI_STATE_POOL:
+        if _GDN_FI_STATE_POOL and (not want_cp or _GDN_FI_CP_POOL):
             # Indexed state-pool I/O: read initial state from ssm_state[slot],
             # write final state back in place. Slots of fresh sequences must
             # start from zero.
@@ -2643,8 +2682,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=cu_seqlens,
                 output=out,
                 output_state=ssm_state,
-                use_cp=False,
+                use_cp=want_cp,  # the CP path also supports the indexed pool
                 state_indices=slots,
+                **_gdn_fi_maxlen_kw(want_cp, attn_metadata),
             )
             return
         # CP path (and VLLM_GDN_FI_STATE_POOL=0): gather/scatter the states, but
@@ -2665,6 +2705,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             cu_seqlens=cu_seqlens,
             output=out,
             use_cp=want_cp,
+            **_gdn_fi_maxlen_kw(want_cp, attn_metadata),
         )
         ssm_state[slots] = final_state.to(ssm_state.dtype)
 
