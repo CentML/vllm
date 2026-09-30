@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import math
 import os
 from typing import Literal
 
@@ -124,6 +125,66 @@ _GDN_FI_CP_POOL = os.environ.get("VLLM_GDN_FI_CP_POOL", "0") == "1"
 
 
 _GDN_FI_HAS_MAXLEN = []
+
+# VLLM_GDN_FI_VSPLIT=1: non-CP FlashInfer GDN prefill steps whose (seq x value-head) grid under-fills
+# the GPU run the V-split kernel (vllm/third_party/flashinfer_gdn_vsplit: one CTA per (seq, head,
+# 64-row V slice), M=64 tcgen05 state GEMMs). Output and final state are bitwise identical to
+# FlashInfer's non-CP kernel.
+_GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "0") == "1"
+_GDN_VSPLIT_STATE: dict = {}
+_GDN_FI_VSPLIT_CHECK = os.environ.get("VLLM_GDN_FI_VSPLIT_CHECK", "0") == "1"
+
+
+def _gdn_vsplit_call(q, k, v, g_exp, beta, out, ssm_state, slots, cu_seqlens, attn_metadata) -> bool:
+    st = _GDN_VSPLIT_STATE
+    if st.get("disabled"):
+        return False
+    try:
+        if "mod" not in st:
+            import vllm.third_party.flashinfer_gdn_vsplit as gdn_vsplit
+
+            st["mod"] = gdn_vsplit
+            st["calls"] = 0
+            logger.info("gdn_vsplit: V-split GDN prefill enabled (rule=%s)", gdn_vsplit.VSPLIT_RULE)
+        mod = st["mod"]
+        n = cu_seqlens.numel() - 1
+        vsf = mod.choose_vsplit(n, q.size(0), int(getattr(attn_metadata, "prefill_max_seqlen", 0)),
+                                hv=v.size(1))
+        if vsf == 1:
+            return False
+        if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and out.is_contiguous()
+                and g_exp.is_contiguous() and beta.is_contiguous() and q.size(2) == 128
+                and ssm_state.dtype == torch.float32 and ssm_state.stride(3) == 1):
+            return False
+        if _GDN_FI_VSPLIT_CHECK:
+            # debug: run stock FlashInfer on copies and compare bitwise (slow; diagnostics only)
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi
+
+            ref_pool = ssm_state.clone()
+            ref_out = out.clone()
+            _fi(q=q, k=k, v=v, g=g_exp, beta=beta, initial_state=ref_pool, output_final_state=True,
+                cu_seqlens=cu_seqlens, output=ref_out, output_state=ref_pool, use_cp=False, state_indices=slots)
+        mod.chunk_gated_delta_rule_vsplit(
+            q, k, v, g_exp, beta, out, cu_seqlens.to(torch.int32), ssm_state, ssm_state,
+            1.0 / math.sqrt(q.size(2)), state_indices=slots, v_split=vsf,
+        )
+        if _GDN_FI_VSPLIT_CHECK:
+            sl = slots.long()
+            no = int((out.view(torch.int16) != ref_out.view(torch.int16)).sum())
+            ns = int((ssm_state[sl].contiguous().view(torch.int32) != ref_pool[sl].contiguous().view(torch.int32)).sum())
+            st["checked"] = st.get("checked", 0) + 1
+            if no or ns or st["checked"] <= 3:
+                logger.warning("gdn_vsplit: CHECK call=%d n=%d T=%d cu=%s out_mis=%d state_mis=%d q%s/%s k%s v%s o%s "
+                               "g%s b%s pool%s%s slots=%s", st["checked"], n, q.size(0),
+                               cu_seqlens.tolist()[:9], no, ns, tuple(q.shape), q.stride(), k.stride(), v.stride(),
+                               out.stride(), g_exp.stride(), beta.stride(), tuple(ssm_state.shape), ssm_state.stride(),
+                               slots.tolist()[:8])
+        st["calls"] += 1
+        return True
+    except Exception as e:  # never break serving: fall back to FlashInfer
+        st["disabled"] = True
+        logger.warning("gdn_vsplit: V-split kernel unavailable (%s: %s); using FlashInfer", type(e).__name__, e)
+        return False
 
 
 def _gdn_fi_maxlen_kw(want_cp: bool, attn_metadata) -> dict:
@@ -2671,6 +2732,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # write final state back in place. Slots of fresh sequences must
             # start from zero.
             gdn_zero_state_slots(ssm_state, slots, has_init)
+            # non-CP steps with few / imbalanced sequences: V-split kernel (bitwise identical)
+            if _GDN_FI_VSPLIT and not want_cp and _gdn_vsplit_call(
+                q, k, v, g_exp, beta, out, ssm_state, slots, cu_seqlens, attn_metadata
+            ):
+                return
             chunk_gated_delta_rule_fi(
                 q=q,
                 k=k,
