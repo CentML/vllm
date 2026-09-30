@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -382,6 +383,24 @@ class Qwen3NextAttention(nn.Module):
             and supports_dtype
             and (text_only or supports_mrope)
         )
+        # Token-tile qk-norm-RoPE (one CTA per token tile instead of per
+        # token-head). It also stores q as the attention backend's FP8 query
+        # when the layer has a static per-tensor query quant the backend
+        # consumes (FlashInfer trtllm-gen FP8-Q on SM100), which removes that
+        # separate quant kernel.
+        self.use_qk_norm_rope_tokens = (
+            self.use_fused_qk_norm_rope_gate
+            and current_platform.is_cuda()
+            and self.head_dim > 32
+        )
+        query_quant = self.attn.query_quant
+        self.qk_norm_rope_fp8_q = bool(
+            self.use_qk_norm_rope_tokens
+            and query_quant is not None
+            and self.attn.impl.supports_quant_query_input
+            and query_quant.group_shape == GroupShape.PER_TENSOR
+            and current_platform.fp8_dtype() == torch.float8_e4m3fn
+        )
 
     def _project_qkv_gate(
         self,
@@ -445,12 +464,52 @@ class Qwen3NextAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def _project_qkv_gate_tokens(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like the fused ``_project_qkv_gate`` path, via the token-tile kernel.
+
+        ``q`` is FP8 (quantized with ``attn._q_scale``) when
+        ``qk_norm_rope_fp8_q``.
+        """
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        mrope_section = getattr(self.rotary_emb, "mrope_section", None)
+        if positions.ndim == 2 and not mrope_section:
+            positions = positions[0]
+        q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope(
+            q_gate,
+            k,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.attn._q_scale if self.qk_norm_rope_fp8_q else None,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.rotary_dim,
+            list(mrope_section) if positions.ndim == 2 else None,
+            1.0,
+            True,
+        )
+        return q, k, v, gate
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.use_qk_norm_rope_tokens:
+            q, k, v, gate = self._project_qkv_gate_tokens(qkv, positions)
+            # An FP8 q skips the attention layer's own query quant.
+            attn_output = self.attn(q, k, v, output_dtype=qkv.dtype)
+            attn_output = attn_output.view(gate.shape) * torch.sigmoid(gate)
+            output, _ = self.o_proj(attn_output.flatten(1))
+            return output
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
