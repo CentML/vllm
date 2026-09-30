@@ -272,11 +272,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        defer: bool = True,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
         # GGM_LAZY=1: metadata read only by the FLA / Triton-conv fallback paths is
         # computed on demand (gdn_step_plan.fill_lazy) instead of here
-        lazy: list | None = [] if gdn_step_plan.LAZY else None
+        lazy: list | None = [] if gdn_step_plan.LAZY and defer else None
+        # VLLM_GDN_STEP_PLAN_LAZY_IDX=1 (with GGM_LAZY): the spec / non-spec token
+        # permutation of mixed batches, read only by fallback paths, is deferred too
+        lazy_idx = lazy is not None and gdn_step_plan.LAZY_IDX
         # the deferred state commit post-step below uses the caller's arguments
         gsc_args = (
             (num_accepted_tokens, num_decode_draft_tokens_cpu)
@@ -387,12 +391,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_tokens_are_prefix = bool(
                     spec_sequence_masks_cpu[:num_spec_decodes].all().item()
                 )
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
-                )
-                index = torch.argsort(spec_token_masks, stable=True)
+                if lazy_idx:
+                    spec_token_masks = gdn_step_plan.LazyT(
+                        torch.repeat_interleave,
+                        (spec_sequence_masks, query_lens),
+                        {"output_size": query_start_loc_cpu[-1].item()},
+                    )
+                    index = gdn_step_plan.LazyT(
+                        torch.argsort, (spec_token_masks,), {"stable": True}
+                    )
+                else:
+                    spec_token_masks = torch.repeat_interleave(
+                        spec_sequence_masks,
+                        query_lens,
+                        output_size=query_start_loc_cpu[-1].item(),
+                    )
+                    index = torch.argsort(spec_token_masks, stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
@@ -630,6 +644,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             from vllm.model_executor.layers.mamba.ops import gdn_state_commit
 
             gdn_state_commit.postprocess_metadata(self, attn_metadata, *gsc_args)
+        if lazy_idx:
+            gdn_step_plan.check_lazy_indices(
+                attn_metadata,
+                lambda: self._build_full(
+                    common_prefix_len,
+                    common_attn_metadata,
+                    num_accepted_tokens,
+                    num_decode_draft_tokens_cpu,
+                    fast_build,
+                    defer=False,
+                ),
+            )
         if lazy:
             gdn_step_plan.defer_metadata(attn_metadata, lazy)
         return attn_metadata
