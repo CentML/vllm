@@ -1964,6 +1964,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if gdn_step_plan.LAZY:
+            # GGM_LAZY=1: this path reads the deferred FLA / Triton-conv metadata
+            gdn_step_plan.fill_lazy(attn_metadata)
         if _GDN_STATE_COMMIT_DEFERRED:
             # commit pending token logs of the non-spec slots before they are read
             gdn_state_commit.forward_core_prologue(self, attn_metadata)
