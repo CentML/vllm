@@ -130,6 +130,7 @@ def _build_layer(
         "_forward_core_decode_spec_fused_norm",
         "_can_use_fused_gdn_mtp_decode",
         "_rms_norm_gated_cuda",
+        "_rms_norm_gated_strided_gate_cuda",
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
         "split_ba",
@@ -195,6 +196,7 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     layer = types.SimpleNamespace(
         prefix=PREFIX,
         enable_fused_gdn_decode=True,
+        gdn_out_mxfp8=False,
         norm=types.SimpleNamespace(
             weight=torch.empty(V, dtype=torch.bfloat16, device=device)
         ),
@@ -244,8 +246,15 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
             [128, 96],
             [SPEC_TOKENS, 64],
             [NUM_SPEC, -1],
+            1,
+            id="mixed-mtp",
+        ),
+        pytest.param(
+            [128, 96, 128],
+            [SPEC_TOKENS, 64, SPEC_TOKENS],
+            [NUM_SPEC, -1, NUM_SPEC],
             0,
-            id="mixed-mtp-falls-back",
+            id="mixed-interleaved-falls-back",
         ),
         pytest.param([96], [64], [-1], 0, id="pure-prefill"),
         pytest.param([128], [1], [-1], 0, id="pure-decode"),
@@ -260,7 +269,9 @@ def test_fused_model_path_matches_reference(
     expected_fused_calls: int,
     output_gate_activation: str,
 ) -> None:
-    """Fused MTP and its mixed/prefill/decode fallbacks match the reference."""
+    """Fused MTP (decode-only batches and the contiguous spec block of mixed
+    batches) and its interleaved/prefill/decode fallbacks match the reference.
+    """
     torch.manual_seed(1)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
