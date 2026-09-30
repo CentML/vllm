@@ -55,6 +55,7 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
 
 logger = init_logger(__name__)
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -277,7 +278,20 @@ def _layer_check(layer):
 
 
 def materialize_non_spec(layer, md):
-    """In-place commit of pending logs for every non-spec reader (prefill / plain decode) slot."""
+    """In-place commit of pending logs for every non-spec reader (prefill / plain decode) slot.
+
+    Single entry for every caller. With VLLM_GDN_GROUP_MATERIALIZE (GGM_OG2=1) all
+    GDN layers of the KV-cache group are committed in one launch (gdn_step_plan).
+    """
+    if gdn_step_plan.GROUP_MATERIALIZE:
+        return gdn_step_plan.group_materialize_non_spec(
+            layer, md, _materialize_non_spec_layer
+        )
+    return _materialize_non_spec_layer(layer, md)
+
+
+def _materialize_non_spec_layer(layer, md):
+    """materialize_non_spec for one layer."""
     done = md.__dict__.setdefault("_gsc_done", set())
     if id(layer) in done:
         return
