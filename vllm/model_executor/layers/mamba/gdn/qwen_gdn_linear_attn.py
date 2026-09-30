@@ -23,6 +23,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -30,6 +31,12 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+    gdn_gated_norm_mxfp8,
+    gdn_mxfp8_scale_numel,
+    gdn_norm_launch_config,
+    zero_fresh_state_rows,
+)
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -43,6 +50,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -89,6 +97,27 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+
+def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
+    """Whether ``linear`` takes a pre-quantized MXFP8 activation with FlashInfer's
+    F8_128x4 swizzled scales, the layout ``gdn_gated_norm_mxfp8`` writes.
+    """
+    if not current_platform.is_cuda():
+        return False
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutedslMxfp8LinearKernel,
+        FlashInferCutlassMxfp8LinearKernel,
+    )
+
+    kernel = getattr(getattr(linear, "quant_method", None), "kernel", None)
+    return (
+        isinstance(
+            kernel,
+            (FlashInferCutedslMxfp8LinearKernel, FlashInferCutlassMxfp8LinearKernel),
+        )
+        and kernel.input_quant_key() == kMxfp8Dynamic
+    )
 
 
 def _resolve_gdn_prefill_backend(
@@ -196,7 +225,18 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    g_is_exp: bool = False,
+    output: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
 ):
+    """FlashInfer chunked GDN prefill.
+
+    ``g_is_exp``: ``g`` already holds exp(g) (``fused_post_conv_prep`` with
+    ``output_g_exp=True``). ``output``: contiguous buffer with ``v.numel()``
+    elements that FlashInfer writes into instead of allocating.
+    ``state_indices``: contiguous int32 slot ids; ``initial_state`` is then the
+    fp32 SSM state pool, read from and updated in place at those rows (SM10x).
+    """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
@@ -212,7 +252,10 @@ def fi_chunk_gated_delta_rule(
 
     g = g.squeeze(0).contiguous()
     beta = beta.squeeze(0).contiguous()
-    fi_state = initial_state.to(torch.float32)
+    # The in-place pool is passed as is (FlashInfer indexes its rows).
+    fi_state = (
+        initial_state if state_indices is not None else initial_state.to(torch.float32)
+    )
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
@@ -221,11 +264,14 @@ def fi_chunk_gated_delta_rule(
         q=q,
         k=k,
         v=v,
-        g=torch.exp(fi_g),
+        g=fi_g if g_is_exp else torch.exp(fi_g),
         beta=fi_beta,
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        output=None if output is None else output.view(v.shape),
+        output_state=fi_state if state_indices is not None else None,
+        state_indices=state_indices,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -244,6 +290,9 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        # Callers of the FlashInfer path pass exp(g), computed in
+        # fused_post_conv_prep, instead of g.
+        self.expects_exp_g = active_backend == "flashinfer"
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -260,6 +309,16 @@ class ChunkGatedDeltaRule(CustomOp):
         else:
             self._forward_method = self.forward_native
 
+    def updates_state_in_place(self, state_dtype: torch.dtype) -> bool:
+        """Whether prefill reads and writes the SSM state pool in place
+        (FlashInfer ``state_indices``, SM10x, fp32 pool).
+        """
+        return (
+            self.gdn_prefill_backend == "flashinfer"
+            and current_platform.is_device_capability_family(100)
+            and state_dtype == torch.float32
+        )
+
     def forward_cuda(
         self,
         q: torch.Tensor,
@@ -274,6 +333,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
+        state_indices: torch.Tensor | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -285,11 +345,10 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            g_is_exp=self.expects_exp_g,
+            output=core_attn_out,
+            state_indices=state_indices,
         )
-        if core_attn_out is not None:
-            o_flat = o.squeeze(0).reshape(-1)
-            co_flat = core_attn_out.reshape(-1)
-            co_flat[: o_flat.numel()].copy_(o_flat)
         return o, final_state
 
     def forward_native(
@@ -526,6 +585,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.enable_fused_gdn_decode = self.gdn_decode_kernel == "cuda"
         logger.info_once("GDN decode kernel: %s", self.gdn_decode_kernel)
+        # The fused core op also emits out_proj's swizzled MXFP8 activation
+        # when out_proj is a FlashInfer MXFP8 linear that consumes it.
+        self.gdn_out_mxfp8 = self.enable_fused_gdn_decode and _consumes_swizzled_mxfp8(
+            self.out_proj
+        )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -915,16 +979,50 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_decode:
-            core_attn_out = torch.zeros(
+            layer_name = _encode_layer_name(self.prefix)
+            # The core op writes or zeroes every row itself.
+            core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+            if self.gdn_out_mxfp8:
+                # The core op writes out_proj's e4m3 activation and swizzled
+                # scales; core_attn_out is only its bf16 scratch.
+                hidden = core_attn_out.shape[1] * core_attn_out.shape[2]
+                out_q = torch.empty(
+                    (num_tokens, hidden),
+                    dtype=torch.float8_e4m3fn,
+                    device=hidden_states.device,
+                )
+                out_scale = torch.empty(
+                    gdn_mxfp8_scale_numel(num_tokens, hidden),
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+                torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                    mixed_qkvz,
+                    ba,
+                    core_attn_out,
+                    layer_name=layer_name,
+                    out_q=out_q,
+                    out_scale=out_scale,
+                )
+                output, _ = self.out_proj(
+                    QuantizedActivation(
+                        out_q,
+                        out_scale,
+                        hidden_states.dtype,
+                        out_q.shape,
+                        kMxfp8Dynamic,
+                    )
+                )
+                return output
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
                 mixed_qkvz,
                 ba,
                 core_attn_out,
-                layer_name=_encode_layer_name(self.prefix),
+                layer_name=layer_name,
             )
             output, _ = self.out_proj(core_attn_out.flatten(-2))
             return output
@@ -1123,7 +1221,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
         )
         q = q.unsqueeze(0)
         k = k.unsqueeze(0)
@@ -1268,6 +1366,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        spec_done: bool = False,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1276,6 +1375,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b: beta gating vector                   (num_tokens, num_heads)
             a: alpha gating vector                  (num_tokens, num_heads)
             core_attn_out: Pre-allocated output buffer for attention results.
+            spec_done: the caller already ran the spec rows of this mixed
+                batch (contiguous spec block only); process the rest.
 
         """
         forward_context = get_forward_context()
@@ -1310,6 +1411,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
+        # When the builder found the spec and non-spec tokens in two contiguous
+        # blocks, slice instead of gathering and let the recurrent kernels write
+        # their outputs into core_attn_out in place.
+        spec_slice: slice | None = None
+        non_spec_slice: slice | None = None
+        if attn_metadata.spec_token_start is not None:
+            assert attn_metadata.non_spec_token_start is not None
+            spec_start = attn_metadata.spec_token_start
+            non_spec_start = attn_metadata.non_spec_token_start
+            spec_slice = slice(
+                spec_start, spec_start + attn_metadata.num_spec_decode_tokens
+            )
+            non_spec_slice = slice(
+                non_spec_start,
+                non_spec_start
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens,
+            )
+        assert not spec_done or (
+            spec_slice is not None and attn_metadata.num_prefills > 0
+        )
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
@@ -1339,6 +1461,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_slice is not None:
+                mixed_qkv_spec = mixed_qkv[spec_slice]
+                a_spec = a[spec_slice]
+                b_spec = b[spec_slice]
+                mixed_qkv_non_spec = mixed_qkv[non_spec_slice]
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 a_spec = a.index_select(0, spec_token_indx)
@@ -1349,7 +1476,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and not spec_done:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -1400,7 +1527,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+            None if spec_done else mixed_qkv_spec
+        )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
@@ -1414,7 +1543,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
+            if non_spec_slice is not None:
+                a_non_spec = a[non_spec_slice]
+                b_non_spec = b[non_spec_slice]
+            elif spec_sequence_masks is not None:
                 a_non_spec = a.index_select(0, non_spec_token_indx)
                 b_non_spec = b.index_select(0, non_spec_token_indx)
             else:
@@ -1446,7 +1578,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
                 apply_l2norm=True,
-                output_g_exp=False,
+                output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
             )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
@@ -1463,7 +1595,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and not spec_done:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1482,6 +1614,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    out=None if spec_slice is None else core_attn_out[spec_slice],
                 )
             )
         else:
@@ -1521,26 +1654,66 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            initial_state = ssm_state[prefill_state_indices]
-            initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
+            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+            if attn_metadata.prefill_query_start_loc_i64 is not None:
+                prefill_query_start_loc = attn_metadata.prefill_query_start_loc_i64
+            non_spec_out = (
+                None if non_spec_slice is None else core_attn_out[non_spec_slice]
             )
-            # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
+                # FlashInfer reads and updates the pool rows in place through
+                # state_indices; only the rows of sequences without initial
+                # state are zeroed first. Batches without spec rows index
+                # block_table[:, 0], a strided view; FlashInfer and the zeroing
+                # kernel need unit stride.
+                prefill_state_indices = prefill_state_indices.contiguous()
+                zero_fresh_state_rows(
+                    ssm_state, prefill_state_indices, prefill_has_initial_state
+                )
+                core_attn_out_non_spec, _ = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=ssm_state,
+                    output_final_state=True,
+                    cu_seqlens=prefill_query_start_loc,
+                    use_qk_l2norm_in_kernel=False,
+                    core_attn_out=non_spec_out,
+                    state_indices=prefill_state_indices,
+                )
+            else:
+                if attn_metadata.prefill_state_indices_i64 is not None:
+                    # int64 indices and the inverted mask were converted once
+                    # per step by the metadata builder.
+                    prefill_state_indices = attn_metadata.prefill_state_indices_i64
+                    initial_state = ssm_state[prefill_state_indices]
+                    initial_state[attn_metadata.prefill_no_initial_state, ...] = 0
+                else:
+                    initial_state = ssm_state[prefill_state_indices]
+                    initial_state[~prefill_has_initial_state, ...] = 0
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                    core_attn_out=non_spec_out,
+                )
+                # Init cache
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1573,10 +1746,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
-            core_attn_out.index_copy_(
-                0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
-            )
+            # With spec_slice set, both blocks were written in place above.
+            if spec_slice is None:
+                core_attn_out.index_copy_(
+                    0, spec_token_indx, core_attn_out_spec.squeeze(0)
+                )
+                core_attn_out.index_copy_(
+                    0, non_spec_token_indx, core_attn_out_non_spec.squeeze(0)
+                )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
@@ -1787,6 +1964,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,
         core_attn_out: torch.Tensor,
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -1796,6 +1975,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
+            # The outputs are uninitialized; hand out_proj the zeros they
+            # would have been allocated with.
+            if out_q is not None:
+                assert out_scale is not None
+                out_q.zero_()
+                out_scale.zero_()
+            else:
+                core_attn_out.zero_()
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1812,6 +1999,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             output_gate=output_gate,
             core_attn_out=core_attn_out,
+            out_q=out_q,
+            out_scale=out_scale,
         )
 
     def _can_use_fused_gdn_mtp_decode(
@@ -1865,6 +2054,76 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=self.norm.activation,
         )
 
+    def _rms_norm_gated_strided_gate_cuda(
+        self,
+        x: torch.Tensor,
+        output_gate: torch.Tensor,
+    ) -> None:
+        """In-place ``_rms_norm_gated_cuda(x, output_gate, x)`` for [T, HV, V].
+
+        Normalizes T rows of HV * V columns with one group per head (group size
+        V), so every (token, head) sees the same math as the [T * HV, V] launch.
+        The output gate, a row-strided view of mixed_qkvz, is read in place
+        instead of first being copied into a compact [T * HV, V] tensor. The
+        kernel indexes the weight per group, so it gets norm.weight tiled across
+        heads (8 KiB, rebuilt per call so weight reloads are always honored).
+        The launch uses more rows and warps per CTA than the heuristic for
+        [T * HV, V] rows once T is large (``gdn_norm_launch_config``).
+        """
+        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+            layer_norm_fwd,
+        )
+
+        num_tokens, num_heads, head_dim = x.shape
+        assert output_gate.shape == x.shape
+        x_2d = x.view(num_tokens, num_heads * head_dim)
+        # view, not reshape: merging (HV, V) of the gate must not copy.
+        output_gate_2d = output_gate.view(num_tokens, num_heads * head_dim)
+        assert output_gate_2d.stride(-1) == 1
+        rows_per_block, num_warps = gdn_norm_launch_config(num_tokens, x.device)
+        layer_norm_fwd(
+            x_2d,
+            self.norm.weight.repeat(num_heads),
+            self.norm.bias,
+            self.norm.eps,
+            z=output_gate_2d,
+            out=x_2d,
+            group_size=(
+                head_dim if self.norm.group_size is None else self.norm.group_size
+            ),
+            norm_before_gate=self.norm.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.norm.activation,
+            rows_per_block=rows_per_block,
+            num_warps=num_warps,
+        )
+
+    def _gated_norm_mxfp8(
+        self,
+        core_attn_out: torch.Tensor,
+        output_gate: torch.Tensor,
+        out_q: torch.Tensor,
+        out_scale: torch.Tensor,
+        norm_rows: tuple[int, int],
+        num_valid: int | torch.Tensor,
+    ) -> None:
+        """Gated RMSNorm of ``norm_rows`` plus out_proj's MXFP8 activation of
+        every valid row; rows ``>= num_valid`` are zero-filled unread.
+        """
+        assert self.norm.bias is None and self.norm.norm_before_gate
+        assert self.norm.group_size in (None, self.head_v_dim)
+        gdn_gated_norm_mxfp8(
+            core_attn_out,
+            output_gate,
+            self.norm.weight,
+            self.norm.eps,
+            self.norm.activation,
+            out_q,
+            out_scale,
+            norm_rows,
+            num_valid,
+        )
+
     def _forward_core_fused_norm(
         self,
         mixed_qkv: torch.Tensor,
@@ -1872,7 +2131,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
     ) -> None:
+        """Core + gated RMSNorm into ``core_attn_out``, or, when ``out_q`` and
+        ``out_scale`` are given, into out_proj's swizzled MXFP8 activation, with
+        ``core_attn_out`` as bf16 scratch. The outputs are uninitialized: every
+        row is either written by the kernels or zeroed here.
+        """
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         attn_metadata = None
@@ -1883,10 +2149,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        quantize = out_q is not None
+        assert quantize == (out_scale is not None)
         if (
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
         ):
+            if not quantize:
+                # The MTP kernel skips FULL-graph padding requests.
+                core_attn_out.zero_()
             self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -1895,19 +2166,106 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
+            if quantize:
+                # Only the MTP rows of real requests are valid; their count is
+                # on the device (FULL-graph replay pads the requests).
+                num_spec = attn_metadata.num_spec_decodes
+                assert attn_metadata.spec_query_start_loc is not None
+                self._gated_norm_mxfp8(
+                    core_attn_out,
+                    output_gate,
+                    out_q,  # type: ignore[arg-type]
+                    out_scale,  # type: ignore[arg-type]
+                    norm_rows=(0, 0),
+                    num_valid=attn_metadata.spec_query_start_loc[
+                        num_spec : num_spec + 1
+                    ],
+                )
             return
-        self._forward_core(
-            mixed_qkv=mixed_qkv,
-            b=b.contiguous(),
-            a=a.contiguous(),
-            core_attn_out=core_attn_out,
-        )
+
         num_actual_tokens = attn_metadata.num_actual_tokens
-        self._rms_norm_gated_cuda(
-            core_attn_out[:num_actual_tokens],
-            output_gate[:num_actual_tokens],
-            core_attn_out[:num_actual_tokens],
-        )
+        if attn_metadata.num_prefills > 0:
+            # Mixed batches run eagerly and the core writes every token row.
+            num_written = (
+                attn_metadata.num_spec_decode_tokens
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens
+            )
+        else:
+            # Decode-only batches may replay FULL graphs, whose padding rows
+            # these kernels are not known to write: zero first.
+            core_attn_out.zero_()
+            num_written = num_actual_tokens
+        norm_rows = (0, num_written)
+        if (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.spec_token_start is not None
+            and self._can_use_fused_gdn_mtp_decode(attn_metadata)
+        ):
+            # The contiguous spec block goes through the fused CUDA MTP kernel
+            # (gating, recurrence and gated norm, as in decode-only batches);
+            # the rest through the prefill path, with b/a read strided.
+            assert attn_metadata.non_spec_token_start is not None
+            spec_start = attn_metadata.spec_token_start
+            spec_rows = slice(
+                spec_start, spec_start + attn_metadata.num_spec_decode_tokens
+            )
+            self._forward_core_decode_spec_fused_norm(
+                mixed_qkv=mixed_qkv[spec_rows],
+                b=b[spec_rows],
+                a=a[spec_rows],
+                output_gate=output_gate[spec_rows],
+                core_attn_out=core_attn_out[spec_rows],
+                attn_metadata=attn_metadata,
+            )
+            self._forward_core(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                spec_done=True,
+            )
+            non_spec_start = attn_metadata.non_spec_token_start
+            norm_rows = (
+                non_spec_start,
+                non_spec_start
+                + attn_metadata.num_prefill_tokens
+                + attn_metadata.num_decode_tokens,
+            )
+        else:
+            self._forward_core(
+                mixed_qkv=mixed_qkv,
+                b=b.contiguous(),
+                a=a.contiguous(),
+                core_attn_out=core_attn_out,
+            )
+        if quantize:
+            self._gated_norm_mxfp8(
+                core_attn_out,
+                output_gate,
+                out_q,  # type: ignore[arg-type]
+                out_scale,  # type: ignore[arg-type]
+                norm_rows=norm_rows,
+                num_valid=num_written,
+            )
+            return
+        norm_lo, norm_hi = norm_rows
+        if attn_metadata.num_prefills > 0:
+            # Read the strided output gate in place instead of copying it
+            # compact. Decode-only batches (FULL graphs) keep the [T*HV, V]
+            # launch.
+            self._rms_norm_gated_strided_gate_cuda(
+                core_attn_out[norm_lo:norm_hi],
+                output_gate[norm_lo:norm_hi],
+            )
+            # Only the piecewise-graph padding rows are left to zero.
+            core_attn_out[num_written:].zero_()
+        else:
+            self._rms_norm_gated_cuda(
+                core_attn_out[:num_actual_tokens],
+                output_gate[:num_actual_tokens],
+                core_attn_out[:num_actual_tokens],
+            )
 
 
 @eager_break_during_capture
@@ -1964,7 +2322,13 @@ def qwen_gdn_attention_core_fused_norm_packed(
     ba: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: LayerNameType,
+    out_q: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> None:
+    """``out_q``/``out_scale``: out_proj's e4m3 activation and flat swizzled
+    UE8M0 scales, written instead of the normed bf16 output (``core_attn_out``
+    is then scratch).
+    """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
@@ -1972,13 +2336,15 @@ def qwen_gdn_attention_core_fused_norm_packed(
         mixed_qkvz=mixed_qkvz,
         ba=ba,
         core_attn_out=core_attn_out,
+        out_q=out_q,
+        out_scale=out_scale,
     )
 
 
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed",
     op_func=qwen_gdn_attention_core_fused_norm_packed,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "out_q", "out_scale"],
 )
 
 
