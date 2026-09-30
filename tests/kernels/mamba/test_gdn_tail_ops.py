@@ -193,3 +193,55 @@ def test_gdn_norm_launch_config_is_bitwise(tokens: str) -> None:
     tuned = _layer_norm_strided(x, z, w, "silu", launch_config=True)
     default = _layer_norm_strided(x, z, w, "silu", launch_config=False)
     assert torch.equal(tuned, default)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("num_seqs", [1, 7, 64])
+@torch.inference_mode()
+def test_zero_fresh_state_rows(num_seqs: int) -> None:
+    """Only the slots of sequences without initial state are zeroed, and the
+    pool's row padding (vLLM pads the slot stride) is left untouched.
+    """
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+
+    heads, k, pad, slots = 4, 128, 4096, 96
+    row = heads * V * k
+    g = torch.Generator(device="cuda").manual_seed(num_seqs)
+    pool_raw = torch.randn(slots, row + pad, generator=g, device="cuda")
+    pool = pool_raw[:, :row].view(slots, heads, V, k)
+    cpu = torch.Generator().manual_seed(num_seqs)
+    indices = (torch.randperm(slots - 1, generator=cpu)[:num_seqs] + 1).int().cuda()
+    has_initial_state = torch.rand(num_seqs, generator=g, device="cuda") < 0.5
+    has_initial_state[0] = False
+    expected = pool_raw.clone()
+    expected[indices.long()[~has_initial_state], :row] = 0
+
+    zero_fresh_state_rows(pool, indices, has_initial_state)
+    assert torch.equal(pool_raw, expected)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@torch.inference_mode()
+def test_zero_fresh_state_rows_skips_pad_slots() -> None:
+    """Padded rows (negative slot id, no initial state) write nothing: the
+    pool is a view one row into a larger buffer, so a store at slot -1 would
+    land in the buffer's first row.
+    """
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+
+    heads, k, slots = 4, 128, 8
+    row = heads * V * k
+    g = torch.Generator(device="cuda").manual_seed(0)
+    buf = torch.randn(slots + 1, row, generator=g, device="cuda")
+    pool = buf[1:].view(slots, heads, V, k)
+    indices = torch.tensor([3, -1, 5, -1], dtype=torch.int32, device="cuda")
+    has_initial_state = torch.tensor([False, False, True, False], device="cuda")
+    expected = buf.clone()
+    expected[1 + 3] = 0
+
+    zero_fresh_state_rows(pool, indices, has_initial_state)
+    assert torch.equal(buf, expected)
