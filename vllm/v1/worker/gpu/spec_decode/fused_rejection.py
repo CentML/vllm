@@ -49,10 +49,10 @@ from vllm.v1.worker.gpu.sample.spec_topk_topp import (
 # the survivor search. The second kernel loads KP sub-blocks (KP * SUB logits),
 # chosen in two levels (groups of _GROUP sub-blocks) when there are enough.
 # Launch configuration tuned on VR (sm_107) by sweep_fused.py.
-_BLOCK_SIZE = 4096
-_SUB_SIZE = 128
-_GROUP = 32
-_SUBMAX_WARPS = 8
+_BLOCK_SIZE = 2048
+_SUB_SIZE = 32
+_GROUP = 16
+_SUBMAX_WARPS = 4
 _SELECT_WARPS = 8
 
 
