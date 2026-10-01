@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
 from typing import ClassVar
 
+import flashinfer.decode as flashinfer_decode
 import numpy as np
 import torch
 from flashinfer import (
@@ -19,7 +22,7 @@ from flashinfer import (
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
-from flashinfer.utils import FP4Tensor
+from flashinfer.utils import FP4Tensor, get_trtllm_gen_multi_ctas_kv_counter_bytes
 from typing_extensions import override
 
 from vllm import _custom_ops as custom_ops
@@ -109,6 +112,94 @@ def _get_trtllm_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_workspace_buffer
+
+
+# trtllm-gen decode split-KV control (see _trtllm_gen_decode_sm_count).
+_TRTLLM_GEN_MAX_GROUPED_Q_ROWS = 128
+_TRTLLM_GEN_PARTIAL_BYTES_PER_ROW_ELT = 4
+_TRTLLM_GEN_PARTIAL_STATS_BYTES_PER_ROW = 8
+trtllm_gen_decode_counter_buffer: torch.Tensor | None = None
+
+
+def _trtllm_gen_decode_sm_count(
+    num_reqs: int,
+    max_q_len: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    device_sm_count: int,
+    workspace_bytes: int,
+    max_kv_per_cta: int,
+) -> int:
+    """SM count to report to FlashInfer's trtllm-gen decode kernel selection.
+
+    FlashInfer splits every sequence's KV over
+    ``k = min(ceil(max_seq_len / 512), sm_count // (num_q_ctas * num_kv_heads *
+    num_reqs))`` CTAs, i.e. it fills exactly one wave, and each CTA covers
+    ``max_seq_len / k`` KV tokens (k == 1 selects the Persistent kernel). CUDA
+    graphs are captured with ``max_seq_len = max_model_len``, so with long,
+    uneven contexts the longest request decides the kernel time: on 212 SMs at
+    40-53 requests (k = 2) a request shorter than ``max_model_len / 2`` runs on
+    a single CTA, and from 54 requests on every request does.
+
+    This raises k to ``ceil(max_seq_len / max_kv_per_cta)`` by reporting
+    ``k * num_kv_heads * num_reqs`` SMs. CTAs whose chunk starts beyond their
+    request's KV length exit at once. The partial-O scratch of the gmem
+    reduction (one tile per CTA, inside ``workspace_bytes``) caps k.
+    """
+    if max_kv_per_cta <= 0 or num_reqs <= 0:
+        return device_sm_count
+    q_rows = max_q_len * (num_qo_heads // num_kv_heads)
+    if q_rows > _TRTLLM_GEN_MAX_GROUPED_Q_ROWS:
+        # More than one Q CTA per request and KV head: keep FlashInfer's choice.
+        return device_sm_count
+    ctas_per_split = num_kv_heads * num_reqs
+    default_splits = device_sm_count // ctas_per_split
+    splits = cdiv(max_seq_len, max_kv_per_cta)
+    tile_q = max(8, 1 << (q_rows - 1).bit_length())
+    bytes_per_cta = tile_q * (
+        _TRTLLM_GEN_PARTIAL_STATS_BYTES_PER_ROW
+        + _TRTLLM_GEN_PARTIAL_BYTES_PER_ROW_ELT * head_size
+    )
+    splits = min(splits, workspace_bytes // 2 // (bytes_per_cta * ctas_per_split))
+    if splits <= max(default_splits, 1):
+        return device_sm_count
+    return splits * ctas_per_split
+
+
+@contextmanager
+def _flashinfer_decode_sm_count(sm_count: int) -> Iterator[None]:
+    """Make ``flashinfer.decode`` report ``sm_count`` SMs within this scope.
+
+    ``trtllm_batch_decode_with_kv_cache`` reads the SM count from
+    ``flashinfer.decode.get_device_sm_count`` and passes it to the kernel
+    selection; it has no parameter for it.
+    """
+    device_sm_count = flashinfer_decode.get_device_sm_count
+    flashinfer_decode.get_device_sm_count = lambda _device: sm_count
+    try:
+        yield
+    finally:
+        flashinfer_decode.get_device_sm_count = device_sm_count
+
+
+def _get_trtllm_gen_decode_counter_buffer(
+    num_bytes: int, device: torch.device
+) -> torch.Tensor:
+    """Persistent zeroed semaphore buffer for trtllm-gen multi-CTA-KV decode.
+
+    The kernel resets its semaphores after every launch, so the buffer is
+    zeroed once. Without it, ``trtllm_batch_decode_with_kv_cache`` allocates
+    and zero-fills a fresh buffer before every decode FMHA. Sized once for the
+    worst case so CUDA graphs never see it reallocated.
+    """
+    global trtllm_gen_decode_counter_buffer
+    if trtllm_gen_decode_counter_buffer is None:
+        trtllm_gen_decode_counter_buffer = torch.zeros(
+            num_bytes, dtype=torch.uint8, device=device
+        )
+    return trtllm_gen_decode_counter_buffer
 
 
 def _pack_draft_block_bool_mask(
@@ -1881,6 +1972,21 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        # trtllm-gen decode split-KV policy and the worst-case decode batch
+        # that sizes the persistent counter buffer (resolved on first decode,
+        # never regrown after CUDA-graph capture).
+        self.trtllm_decode_max_kv_per_cta = (
+            envs.VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA
+        )
+        self._trtllm_decode_max_reqs: int | None = None
+        self._trtllm_decode_max_model_len: int | None = None
+        if vllm_config is not None and vllm_config.model_config is not None:
+            sched = vllm_config.scheduler_config
+            self._trtllm_decode_max_reqs = (
+                sched.max_num_batched_tokens or sched.max_num_seqs
+            )
+            self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
+        self._device_sm_count: int | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -1907,6 +2013,58 @@ class FlashInferImpl(AttentionImpl):
     def kv_cache_layout(self) -> KVCacheLayout:
         assert self.cache_config is not None
         return self.cache_config.get_resolved_kv_cache_layout()
+
+    def _trtllm_gen_decode_launch_config(
+        self,
+        num_reqs: int,
+        max_q_len: int,
+        max_seq_len: int,
+        query: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ) -> tuple[int, torch.Tensor | None]:
+        """Kernel-selection SM count and multi-CTA-KV counter buffer for one
+        trtllm-gen decode launch.
+        """
+        if self._device_sm_count is None:
+            self._device_sm_count = flashinfer_decode.get_device_sm_count(query.device)
+        num_qo_heads = query.size(1)
+        workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+        sm_count = _trtllm_gen_decode_sm_count(
+            num_reqs,
+            max_q_len,
+            max_seq_len,
+            num_qo_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self._device_sm_count,
+            workspace_bytes,
+            self.trtllm_decode_max_kv_per_cta,
+        )
+        if self._trtllm_decode_max_reqs is None:
+            return sm_count, None
+        max_reqs = self._trtllm_decode_max_reqs
+        assert self._trtllm_decode_max_model_len is not None
+        # Worst case: every request split ceil(max_model_len / max_kv_per_cta)
+        # ways (the policy never reports more SMs than that).
+        max_splits = (
+            cdiv(self._trtllm_decode_max_model_len, self.trtllm_decode_max_kv_per_cta)
+            if self.trtllm_decode_max_kv_per_cta > 0
+            else 1
+        )
+        counter_buffer = _get_trtllm_gen_decode_counter_buffer(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                max_reqs,
+                num_qo_heads,
+                max(self._device_sm_count, max_splits * self.num_kv_heads * max_reqs),
+            ),
+            query.device,
+        )
+        needed = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            num_reqs, num_qo_heads, sm_count
+        )
+        if needed > counter_buffer.numel():
+            return sm_count, None
+        return sm_count, counter_buffer
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         if quant_key == kNvfp4Dynamic and self.is_kvcache_nvfp4:
@@ -2561,32 +2719,48 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
-                    query=decode_query,
-                    kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
-                    ),
-                    workspace_buffer=workspace_buffer,
-                    block_tables=block_tables_decode,
-                    seq_lens=seq_lens_decode,
-                    max_seq_len=attn_metadata.decode.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
-                    backend=attn_metadata.decode.kernel.value,
-                    q_len_per_req=q_len_per_req,
-                    max_q_len=max_q_len,
-                    cum_seq_lens_q=q_cu_seq_lens,
-                    kv_cache_sf=(
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                    ),
-                    lse=lse,
-                    return_lse=self.need_to_return_lse_for_decode,
+                if q_cu_seq_lens is not None:
+                    decode_batch = q_cu_seq_lens.size(0) - 1
+                    decode_max_q_len = attn_metadata.decode.q_len_per_req
+                else:
+                    assert q_len_per_req is not None
+                    decode_batch = decode_query.size(0) // q_len_per_req
+                    decode_max_q_len = q_len_per_req
+                sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
+                    decode_batch,
+                    decode_max_q_len,
+                    attn_metadata.decode.max_seq_len,
+                    decode_query,
+                    workspace_buffer,
                 )
+                with _flashinfer_decode_sm_count(sm_count):
+                    trtllm_batch_decode_with_kv_cache(
+                        query=decode_query,
+                        kv_cache=(
+                            nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
+                        ),
+                        workspace_buffer=workspace_buffer,
+                        block_tables=block_tables_decode,
+                        seq_lens=seq_lens_decode,
+                        max_seq_len=attn_metadata.decode.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                        backend=attn_metadata.decode.kernel.value,
+                        q_len_per_req=q_len_per_req,
+                        max_q_len=max_q_len,
+                        cum_seq_lens_q=q_cu_seq_lens,
+                        kv_cache_sf=(
+                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        ),
+                        lse=lse,
+                        return_lse=self.need_to_return_lse_for_decode,
+                        multi_ctas_kv_counter_buffer=counter_buffer,
+                    )
 
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)
