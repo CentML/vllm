@@ -254,7 +254,9 @@ class _Diag:
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
     ) -> None:
-        tok = last_sampled[idx_mapping.long()].long()
+        # last_sampled is [max_num_reqs] or [max_num_reqs, 1] (one token per
+        # request state); index it flat like the prefill-input kernel does.
+        tok = last_sampled.reshape(-1)[idx_mapping.long()].long()
         valid = num_sampled > 0
         outside = self._outside(head, tok) & valid
         self.counts[3] += valid.sum()
