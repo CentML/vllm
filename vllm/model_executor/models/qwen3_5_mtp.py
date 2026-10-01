@@ -360,7 +360,7 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             return
         self.draft_lm_head_mxfp8 = Mxfp8DraftLmHead(head.weight.data)
         logger.info(
-            "MTP draft lm_head runs as MXFP8 (M <= 128) on a quantized copy of "
+            "MTP draft lm_head runs as MXFP8 (M <= 32) on a quantized copy of "
             "the BF16 head %s.",
             tuple(head.weight.shape),
         )
