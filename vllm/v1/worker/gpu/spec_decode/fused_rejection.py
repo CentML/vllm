@@ -46,9 +46,14 @@ from vllm.v1.worker.gpu.sample.spec_topk_topp import (
 )
 
 # Vocab block per program of the first kernel and the sub-block granularity of
-# the survivor search. The second kernel loads KP sub-blocks (KP * SUB logits).
+# the survivor search. The second kernel loads KP sub-blocks (KP * SUB logits),
+# chosen in two levels (groups of _GROUP sub-blocks) when there are enough.
+# Launch configuration tuned on VR (sm_107) by sweep_fused.py.
 _BLOCK_SIZE = 4096
 _SUB_SIZE = 128
+_GROUP = 32
+_SUBMAX_WARPS = 8
+_SELECT_WARPS = 8
 
 
 @triton.jit
@@ -101,26 +106,32 @@ def _penalized_submax_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     SUB_SIZE: tl.constexpr,
+    # Power of two >= the most logits rows of one request.
+    ROWS: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
-    end = tl.load(cu_num_logits_ptr + req_idx + 1).to(tl.int64)
+    num_rows = tl.load(cu_num_logits_ptr + req_idx + 1) - start
     temp = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
+    r = tl.arange(0, ROWS)
+    row_mask = r < num_rows
+    rows = start + r
+    tile_mask = row_mask[:, None] & mask[None, :]
     NUM_SUB: tl.constexpr = BLOCK_SIZE // SUB_SIZE
     sub_offs = block_idx * NUM_SUB + tl.arange(0, NUM_SUB)
 
-    use_penalty = False
-    use_rep_penalty = False
-    rep_penalty = 1.0
-    freq_penalty = 0.0
-    pres_penalty = 0.0
-    output_bin_counts = tl.zeros((BLOCK_SIZE,), tl.int32)
-    prompt_bin_mask = tl.zeros((BLOCK_SIZE,), tl.int1)
+    # All rows of the request at once (one wide load, then one shared load of
+    # the request's penalty state).
+    logits = tl.load(
+        logits_ptr + rows[:, None] * logits_stride + block[None, :],
+        mask=tile_mask,
+        other=float("-inf"),
+    ).to(tl.float32)
     if HAS_PENALTIES:
         rep_penalty = tl.load(repetition_penalty_ptr + req_state_idx)
         freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)
@@ -135,45 +146,49 @@ def _penalized_submax_kernel(
                 mask=mask,
                 other=0,
             )
-        if use_rep_penalty:
-            packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
-            packed_mask = tl.load(
-                prompt_bin_mask_ptr
-                + req_state_idx * prompt_bin_mask_stride
-                + packed_block,
-                mask=packed_block < tl.cdiv(vocab_size, 32),
-                other=0,
+            # Row start + p also counts the draft tokens of rows 1..p, as
+            # _penalties_kernel does: a running sum over the row axis.
+            has_draft = row_mask & (r > 0)
+            draft = tl.load(
+                input_ids_ptr
+                + tl.load(logits_indices_ptr + rows, mask=has_draft, other=0),
+                mask=has_draft,
+                other=-1,
             )
-            bits = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
-            prompt_bin_mask = bits.to(tl.int1).reshape(BLOCK_SIZE)
-
-    for row in range(start, end):
-        # Row start + p also counts the draft tokens at positions 1..p of the
-        # request, as _penalties_kernel does.
-        if HAS_PENALTIES and row > start:
-            token_idx = tl.load(logits_indices_ptr + row)
-            prev_token = tl.load(input_ids_ptr + token_idx)
-            output_bin_counts += (block == prev_token).to(tl.int32)
-        logits = tl.load(
-            logits_ptr + row * logits_stride + block,
-            mask=mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        if use_penalty:
+            matches = (block[None, :] == draft[:, None]).to(tl.int32)
+            counts = output_bin_counts[None, :] + tl.cumsum(matches, axis=0)
+            prompt_bin_mask = tl.zeros((BLOCK_SIZE,), tl.int1)
+            if use_rep_penalty:
+                packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(
+                    0, BLOCK_SIZE // 32
+                )
+                packed_mask = tl.load(
+                    prompt_bin_mask_ptr
+                    + req_state_idx * prompt_bin_mask_stride
+                    + packed_block,
+                    mask=packed_block < tl.cdiv(vocab_size, 32),
+                    other=0,
+                )
+                bits = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
+                prompt_bin_mask = bits.to(tl.int1).reshape(BLOCK_SIZE)
             logits = _penalize(
                 logits,
-                output_bin_counts,
-                prompt_bin_mask,
+                counts,
+                prompt_bin_mask[None, :],
                 rep_penalty,
                 freq_penalty,
                 pres_penalty,
                 use_rep_penalty,
             )
-        if temp != 0.0 and temp != 1.0:
-            logits = logits / temp
-        logits = tl.where(mask, logits, float("-inf"))
-        submax = tl.max(tl.reshape(logits, (NUM_SUB, SUB_SIZE)), axis=1)
-        tl.store(submax_ptr + row * submax_stride + sub_offs, submax)
+    if temp != 0.0 and temp != 1.0:
+        logits = logits / temp
+    logits = tl.where(tile_mask, logits, float("-inf"))
+    submax = tl.max(tl.reshape(logits, (ROWS, NUM_SUB, SUB_SIZE)), axis=2)
+    tl.store(
+        submax_ptr + rows[:, None] * submax_stride + sub_offs[None, :],
+        submax,
+        mask=row_mask[:, None],
+    )
 
 
 @triton.jit
@@ -212,6 +227,8 @@ def _select_survivors_kernel(
     KP: tl.constexpr,
     SUB_SIZE: tl.constexpr,
     PADDED_NUM_SUB: tl.constexpr,
+    # 0, or the sub-blocks per group of a two-level selection.
+    GROUP: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
     TOP_P: tl.constexpr,
 ):
@@ -220,14 +237,36 @@ def _select_survivors_kernel(
     top_k = tl.load(top_k_ptr + req_state_idx)
     temp = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
 
-    # 1. The KP sub-blocks with the largest (max, -index) keys.
-    sub = tl.arange(0, PADDED_NUM_SUB)
-    submax = tl.load(
-        submax_ptr + row * submax_stride + sub,
-        mask=sub < num_sub,
-        other=float("-inf"),
-    )
-    top_sub = tl.topk(_pack_keys(submax, sub, PADDED_NUM_SUB), KP)
+    # 1. The KP sub-blocks with the largest (max, -index) keys. Two-level: the
+    # same argument one level up puts them inside the KP groups (contiguous
+    # runs of GROUP sub-blocks) with the largest (max, -index) keys.
+    if GROUP > 0:
+        NUM_GROUPS: tl.constexpr = PADDED_NUM_SUB // GROUP
+        grp = tl.arange(0, NUM_GROUPS)
+        sub = grp[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        top_grp = tl.topk(_pack_keys(tl.max(submax, axis=1), grp, NUM_GROUPS), KP)
+        _, grp_idx = _unpack_keys(top_grp, NUM_GROUPS)
+        sub = grp_idx[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        sub_keys = tl.reshape(_pack_keys(submax, sub, PADDED_NUM_SUB), (KP * GROUP,))
+    else:
+        sub = tl.arange(0, PADDED_NUM_SUB)
+        submax = tl.load(
+            submax_ptr + row * submax_stride + sub,
+            mask=sub < num_sub,
+            other=float("-inf"),
+        )
+        sub_keys = _pack_keys(submax, sub, PADDED_NUM_SUB)
+    top_sub = tl.topk(sub_keys, KP)
     _, sub_idx = _unpack_keys(top_sub, PADDED_NUM_SUB)
 
     # 2. Their processed logits.
@@ -472,6 +511,8 @@ def select_survivors(
     penalties: tuple[torch.Tensor, ...] | None,
     max_top_k: int,
     use_top_p: bool,
+    # Most logits rows of one request (num_speculative_steps + 1).
+    max_rows_per_req: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Top-k/top-p survivors of the penalized, temperature-scaled logits.
 
@@ -489,6 +530,9 @@ def select_survivors(
     kp = _top_k_pow2(max_top_k)
     num_blocks = triton.cdiv(vocab_size, _BLOCK_SIZE)
     num_sub = num_blocks * (_BLOCK_SIZE // _SUB_SIZE)
+    # At least KP wide, so topk returns KP distinct (possibly empty) sub-blocks
+    # when the vocab has fewer sub-blocks than KP.
+    padded_num_sub = max(triton.next_power_of_2(num_sub), kp)
     submax = torch.empty(num_logits, num_sub, dtype=torch.float32, device=device)
     surv_val = torch.empty(num_logits, kp, dtype=torch.float32, device=device)
     surv_idx = torch.empty(num_logits, kp, dtype=torch.int32, device=device)
@@ -527,8 +571,9 @@ def select_survivors(
         vocab_size,
         BLOCK_SIZE=_BLOCK_SIZE,
         SUB_SIZE=_SUB_SIZE,
+        ROWS=triton.next_power_of_2(max_rows_per_req),
         HAS_PENALTIES=has_penalties,
-        num_warps=8,
+        num_warps=_SUBMAX_WARPS,
     )
     _select_survivors_kernel[(num_logits,)](
         surv_val,
@@ -557,12 +602,11 @@ def select_survivors(
         vocab_size,
         KP=kp,
         SUB_SIZE=_SUB_SIZE,
-        # At least KP wide, so topk returns KP distinct (possibly empty)
-        # sub-blocks when the vocab has fewer sub-blocks than KP.
-        PADDED_NUM_SUB=max(triton.next_power_of_2(num_sub), kp),
+        PADDED_NUM_SUB=padded_num_sub,
+        GROUP=_GROUP if _GROUP and padded_num_sub // _GROUP >= kp else 0,
         HAS_PENALTIES=has_penalties,
         TOP_P=use_top_p,
-        num_warps=8,
+        num_warps=_SELECT_WARPS,
     )
     return surv_val, surv_idx, num_surv, lse
 
@@ -624,6 +668,7 @@ def fused_rejection_sample(
         penalties,
         max_top_k,
         use_top_p,
+        num_speculative_steps + 1,
     )
     _compact_rejection_kernel[(num_reqs,)](
         sampled,
