@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int | None = None
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL: bool = True
+    VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
     VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
     VLLM_FI_PERSISTENT_KV_COUNTER_BYTES: int = 1 << 20
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1792,12 +1793,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: maybe_convert_int(
         os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA")
     ),
-    # Run single-request chunked prefills over a long cached prefix on the
-    # trtllm-gen generation kernel when its wave/KV-split model predicts a gain
-    # (SM107, FP8 Q/KV, head_dim 256, GQA 8). Set to 0 to always use the
-    # trtllm-gen context kernel.
+    # Run chunked prefills over a long cached prefix on the trtllm-gen generation
+    # kernel when its wave/KV-split model predicts a gain (SM107, FP8 Q/KV,
+    # head_dim 256, GQA 8). Set to 0 to always use the trtllm-gen context kernel.
     "VLLM_FLASHINFER_TRTLLM_GEN_PREFILL": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_TRTLLM_GEN_PREFILL", "1"))
+    ),
+    # Most prefill requests one generation-kernel prefill launch may cover (the
+    # launch is varlen; see trtllm_gen_prefill_sm_count). 1 = single-request
+    # chunks only.
+    "VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS", "64")
     ),
     # Pass one persistent, zero-initialized multi-CTA KV counter buffer per
     # device to the trtllm-gen context kernel instead of letting FlashInfer
