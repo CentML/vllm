@@ -177,7 +177,7 @@ def _survivors(b: Batch):
     return select_survivors(
         b.logits, b.input_ids, b.logits_indices, b.cu_num_logits, b.idx_mapping,
         b.expanded_idx_mapping, b.expanded_local_pos, b.temperature, b.top_k,
-        b.top_p, b.penalties, b.max_top_k, b.use_top_p, STEPS + 1,
+        b.top_p, b.penalties, b.max_top_k, b.use_top_p,
     )  # fmt: skip
 
 
