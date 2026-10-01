@@ -308,6 +308,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
+    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2107,6 +2108,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which tokens are proposed (acceptance), never the target distribution.
     "VLLM_MTP_DRAFT_LM_HEAD_MXFP8": lambda: bool(
         int(os.getenv("VLLM_MTP_DRAFT_LM_HEAD_MXFP8", "0"))
+    ),
+    # SM107 only: launch the FlashInfer trtllm-gen MoE pipeline with PDL for
+    # calls of at most this many tokens (clamped to 16; 0 = FlashInfer default,
+    # which disables MoE PDL on SM107). Up to 16 tokens the pipeline runs only
+    # Block/DynBlock routing, bmm FC1/FC2 and finalizeKernel, which all wait on
+    # their producer before reading it.
+    "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: min(
+        int(os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")), 16
     ),
     # SM107 only: run the small unquantized BF16 decode projections (MoE router,
     # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.
