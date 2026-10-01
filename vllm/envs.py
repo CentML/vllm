@@ -307,6 +307,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2100,6 +2101,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Qwen3.5/3.6 MTP drafter: run the draft lm_head (greedy draft argmax
+    # only) as an MXFP8 GEMM on a quantized copy of the BF16 head. Changes
+    # which tokens are proposed (acceptance), never the target distribution.
+    "VLLM_MTP_DRAFT_LM_HEAD_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_MTP_DRAFT_LM_HEAD_MXFP8", "0"))
     ),
     # SM107 only: run the small unquantized BF16 decode projections (MoE router,
     # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.

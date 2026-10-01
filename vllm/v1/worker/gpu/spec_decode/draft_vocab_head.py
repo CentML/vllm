@@ -30,6 +30,10 @@ Environment:
                                         (device counters, logged every
                                         VLLM_DRAFT_LMH_DIAG_S seconds; costs a
                                         full lm_head per step: diagnostics only)
+
+When ``VLLM_DRAFT_LMH_VOCAB`` is set, this head replaces the draft model's
+lm_head for the draft argmax, so it takes precedence over the MXFP8 draft
+lm_head (``VLLM_MTP_DRAFT_LM_HEAD_MXFP8``); do not combine the two.
 """
 
 import os

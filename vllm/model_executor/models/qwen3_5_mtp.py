@@ -7,10 +7,12 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.mxfp8_draft_head import Mxfp8DraftLmHead
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -18,6 +20,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import LocalArgmaxMixin
@@ -31,6 +34,7 @@ from vllm.model_executor.models.qwen3_next import (
     QwenNextMixtureOfExperts,
 )
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -255,6 +259,8 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        # Built after weight loading when VLLM_MTP_DRAFT_LM_HEAD_MXFP8 is set.
+        self.draft_lm_head_mxfp8: Mxfp8DraftLmHead | None = None
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -305,6 +311,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        if self.draft_lm_head_mxfp8 is not None:
+            # Draft-only logits (greedy proposals); TP=1, no scale/soft cap.
+            logits = self.draft_lm_head_mxfp8(hidden_states, self.lm_head.weight)
+            return logits[..., : self.logits_processor.org_vocab_size]
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -320,7 +330,40 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remap_weight_names(weights))
+        self._maybe_build_mxfp8_draft_head()
+        return loaded
+
+    def _maybe_build_mxfp8_draft_head(self) -> None:
+        if not envs.VLLM_MTP_DRAFT_LM_HEAD_MXFP8:
+            return
+        lp = self.logits_processor
+        head = self.lm_head
+        reason = None
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(100)
+        ):
+            reason = "needs an SM10x GPU (FlashInfer CuTe-DSL MXFP8 GEMM)"
+        elif not isinstance(head, ParallelLMHead) or head.tp_size != 1:
+            reason = "needs an unsharded lm_head (TP=1)"
+        elif not isinstance(head.quant_method, UnquantizedEmbeddingMethod):
+            reason = "lm_head is already quantized"
+        elif head.weight.dtype != torch.bfloat16:
+            reason = "lm_head is not BF16"
+        elif lp.scale != 1.0 or lp.soft_cap is not None or lp.logits_as_input:
+            reason = "logits scaling/soft-cap is not supported"
+        elif lp.head_dtype not in (None, torch.bfloat16):
+            reason = "head_dtype must be the model dtype"
+        if reason is not None:
+            logger.warning("VLLM_MTP_DRAFT_LM_HEAD_MXFP8 ignored: %s.", reason)
+            return
+        self.draft_lm_head_mxfp8 = Mxfp8DraftLmHead(head.weight.data)
+        logger.info(
+            "MTP draft lm_head runs as MXFP8 (M <= 128) on a quantized copy of "
+            "the BF16 head %s.",
+            tuple(head.weight.shape),
+        )
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
