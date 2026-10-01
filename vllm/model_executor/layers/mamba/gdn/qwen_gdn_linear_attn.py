@@ -55,6 +55,12 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
+    FUSED_CONV_MAX_SEQS,
+    FUSED_CONV_TILE_LONG,
+    FUSED_CONV_TILE_SHORT,
+    gdn_fused_conv_prep,
+)
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
@@ -123,6 +129,9 @@ GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS",
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
 # (2144 tokens: 96 vs 76 us).
 GDN_FI_NON_CP_MAX_TOKENS = int(os.environ.get("VLLM_GDN_FI_NON_CP_MAX_TOKENS", "4608"))
+# Prefill rows: causal conv1d and the post-conv prep (L2 norm, exp(g), beta) in
+# one kernel (gdn_fused_conv_prep), bitwise equal to the two-kernel pair.
+GDN_FUSED_CONV_PREP = os.environ.get("VLLM_GDN_FUSED_CONV_PREP", "1") == "1"
 # Non-CP FlashInfer GDN prefill on the in-place state pool: steps whose
 # (sequence x value head) grid under-fills the GPU run the V-split copy of the
 # kernel (vllm/third_party/flashinfer_gdn_vsplit: one CTA per (sequence, head,
@@ -1533,6 +1542,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
 
         if (
+            GDN_FUSED_CONV_PREP
+            and self.chunk_gated_delta_rule.expects_exp_g
+            and self.conv1d.bias is None
+            and qkv_or_qkvz.shape[0] > 0
+        ):
+            # Compile both tile variants of gdn_fused_conv_prep with serving's
+            # layout: the row-strided in_proj view, a/b as strided columns of
+            # ba, conv state oriented like the KV cache.
+            T = min(FLA_CHUNK_SIZE, qkv_or_qkvz.shape[0])
+            conv_dim = qkv_or_qkvz.shape[-1] - v_dim
+            conv_state = torch.zeros(
+                2, *self.get_state_shape()[0], device=device, dtype=dtype
+            )
+            if not is_conv_state_dim_first():
+                conv_state = conv_state.transpose(-1, -2)
+            ba = torch.zeros(T, 2 * num_v_heads, device=device, dtype=dtype)
+            for tile in (FUSED_CONV_TILE_SHORT, FUSED_CONV_TILE_LONG):
+                gdn_fused_conv_prep(
+                    x=qkv_or_qkvz[:T, :conv_dim],
+                    conv_weights=self.conv1d.weight.view(
+                        self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+                    ),
+                    conv_state=conv_state,
+                    cache_indices=torch.ones(1, device=device, dtype=torch.int32),
+                    has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
+                    cu_seqlens=torch.tensor([0, T], device=device, dtype=torch.int32),
+                    a=ba[:, num_v_heads:],
+                    b=ba[:, :num_v_heads],
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=num_k_heads,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    tile=tile,
+                )
+            del conv_state, ba
+
+        if (
             GDN_FI_VSPLIT
             and self.chunk_gated_delta_rule.updates_state_in_place(state_dtype)
             and self.head_k_dim == 128
@@ -1882,15 +1929,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         # 1.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
+        # Prefill rows without peeled-off decodes (FlashInfer backend, which
+        # takes exp(g)) run conv1d and the post-conv prep in one kernel below.
+        fused_conv_prep = (
+            GDN_FUSED_CONV_PREP
+            and attn_metadata.num_prefills > 0
+            and not (spec_sequence_masks is None and attn_metadata.num_decodes > 0)
+            and self.chunk_gated_delta_rule.expects_exp_g
+            and self.conv1d.bias is None
+            and non_spec_query_start_loc is not None
+            and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
+        )
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill_checkpoint is not None:
+            # Both prefill conv paths read the pre-conv inputs; the checkpoint's
+            # conv window is taken from them before either conv runs.
             assert mixed_qkv_non_spec is not None
-            if attn_metadata.prefill_checkpoint is not None:
-                self._store_conv_checkpoint(
-                    mixed_qkv_non_spec,
-                    conv_state,
-                    conv_weights.size(-1),
-                    attn_metadata.prefill_checkpoint,
-                )
+            self._store_conv_checkpoint(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights.size(-1),
+                attn_metadata.prefill_checkpoint,
+            )
+        if fused_conv_prep:
+            pass  # mixed_qkv_non_spec stays pre-conv for gdn_fused_conv_prep
+        elif attn_metadata.num_prefills > 0:
+            assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
@@ -1956,24 +2019,47 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_prefill = a_non_spec
                 b_prefill = b_non_spec
 
-            (
-                query_non_spec,
-                key_non_spec,
-                value_non_spec,
-                g_non_spec,
-                beta_non_spec,
-            ) = fused_post_conv_prep(
-                conv_output=conv_output_prefill,
-                a=a_prefill,
-                b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                num_k_heads=self.num_k_heads // self.tp_size,
-                head_k_dim=self.head_k_dim,
-                head_v_dim=self.head_v_dim,
-                apply_l2norm=True,
-                output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
-            )
+            if fused_conv_prep:
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = gdn_fused_conv_prep(
+                    x=mixed_qkv_non_spec,
+                    conv_weights=conv_weights,
+                    conv_state=conv_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    has_initial_state=has_initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                )
+            else:
+                (
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                ) = fused_post_conv_prep(
+                    conv_output=conv_output_prefill,
+                    a=a_prefill,
+                    b=b_prefill,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    num_k_heads=self.num_k_heads // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    apply_l2norm=True,
+                    output_g_exp=self.chunk_gated_delta_rule.expects_exp_g,
+                )
             query_non_spec = query_non_spec.unsqueeze(0)
             key_non_spec = key_non_spec.unsqueeze(0)
             value_non_spec = value_non_spec.unsqueeze(0)
