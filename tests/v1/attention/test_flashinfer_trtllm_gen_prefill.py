@@ -12,7 +12,11 @@ WS = 394 * 1024 * 1024
 
 
 def choose(q, kv, ws=WS):
-    return trtllm_gen_prefill_sm_count(q, kv, HQ, HKV, D, SMS, ws)
+    return choose_batch([q], [kv], ws)
+
+
+def choose_batch(qs, kvs, ws=WS):
+    return trtllm_gen_prefill_sm_count(qs, kvs, HQ, HKV, D, SMS, ws)
 
 
 @pytest.mark.parametrize("q,kv", [(4096, 4096), (2048, 10240), (4096, 30000)])
@@ -51,3 +55,40 @@ def test_full_waves_keep_context_kernel():
     # 128-token context tiles fill whole waves (17 * 16 = 272 CTAs = 2 waves are
     # not full, but 13 * 16 = 208 CTAs are one full wave of 212 SMs).
     assert choose(13 * 128, 13 * 128 * 40) is None
+
+
+@pytest.mark.parametrize(
+    "qs,kvs",
+    [
+        ([128, 37], [131200, 90000]),
+        ([512, 64, 300], [98816, 140000, 60000]),
+        ([640, 128, 128, 16], [120000, 138000, 50000, 70000]),
+    ],
+)
+def test_multi_request_split_is_a_multiple_of_the_padded_grid(qs, kvs):
+    # FlashInfer divides the SM count by the grid padded to the longest chunk.
+    sm = choose_batch(qs, kvs)
+    assert sm is not None
+    grid_ctas = cdiv(max(qs), 16) * HKV * len(qs)
+    assert sm % grid_ctas == 0
+    splits = sm // grid_ctas
+    assert 1 <= splits <= 8
+    assert splits == 1 or max(kvs) // splits >= 8192
+    assert sm * 128 * (2 * D + 8) <= WS // 2
+
+
+def test_long_sequence_alone_bounds_the_split():
+    # One long sequence sets the critical path; a short one in the same launch
+    # neither forbids the split nor caps it at its own length.
+    sm = choose_batch([128, 128], [131200, 4000])
+    grid_ctas = cdiv(128, 16) * HKV * 2
+    assert sm is not None and sm % grid_ctas == 0
+    assert 1 < sm // grid_ctas <= 131200 // 8192
+
+
+def test_multi_request_workspace_cap_uses_padded_grid():
+    qs, kvs = [2048, 16], [190000, 190000]
+    grid_ctas = cdiv(max(qs), 16) * HKV * len(qs)
+    # Room for one split of the padded grid only.
+    tight = choose_batch(qs, kvs, ws=2 * grid_ctas * 128 * (2 * D + 8))
+    assert tight == grid_ctas or tight is None
