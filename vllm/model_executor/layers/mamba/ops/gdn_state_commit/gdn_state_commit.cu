@@ -34,6 +34,9 @@
 #ifndef GSC_QO
 #define GSC_QO 0
 #endif
+#ifndef GSC_PERSIST
+#define GSC_PERSIST 0  // (also defaulted inside decode(); needed here by decode_core's GSC_QO check)
+#endif
 #if GSC_QO
 #include <cuda_fp8.h>
 #endif
