@@ -9,7 +9,11 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs, gdn_step_plan
+from vllm.model_executor.layers.mamba.gdn import (
+    gdn_layer_graphs,
+    gdn_prefill_census,
+    gdn_step_plan,
+)
 from vllm.v1.attention.backends import gdn_fused_metadata
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -267,6 +271,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if md is not None:
                 if gdn_layer_graphs.ENABLED:
                     gdn_layer_graphs.after_build(self, md)
+                if gdn_prefill_census.ENABLED:
+                    gdn_prefill_census.record(self, common_attn_metadata, md)
                 return md
         if gdn_step_plan.MDREUSE:
             # GGM_MDREUSE=1: derive the metadata of the other GDN KV-cache groups
@@ -292,6 +298,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # VLLM_GDN_LAYER_GRAPHS=1: pack the step into the graphs' static
             # buffers (see gdn_layer_graphs)
             gdn_layer_graphs.after_build(self, md)
+        if gdn_prefill_census.ENABLED:
+            # VLLM_GDNP_CENSUS=<dir>: prefill-shape census (diagnostics)
+            gdn_prefill_census.record(self, common_attn_metadata, md)
         return md
 
     def _build_full(
