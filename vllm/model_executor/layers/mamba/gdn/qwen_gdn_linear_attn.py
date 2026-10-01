@@ -46,6 +46,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -97,6 +98,11 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+# Spec-decode batches of at most this many requests run the GDN recurrence in
+# the value-split Triton kernel (gdn_mtp_recurrence; latency-bound regime) and
+# the gated norm in the MXFP8/norm kernel after it. Larger batches use the CUDA
+# MTP kernel (bandwidth-bound regime). VR crossover, norm included: ~4-6.
+GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS", "4"))
 # FlashInfer GDN prefill: a single sequence of at most this many tokens runs
 # the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
@@ -1896,7 +1902,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
-    ) -> None:
+    ) -> bool:
+        """Conv + recurrence of the spec-decode rows into ``core_attn_out``.
+        Returns whether the gated norm was applied too (CUDA MTP kernel); the
+        Triton recurrence leaves it to the caller's norm launch.
+        """
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
         num_accepted_tokens = attn_metadata.num_accepted_tokens
@@ -1926,7 +1936,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             max_query_len=state_indices.size(1),
             validate_data=False,
         )
-        self._forward_core_decode_spec_post_conv_fused_norm(
+        return self._forward_core_decode_spec_post_conv_fused_norm(
             mixed_qkv=mixed_qkv,
             b=b[:num_actual_tokens],
             a=a[:num_actual_tokens],
@@ -1943,7 +1953,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
-    ) -> None:
+    ) -> bool:
+        """Spec-decode recurrence; returns whether the gated norm was applied
+        (CUDA MTP kernel) or is left to the caller (Triton recurrence).
+        """
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
         num_accepted_tokens = attn_metadata.num_accepted_tokens
@@ -1952,6 +1965,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
+        if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS:
+            gdn_mtp_recurrence(
+                mixed_qkv,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state_indices[:num_requests],
+                cu_seqlens[: num_requests + 1],
+                num_accepted_tokens[:num_requests],
+                self.kv_cache[1],
+                core_attn_out,
+                scale=self.head_k_dim**-0.5,
+            )
+            return False
         ops.fused_gdn_decode_post_conv_mtp(
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1969,6 +1997,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             norm_eps=self.layer_norm_epsilon,
             output_gate_activation=self.norm.activation,
         )
+        return True
 
     def _forward_core_fused_norm_packed(
         self,
@@ -2167,9 +2196,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and attn_metadata.num_prefills == 0
         ):
             if not quantize:
-                # The MTP kernel skips FULL-graph padding requests.
+                # The MTP kernels skip FULL-graph padding requests.
                 core_attn_out.zero_()
-            self._forward_core_decode_spec_fused_norm(
+            normalized = self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
                 a=a,
@@ -2187,11 +2216,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     output_gate,
                     out_q,  # type: ignore[arg-type]
                     out_scale,  # type: ignore[arg-type]
-                    norm_rows=(0, 0),
+                    norm_rows=(0, 0 if normalized else core_attn_out.shape[0]),
                     num_valid=attn_metadata.spec_query_start_loc[
                         num_spec : num_spec + 1
                     ],
                 )
+            elif not normalized:
+                self._rms_norm_gated_strided_gate_cuda(core_attn_out, output_gate)
             return
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -2213,15 +2244,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and attn_metadata.spec_token_start is not None
             and self._can_use_fused_gdn_mtp_decode(attn_metadata)
         ):
-            # The contiguous spec block goes through the fused CUDA MTP kernel
-            # (gating, recurrence and gated norm, as in decode-only batches);
-            # the rest through the prefill path, with b/a read strided.
+            # The contiguous spec block goes through the MTP decode kernels
+            # (gating and recurrence, plus the gated norm in the CUDA kernel,
+            # as in decode-only batches); the rest through the prefill path,
+            # with b/a read strided.
             assert attn_metadata.non_spec_token_start is not None
             spec_start = attn_metadata.spec_token_start
             spec_rows = slice(
                 spec_start, spec_start + attn_metadata.num_spec_decode_tokens
             )
-            self._forward_core_decode_spec_fused_norm(
+            spec_normalized = self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv[spec_rows],
                 b=b[spec_rows],
                 a=a[spec_rows],
@@ -2236,13 +2268,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out=core_attn_out,
                 spec_done=True,
             )
-            non_spec_start = attn_metadata.non_spec_token_start
-            norm_rows = (
-                non_spec_start,
-                non_spec_start
-                + attn_metadata.num_prefill_tokens
-                + attn_metadata.num_decode_tokens,
-            )
+            if spec_normalized:
+                non_spec_start = attn_metadata.non_spec_token_start
+                norm_rows = (
+                    non_spec_start,
+                    non_spec_start
+                    + attn_metadata.num_prefill_tokens
+                    + attn_metadata.num_decode_tokens,
+                )
         else:
             self._forward_core(
                 mixed_qkv=mixed_qkv,

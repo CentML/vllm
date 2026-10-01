@@ -261,6 +261,7 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
     ],
 )
 @pytest.mark.parametrize("output_gate_activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("decode_backend", ["cuda", "triton"])
 @torch.inference_mode()
 def test_fused_model_path_matches_reference(
     seq_lens: list[int],
@@ -268,10 +269,17 @@ def test_fused_model_path_matches_reference(
     draft_tokens: list[int],
     expected_fused_calls: int,
     output_gate_activation: str,
+    decode_backend: str,
 ) -> None:
     """Fused MTP (decode-only batches and the contiguous spec block of mixed
-    batches) and its interleaved/prefill/decode fallbacks match the reference.
+    batches) and its interleaved/prefill/decode fallbacks match the reference,
+    with the spec recurrence in the CUDA MTP kernel (gated norm inside) or in
+    the Triton value-split kernel (gated norm in the following norm launch).
     """
+    if decode_backend == "cuda" and not hasattr(
+        torch.ops._C, "fused_gdn_decode_post_conv_mtp"
+    ):
+        pytest.skip("fused GDN decode MTP op is not built")
     torch.manual_seed(1)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config()
@@ -374,14 +382,24 @@ def test_fused_model_path_matches_reference(
     )
     context.no_compile_layers = {PREFIX: fused_layer}
     fused_out = torch.zeros_like(output_gate)
-    fused_op = qwen_gdn_linear_attn.ops.fused_gdn_decode_post_conv_mtp
+    use_triton = decode_backend == "triton"
     with (
         patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=context),
         patch.object(
+            qwen_gdn_linear_attn,
+            "GDN_MTP_TRITON_MAX_REQUESTS",
+            1 << 20 if use_triton else 0,
+        ),
+        patch.object(
             qwen_gdn_linear_attn.ops,
             "fused_gdn_decode_post_conv_mtp",
-            wraps=fused_op,
-        ) as fused_mock,
+            wraps=qwen_gdn_linear_attn.ops.fused_gdn_decode_post_conv_mtp,
+        ) as cuda_mock,
+        patch.object(
+            qwen_gdn_linear_attn,
+            "gdn_mtp_recurrence",
+            wraps=qwen_gdn_linear_attn.gdn_mtp_recurrence,
+        ) as triton_mock,
     ):
         torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
             mixed_qkvz.clone(),
@@ -390,7 +408,9 @@ def test_fused_model_path_matches_reference(
             layer_name=_encode_layer_name(PREFIX),
         )
 
-    assert fused_mock.call_count == expected_fused_calls
+    used, unused = (triton_mock, cuda_mock) if use_triton else (cuda_mock, triton_mock)
+    assert used.call_count == expected_fused_calls
+    assert unused.call_count == 0
     torch.testing.assert_close(
         fused_layer.kv_cache[0], reference_layer.kv_cache[0], atol=0, rtol=0
     )
