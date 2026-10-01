@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -200,6 +201,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.supports_mm_inputs = False
         self.pcp_manager: PCPManager | None = None
+        # Opt-in reduced-vocabulary greedy draft head (VLLM_DRAFT_LMH_VOCAB).
+        self.draft_vocab_head: draft_vocab_head.DraftVocabHead | None = None
 
     @abstractmethod
     def load_draft_model(
@@ -219,6 +222,18 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        if draft_vocab_head.ENABLED:
+            if (
+                self.speculative_config.draft_sample_method != "greedy"
+                or self.use_local_argmax_reduction
+                or self.enable_adaptive_verification
+                or self.draft_watermarker is not None
+            ):
+                raise ValueError(
+                    "VLLM_DRAFT_LMH_VOCAB needs greedy drafts without local "
+                    "argmax reduction, adaptive verification or watermarking."
+                )
+            self.draft_vocab_head = draft_vocab_head.maybe_build(self.model)
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
@@ -410,6 +425,11 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.draft_vocab_head is not None:
+            # Greedy draft over the token-id subset (draft proposals only).
+            return draft_vocab_head.sample(
+                self.draft_vocab_head, self.model, hidden_states
+            )
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             sampled = gumbel_sample(

@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -392,6 +393,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+        if self.draft_vocab_head is not None and not dummy_run:
+            draft_vocab_head.maybe_log(self.draft_vocab_head)
 
         return self.draft_tokens[:num_reqs]
 
