@@ -28,6 +28,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
+from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
 
 SF_VEC = 32
 INV_E4M3_MAX = 1.0 / 448.0
@@ -41,8 +42,10 @@ def _nqf_norm_quant_kernel(
     stride_s, stride_f, stride_a, stride_r, stride_out, stride_res, stride_q,
     H: tl.constexpr, XBLOCK: tl.constexpr, RB: tl.constexpr, NUM_IN: tl.constexpr,
     EMIT_Q: tl.constexpr, EMIT_SWZ: tl.constexpr, EMIT_LIN: tl.constexpr,
-    PADDED_SF_COLS: tl.constexpr,
-):
+    PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # Same tile shape / loop structure as Inductor's triton_red_fused__to_copy_add_fused_add_rms_norm_*
     # so the fp32 sum-of-squares has the identical summation order (bit-identical bf16 outputs).
     NSF_RB: tl.constexpr = RB // 32
@@ -145,16 +148,18 @@ def norm_quant(a, r, w, eps, s=None, f=None, emit_q=True, emit_swz=True, emit_li
         a.stride(0), r.stride(0), out.stride(0), res.stride(0) if res is not None else 0,
         q.stride(0) if q is not None else 0,
         H=H, XBLOCK=xb, RB=cfg["RB"], NUM_IN=num_in, EMIT_Q=emit_q, EMIT_SWZ=emit_swz, EMIT_LIN=emit_lin,
-        PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"], num_stages=1,
-    )
+        PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"], num_stages=1, launch_pdl=_lcd_pdl_on())
     return out, res, q, sf_swz, sf_lin
 
 
 @triton.jit
 def _nqf_silu_mul_quant_kernel(X, Q, SF_SWZ, M, PADDED_M, stride_x, stride_q,
-                               I: tl.constexpr, XBLOCK: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
+                               I: tl.constexpr, XBLOCK: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """y = bf16(silu(gate) * up) exactly like Inductor's triton_poi_fused_mul_silu_slice_0
     (gate / (1 + exp(-gate)) * up in fp32), then the same MXFP8 epilogue; y itself is not stored."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     NSF: tl.constexpr = I // 32
     row = tl.program_id(0).to(tl.int64) * XBLOCK + tl.arange(0, XBLOCK)[:, None]
     xmask = row < M
@@ -199,7 +204,7 @@ def silu_mul_quant(x, config=None):
     if padded_m:
         _nqf_silu_mul_quant_kernel[(triton.cdiv(padded_m, cfg["XBLOCK"]),)](
             x, q, sf, M, padded_m, x.stride(0), q.stride(0), I=I, XBLOCK=cfg["XBLOCK"],
-            PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"])
+            PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"], launch_pdl=_lcd_pdl_on())
     return q, sf
 
 
@@ -231,8 +236,11 @@ def _mx_epilogue(yb, row, cols, dmask, smask, Q, SF_SWZ, stride_q, j0,
 
 @triton.jit
 def _nqf_gate_mul_quant_kernel(A, G, OUT, Q, SF_SWZ, M, PADDED_M, stride_a, stride_g, stride_o, stride_q,
-                               N: tl.constexpr, BN: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
+                               N: tl.constexpr, BN: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """out = bf16(f32(attn) * tl.sigmoid(f32(gate)))  == Inductor triton_poi_fused_mul_sigmoid_view_0; + MXFP8."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) + tl.zeros([1, 1], tl.int64)
     rmask = row < M
     for c0 in tl.static_range(0, N, BN):
@@ -255,16 +263,19 @@ def gate_mul_quant(a, g, bn=1024):
     sf = torch.empty((pm * psc,), dtype=torch.uint8, device=a.device)
     if pm:
         _nqf_gate_mul_quant_kernel[(pm,)](a, g, out, q, sf, M, pm, a.stride(0), g.stride(0), out.stride(0),
-                                          q.stride(0), N=N, BN=bn, PADDED_SF_COLS=psc, num_warps=4)
+                                          q.stride(0), N=N, BN=bn, PADDED_SF_COLS=psc, num_warps=4, launch_pdl=_lcd_pdl_on())
     return out, q, sf
 
 
 @triton.jit(do_not_specialize=["T", "ROW0"])
 def _nqf_gdn_gated_rmsnorm_quant_kernel(x_ptr, z_ptr, w_ptr, y_ptr, Q, SF_SWZ, T, ROW0, stride_z_tok, stride_q, eps,
                                         HV: tl.constexpr, D: tl.constexpr, BT: tl.constexpr,
-                                        SIGMOID_GATE: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
+                                        SIGMOID_GATE: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """== _gdn_gated_rmsnorm_kernel of qwen_gdn_linear_attn (same tile, same math; y may alias x) + MXFP8 epilogue writing
     rows ROW0 + t of the [*, HV*D] fp8 / swizzled-scale buffers."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     i_h = tl.program_id(1)
     offs_t = i_t * BT + tl.arange(0, BT)
@@ -296,13 +307,16 @@ def gdn_gated_rmsnorm_quant_(x, z, weight, eps, activation, q, sf, row0, padded_
     BT = 16
     _nqf_gdn_gated_rmsnorm_quant_kernel[(triton.cdiv(T, BT), HV)](
         x, z, weight, x, q, sf, T, row0, z.stride(0), q.stride(0), eps,
-        HV=HV, D=D, BT=BT, SIGMOID_GATE=(activation == "sigmoid"), PADDED_SF_COLS=padded_sf_cols, num_warps=4)
+        HV=HV, D=D, BT=BT, SIGMOID_GATE=(activation == "sigmoid"), PADDED_SF_COLS=padded_sf_cols, num_warps=4, launch_pdl=_lcd_pdl_on())
 
 
 @triton.jit(do_not_specialize=["LO", "HI", "M"])
 def _nqf_quant_rows_kernel(X, Q, SF_SWZ, LO, HI, M, stride_x, stride_q,
-                           N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
+                           N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """Plain MXFP8 quant of rows [LO, HI) (rows >= M are padding: zero scales, no data)."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = LO + tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
     in_rng = row < HI
     dmask = in_rng & (row < M)
@@ -341,14 +355,17 @@ def quant_rows(x, q, sf, lo, hi, m, padded_sf_cols, config=None):
     N = x.shape[-1]
     _nqf_quant_rows_kernel[(triton.cdiv(hi - lo, c["XB"]),)](
         x, q, sf, lo, hi, m, x.stride(0), q.stride(0), N=N, BN=c["BN"], XB=c["XB"],
-        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"])
+        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"], launch_pdl=_lcd_pdl_on())
 
 
 @triton.jit(do_not_specialize=["LO", "HI", "LO2", "HI2", "NB1", "M"])
 def _quant_rows_two_range_kernel(X, Q, SF_SWZ, LO, HI, LO2, HI2, NB1, M, stride_x, stride_q,
                                  N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr,
-                                 PADDED_SF_COLS: tl.constexpr):
+                                 PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """_nqf_quant_rows_kernel over rows [LO, HI) U [LO2, HI2): programs < NB1 take the first range."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     pid = tl.program_id(0).to(tl.int64)
     first = pid < NB1
     base = tl.where(first, LO + pid * XB, LO2 + (pid - NB1) * XB)
@@ -371,7 +388,7 @@ def quant_rows2(x, q, sf, r1, r2, m, padded_sf_cols, config):
     nb2 = triton.cdiv(hi2 - lo2, xb)
     _quant_rows_two_range_kernel[(nb1 + nb2,)](x, q, sf, lo1, hi1, lo2, hi2, nb1, m, x.stride(0), q.stride(0),
                                                N=x.shape[-1], BN=config["BN"], XB=xb,
-                                               PADDED_SF_COLS=padded_sf_cols, num_warps=config["num_warps"])
+                                               PADDED_SF_COLS=padded_sf_cols, num_warps=config["num_warps"], launch_pdl=_lcd_pdl_on())
 
 
 # ================================================================================================================
@@ -381,12 +398,15 @@ def quant_rows2(x, q, sf, r1, r2, m, padded_sf_cols, config):
 @triton.jit(do_not_specialize=["T", "L0", "H0", "L1", "H1", "L2", "H2", "L3", "H3"])
 def _qgf_gdn_fixup_kernel(X, Q, SF_SWZ, SLOT, T, L0, H0, L1, H1, L2, H2, L3, H3, stride_x, stride_q,
                           N: tl.constexpr, BN: tl.constexpr, HAS_SLOT: tl.constexpr, ZERO_ONLY: tl.constexpr,
-                          PADDED_SF_COLS: tl.constexpr):
+                          PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
     """One program per row of the GDN out_proj input (core_attn_out viewed [T, N] bf16) after the GDN core op:
       pad row (slot < 0):   bf16 row := 0 (replaces a separate pad-row zeroing kernel), fp8 row := 0, scales := 0
       row >= T (< 128-pad): swizzled scales := 0 (FlashInfer zeroes the scale padding rows)
       real row not covered by a fused producer (ranges [Li, Hi)): plain MXFP8 quant of the bf16 row
       covered row: untouched (written by a fused MXFP8 producer, e.g. the fused gated-RMSNorm+quant kernel)."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) + tl.zeros([1, 1], tl.int64)
     real = row < T
     if HAS_SLOT:
@@ -417,7 +437,7 @@ def gdn_fixup(x2, q, sf, slot, T, pm, psc, uncovered, zero_only=False):
         x2, q if q is not None else x2, sf if sf is not None else x2, slot if slot is not None else x2, T,
         rng[0][0], rng[0][1], rng[1][0], rng[1][1], rng[2][0], rng[2][1], rng[3][0], rng[3][1],
         x2.stride(0), q.stride(0) if q is not None else 0,
-        N=N, BN=1024, HAS_SLOT=slot is not None, ZERO_ONLY=zero_only, PADDED_SF_COLS=psc, num_warps=4)
+        N=N, BN=1024, HAS_SLOT=slot is not None, ZERO_ONLY=zero_only, PADDED_SF_COLS=psc, num_warps=4, launch_pdl=_lcd_pdl_on())
 
 
 @triton.jit
@@ -441,7 +461,10 @@ def _qgf_fin_gather(G, WT, IDX, row, xmask, cols, stride_g, TOPK: tl.constexpr, 
 
 @triton.jit(do_not_specialize=["M"])
 def _qgf_finalize_kernel(G, WT, IDX, OUT, M, stride_g, stride_o, H: tl.constexpr, BH: tl.constexpr,
-                         TOPK: tl.constexpr, XB: tl.constexpr, USE_FMA: tl.constexpr):
+                         TOPK: tl.constexpr, XB: tl.constexpr, USE_FMA: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
     xmask = row < M
     for c0 in tl.static_range(0, H, BH):
@@ -461,7 +484,7 @@ def finalize(g2, wts, idx, M, H, out=None):
         out = torch.empty((M, H), dtype=torch.bfloat16, device=g2.device)
     if M:
         _qgf_finalize_kernel[(triton.cdiv(M, 2),)](g2, wts, idx, out, M, g2.stride(0), out.stride(0), H=H, BH=1024,
-                                                   TOPK=topk, XB=2, USE_FMA=FIN_FMA, num_warps=4)
+                                                   TOPK=topk, XB=2, USE_FMA=FIN_FMA, num_warps=4, launch_pdl=_lcd_pdl_on())
     return out
 
 
@@ -506,11 +529,14 @@ def _qgf_norm_out(x, rs, row, xmask, cols, W, OUT, Q, SF_SWZ, PADDED_M, stride_o
 def _qgf_fin_norm_quant_kernel(G, WT, IDX, F, A, R, W, OUT, RES_OUT, Q, SF_SWZ, M, PADDED_M, eps,
                                stride_g, stride_f, stride_a, stride_r, stride_out, stride_res, stride_q,
                                H: tl.constexpr, XBLOCK: tl.constexpr, RB: tl.constexpr, TOPK: tl.constexpr,
-                               PADDED_SF_COLS: tl.constexpr, USE_FMA: tl.constexpr):
+                               PADDED_SF_COLS: tl.constexpr, USE_FMA: tl.constexpr, launch_pdl: tl.constexpr = False):
     """== finalizeKernelVecLoad (MoE unpermute + top-k weighting, bf16 out) followed by nqf pre_norm
     (x = (s + f) + (a + r); Inductor-order RMSNorm; MXFP8 swizzled epilogue). H == 2 * RB: the row is kept in
     registers so the 9 gathered rows are read once; the sum of squares uses the same [XBLOCK, RB] accumulator
     and update order as Inductor's 2-iteration loop (bit-identical)."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) * XBLOCK + tl.arange(0, XBLOCK)[:, None]
     xmask = row < M
     rbase = tl.arange(0, RB)[None, :]
@@ -552,5 +578,5 @@ def fin_norm_quant(g2, wts, idx, f, a, r, w, eps, config=None):
             g2, wts, idx, f, a, r, w, out, res, q, sf, M, pm, eps,
             g2.stride(0), f.stride(0), a.stride(0), r.stride(0), out.stride(0), res.stride(0), q.stride(0),
             H=H, XBLOCK=cfg["XBLOCK"], RB=cfg["RB"], TOPK=idx.numel() // M, PADDED_SF_COLS=psc, USE_FMA=FIN_FMA,
-            num_warps=cfg["num_warps"], num_stages=1)
+            num_warps=cfg["num_warps"], num_stages=1, launch_pdl=_lcd_pdl_on())
     return out, res, q, sf

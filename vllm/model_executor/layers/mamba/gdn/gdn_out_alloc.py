@@ -31,6 +31,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
 
 logger = init_logger(__name__)
 
@@ -39,7 +40,10 @@ ENABLED = (os.environ.get("EWS", "0") == "1"
 
 
 @triton.jit
-def _zero_pad_rows_kernel(out_ptr, slot_ptr, row_elems, BLOCK: tl.constexpr, HAS_SLOT: tl.constexpr):
+def _zero_pad_rows_kernel(out_ptr, slot_ptr, row_elems, BLOCK: tl.constexpr, HAS_SLOT: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     r = tl.program_id(0)
     if HAS_SLOT:
         s = tl.load(slot_ptr + r)
@@ -79,7 +83,7 @@ def gdn_out_alloc_impl(like: torch.Tensor, h: int, d: int) -> torch.Tensor:
         return out
     slot = _any_slot_mapping(T)
     _zero_pad_rows_kernel[(T,)](out, slot if slot is not None else out, h * d, BLOCK=1024,
-                                HAS_SLOT=slot is not None, num_warps=4)
+                                HAS_SLOT=slot is not None, num_warps=4, launch_pdl=_lcd_pdl_on())
     return out
 
 

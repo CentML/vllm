@@ -46,6 +46,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import _encode_layer_name
+from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
 
 logger = init_logger(__name__)
 
@@ -70,8 +71,10 @@ def _ews_qkv_kernel(
     rotary_dim: tl.constexpr, half_rotary: tl.constexpr, eps: tl.constexpr, norm_beta: tl.constexpr,
     INPUT_DTYPE: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROT_HALF_BLOCK: tl.constexpr,
     HAS_PASS: tl.constexpr, HAS_MROPE: tl.constexpr, MROPE_SECTION_H: tl.constexpr,
-    MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr,
-):
+    MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     head = tl.program_id(1)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
@@ -211,8 +214,7 @@ def launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, 
         INPUT_DTYPE=tl.bfloat16 if qkv.dtype == torch.bfloat16 else tl.float16,
         HEAD_BLOCK=head_block, ROT_HALF_BLOCK=triton.next_power_of_2(rotary_dim // 2),
         HAS_PASS=rotary_dim < head_dim, HAS_MROPE=has_mrope, MROPE_SECTION_H=mh, MROPE_SECTION_W=mw,
-        WRITE_KV=write_kv, TPP=tpp, num_warps=max(1, head_block // 64), num_stages=2,
-    )
+        WRITE_KV=write_kv, TPP=tpp, num_warps=max(1, head_block // 64), num_stages=2, launch_pdl=_lcd_pdl_on())
     return q8, k_out, gate
 
 
