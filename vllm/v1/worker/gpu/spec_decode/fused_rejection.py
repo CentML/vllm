@@ -106,32 +106,26 @@ def _penalized_submax_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     SUB_SIZE: tl.constexpr,
-    # Power of two >= the most logits rows of one request.
-    ROWS: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
-    num_rows = tl.load(cu_num_logits_ptr + req_idx + 1) - start
+    end = tl.load(cu_num_logits_ptr + req_idx + 1).to(tl.int64)
     temp = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
     block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = block < vocab_size
-    r = tl.arange(0, ROWS)
-    row_mask = r < num_rows
-    rows = start + r
-    tile_mask = row_mask[:, None] & mask[None, :]
     NUM_SUB: tl.constexpr = BLOCK_SIZE // SUB_SIZE
     sub_offs = block_idx * NUM_SUB + tl.arange(0, NUM_SUB)
 
-    # All rows of the request at once (one wide load, then one shared load of
-    # the request's penalty state).
-    logits = tl.load(
-        logits_ptr + rows[:, None] * logits_stride + block[None, :],
-        mask=tile_mask,
-        other=float("-inf"),
-    ).to(tl.float32)
+    use_penalty = False
+    use_rep_penalty = False
+    rep_penalty = 1.0
+    freq_penalty = 0.0
+    pres_penalty = 0.0
+    output_bin_counts = tl.zeros((BLOCK_SIZE,), tl.int32)
+    prompt_bin_mask = tl.zeros((BLOCK_SIZE,), tl.int1)
     if HAS_PENALTIES:
         rep_penalty = tl.load(repetition_penalty_ptr + req_state_idx)
         freq_penalty = tl.load(frequency_penalty_ptr + req_state_idx)
@@ -146,49 +140,45 @@ def _penalized_submax_kernel(
                 mask=mask,
                 other=0,
             )
-            # Row start + p also counts the draft tokens of rows 1..p, as
-            # _penalties_kernel does: a running sum over the row axis.
-            has_draft = row_mask & (r > 0)
-            draft = tl.load(
-                input_ids_ptr
-                + tl.load(logits_indices_ptr + rows, mask=has_draft, other=0),
-                mask=has_draft,
-                other=-1,
+        if use_rep_penalty:
+            packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
+            packed_mask = tl.load(
+                prompt_bin_mask_ptr
+                + req_state_idx * prompt_bin_mask_stride
+                + packed_block,
+                mask=packed_block < tl.cdiv(vocab_size, 32),
+                other=0,
             )
-            matches = (block[None, :] == draft[:, None]).to(tl.int32)
-            counts = output_bin_counts[None, :] + tl.cumsum(matches, axis=0)
-            prompt_bin_mask = tl.zeros((BLOCK_SIZE,), tl.int1)
-            if use_rep_penalty:
-                packed_block = block_idx * BLOCK_SIZE // 32 + tl.arange(
-                    0, BLOCK_SIZE // 32
-                )
-                packed_mask = tl.load(
-                    prompt_bin_mask_ptr
-                    + req_state_idx * prompt_bin_mask_stride
-                    + packed_block,
-                    mask=packed_block < tl.cdiv(vocab_size, 32),
-                    other=0,
-                )
-                bits = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
-                prompt_bin_mask = bits.to(tl.int1).reshape(BLOCK_SIZE)
+            bits = (packed_mask[:, None] >> (tl.arange(0, 32)[None, :])) & 1
+            prompt_bin_mask = bits.to(tl.int1).reshape(BLOCK_SIZE)
+
+    for row in range(start, end):
+        # Row start + p also counts the draft tokens at positions 1..p of the
+        # request, as _penalties_kernel does.
+        if HAS_PENALTIES and row > start:
+            token_idx = tl.load(logits_indices_ptr + row)
+            prev_token = tl.load(input_ids_ptr + token_idx)
+            output_bin_counts += (block == prev_token).to(tl.int32)
+        logits = tl.load(
+            logits_ptr + row * logits_stride + block,
+            mask=mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        if use_penalty:
             logits = _penalize(
                 logits,
-                counts,
-                prompt_bin_mask[None, :],
+                output_bin_counts,
+                prompt_bin_mask,
                 rep_penalty,
                 freq_penalty,
                 pres_penalty,
                 use_rep_penalty,
             )
-    if temp != 0.0 and temp != 1.0:
-        logits = logits / temp
-    logits = tl.where(tile_mask, logits, float("-inf"))
-    submax = tl.max(tl.reshape(logits, (ROWS, NUM_SUB, SUB_SIZE)), axis=2)
-    tl.store(
-        submax_ptr + rows[:, None] * submax_stride + sub_offs[None, :],
-        submax,
-        mask=row_mask[:, None],
-    )
+        if temp != 0.0 and temp != 1.0:
+            logits = logits / temp
+        logits = tl.where(mask, logits, float("-inf"))
+        submax = tl.max(tl.reshape(logits, (NUM_SUB, SUB_SIZE)), axis=1)
+        tl.store(submax_ptr + row * submax_stride + sub_offs, submax)
 
 
 @triton.jit
@@ -511,8 +501,6 @@ def select_survivors(
     penalties: tuple[torch.Tensor, ...] | None,
     max_top_k: int,
     use_top_p: bool,
-    # Most logits rows of one request (num_speculative_steps + 1).
-    max_rows_per_req: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Top-k/top-p survivors of the penalized, temperature-scaled logits.
 
@@ -571,7 +559,6 @@ def select_survivors(
         vocab_size,
         BLOCK_SIZE=_BLOCK_SIZE,
         SUB_SIZE=_SUB_SIZE,
-        ROWS=triton.next_power_of_2(max_rows_per_req),
         HAS_PENALTIES=has_penalties,
         num_warps=_SUBMAX_WARPS,
     )
@@ -668,7 +655,6 @@ def fused_rejection_sample(
         penalties,
         max_top_k,
         use_top_p,
-        num_speculative_steps + 1,
     )
     _compact_rejection_kernel[(num_reqs,)](
         sampled,
