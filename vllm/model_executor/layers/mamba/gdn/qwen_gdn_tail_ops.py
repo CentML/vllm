@@ -18,6 +18,7 @@
 
 import torch
 
+from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     MXFP8_BLOCK,
     mxfp8_quantize_row,
@@ -48,10 +49,12 @@ def _gdn_gated_norm_mxfp8_kernel(
     VALID_FROM_PTR: tl.constexpr,
     ACTIVATION: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     K: tl.constexpr = HEADS * HEAD_DIM
     BLOCK: tl.constexpr = BLOCK_H * HEAD_DIM
@@ -189,6 +192,7 @@ def gdn_gated_norm_mxfp8(
         VALID_FROM_PTR=valid_from_ptr,
         ACTIVATION=activation,
         LAUNCH_PDL=launch_pdl,
+        EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
         launch_pdl=launch_pdl,
         num_warps=num_warps,
     )

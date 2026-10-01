@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fusion.moe_finalize import (
     check_unfinalized,
     moe_finalize_row,
 )
+from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -105,6 +106,7 @@ def _add_rms_norm_mxfp8_kernel(
     STORE_NORMED: tl.constexpr,
     STORE_LINEAR_SF: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
     MOE_TOP_K: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -114,9 +116,10 @@ def _add_rms_norm_mxfp8_kernel(
     NUM_GROUPS: tl.constexpr = HIDDEN // 32
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
-        # The consumer (MXFP8 GEMM) waits on this grid before reading, so let
-        # it launch and run its prologue while this one works.
-        tl.extra.cuda.gdc_launch_dependents()
+        if EARLY_TRIGGER:
+            # The consumer (MXFP8 GEMM) waits on this grid before reading, so
+            # let it launch and run its prologue while this one works.
+            tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         if MOE_TOP_K > 0:
             # x_ptr holds permuted GEMM2 rows: reduce them as moe_finalize
@@ -290,6 +293,7 @@ def add_rms_norm_mxfp8_quant(
             STORE_NORMED=store_normed,
             STORE_LINEAR_SF=store_linear_scales,
             LAUNCH_PDL=launch_pdl,
+            EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
             MOE_TOP_K=top_k,
             launch_pdl=launch_pdl,
             num_warps=num_warps,

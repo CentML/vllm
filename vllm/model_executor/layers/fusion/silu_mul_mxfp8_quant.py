@@ -11,6 +11,7 @@ F8_128x4-swizzled UE8M0 scales.
 
 import torch
 
+from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     MXFP8_BLOCK,
@@ -33,6 +34,7 @@ def _silu_mul_mxfp8_kernel(
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
@@ -40,7 +42,8 @@ def _silu_mul_mxfp8_kernel(
     groups = tl.arange(0, BLOCK // 32)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         a = tl.load(x_ptr + row * x_stride + cols, mask=mask, other=0.0)
         b = tl.load(x_ptr + row * x_stride + D + cols, mask=mask, other=0.0)
@@ -92,6 +95,7 @@ def silu_mul_mxfp8_quant(
             D=d,
             BLOCK=triton.next_power_of_2(d),
             LAUNCH_PDL=launch_pdl,
+            EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
             launch_pdl=launch_pdl,
             num_warps=4,
         )

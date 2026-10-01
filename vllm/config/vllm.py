@@ -3323,6 +3323,14 @@ def set_current_vllm_config(
 
         _current_vllm_config = vllm_config
         _current_prefix = prefix
+        # The MXFP8 producers' early PDL trigger is unsafe next to Inductor PDL.
+        from vllm.model_executor.layers.fusion.mxfp8_pdl import (
+            configure_mxfp8_producer_early_trigger,
+        )
+
+        configure_mxfp8_producer_early_trigger(
+            vllm_config.compilation_config.inductor_compile_config
+        )
         yield
     except Exception:
         raise
