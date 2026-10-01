@@ -978,6 +978,13 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         """
         return False
 
+    def supports_deferred_finalize(self) -> bool:
+        """Whether ``apply`` returns an ``UnfinalizedMoEOutput`` whenever
+        ``moe_config.should_defer_moe_finalize`` holds, so a runner may route
+        every call through a deferred-finalize consumer.
+        """
+        return False
+
     def set_capture_fn(
         self,
         capture_fn: Callable[[torch.Tensor], None] | None,
