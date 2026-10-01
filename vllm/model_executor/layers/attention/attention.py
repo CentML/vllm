@@ -234,6 +234,10 @@ class Attention(nn.Module, AttentionLayerBase):
     3. Return the output tensor.
     """
 
+    # Set by fused_qkv_prologue.configure_attention (EWS=1) when the model
+    # writes the FP8 query and the KV cache in its own fused prologue.
+    _ews_prefused: bool = False
+
     def __init__(
         self,
         num_heads: int,
@@ -500,6 +504,8 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        if self._ews_prefused and query.dtype == torch.float8_e4m3fn:
+            return self._forward_prefused(query, key, value, output_shape, output_dtype)
         if output_dtype is None:
             output_dtype = query.dtype
         if self.query_quant is not None:
@@ -571,6 +577,46 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 encoded,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+        return output.view(-1, hidden_size)
+
+    def _forward_prefused(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output_shape: torch.Size | None,
+        output_dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        """forward() for layers whose query is already FP8 and whose K/V are
+        already in the KV cache (fused QKV prologue, see
+        fused_qkv_prologue.py): no query quant, no KV-cache update; the rest
+        is forward() unchanged."""
+        if output_dtype is None:
+            # the model dtype (bf16); forward() uses query.dtype before quant
+            output_dtype = key.dtype
+        if output_shape is None:
+            output_shape = torch.Size(
+                (query.shape[0], self.num_heads * self.head_size_v)
+            )
+        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+        hidden_size = output_shape[-1]
+        query = query.view(-1, self.num_heads, self.head_size)
+        output = output.view(-1, self.num_heads, self.head_size_v)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size_v)
+        if self.use_direct_call:
+            unified_attention_with_output(
+                query, key, value, output, self.layer_name, kv_cache_dummy_dep=None
+            )
+        else:
+            torch.ops.vllm.unified_attention_with_output(
+                query,
+                key,
+                value,
+                output,
+                _encode_layer_name(self.layer_name),
+                kv_cache_dummy_dep=None,
             )
         return output.view(-1, hidden_size)
 

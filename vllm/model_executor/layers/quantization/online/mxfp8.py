@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
 from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+from vllm.model_executor.layers.fused_moe import shared_expert_fold
 from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
@@ -76,6 +77,11 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
+
+        if shared_expert_fold.SEG_FOLD:
+            # Keep the BF16 shared-expert weights for the post-load fold into
+            # the routed MoE (see shared_expert_fold).
+            shared_expert_fold.stash_shared_expert_weight(layer)
 
         weight_fp8, weight_scale = mxfp8_e4m3_quantize(layer.weight.contiguous())
 
