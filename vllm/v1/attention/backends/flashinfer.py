@@ -1800,27 +1800,29 @@ _FI_KV_COUNTER_ENABLED = os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER", "0") ==
 _FI_KV_COUNTER_BYTES = int(
     os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
 )
-_FI_KV_COUNTER_BUFS: dict[torch.device, torch.Tensor] = {}
+# One buffer per (device, kernel kind): the context and generation kernels of a
+# layer run back to back and may overlap under PDL, so they never share one.
+_FI_KV_COUNTER_BUFS: dict[tuple[torch.device, str], torch.Tensor] = {}
 
 
-def _fi_kv_counter_buffer(device: torch.device) -> torch.Tensor | None:
+def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | None:
     if not _FI_KV_COUNTER_ENABLED:
         return None
-    buf = _FI_KV_COUNTER_BUFS.get(device)
+    buf = _FI_KV_COUNTER_BUFS.get((device, kind))
     if buf is None:
         if torch.cuda.is_current_stream_capturing():
             # Never create the persistent buffer inside a graph capture (it
             # would live in the graph's private pool); FlashInfer allocates.
             return None
         buf = torch.zeros(_FI_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
-        _FI_KV_COUNTER_BUFS[device] = buf
+        _FI_KV_COUNTER_BUFS[(device, kind)] = buf
     return buf
 
 
 def _fi_kv_counter_kwargs(
-    device: torch.device, batch_size: int, num_qo_heads: int
+    device: torch.device, batch_size: int, num_qo_heads: int, kind: str
 ) -> dict:
-    buf = _fi_kv_counter_buffer(device)
+    buf = _fi_kv_counter_buffer(device, kind)
     if buf is None:
         return {}
     # FlashInfer needs round_up(max(batch * heads, sm_count), 8) int32 semaphores.
@@ -2426,6 +2428,7 @@ class FlashInferImpl(AttentionImpl):
                         prefill_query.device,
                         attn_metadata.num_prefills,
                         prefill_query.shape[1],
+                        "ctx",
                     ),
                 )
 
@@ -2662,6 +2665,7 @@ class FlashInferImpl(AttentionImpl):
                         decode_query.device,
                         decode_query.shape[0],
                         decode_query.shape[1],
+                        "gen",
                     ),
                 )
 
