@@ -296,11 +296,6 @@ def _glue_ews_qkv_kernel(
                              mask=head_mask)
 
 
-EWS_VARIANTS = [dict(hg=1, tpp=2, gate_copy=True), dict(hg=2, tpp=1, gate_copy=True), dict(hg=2, tpp=2, gate_copy=True),
-                dict(hg=4, tpp=1, gate_copy=True), dict(hg=8, tpp=1, gate_copy=True), dict(hg=2, tpp=1, gate_copy=False),
-                dict(hg=4, tpp=1, gate_copy=False)]
-
-
 def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, num_kv_heads, head_dim,
                rotary_dim, mrope_section, norm_beta, q_scale, k_scale, v_scale, slot_mapping, k_cache, v_cache,
                tpp=1, hg=2, gate_copy=True, num_warps=None):

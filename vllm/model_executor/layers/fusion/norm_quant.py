@@ -77,6 +77,11 @@ STATS = {"hit_swz": 0, "hit_lin": 0, "miss": 0, "pre": 0, "post": 0}
 GLUE_NQRR = os.environ.get("GLUE_NQRR", "0") == "1"
 GLUE_GMRR = os.environ.get("GLUE_GMRR", "0") == "1"
 GLUE_GMRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_GMRR_CFG", "1,8").split(","))  # rows/program, warps
+# rows/program, warps of norm_quant_rr: 1 row x 4 warps keeps the [1, 1024] per-row reduction layout of the port
+# config (2 rows x 8 warps) -> bit-identical (bench: -0.4..-1 us at decode M, -45 % at mixed M on GB300)
+GLUE_NQRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_NQRR_CFG", "1,4").split(","))
+# GLUE_FNQ_XB=1: fused finalize + pre-norm + MXFP8 with 1 row x 4 warps per program (same kernel, same per-row layout)
+GLUE_FNQ_XB = int(os.environ.get("GLUE_FNQ_XB", "0"))
 QGF_GDNM = EMIT and os.environ.get("QGF_GDNM", "0") == "1"
 QGF_FIN_MAXM = int(os.environ.get("VLLM_MOE_FINALIZE_FOLD_MAX_M", "1024"))
 QGF_FIN = EMIT and os.environ.get("QGF_FIN", "0") == "1"
@@ -152,7 +157,8 @@ def _norm_quant(*args, **kw):
         from vllm.model_executor.layers.fusion import glue_kernels as G
 
         STATS["glue_nqrr"] = STATS.get("glue_nqrr", 0) + 1
-        return G.norm_quant_rr(*args, **kw)
+        cfg = {"XBLOCK": GLUE_NQRR_CFG[0], "RB": K.CONFIG["RB"], "num_warps": GLUE_NQRR_CFG[1]}
+        return G.norm_quant_rr(*args, config=cfg, **kw)
     return K.norm_quant(*args, **kw)
 
 
@@ -189,7 +195,14 @@ def _pre_norm(
         # weight the expert outputs here (== trtllm finalize, then pre_norm).
         g2, wts, idx = e[1], e[2], e[3].view(-1)
         if s.shape[0] <= QGF_FIN_MAXM:
-            out, res, q, swz = K.fin_norm_quant(g2, wts, idx, f, a, r, w, eps)
+            if GLUE_FNQ_XB > 0:
+                from vllm.model_executor.layers.fusion import glue_kernels as G
+
+                out, res, q, swz = G.fin_norm_quant_rr(
+                    g2, wts, idx, f, a, r, w, eps, GLUE_FNQ_XB, 4 * GLUE_FNQ_XB
+                )
+            else:
+                out, res, q, swz = K.fin_norm_quant(g2, wts, idx, f, a, r, w, eps)
             STATS["fin_fused"] = STATS.get("fin_fused", 0) + 1
         else:  # large M: finalize + pre_norm is faster than the fused kernel
             s_m = K.finalize(g2, wts, idx, s.shape[0], s.shape[1])
@@ -693,13 +706,18 @@ def compile_hash_factors() -> list[str]:
     return [
         f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
         f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
-        f"glue-v1-nqrr{int(GLUE_NQRR)}-gmrr{int(GLUE_GMRR)}-{GLUE_GMRR_CFG}",
+        f"glue-v2-nqrr{int(GLUE_NQRR)}{GLUE_NQRR_CFG}-gmrr{int(GLUE_GMRR)}{GLUE_GMRR_CFG}-fnq{GLUE_FNQ_XB}",
     ]
 
 
 if NQF:
     register_ops()
     logger.info("norm_quant_fusion enabled (emit=%s)", EMIT)
+    if GLUE_NQRR or GLUE_GMRR or GLUE_FNQ_XB:
+        logger.info(
+            "[glue] norm_quant_rr=%s cfg=%s gate_mul_rr=%s cfg=%s fin_norm_quant rows/program=%s",
+            GLUE_NQRR, GLUE_NQRR_CFG, GLUE_GMRR, GLUE_GMRR_CFG, GLUE_FNQ_XB,
+        )
     if QGF_FIN:
         logger.info("norm_quant_fusion: MoE finalize fold enabled (QGF_FIN)")
     if QGF_GDNM:

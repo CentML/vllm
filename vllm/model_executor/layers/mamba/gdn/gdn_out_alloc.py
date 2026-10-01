@@ -93,6 +93,7 @@ def gdn_out_alloc_impl(like: torch.Tensor, h: int, d: int) -> torch.Tensor:
     if NOZERO_FULL and _full_graph_forward():
         _DEFERRED[out.data_ptr()] = slot
         STATS["deferred"] += 1
+        logger.info_once("[glue] GDN core_attn_out pad-row zeroing deferred in FULL decode graphs (GLUE_GSC_QO)")
         return out
     _zero_pad_rows_kernel[(T,)](out, slot if slot is not None else out, h * d, BLOCK=1024,
                                 HAS_SLOT=slot is not None, num_warps=4, launch_pdl=_lcd_pdl_on())
@@ -125,6 +126,7 @@ def zero_pad_rows_late(out: torch.Tensor, quant_done: bool) -> None:
         STATS["skipped"] += 1
         return
     STATS["late_zero"] += 1
+    logger.warning_once("[glue] GDN pad-row zeroing ran late (the fused decode quant did not engage for a layer)")
     T = out.shape[0]
     row = out[0].numel()
     _zero_pad_rows_kernel[(T,)](out, slot if slot is not None else out, row, BLOCK=1024,

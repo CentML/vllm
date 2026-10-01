@@ -60,6 +60,9 @@ GLUE_EWS_TPP = int(os.environ.get("GLUE_EWS_TPP", "1"))
 # GLUE_EWS_NOGATE=1 (with GLUE_EWS_HG > 0, NQF=1): no contiguous gate copy; the o_proj gate-mul + MXFP8 op reads the
 # gate straight from the [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv).
 GLUE_EWS_NOGATE = GLUE_EWS_HG > 0 and os.environ.get("GLUE_EWS_NOGATE", "0") == "1"
+# GLUE_EWS_TPP_SPLIT=<n> (> 0): tokens per program 1 for T <= n, else EWS_QKV_TPP (same kernel and per-token math;
+# GB300 bench: TPP 1 is 0.4-1.1 us faster at decode T, TPP 2 4-5 % faster at T >= 3K)
+GLUE_EWS_TPP_SPLIT = int(os.environ.get("GLUE_EWS_TPP_SPLIT", "0"))
 STATS = {"calls": 0, "layers": 0}
 
 
@@ -209,7 +212,7 @@ def launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, 
         block_size = 1
         kcs = vcs = (0, 0, 0)
         sm = q8
-    tpp = tpp or TPP
+    tpp = tpp or (1 if 0 < T <= GLUE_EWS_TPP_SPLIT else TPP)
     head_block = triton.next_power_of_2(head_dim)
     grid = (triton.cdiv(T, tpp), num_q_heads + num_kv_heads)
     _ews_qkv_kernel[grid](
@@ -351,3 +354,6 @@ def project_qkv_gate(mod, qkv, positions):
 
 if ENABLED:
     register_op()
+    if GLUE_EWS_TPP_SPLIT or GLUE_EWS_HG:
+        logger.info("[glue] QKV prologue: tokens/program 1 up to T=%d (else %d); heads/program %d, gate copy %s",
+                    GLUE_EWS_TPP_SPLIT, TPP, GLUE_EWS_HG, not GLUE_EWS_NOGATE)
