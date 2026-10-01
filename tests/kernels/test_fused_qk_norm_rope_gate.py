@@ -183,3 +183,86 @@ def test_fused_qk_rmsnorm_rope_matches_gate_kernel_bitwise(
         q_fp8_ref, _ = quant(q_ref, q_scale)
         assert torch.equal(q_fp8.view(torch.uint8), q_fp8_ref.view(torch.uint8))
         torch.testing.assert_close(k_fp8, k_ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="fused_qk_rmsnorm_rope Triton kernel requires CUDA",
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "auto"])
+@pytest.mark.parametrize("num_tokens,num_slots", [(1, 1), (13, 9), (300, 300)])
+@torch.inference_mode()
+def test_fused_qk_rmsnorm_rope_kv_write_matches_reshape_and_cache_flash(
+    default_vllm_config,
+    num_tokens: int,
+    num_slots: int,
+    kv_cache_dtype: str,
+) -> None:
+    """The paged-cache write equals reshape_and_cache_flash of the op's k and v
+    (padding slots -1 and rows past slot_mapping untouched), byte for byte.
+    """
+    from vllm import _custom_ops  # noqa: F401  (registers _C_cache_ops)
+    from vllm.model_executor.layers.fused_qk_norm_rope import (
+        PagedKVWrite,
+        fused_qk_rmsnorm_rope,
+    )
+
+    num_q_heads, num_kv_heads, block_size, num_blocks = 16, 2, 16, 64
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    set_random_seed(SEED)
+    # Per-element magnitudes over 1e-4..1e3, so FP8 saturates (> 448 after the
+    # scale) and underflows in every case.
+    width = (2 * num_q_heads + 2 * num_kv_heads) * HEAD_DIM
+    magnitude = 10 ** (torch.rand(num_tokens, width, device=device) * 7 - 4)
+    qkv = (torch.randn(num_tokens, width, device=device) * magnitude).to(DTYPE)
+    q_size, kv_size = num_q_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
+    q_gate, k, v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
+    q_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
+    k_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
+    cos_sin_cache = torch.randn(4096, ROTARY_DIM, device=device).to(DTYPE)
+    positions = torch.randint(0, 4096, (num_tokens,), device=device)
+    slots = torch.randperm(num_blocks * block_size, device=device)[:num_slots]
+    slots[1::5] = -1
+    k_scale = torch.tensor(0.37, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.9, dtype=torch.float32, device=device)
+    # The FlashInfer backend's cache (B, H, N, 2 * D) and its write views.
+    cache_dtype = torch.uint8 if kv_cache_dtype == "fp8" else DTYPE
+    caches = []
+    for _ in range(2):
+        cache = torch.zeros(
+            num_blocks, num_kv_heads, block_size, 2 * HEAD_DIM, device=device
+        ).to(cache_dtype)
+        caches.append(cache)
+    caches[1].copy_(caches[0])
+    args = (q_gate, k, q_weight, k_weight, cos_sin_cache, positions, None)
+    geometry = (RMS_NORM_EPS, num_q_heads, num_kv_heads, HEAD_DIM, ROTARY_DIM)
+
+    q_ref, k_ref, _ = fused_qk_rmsnorm_rope(*args, *geometry, norm_beta=1.0)
+    k_cache, v_cache = caches[0].transpose(1, 2).split(HEAD_DIM, dim=-1)
+    torch.ops._C_cache_ops.reshape_and_cache_flash(
+        k_ref.view(-1, num_kv_heads, HEAD_DIM),
+        v.view(-1, num_kv_heads, HEAD_DIM),
+        k_cache,
+        v_cache,
+        slots,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+    k_cache, v_cache = caches[1].transpose(1, 2).split(HEAD_DIM, dim=-1)
+    if kv_cache_dtype == "fp8":
+        k_cache = k_cache.view(torch.float8_e4m3fn)
+        v_cache = v_cache.view(torch.float8_e4m3fn)
+    q_out, k_out, _ = fused_qk_rmsnorm_rope(
+        *args,
+        *geometry,
+        norm_beta=1.0,
+        kv_write=PagedKVWrite(v, k_cache, v_cache, slots, k_scale, v_scale),
+    )
+    assert torch.equal(q_out, q_ref) and torch.equal(k_out, k_ref)
+    assert torch.equal(caches[1].view(torch.uint8), caches[0].view(torch.uint8))
+    if kv_cache_dtype == "fp8":
+        # The case exercises saturation, zeros and both scales.
+        written = caches[0].view(torch.float8_e4m3fn).float()
+        assert written.abs().max() == 448.0 and (written == 0).any()

@@ -491,6 +491,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
         output_dtype: torch.dtype | None = None,
+        kv_cache_written: bool = False,
     ) -> torch.Tensor:
         """The KV cache is stored inside this class and is accessed via
         `self.kv_cache`.
@@ -499,6 +500,11 @@ class Attention(nn.Module, AttentionLayerBase):
         the model runner's `execute_model` method. It is accessed via forward
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
+
+        With ``kv_cache_written`` the caller's producer of ``query`` already
+        wrote ``key``/``value`` into this layer's cache (e.g.
+        ``vllm::fused_qk_rmsnorm_rope_kv_cache``), so the cache update is
+        skipped.
         """
         if output_dtype is None:
             output_dtype = query.dtype
@@ -539,7 +545,8 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_written
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -559,7 +566,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not kv_cache_written
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
