@@ -1943,6 +1943,13 @@ class FlashInferImpl(AttentionImpl):
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
 
+        # attn-pdo: create the side stream + private workspace now, before the
+        # KV-cache memory profiling, so the extra workspace is accounted for.
+        if attn_pd_overlap.ENABLED:
+            attn_pd_overlap.preallocate(
+                torch.device("cuda", torch.cuda.current_device())
+            )
+
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
         assert self.cache_config is not None

@@ -36,7 +36,9 @@ Environment (read at import; default off):
 ``VLLM_ATTN_PD_CHECK``        the first N forks per process are re-run serially
                               and compared bitwise; any mismatch keeps the serial
                               result and disables the fork.
-``VLLM_ATTN_PD_LOG_EVERY``    log fork counts every N forks (0 = off).
+``VLLM_ATTN_PD_LOG_EVERY``    log counts every N mixed attention calls (5000; 0 = off):
+                              forks, calls below the decode-row minimum, and the
+                              mean host cost of plan() when it does not fork.
 
 Only eager calls fork (never during CUDA-graph capture); with PIECEWISE graphs
 the attention op of mixed steps is eager, and FULL decode graphs have no
@@ -45,6 +47,7 @@ prefill rows.
 
 import os
 import threading
+import time
 
 import torch
 
@@ -57,13 +60,14 @@ ORDER = os.environ.get("VLLM_ATTN_PD_ORDER", "pp").strip().lower()
 MIN_DEC_ROWS = int(os.environ.get("VLLM_ATTN_PD_MIN_DEC_ROWS", "64"))
 SPIN_CYC = int(os.environ.get("VLLM_ATTN_PD_SPIN_CYC", "40000"))
 _CHECK = [int(os.environ.get("VLLM_ATTN_PD_CHECK", "0"))]
-LOG_EVERY = int(os.environ.get("VLLM_ATTN_PD_LOG_EVERY", "20000"))
+LOG_EVERY = int(os.environ.get("VLLM_ATTN_PD_LOG_EVERY", "5000"))
 if ORDER not in ("pp", "dly"):
     raise ValueError(f"VLLM_ATTN_PD_ORDER must be pp or dly, got {ORDER!r}")
 
 _TLS = threading.local()
 _DEV: dict = {}  # device index -> per-device state
-_STATS = {"forks": 0, "checks": 0, "mismatch": 0, "disabled": False}
+_STATS = {"calls": 0, "forks": 0, "below_min": 0, "capture": 0, "off_ns": 0, "fork_ns": 0,
+          "checks": 0, "mismatch": 0, "disabled": False}
 if ENABLED:
     logger.info(
         "attention decode||prefill overlap (attn-pdo) enabled: order=%s "
@@ -151,19 +155,65 @@ class Fork:
         self.main.wait_event(self.st.ev_side)
 
 
+def preallocate(device: torch.device) -> None:
+    """Create the per-device state (side stream, private workspace + counter
+    buffer) at model construction, i.e. before vLLM profiles memory for the KV
+    cache, so the extra workspace is accounted for and cannot OOM later."""
+    if not ENABLED:
+        return
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _DEV:
+        from vllm import envs
+
+        _DEV[idx] = _DevState(device, envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE)
+
+
+def _log_counts() -> None:
+    c = _STATS
+    off_n = max(1, c["calls"] - c["forks"])
+    logger.info(
+        "attn-pdo: mixed attention calls %d: forks %d (%.1f%%), below %d decode rows "
+        "%d, under capture %d; plan() host cost: not forked %.0f ns/call, forked "
+        "%.0f ns/call; checks ok %d, mismatches %d",
+        c["calls"],
+        c["forks"],
+        100.0 * c["forks"] / max(1, c["calls"]),
+        MIN_DEC_ROWS,
+        c["below_min"],
+        c["capture"],
+        c["off_ns"] / off_n,
+        c["fork_ns"] / max(1, c["forks"]),
+        c["checks"],
+        c["mismatch"],
+    )
+
+
 def plan(
     num_prefill_tokens: int, num_decode_tokens: int, device: torch.device
 ) -> "Fork | None":
     """Return a Fork (and record the fork point on the current stream) when this
     attention call should overlap its prefill and decode kernels."""
+    if not ENABLED or num_prefill_tokens <= 0:
+        return None
+    t0 = time.perf_counter_ns()
+    c = _STATS
+    c["calls"] += 1
+    if LOG_EVERY and c["calls"] % LOG_EVERY == 0:
+        _log_counts()
     if (
-        not ENABLED
-        or _STATS["disabled"]
+        c["disabled"]
         or getattr(_TLS, "serial", False)
-        or num_prefill_tokens <= 0
         or num_decode_tokens < MIN_DEC_ROWS
         or torch.cuda.is_current_stream_capturing()
     ):
+        if num_decode_tokens < MIN_DEC_ROWS:
+            c["below_min"] += 1
+        elif not c["disabled"] and not getattr(_TLS, "serial", False):
+            c["capture"] += 1
+        if getattr(_TLS, "serial", False):
+            c["calls"] -= 1  # the CHECK re-run is not a new call
+        else:
+            c["off_ns"] += time.perf_counter_ns() - t0
         return None
     idx = device.index if device.index is not None else torch.cuda.current_device()
     st = _DEV.get(idx)
@@ -173,9 +223,8 @@ def plan(
         st = _DEV[idx] = _DevState(device, envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE)
     main = torch.cuda.current_stream(device)
     st.ev_in.record(main)
-    _STATS["forks"] += 1
-    if LOG_EVERY and _STATS["forks"] % LOG_EVERY == 0:
-        logger.info("attn-pdo: %d forks, %d checks ok", _STATS["forks"], _STATS["checks"])
+    c["forks"] += 1
+    c["fork_ns"] += time.perf_counter_ns() - t0
     return Fork(st, main)
 
 
