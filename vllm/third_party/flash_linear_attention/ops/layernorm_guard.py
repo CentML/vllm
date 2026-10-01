@@ -13,7 +13,8 @@
 # This backward pass is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -206,6 +207,8 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
         NORM_BEFORE_GATE: bool
         IS_RMS_NORM: bool
         ACTIVATION: str
+        # None: the default for BLOCK_N. Set by launch-config overrides.
+        NUM_WARPS: int | None = None
 
     kernel = staticmethod(layer_norm_fwd_kernel)
 
@@ -279,6 +282,7 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
         norm_before_gate: bool,
         is_rms_norm: bool,
         activation: str,
+        launch_config: Callable[[int], tuple[int, int]] | None = None,
     ) -> list[CompileKey]:
         if max_num_tokens < 1 or rows_per_token < 1:
             return []
@@ -295,7 +299,9 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
             M = num_tokens * rows_per_token
             signature = (
                 triton_scalar_specialization_rep(M),
-                calc_rows_per_block(M, device),
+                calc_rows_per_block(M, device)
+                if launch_config is None
+                else launch_config(M),
             )
             m_values.setdefault(signature, M)
 
@@ -327,6 +333,9 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
                 is_rms_norm=is_rms_norm,
                 activation=activation,
             )
+            if launch_config is not None:
+                rows_per_block, num_warps = launch_config(M)
+                key = replace(key, ROWS_PER_BLOCK=rows_per_block, NUM_WARPS=num_warps)
             keys[key] = None
         return list(keys)
 
@@ -359,7 +368,11 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
             NORM_BEFORE_GATE=compile_key.NORM_BEFORE_GATE,
             IS_RMS_NORM=compile_key.IS_RMS_NORM,
             ACTIVATION=compile_key.ACTIVATION,
-            num_warps=min(max(compile_key.BLOCK_N // 256, 1), 8),
+            num_warps=(
+                min(max(compile_key.BLOCK_N // 256, 1), 8)
+                if compile_key.NUM_WARPS is None
+                else compile_key.NUM_WARPS
+            ),
             grid=(1, 1),
         )
 
@@ -377,13 +390,18 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
         norm_before_gate: bool,
         is_rms_norm: bool,
         activation: str,
+        rows_per_block: int | None = None,
+        num_warps: int | None = None,
     ) -> None:
         M = x.shape[0]
         max_fused_size = 65536 // x.element_size()
         block_n = min(max_fused_size, triton.next_power_of_2(group_size))
         if group_size > block_n:
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-        rows_per_block = calc_rows_per_block(M, x.device)
+        if rows_per_block is None:
+            rows_per_block = calc_rows_per_block(M, x.device)
+        if num_warps is None:
+            num_warps = min(max(block_n // 256, 1), 8)
         grid = (cdiv(M, rows_per_block), x.shape[1] // group_size)
         self.kernel[grid](
             x,
@@ -406,7 +424,7 @@ class LayerNormFwdKernel(VllmJitKernel["LayerNormFwdKernel.CompileKey"]):
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             ACTIVATION=activation,
-            num_warps=min(max(block_n // 256, 1), 8),
+            num_warps=num_warps,
         )
 
 
@@ -424,7 +442,10 @@ def warmup_layer_norm_fwd(
     norm_before_gate: bool,
     is_rms_norm: bool,
     activation: str,
+    launch_config: Callable[[int], tuple[int, int]] | None = None,
 ) -> None:
+    """``launch_config(M) -> (rows_per_block, num_warps)`` warms a launch that
+    overrides the default heuristics with the same function."""
     _LAYER_NORM_FWD_KERNEL.warmup(
         max_num_tokens=max_num_tokens,
         rows_per_token=rows_per_token,
@@ -435,6 +456,7 @@ def warmup_layer_norm_fwd(
         norm_before_gate=norm_before_gate,
         is_rms_norm=is_rms_norm,
         activation=activation,
+        launch_config=launch_config,
     )
 
 
@@ -449,7 +471,10 @@ def layer_norm_fwd(
     norm_before_gate: bool = True,
     is_rms_norm: bool = False,
     activation: str = "swish",
+    rows_per_block: int | None = None,
+    num_warps: int | None = None,
 ):
+    """``rows_per_block`` / ``num_warps`` override the launch heuristics."""
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -489,6 +514,8 @@ def layer_norm_fwd(
         norm_before_gate,
         is_rms_norm,
         activation,
+        rows_per_block=rows_per_block,
+        num_warps=num_warps,
     )
     return out, mean, rstd
 

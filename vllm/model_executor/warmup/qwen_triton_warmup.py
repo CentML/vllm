@@ -3,6 +3,7 @@
 """Warm up Qwen Triton kernels from the loaded model's compile keys."""
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,6 +46,12 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    # The FlashInfer prefill path makes the post-conv kernel emit exp(g).
+    post_conv_output_g_exp: bool = False
+    # out_proj consumes the MXFP8 activation written by the core op.
+    gdn_out_mxfp8: bool = False
+    # Prefill updates the SSM state pool in place (FlashInfer state_indices).
+    state_in_place: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -134,6 +141,17 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            post_conv_output_g_exp=bool(
+                getattr(
+                    getattr(layer, "chunk_gated_delta_rule", None),
+                    "expects_exp_g",
+                    False,
+                )
+            ),
+            gdn_out_mxfp8=bool(getattr(layer, "gdn_out_mxfp8", False)),
+            state_in_place=bool(
+                layer.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype)
+            ),
         )
 
     if found_layer:
@@ -149,20 +167,87 @@ def _warm_gated_rms_norm_kernel(
     max_num_tokens: int,
     x_dtype: torch.dtype,
 ) -> None:
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_norm_launch_config,
+    )
     from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
         warmup_layer_norm_fwd,
     )
 
-    warmup_layer_norm_fwd(
-        max_num_tokens=max_num_tokens,
-        rows_per_token=config.hv,
-        group_size=config.v,
-        x_dtype=x_dtype,
-        weight_dtype=config.norm_weight_dtype,
-        device=device,
-        norm_before_gate=config.norm_before_gate,
-        is_rms_norm=True,
-        activation=config.norm_activation,
+    # Decode-only batches normalize T * HV rows of V; batches with prefill
+    # normalize T rows of HV * V (one group per head), with the layer's launch
+    # config.
+    for rows_per_token in (config.hv, 1):
+        launch_config = None
+        if rows_per_token == 1:
+            launch_config = partial(gdn_norm_launch_config, device=device)
+        warmup_layer_norm_fwd(
+            max_num_tokens=max_num_tokens,
+            rows_per_token=rows_per_token,
+            group_size=config.v,
+            x_dtype=x_dtype,
+            weight_dtype=config.norm_weight_dtype,
+            device=device,
+            norm_before_gate=config.norm_before_gate,
+            is_rms_norm=True,
+            activation=config.norm_activation,
+            launch_config=launch_config,
+        )
+
+
+def _warm_gdn_gated_norm_mxfp8_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig, x_dtype: torch.dtype
+) -> None:
+    if not config.gdn_out_mxfp8:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_gated_norm_mxfp8,
+        gdn_mxfp8_scale_numel,
+    )
+
+    hidden = config.hv * config.v
+    weight = torch.ones(config.v, dtype=config.norm_weight_dtype, device=device)
+    # Both num_warps classes, with the valid row count as a host int (mixed
+    # batches) and as a device scalar (decode-only batches).
+    for num_rows in (1, 1024):
+        x = torch.zeros((num_rows, config.hv, config.v), dtype=x_dtype, device=device)
+        q = torch.empty((num_rows, hidden), dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty(
+            gdn_mxfp8_scale_numel(num_rows, hidden), dtype=torch.uint8, device=device
+        )
+        for num_valid in (
+            num_rows,
+            torch.full((1,), num_rows, dtype=torch.int32, device=device),
+        ):
+            gdn_gated_norm_mxfp8(
+                x,
+                x,
+                weight,
+                1e-6,
+                config.norm_activation,
+                q,
+                scale,
+                (0, num_rows),
+                num_valid,
+            )
+
+
+def _warm_zero_fresh_state_rows_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig
+) -> None:
+    if not config.state_in_place:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+
+    pool = torch.empty(
+        (1, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
+    )
+    zero_fresh_state_rows(
+        pool,
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.bool, device=device),
     )
 
 
@@ -228,7 +313,7 @@ def _warm_fused_post_conv_kernel(
             config.k,
             config.v,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=config.post_conv_output_g_exp,
         )
 
 
@@ -301,6 +386,8 @@ def qwen_triton_warmup(
 
     max_num_tokens = max(1, int(runner.max_num_tokens))
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
+    _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
+    _warm_zero_fresh_state_rows_kernel(device, gdn_config)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
