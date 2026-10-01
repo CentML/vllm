@@ -40,6 +40,14 @@ Environment:
   generated; until then (or if the patch does not apply) MoE PDL stays off.
   Launch attributes only: numerics are unchanged. Works with or without
   ``GS2_ROUTE``.
+* ``VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE``: optional persistent directory
+  for the built module. FlashInfer builds JIT modules inside its workspace,
+  which serving launchers often make fresh per process (minutes of nvcc per
+  start for this module). With this set, the built ``.so`` is copied to
+  ``<dir>/<module>-<input hash>/<module>.so`` and later processes whose
+  inputs hash the same (source bytes, compiler/linker flags, include dirs,
+  FlashInfer version, device capability) load it instead of rebuilding.
+  Start-up only: the loaded code is the code the build would produce.
 
 FlashInfer adapter: FlashInfer builds the module through the module-level
 function ``flashinfer.fused_moe.core.gen_trtllm_gen_fused_moe_sm100_module``
@@ -64,6 +72,7 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("GS2_ROUTE", "0") != "0"
 TAG = os.environ.get("GS2_ROUTE_TAG", "exact_routing")
 _CSRC_OVERRIDE = os.environ.get("VLLM_FLASHINFER_MOE_ROUTING_CSRC")
+_MODULE_CACHE = os.environ.get("VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE", "")
 
 ROUTING_SOURCE_NAME = "trtllm_fused_moe_routing_common.cu"
 PATCH_FILE = (
@@ -226,6 +235,91 @@ def _moe_pdl_fc_supported(device) -> bool:
     from flashinfer.fused_moe import core
 
     return bool(core.device_support_pdl(device))
+def _module_cache_key(spec) -> str:
+    import flashinfer
+    import torch
+    from flashinfer.jit import env as jit_env
+
+    # Paths inside the (per-process) FlashInfer workspace are normalised, so the
+    # key does not depend on where the workspace lives; the generated headers
+    # there are a function of the FlashInfer version and the module flags.
+    ws = str(jit_env.FLASHINFER_WORKSPACE_DIR)
+    h = hashlib.sha256()
+    cap = torch.cuda.get_device_capability()
+    h.update(f"{spec.name}|{flashinfer.__version__}|{cap}".encode())
+    for p in spec.sources:
+        h.update(Path(p).name.encode())
+        h.update(Path(p).read_bytes())
+    groups = (
+        "extra_cflags",
+        "extra_cuda_cflags",
+        "extra_ldflags",
+        "extra_include_dirs",
+    )
+    for group in groups:
+        for item in getattr(spec, group, None) or []:
+            h.update(f"{group}={str(item).replace(ws, '<ws>')}".encode())
+    return h.hexdigest()[:16]
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(src.read_bytes())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _with_module_cache(spec):
+    """Return ``spec`` whose build output is shared through
+    ``VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE`` (see the module docstring).
+    """
+    if not _MODULE_CACHE:
+        return spec
+    cached = (
+        Path(_MODULE_CACHE)
+        / f"{spec.name}-{_module_cache_key(spec)}"
+        / f"{spec.name}.so"
+    )
+
+    class _CachedSpec(type(spec)):
+        def try_load(self):
+            if cached.is_file():
+                try:
+                    # Materialise the cached build at the module's JIT path:
+                    # FlashInfer also opens that path directly (cubin loader).
+                    dst = Path(self.jit_library_path)
+                    _copy_atomic(cached, dst)
+                    module = self.load(dst)
+                    logger.info(
+                        "exact MoE routing: loaded %s from %s", self.name, cached
+                    )
+                    return module
+                except Exception as e:  # corrupt / incompatible copy: rebuild
+                    logger.warning(
+                        "exact MoE routing: cannot load %s (%r); rebuilding", cached, e
+                    )
+            return super().try_load()
+
+        def build(self, *args, **kwargs):
+            super().build(*args, **kwargs)
+            try:
+                _copy_atomic(Path(self.jit_library_path), cached)
+                logger.info("exact MoE routing: cached %s at %s", self.name, cached)
+            except Exception as e:  # the module still loads from the workspace
+                logger.warning(
+                    "exact MoE routing: could not cache %s (%r)", self.name, e
+                )
+
+    out = object.__new__(_CachedSpec)
+    out.__dict__.update(spec.__dict__)
+    return out
 
 
 def maybe_install() -> None:
@@ -267,7 +361,7 @@ def maybe_install() -> None:
             assert stock_l, f"{LAUNCHER_SOURCE_NAME} not in spec sources"
             lsrc = patched_launcher_source(Path(stock_l[0]), out_dir)
             srcs = [lsrc if Path(p).name == LAUNCHER_SOURCE_NAME else p for p in srcs]
-        new = dataclasses.replace(spec, name=name, sources=srcs)
+        new = _with_module_cache(dataclasses.replace(spec, name=name, sources=srcs))
         if ENABLED:
             logger.info(
                 "exact MoE routing: module %s -> %s, routing source %s",
