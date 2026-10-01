@@ -1429,6 +1429,9 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        # JIT-compiled (torch cpp_extension) GDN CUDA kernel sources
+        "model_executor/layers/mamba/ops/gdn_conv_cuda/*.cu",
+        "model_executor/layers/mamba/ops/gdn_state_commit/*.cu",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",
