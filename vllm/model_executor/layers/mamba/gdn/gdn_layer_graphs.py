@@ -86,6 +86,16 @@ FIX_PROFILE = os.environ.get(_P + "_FIX_PROFILE", "1") == "1"
 # behaviour; piece mode always needs NONE). Layer graphs are then captured
 # only inside vLLM's capture phase (never while serving an unpacked step).
 KEEP_PW = os.environ.get(_P + "_KEEP_PIECEWISE", "1") == "1"
+# gdnp: VLLM_GDNP_SPEC_OVERLAP=1 captures the spec-decode part of the layer
+# (conv update + deferred-commit decode of rows [0, S), spec slots) on a side
+# stream, concurrent with the prefill part (CUDA conv + V-split chunk kernel of
+# rows [S, N), prefill slots), joined before the norm-quant kernel. The two
+# parts touch disjoint rows / state slots and run the same kernels, so the
+# result is bitwise identical; the V-split kernel is latency-bound on
+# num_prefills * HV * v_split CTAs and leaves SMs idle that the bandwidth-bound
+# decode can use. Only inside graph capture (eager calls stay serial).
+SPEC_OVERLAP = os.environ.get("VLLM_GDNP_SPEC_OVERLAP", "0") == "1"
+_SIDE: dict = {}  # device -> side capture stream
 # In-serving check: the first N layer replays of packed steps also run the
 # eager path on the same inputs / state pages (restored in between) and compare
 # outputs, MXFP8 stash buffers and the touched state pages bitwise; a mismatch
@@ -111,7 +121,7 @@ def check_config() -> None:
     if ENABLED:
         logger.info(
             "GDN layer graphs enabled: MODE=%s DEVICE_NB=%d NR=%d NP=%d T_MAX=%d "
-            "TPH=%d V2ONLY=%d FIX_PROFILE=%d",
+            "TPH=%d V2ONLY=%d FIX_PROFILE=%d SPEC_OVERLAP=%d",
             MODE,
             int(DEVNB),
             NR,
@@ -120,6 +130,7 @@ def check_config() -> None:
             TPH,
             int(V2ONLY),
             int(FIX_PROFILE),
+            int(SPEC_OVERLAP),
         )
 
 
@@ -922,6 +933,15 @@ def _graph_core(layer, gb, mixed_qkvz, ba, core_attn_out, stash=True, only_vsf=N
     )
     # spec rows [0, S): conv update (in place) + deferred-commit decode (fused gated
     # RMSNorm), NR padded requests
+    side = None
+    if SPEC_OVERLAP and torch.cuda.is_current_stream_capturing():
+        main = torch.cuda.current_stream()
+        side = _SIDE.get(main.device)
+        if side is None:
+            side = _SIDE[main.device] = torch.cuda.Stream(device=main.device)
+        side.wait_stream(main)
+        side_ctx = torch.cuda.stream(side)
+        side_ctx.__enter__()
     mq = mod.causal_conv1d_update(
         mixed_qkv,
         conv_state,
@@ -951,6 +971,8 @@ def _graph_core(layer, gb, mixed_qkvz, ba, core_attn_out, stash=True, only_vsf=N
         float(layer.layer_norm_epsilon),
         layer.norm.activation == "sigmoid",
     )
+    if side is not None:
+        side_ctx.__exit__(None, None, None)
     # prefill rows [S, N): conv + post-conv into absolute rows of the shared buffers
     q, k, v, g, beta = (t[:T] for t in _shared(ssm.device, H, HV))
     gcc = mod._GDN_CONV_CUDA_MOD[0]
@@ -994,6 +1016,9 @@ def _graph_core(layer, gb, mixed_qkvz, ba, core_attn_out, stash=True, only_vsf=N
             layer.head_k_dim**-0.5,
             vsf,
         )
+    if side is not None:
+        # join: the norm-quant kernel reads rows [0, S) written by the decode
+        torch.cuda.current_stream().wait_stream(side)
     # gated RMSNorm + MXFP8 quant (norm-quant fusion math) with device-side row
     # ranges, then the stash for out_proj
     K_ = HV * layer.head_v_dim
