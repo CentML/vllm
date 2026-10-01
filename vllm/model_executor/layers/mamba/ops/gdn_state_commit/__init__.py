@@ -203,10 +203,11 @@ def load(minb=None, gb=None):
     gb_env = gb
     gb = int(os.environ.get("GDN_STATE_COMMIT_GB", "0")) if gb_env is None else int(gb_env)
     gbo = {k: int(os.environ.get(f"GDN_STATE_COMMIT_GB_{k}", v))
-           for k, v in (("W", "8"), ("D", "2"), ("NS", "1"), ("F2", "1"), ("MINB", "4"), ("KREG", "1"))}
+           for k, v in (("W", "8"), ("D", "1"), ("NS", "2"), ("F2", "1"), ("MINB", "3"), ("KREG", "1"),
+                        ("SPEC", "1"))}
     gb_flags = []
     if gb:
-        tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k".format(**gbo)
+        tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k{SPEC}s".format(**gbo)
         gb_flags = ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)

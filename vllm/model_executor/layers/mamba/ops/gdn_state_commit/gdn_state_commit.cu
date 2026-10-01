@@ -1374,16 +1374,16 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
 #define GB_W 8
 #endif
 #ifndef GB_D
-#define GB_D 2
+#define GB_D 1
 #endif
 #ifndef GB_NS
-#define GB_NS 1
+#define GB_NS 2
 #endif
 #ifndef GB_F2
 #define GB_F2 1
 #endif
 #ifndef GB_MINB
-#define GB_MINB 4
+#define GB_MINB 3
 #endif
 #ifndef GB_KREG
 #define GB_KREG 1  // 1: keep this token's 16 k values in registers across the dot and the update
@@ -1392,8 +1392,10 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
 #define GB_SPEC 1  // 1: prep the replay tokens j < accepted before the flag is known (speculative log loads)
 #endif
 #ifndef GB_PROBE
-#define GB_PROBE 0  // timing-only ablations (WRONG results): 1 = no token math, 2 = no state load/store
+#define GB_PROBE 0  // timing-only ablations (WRONG results): 1 = no token math, 2 = no state load/store, 3 = neither
 #endif
+#define GB_NOMATH (GB_PROBE == 1 || GB_PROBE == 3)
+#define GB_NOIO (GB_PROBE == 2 || GB_PROBE == 3)
 constexpr int kGbW = GB_W;
 constexpr int kGbThreads = kGbW * 32;
 constexpr int kGbNS = GB_NS;
@@ -1579,7 +1581,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
   // (1) state: the first kGbD passes of this warp (one cp.async group per pass)
 #pragma unroll
   for (int d = 0; d < kGbD; ++d) {
-    if (GB_PROBE != 2) gb_issue_pass(ring + d * kGbPassFloats, head_state, d, warp, rq, seg);
+    if (!GB_NOIO) gb_issue_pass(ring + d * kGbPassFloats, head_state, d, warp, rq, seg);
     cp_async_commit();
   }
   const int flag = *log_flag;
@@ -1702,10 +1704,10 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
       hp[n][2][0] = gb_pack(x[0].z, x[1].z); hp[n][2][1] = gb_pack(x[2].z, x[3].z);
       hp[n][3][0] = gb_pack(x[0].w, x[1].w); hp[n][3][1] = gb_pack(x[2].w, x[3].w);
     }
-    if (GB_PROBE != 1)
+    if (!GB_NOMATH)
       for (int j = 0; j < R; ++j)
         gb_token<false>(hp, s_kp[j], nullptr, s_v[j], s_decay[j], s_beta[j], row, seg, nullptr);
-    if (R > 0 && GB_PROBE != 2) {
+    if (R > 0 && !GB_NOIO) {
 #pragma unroll
       for (int n = 0; n < kGbNS; ++n) {
         float* dst = head_state + row[n] * kDimK + seg * 4;
@@ -1719,10 +1721,10 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
       }
     }
     // refill this ring buffer with pass p + kGbD (its data is in registers); always commit one group per pass
-    if (p + kGbD < kGbPasses && GB_PROBE != 2)
+    if (p + kGbD < kGbPasses && !GB_NOIO)
       gb_issue_pass(ring + (p % kGbD) * kGbPassFloats, head_state, p + kGbD, warp, rq, seg);
     cp_async_commit();
-    if (GB_PROBE != 1)
+    if (!GB_NOMATH)
     for (int t = 0; t < num_tokens; ++t)
       gb_token<true>(hp, s_kp[kMaxT + t], s_qp[t], s_v[kMaxT + t], s_decay[kMaxT + t], s_beta[kMaxT + t], row, seg,
                      s_out[t]);
