@@ -18,6 +18,9 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.kernels.linear import Mxfp8LinearKernel
+from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+    maybe_use_lowm_bf16_gemm,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -200,6 +203,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.shared_expert_gate",
         )
+        # Decode-size router / shared-expert-gate GEMMs: one kernel instead of
+        # cuBLAS split-K + reduce (SM107 only; no-op elsewhere).
+        maybe_use_lowm_bf16_gemm(self.gate)
+        maybe_use_lowm_bf16_gemm(self.shared_expert_gate)
 
         if (
             self.is_fused_shared_expert_enabled
