@@ -167,6 +167,11 @@ def _gdn_vsplit_warmup(
     enable it; once per process. cute.compile keeps no on-disk cache: without
     this, the first eligible prefill of each worker would stall for seconds on
     the compile. A failed compile leaves FlashInfer's kernel in place.
+
+    The stock FlashInfer non-CP kernel still runs the steps choose_vsplit
+    leaves at v_split=1 (some 4-6 sequence batches). Without V-split, the
+    warmup's dummy batches compile it; with V-split they all take the V-split
+    kernel, so the same pooled variant is compiled here as well.
     """
     if _gdn_vsplit_tried:
         return
@@ -194,6 +199,22 @@ def _gdn_vsplit_warmup(
             head_dim**-0.5,
             state_indices=torch.ones(1, device=device, dtype=torch.int32),
             v_split=2,
+        )
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        chunk_gated_delta_rule(
+            q=q,
+            k=q,
+            v=v,
+            g=gate,
+            beta=gate,
+            initial_state=pool,
+            output_final_state=True,
+            cu_seqlens=torch.tensor([0, T], device=device, dtype=torch.int64),
+            output=torch.empty_like(v),
+            output_state=pool,
+            state_indices=torch.ones(1, device=device, dtype=torch.int32),
+            use_cp=False,
         )
     except Exception:
         logger.warning(
