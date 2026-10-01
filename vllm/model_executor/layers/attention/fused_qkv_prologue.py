@@ -53,6 +53,13 @@ logger = init_logger(__name__)
 ENABLED = (os.environ.get("EWS", "0") == "1"
            and os.environ.get("VLLM_FUSED_QKV_PROLOGUE", "1") == "1")
 TPP = int(os.environ.get("EWS_QKV_TPP", "1"))  # tokens per program (static unroll; 1 == stock grid)
+# gb300 glue: GLUE_EWS_HG=<n> (> 0) runs glue_kernels._glue_ews_qkv_kernel with n heads per program (2-D tiles,
+# 4*n warps, same per-head reduction layout -> bit-identical); GLUE_EWS_TPP tokens per program (default 1).
+GLUE_EWS_HG = int(os.environ.get("GLUE_EWS_HG", "0"))
+GLUE_EWS_TPP = int(os.environ.get("GLUE_EWS_TPP", "1"))
+# GLUE_EWS_NOGATE=1 (with GLUE_EWS_HG > 0, NQF=1): no contiguous gate copy; the o_proj gate-mul + MXFP8 op reads the
+# gate straight from the [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv).
+GLUE_EWS_NOGATE = GLUE_EWS_HG > 0 and os.environ.get("GLUE_EWS_NOGATE", "0") == "1"
 STATS = {"calls": 0, "layers": 0}
 
 
@@ -237,6 +244,19 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
         # identical views to FlashInferImpl.do_kv_cache_update: (B, H, N, 2*hs) -> (B, N, H, hs) x2
         k_cache, v_cache = kv_cache.transpose(1, 2).split(m.head_dim, dim=-1)
     STATS["calls"] += 1
+    if GLUE_EWS_HG > 0:
+        from vllm.model_executor.layers.fusion import glue_kernels as G
+
+        STATS["glue"] = STATS.get("glue", 0) + 1
+        q8, k_out, gate = G.ews_launch(
+            qkv, positions, m.q_norm.weight, m.k_norm.weight, m.rotary_emb.cos_sin_cache,
+            m.q_norm.variance_epsilon, m.num_heads, m.num_kv_heads, m.head_dim, m.rotary_emb.rotary_dim,
+            getattr(m.rotary_emb, "mrope_section", None) if positions.ndim == 2 else None, 1.0,
+            attn_layer._q_scale, attn_layer._k_scale, attn_layer._v_scale, slot_mapping, k_cache, v_cache,
+            tpp=GLUE_EWS_TPP, hg=GLUE_EWS_HG, gate_copy=not GLUE_EWS_NOGATE)
+        if gate is None:  # GLUE_EWS_NOGATE: zero-width placeholder (the gate is read from qkv)
+            gate = qkv.new_empty((qkv.shape[0], 0))
+        return q8, k_out, gate
     return launch(qkv, positions, m.q_norm.weight, m.k_norm.weight, m.rotary_emb.cos_sin_cache,
                   m.q_norm.variance_epsilon, m.num_heads, m.num_kv_heads, m.head_dim, m.rotary_emb.rotary_dim,
                   getattr(m.rotary_emb, "mrope_section", None) if positions.ndim == 2 else None, 1.0,
@@ -247,7 +267,7 @@ def _op_fake(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str, q_dim:
     # must not touch layer_name (an opaque LayerName under torch.compile)
     T = qkv.shape[0]
     return (qkv.new_empty((T, q_dim), dtype=torch.float8_e4m3fn), qkv.new_empty((T, kv_dim)),
-            qkv.new_empty((T, q_dim)))
+            qkv.new_empty((T, 0 if GLUE_EWS_NOGATE else q_dim)))
 
 
 _REGISTERED = [False]
@@ -323,6 +343,9 @@ def project_qkv_gate(mod, qkv, positions):
     q8, k, gate = torch.ops.vllm.ews_qkv_prologue(qkv, positions, _encode_layer_name(mod.attn.layer_name),
                                                   mod.q_size, mod.kv_size)
     v = qkv[:, mod.q_size * 2 + mod.kv_size:]
+    if GLUE_EWS_NOGATE:
+        # [q | gate] per head, row stride of qkv: the gate-mul op reads the gate columns in place
+        gate = qkv[:, : mod.q_size * 2]
     return q8, k, v, gate
 
 

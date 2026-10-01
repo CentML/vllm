@@ -349,3 +349,27 @@ def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_hea
         WRITE_KV=write_kv, TPP=tpp, HG=hg, GATE_COPY=gate_copy, num_warps=nw, num_stages=2,
     )
     return q8, k_out, gate
+
+
+def fin_norm_quant_rr(g2, wts, idx, f, a, r, w, eps, xblock=1, num_warps=4):
+    """norm_quant_kernels.fin_norm_quant (MoE finalize fold + pre-norm + MXFP8) with `xblock` rows per program and
+    4 warps per row (the stock per-row reduction layout: [1, RB] = 32 lanes x 4 warps x 8 elements), i.e. twice the
+    programs at xblock=1 for small M. Same kernel source, same math."""
+    from vllm.model_executor.layers.fusion import norm_quant_kernels as K
+    M, H = a.shape
+    RB = K.CONFIG["RB"]
+    assert g2.dim() == 2 and M and idx.numel() % M == 0 and wts.numel() == idx.numel() and H == 2 * RB
+    dev = a.device
+    out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+    res = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+    nsf = H // 32
+    psc = (nsf + 3) // 4 * 4
+    pm = (M + 127) // 128 * 128
+    q = torch.empty((M, H), dtype=torch.float8_e4m3fn, device=dev)
+    sf = torch.empty((pm * psc,), dtype=torch.uint8, device=dev)
+    K._qgf_fin_norm_quant_kernel[(triton.cdiv(pm, xblock),)](
+        g2, wts, idx, f, a, r, w, out, res, q, sf, M, pm, eps,
+        g2.stride(0), f.stride(0), a.stride(0), r.stride(0), out.stride(0), res.stride(0), q.stride(0),
+        H=H, XBLOCK=xblock, RB=RB, TOPK=idx.numel() // M, PADDED_SF_COLS=psc, USE_FMA=K.FIN_FMA,
+        num_warps=num_warps, num_stages=1)
+    return out, res, q, sf

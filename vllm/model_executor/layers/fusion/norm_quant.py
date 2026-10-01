@@ -72,6 +72,11 @@ _OUT_PROJ_ENV = os.environ.get("VLLM_NORM_QUANT_FUSION_OUT_PROJ", "1")
 _H_OK = (2048,)
 STATS = {"hit_swz": 0, "hit_lin": 0, "miss": 0, "pre": 0, "post": 0}
 
+# gb300 glue: latency-restructured (register-resident, same reduction) norm/quant and gate-mul kernels
+# (glue_kernels.py; bit-identical). GLUE_NQRR=1 norm_quant_rr, GLUE_GMRR=1 gate_mul_quant_rr.
+GLUE_NQRR = os.environ.get("GLUE_NQRR", "0") == "1"
+GLUE_GMRR = os.environ.get("GLUE_GMRR", "0") == "1"
+GLUE_GMRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_GMRR_CFG", "1,8").split(","))  # rows/program, warps
 QGF_GDNM = EMIT and os.environ.get("QGF_GDNM", "0") == "1"
 QGF_FIN_MAXM = int(os.environ.get("VLLM_MOE_FINALIZE_FOLD_MAX_M", "1024"))
 QGF_FIN = EMIT and os.environ.get("QGF_FIN", "0") == "1"
@@ -142,10 +147,19 @@ def consume_stash(x, is_sf_swizzled_layout=False, alignment=0):
 
 
 # ----------------------------------------------------------------------- ops
+def _norm_quant(*args, **kw):
+    if GLUE_NQRR and args[0].shape[-1] == 2 * K.CONFIG["RB"]:
+        from vllm.model_executor.layers.fusion import glue_kernels as G
+
+        STATS["glue_nqrr"] = STATS.get("glue_nqrr", 0) + 1
+        return G.norm_quant_rr(*args, **kw)
+    return K.norm_quant(*args, **kw)
+
+
 def _post_norm(
     a: torch.Tensor, r: torch.Tensor, w: torch.Tensor, eps: float, emit: bool
 ) -> torch.Tensor:
-    out, _, q, swz, lin = K.norm_quant(
+    out, _, q, swz, lin = _norm_quant(
         a, r, w, eps, emit_q=emit, emit_swz=True, emit_lin=True
     )
     if emit:
@@ -179,14 +193,14 @@ def _pre_norm(
             STATS["fin_fused"] = STATS.get("fin_fused", 0) + 1
         else:  # large M: finalize + pre_norm is faster than the fused kernel
             s_m = K.finalize(g2, wts, idx, s.shape[0], s.shape[1])
-            out, res, q, swz, _ = K.norm_quant(
+            out, res, q, swz, _ = _norm_quant(
                 a, r, w, eps, s=s_m, f=f, emit_q=True, emit_swz=True, emit_lin=False
             )
             STATS["fin_split"] = STATS.get("fin_split", 0) + 1
         _stash_set(out, q, swz, None)
         STATS["pre"] += 1
         return out, res
-    out, res, q, swz, _ = K.norm_quant(
+    out, res, q, swz, _ = _norm_quant(
         a, r, w, eps, s=s, f=f, emit_q=emit, emit_swz=True, emit_lin=False
     )
     if emit:
@@ -223,13 +237,34 @@ def _silu_mul_mxfp8_fake(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _gate_mul_mxfp8(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    out, q, sf = K.gate_mul_quant(a, g)
+    if GLUE_GMRR and (a.shape[-1] & (a.shape[-1] - 1)) == 0:
+        from vllm.model_executor.layers.fusion import glue_kernels as G
+
+        STATS["glue_gmrr"] = STATS.get("glue_gmrr", 0) + 1
+        out, q, sf = G.gate_mul_quant_rr(a, g, 0, GLUE_GMRR_CFG[0], GLUE_GMRR_CFG[1])
+    else:
+        out, q, sf = K.gate_mul_quant(a, g)
     _stash_set(out, q, sf, None)
     STATS["gate"] = STATS.get("gate", 0) + 1
     return out
 
 
 def _gate_mul_mxfp8_fake(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+def _gate_mul_mxfp8_qkv(a: torch.Tensor, g: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """gb300 glue: _gate_mul_mxfp8 with the gate read from the [q | gate]-interleaved QKV rows g ([T, 2N],
+    row stride of the QKV projection output): gate column c = g[:, (c // D) * 2D + D + c % D]."""
+    from vllm.model_executor.layers.fusion import glue_kernels as G
+
+    out, q, sf = G.gate_mul_quant_rr(a, g, head_dim, GLUE_GMRR_CFG[0], GLUE_GMRR_CFG[1])
+    _stash_set(out, q, sf, None)
+    STATS["gate_qkv"] = STATS.get("gate_qkv", 0) + 1
+    return out
+
+
+def _gate_mul_mxfp8_qkv_fake(a: torch.Tensor, g: torch.Tensor, head_dim: int) -> torch.Tensor:
     return torch.empty_like(a)
 
 
@@ -280,6 +315,14 @@ def register_ops() -> None:
         _gate_mul_mxfp8,
         mutates_args=[],
         fake_impl=_gate_mul_mxfp8_fake,
+        target_lib=_LIB,
+        dispatch_key="CUDA",
+    )
+    direct_register_custom_op(
+        "gate_mul_mxfp8_qkv",
+        _gate_mul_mxfp8_qkv,
+        mutates_args=[],
+        fake_impl=_gate_mul_mxfp8_qkv_fake,
         target_lib=_LIB,
         dispatch_key="CUDA",
     )
@@ -439,6 +482,22 @@ def gate_mul_fusable(attn: torch.nn.Module, attn_output, gate) -> bool:
         and gate.numel() == attn_output.numel()
         and gate.is_contiguous()
         and attn_output.is_contiguous()
+    )
+
+
+def gate_mul_qkv_fusable(attn: torch.nn.Module, attn_output, g) -> bool:
+    """gb300 glue (GLUE_EWS_NOGATE): the gate-mul + MXFP8 op on the interleaved [q | gate] QKV columns."""
+    return (
+        EMIT
+        and getattr(attn, "_nqf_gate", False)
+        and attn_output.dim() == 2
+        and attn_output.dtype == torch.bfloat16
+        and attn_output.is_contiguous()
+        and g.dim() == 2
+        and g.shape[0] == attn_output.shape[0]
+        and g.shape[1] == 2 * attn_output.shape[1]
+        and g.stride(-1) == 1
+        and (attn_output.shape[-1] & (attn_output.shape[-1] - 1)) == 0
     )
 
 
@@ -634,6 +693,7 @@ def compile_hash_factors() -> list[str]:
     return [
         f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
         f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
+        f"glue-v1-nqrr{int(GLUE_NQRR)}-gmrr{int(GLUE_GMRR)}-{GLUE_GMRR_CFG}",
     ]
 
 
