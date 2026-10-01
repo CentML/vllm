@@ -1503,18 +1503,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _store_conv_checkpoint(
         conv_input: torch.Tensor,
         conv_state: torch.Tensor,
+        width: int,
         checkpoint: GDNPrefillCheckpointMetadata,
     ) -> None:
         """Write each checkpoint's conv state, the ``width - 1`` conv inputs
         before the checkpoint token, into its checkpoint slot.
 
         ``conv_input``: the non-spec conv input rows ``[tokens, dim]``;
-        ``conv_state``: the ``[..., dim, width - 1]`` view of the conv pool.
+        ``conv_state``: the ``[..., dim, state_len]`` view of the conv pool.
+        With MTP, ``state_len = width - 1 + num_spec``, but the prefill and
+        decode conv kernels read the initial state from columns
+        ``[0, width - 1)`` (newest last), so the checkpoint goes there.
         """
-        state_len = conv_state.shape[-1]
+        state_len = width - 1
         offsets = torch.arange(-state_len, 0, device=conv_input.device)
         rows = checkpoint.conv_token_indices.unsqueeze(1) + offsets
-        conv_state[checkpoint.checkpoint_state_indices_i64] = (
+        conv_state[checkpoint.checkpoint_state_indices_i64, :, :state_len] = (
             conv_input[rows].transpose(1, 2).to(conv_state.dtype)
         )
 
@@ -1774,7 +1778,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None
             if attn_metadata.prefill_checkpoint is not None:
                 self._store_conv_checkpoint(
-                    mixed_qkv_non_spec, conv_state, attn_metadata.prefill_checkpoint
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights.size(-1),
+                    attn_metadata.prefill_checkpoint,
                 )
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
