@@ -241,6 +241,10 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        # Prefill coalescing cadence (prefill_schedule_interval); the DP engine
+        # core overrides _should_throttle_prefills with a DP-aligned cadence.
+        self._prefill_interval = vllm_config.scheduler_config.prefill_schedule_interval
+        self._prefill_cadence = 0
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -601,10 +605,17 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise.
+        """Whether to defer prefill compute this step (prefill coalescing).
+
+        With ``prefill_schedule_interval`` N > 1, prefill chunks run only on
+        every N-th schedule call; the scheduler ignores the deferral when no
+        request is decoding or the last release step left requests waiting.
+        Overridden by the DP engine core with a cadence aligned across ranks.
         """
-        return False
+        if self._prefill_interval <= 1:
+            return False
+        self._prefill_cadence += 1
+        return self._prefill_cadence % self._prefill_interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
