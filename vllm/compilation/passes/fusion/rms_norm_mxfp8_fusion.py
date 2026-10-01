@@ -11,7 +11,10 @@ Before vLLM IR lowering, a chain
 becomes one ``vllm.add_rms_norm_mxfp8_quant(a, b, residual, w, eps, 1.0, ...)``.
 When one summand is the deferred Qwen shared-expert gate
 ``apply_shared_expert_gate(g, shared)``, the gate chain is absorbed as well
-and the op receives ``shared`` and ``g``.
+and the op receives ``shared`` and ``g``. When the other summand is
+``vllm.moe_finalize`` of a deferred MoE output used only here, the reduction
+moves into the norm as well (``vllm.moe_finalize_add_rms_norm_mxfp8_quant``),
+so the routed output is never written.
 Its e4m3 values and swizzled scales are bit-identical to what
 ``mxfp8_quantize`` produces from the fused op's own bf16 output, so every
 swizzled MXFP8 consumer is unaffected. ``y`` is still written when anything
@@ -49,6 +52,8 @@ logger = init_logger(__name__)
 aten = torch.ops.aten
 _QUANT = torch.ops.vllm.mxfp8_quantize.default
 _FUSED = torch.ops.vllm.add_rms_norm_mxfp8_quant.default
+_FUSED_MOE = torch.ops.vllm.moe_finalize_add_rms_norm_mxfp8_quant.default
+_MOE_FINALIZE = torch.ops.vllm.moe_finalize.default
 _FUSED_ADD_RMS_NORM = ir.ops.fused_add_rms_norm.torch_op
 _RMS_NORM = ir.ops.rms_norm.torch_op
 _VIEWS = (aten.view.default, aten.reshape.default, aten._unsafe_view.default)
@@ -327,16 +332,26 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
                 else:
                     store_normed = True
 
-        args = (x_src, x2, residual, weight, eps, weight_offset, store_normed, gate)
+        # A deferred MoE reduction read only by this norm moves into the op.
+        target, finalize = _FUSED, None
+        if (
+            x_src.op == "call_function"
+            and x_src.target is _MOE_FINALIZE
+            and len(x_src.users) == 1
+            and all(isinstance(a, fx.Node) for a in x_src.args)
+        ):
+            target, finalize = _FUSED_MOE, x_src
+        x_args = (x_src,) if finalize is None else tuple(finalize.args)
+        args = (*x_args, x2, residual, weight, eps, weight_offset, store_normed, gate)
         fake_mode = detect_fake_mode(
-            [_val(n) for n in (x_src, x2, residual, weight, gate) if n is not None]
+            [_val(n) for n in (*x_args, x2, residual, weight, gate) if n is not None]
         )
         if fake_mode is None:
             return False
         with fake_mode:
-            fake = _FUSED(*(_val(a) if isinstance(a, fx.Node) else a for a in args))
+            fake = target(*(_val(a) if isinstance(a, fx.Node) else a for a in args))
         with graph.inserting_before(norm):
-            fused = graph.call_function(_FUSED, args)
+            fused = graph.call_function(target, args)
             fused.meta["val"] = fake
             outs = []
             for i, val in enumerate(fake):
@@ -360,6 +375,8 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
         dead += [*norm_items.values(), norm, *x_views]
         if add is not None:
             dead.append(add)
+        if finalize is not None:
+            dead.append(finalize)
         dead += sorted(gate_chain, key=order.__getitem__, reverse=True)
         for node in dict.fromkeys(dead):
             if node not in self._erased and not node.users:

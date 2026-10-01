@@ -15,6 +15,7 @@ from vllm.compilation.passes.fusion.rms_norm_mxfp8_fusion import (
 from vllm.compilation.passes.utility.noop_elimination import NoOpEliminationPass
 from vllm.compilation.passes.utility.post_cleanup import PostCleanupPass
 from vllm.config import CompilationConfig, CompilationMode, VllmConfig
+from vllm.model_executor.layers.fusion.moe_finalize import moe_finalize
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     add_rms_norm_mxfp8_quant,
 )
@@ -35,6 +36,8 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, EPS, M = 2048, 1e-6, 300
 FUSED = torch.ops.vllm.add_rms_norm_mxfp8_quant.default
+FUSED_MOE = torch.ops.vllm.moe_finalize_add_rms_norm_mxfp8_quant.default
+FINALIZE = torch.ops.vllm.moe_finalize.default
 QUANT = torch.ops.vllm.mxfp8_quantize.default
 
 
@@ -94,6 +97,26 @@ class GatedCombine(torch.nn.Module):
         q, s = _quant(y)
         if self.gate_reused:  # the gated tensor is needed elsewhere
             return q, s, residual, gated
+        return q, s, residual
+
+
+class DeferredMoECombine(torch.nn.Module):
+    """Deferred routed finalize + gated shared combine -> input norm -> quant."""
+
+    def __init__(self, routed_reused: bool) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(HIDDEN, device="cuda").bfloat16())
+        self.routed_reused = routed_reused
+
+    def forward(self, g, shared, permuted, expert_weights, permuted_idx, residual):
+        routed = torch.ops.vllm.moe_finalize(permuted, expert_weights, permuted_idx)
+        x = (apply_shared_expert_gate(g, shared) + routed).view(-1, HIDDEN)
+        y, residual = vllm.ir.ops.fused_add_rms_norm(
+            x, residual, self.weight.float() + 1.0, EPS
+        )
+        q, s = _quant(y)
+        if self.routed_reused:  # the routed output is needed elsewhere
+            return q, s, residual, routed
         return q, s, residual
 
 
@@ -214,3 +237,36 @@ def test_shared_expert_gate_absorbed(vllm_config, gate_reused: bool) -> None:
     )
     assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
     assert torch.equal(out[2], res_k)
+
+
+@pytest.mark.parametrize("routed_reused", [False, True])
+@torch.inference_mode()
+def test_deferred_moe_finalize_absorbed(vllm_config, routed_reused: bool) -> None:
+    top_k = 8
+    model = DeferredMoECombine(routed_reused)
+    g = (torch.randn(M, 1, device="cuda") * 3).bfloat16()
+    shared = torch.randn(M, HIDDEN, device="cuda").bfloat16()
+    permuted = torch.randn(M * top_k, HIDDEN, device="cuda").bfloat16()
+    expert_weights = torch.rand(M, top_k, device="cuda").bfloat16()
+    permuted_idx = torch.randperm(M * top_k, device="cuda").int().view(M, top_k)
+    residual = (torch.randn(M, HIDDEN, device="cuda") * 4).bfloat16()
+    inputs = (g, shared, permuted, expert_weights, permuted_idx, residual)
+    fusion, backend, out = _compile(vllm_config, model, *inputs, dynamic=True)
+
+    routed = moe_finalize(permuted, expert_weights, permuted_idx)
+    pre_gated = torch.sigmoid(g) * shared
+    _, res_k, q_k, s_k, _ = add_rms_norm_mxfp8_quant(
+        routed, pre_gated, residual, model.weight, EPS, 1.0, False
+    )
+    assert fusion.matched_count == 1
+    assert _bitwise(out[0], q_k) and _bitwise(out[1], s_k)
+    assert torch.equal(out[2], res_k)
+    if routed_reused:
+        # The routed output is written anyway: only the gate is absorbed.
+        assert backend.op_count(FINALIZE) == 1
+        assert backend.op_count(FUSED_MOE) == 0
+        assert torch.equal(out[3], routed)
+        return
+    assert backend.op_count(FINALIZE) == 0
+    (node,) = backend.graph_post_pass.find_nodes(op="call_function", target=FUSED_MOE)
+    assert node.args[9] is not None  # the gate logits

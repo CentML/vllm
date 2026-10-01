@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+import vllm.model_executor.layers.fusion.moe_finalize  # noqa: F401
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -292,6 +293,105 @@ direct_register_custom_op(
 )
 
 
+def _moe_forward_shared_ext_unfinalized(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    act_q: torch.Tensor | None,
+    act_scale_swizzled: torch.Tensor | None,
+    act_scale_linear: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    shared_gate_dim: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    layer._enable_deferred_finalize()
+    quantized_input = (
+        None if act_q is None else (act_q, act_scale_swizzled, act_scale_linear)
+    )
+    shared, gate, routed = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | UnfinalizedMoEOutput],
+        layer._forward_impl(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            quantized_input=quantized_input,
+        ),
+    )
+    num_tokens = hidden_states.shape[0]
+    if not isinstance(routed, UnfinalizedMoEOutput):
+        # Only the 0-token call keeps the finalized (empty) form.
+        assert num_tokens == 0, "the routed experts did not defer the finalize"
+        return (
+            shared,
+            gate,
+            routed.new_empty((0, routed.shape[-1])),
+            routed.new_empty((0, top_k)),
+            routed.new_empty((0, top_k), dtype=torch.int32),
+        )
+    permuted = routed.gemm2_permuted
+    # Every route lands in a distinct permuted row, so the GEMM2 output has at
+    # least tokens * top_k rows; return that leading view (a shape the fake can
+    # state) and leave the expert-tile padding rows to be reached via the map.
+    assert permuted.shape[0] >= num_tokens * top_k and permuted.is_contiguous()
+    return (
+        shared,
+        gate,
+        permuted[: num_tokens * top_k],
+        routed.expert_weights,
+        routed.expanded_idx_to_permuted_idx,
+    )
+
+
+def _moe_forward_shared_ext_unfinalized_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    act_q: torch.Tensor | None,
+    act_scale_swizzled: torch.Tensor | None,
+    act_scale_linear: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    shared_gate_dim: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    shared_out, gate, _ = _moe_forward_shared_ext_fake(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        act_q,
+        act_scale_swizzled,
+        act_scale_linear,
+        layer_name,
+        0,
+        shared_gate_dim,
+    )
+    num_tokens, hidden = hidden_states.shape
+    return (
+        shared_out,
+        gate,
+        hidden_states.new_empty((num_tokens * top_k, hidden)),
+        hidden_states.new_empty((num_tokens, top_k)),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
+    )
+
+
+# moe_forward_shared_ext whose routed output stays unfinalized (MLPerf
+# submission path; specialized for Qwen3.6-35B-A3B): it returns the TRT-LLM
+# GEMM2 rows ([tokens * top_k, hidden] leading view of the permuted buffer),
+# the [tokens, top_k] routing weights and the int32 permute map, for
+# vllm::moe_finalize -- which the compiled graph folds into the next norm.
+direct_register_custom_op(
+    op_name="moe_forward_shared_ext_unfinalized",
+    op_func=_moe_forward_shared_ext_unfinalized,
+    fake_impl=_moe_forward_shared_ext_unfinalized_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor
     | UnfinalizedMoEOutput
@@ -424,6 +524,59 @@ class MoERunner(MoERunnerInterface):
     @property
     def _uses_shared_ext_op(self) -> bool:
         return self._defer_shared_gate or self.accepts_quantized_input
+
+    def _routed_finalize_deferred(self) -> bool:
+        """Whether the routed experts hand back their output unfinalized.
+
+        Then forward() runs moe_forward_shared_ext_unfinalized plus
+        vllm::moe_finalize, which the compiled graph folds into the next
+        layer's norm (MLPerf submission path; specialized for Qwen3.6-35B-A3B).
+        Requires the shared-ext op with a deferred gate, a single-rank
+        monolithic kernel whose experts defer (TRT-LLM MXFP8), and no step
+        between the experts and the shared + routed add. A read-only
+        predicate, so Dynamo traces it; the op enables the experts' side
+        (_enable_deferred_finalize) when it runs, also for a cached graph.
+        """
+        if not (
+            self._defer_shared_gate
+            and self._shared_experts is not None
+            and current_platform.is_cuda()
+            and self.moe_config.in_dtype == torch.bfloat16
+            and self.moe_config.tp_size == 1
+            and self.moe_config.dp_size == 1
+            and self.moe_config.ep_size == 1
+            and self.moe_config.pcp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and not self.do_naive_dispatch_combine
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not isinstance(self.router, ZeroExpertRouter)
+            and self.moe_config.hidden_dim == self.moe_config.hidden_dim_unpadded
+        ):
+            return False
+        quant_method = self._quant_method
+        kernel = getattr(quant_method, "moe_kernel", None)
+        return (
+            quant_method.is_monolithic
+            and not quant_method.has_unpadded_output
+            and kernel is not None
+            and kernel.supports_deferred_moe_finalize()
+            and kernel.fused_experts.supports_deferred_finalize()
+        )
+
+    def _enable_deferred_finalize(self) -> None:
+        """Make the routed experts stop after GEMM2 (idempotent, eager)."""
+        kernel = self._quant_method.moe_kernel
+        if kernel is None or not self._routed_finalize_deferred():
+            raise RuntimeError(f"{self.layer_name} cannot defer the MoE finalize.")
+        experts = kernel.fused_experts
+        if not experts.moe_config.defer_moe_finalize_local:
+            experts.moe_config.defer_moe_finalize_local = True
+            assert experts.moe_config.use_deferred_moe_finalize
+            logger.info_once(
+                "Deferring the routed MoE top-k finalize into its consumer norm."
+            )
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu():
@@ -879,18 +1032,39 @@ class MoERunner(MoERunnerInterface):
                 if quantized_input is not None and self.accepts_quantized_input
                 else (None, None, None)
             )
-            shared_output, shared_gate, fused_output = self._forward_entry(
-                hidden_states,
-                router_logits,
-                shared_experts_input,
-                input_ids,
-                act_q,
-                act_sf_swizzled,
-                act_sf_linear,
-                self._encode_layer_name(),
-                hidden_dim_unpadded,
-                1 if self._defer_shared_gate else 0,
-            )
+            if self._routed_finalize_deferred():
+                shared_output, shared_gate, permuted, weights, permuted_idx = (
+                    torch.ops.vllm.moe_forward_shared_ext_unfinalized(
+                        hidden_states,
+                        router_logits,
+                        shared_experts_input,
+                        input_ids,
+                        act_q,
+                        act_sf_swizzled,
+                        act_sf_linear,
+                        self._encode_layer_name(),
+                        1,
+                        self.moe_config.experts_per_token,
+                    )
+                )
+                # The compiled graph folds the reduction into the consumer
+                # norm together with the shared + routed add.
+                fused_output = torch.ops.vllm.moe_finalize(
+                    permuted, weights, permuted_idx
+                )
+            else:
+                shared_output, shared_gate, fused_output = self._forward_entry(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    act_q,
+                    act_sf_swizzled,
+                    act_sf_linear,
+                    self._encode_layer_name(),
+                    hidden_dim_unpadded,
+                    1 if self._defer_shared_gate else 0,
+                )
             if self._defer_shared_gate:
                 # Applied before any reduction or scaling, exactly where the
                 # shared expert applies it; the compiled graph fuses it into
