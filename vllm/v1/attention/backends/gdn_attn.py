@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs, gdn_step_plan
+from vllm.v1.attention.backends import gdn_fused_metadata
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -24,6 +25,8 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+gdn_fused_metadata.log_config()
 
 # Deferred GDN state commit (GDN_STATE_COMMIT=1, not in the layout-only control
 # mode), see vllm/model_executor/layers/mamba/ops/gdn_state_commit.
@@ -245,6 +248,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
+        if gdn_fused_metadata.ENABLED:
+            # VLLM_GDN_FUSED_MD=1: one Triton launch per KV-cache group for the
+            # spec-decode step shapes (see gdn_fused_metadata); None = regular
+            md = gdn_fused_metadata.build(
+                self,
+                lambda: self._build_full(
+                    common_prefix_len,
+                    common_attn_metadata,
+                    num_accepted_tokens,
+                    num_decode_draft_tokens_cpu,
+                    fast_build,
+                ),
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+            )
+            if md is not None:
+                if gdn_layer_graphs.ENABLED:
+                    gdn_layer_graphs.after_build(self, md)
+                return md
         if gdn_step_plan.MDREUSE:
             # GGM_MDREUSE=1: derive the metadata of the other GDN KV-cache groups
             # of a step from the first group's full build (see gdn_step_plan)
@@ -689,4 +712,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
+        if gdn_fused_metadata.ENABLED:
+            # capture metadata always comes from the regular build
+            with gdn_fused_metadata.capture_guard():
+                return self.build(
+                    0, m, num_accepted_tokens, num_decode_draft_tokens_cpu
+                )
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)

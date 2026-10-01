@@ -261,6 +261,17 @@ def group_materialize_non_spec(layer, md, per_layer) -> None:
         )
     # identical to gdn_state_commit.materialize_non_spec, once for the group
     items = min(items, slots.size(0))
+    from vllm.v1.attention.backends import gdn_fused_metadata
+
+    views = gdn_fused_metadata.mat_inputs(md, items)
+    if views is not None:
+        # VLLM_GDN_FUSED_MD_MAT: views of the fused metadata, same values as the
+        # zeros + slice copies below
+        gsc.materialize(
+            0, items, gt.gsc_table, gt.H, slots[:items], views[0], has_init=views[1]
+        )
+        STATS["mat_launches"] += 1
+        return
     n_src = getattr(md, "gsc_non_spec_num_accepted", None)
     n = torch.zeros(items, dtype=torch.int32, device=slots.device)
     if n_src is not None and n_src.numel() > 0:
@@ -445,6 +456,17 @@ def _materialize_rows(md, layers, gt):
     if slots is None or items <= 0:
         return
     items = min(items, slots.size(0))
+    from vllm.v1.attention.backends import gdn_fused_metadata
+
+    views = gdn_fused_metadata.mat_inputs(md, items)
+    if views is not None:
+        # VLLM_GDN_FUSED_MD_MAT: views of the fused metadata, same values as the
+        # zeros + slice copies below
+        gsc.materialize(
+            0, items, gt.gsc_table, gt.H, slots[:items], views[0], has_init=views[1]
+        )
+        STATS["mat_launches"] += 1
+        return
     n_src = getattr(md, "gsc_non_spec_num_accepted", None)
     n = torch.zeros(items, dtype=torch.int32, device=slots.device)
     if n_src is not None and n_src.numel() > 0:
