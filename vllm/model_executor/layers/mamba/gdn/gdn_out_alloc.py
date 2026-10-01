@@ -37,6 +37,14 @@ logger = init_logger(__name__)
 
 ENABLED = (os.environ.get("EWS", "0") == "1"
            and os.environ.get("VLLM_GDN_OUT_ZERO_PAD_ROWS_ONLY", "1") == "1")
+# gb300 glue: with GLUE_GSC_QO=1 the GDN decode kernel writes the out_proj MXFP8 input of every row (padding rows
+# zeroed), so in FULL (decode-only) CUDA graphs the bf16 padding rows are never read and their zeroing is deferred
+# to the GDN core op, which zeroes them only if the fused quant did not run (zero_pad_rows_late).
+# GLUE_GSC_QO_NOZERO=0 keeps the zeroing kernel.
+NOZERO_FULL = (ENABLED and os.environ.get("GLUE_GSC_QO", "0") == "1"
+               and os.environ.get("GLUE_GSC_QO_NOZERO", "1") == "1")
+STATS = {"deferred": 0, "late_zero": 0, "skipped": 0}
+_DEFERRED: dict = {}  # core_attn_out data_ptr -> slot mapping (or None) whose pad-row zeroing was deferred
 
 
 @triton.jit
@@ -82,9 +90,45 @@ def gdn_out_alloc_impl(like: torch.Tensor, h: int, d: int) -> torch.Tensor:
     if T == 0:
         return out
     slot = _any_slot_mapping(T)
+    if NOZERO_FULL and _full_graph_forward():
+        _DEFERRED[out.data_ptr()] = slot
+        STATS["deferred"] += 1
+        return out
     _zero_pad_rows_kernel[(T,)](out, slot if slot is not None else out, h * d, BLOCK=1024,
                                 HAS_SLOT=slot is not None, num_warps=4, launch_pdl=_lcd_pdl_on())
     return out
+
+
+def _full_graph_forward() -> bool:
+    """True inside a FULL-cudagraph forward (decode-only batches in FULL_AND_PIECEWISE)."""
+    try:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        return (is_forward_context_available()
+                and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL)
+    except Exception:  # no forward context: keep the zeroing
+        return False
+
+
+def zero_pad_rows_late(out: torch.Tensor, quant_done: bool) -> None:
+    """Called by the GDN core op right after the core ran on `out` ([T, h, d]): if this tensor's pad-row zeroing
+    was deferred by gdn_out_alloc_impl and the decode kernel did NOT write the quantized rows itself
+    (quant_done False), zero the pad rows now (same kernel, before anything reads them)."""
+    if not _DEFERRED:
+        return
+    k = out.data_ptr()
+    if k not in _DEFERRED:
+        return
+    slot = _DEFERRED.pop(k)
+    if quant_done:
+        STATS["skipped"] += 1
+        return
+    STATS["late_zero"] += 1
+    T = out.shape[0]
+    row = out[0].numel()
+    _zero_pad_rows_kernel[(T,)](out, slot if slot is not None else out, row, BLOCK=1024,
+                                HAS_SLOT=slot is not None, num_warps=4)
 
 
 def gdn_out_alloc_fake(like: torch.Tensor, h: int, d: int) -> torch.Tensor:

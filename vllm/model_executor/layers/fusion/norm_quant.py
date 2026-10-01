@@ -61,7 +61,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion import norm_quant_kernels as K
-from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
+from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc, gdn_step_plan
 
 logger = init_logger(__name__)
 
@@ -579,12 +579,15 @@ def gdn_forward_core_fused_norm_packed(
         "sf": sf,
         "psc": psc,
         "covered": [],
+        "T": T,  # gb300 glue: rows of core_attn_out (GLUE_GSC_QO target check)
+        "qo": False,  # set by the gdn_state_commit decode when it wrote q / sf of every row
     }
     _GDN_TGT[0] = t
     try:
         core_fn(mixed_qkvz, ba, core_attn_out)
     finally:
         _GDN_TGT[0] = None
+    gdn_out_alloc.zero_pad_rows_late(core_attn_out, t["qo"])
     x2 = core_attn_out.view(T, K_)
     pm = (T + 127) // 128 * 128
     if QGF_GDNM and t["covered"]:
@@ -604,6 +607,11 @@ def gdn_forward_core_fused_norm_packed(
         STATS["gdn_unc_rows"] = STATS.get("gdn_unc_rows", 0) + sum(
             b - a for a, b in unc
         )
+    elif t["qo"] and not t["covered"]:
+        # gb300 glue (GLUE_GSC_QO=1): the decode kernel already wrote the
+        # MXFP8 data + swizzled scales of every row (padding rows zeroed),
+        # bit-identical to the FlashInfer kernel below
+        STATS["gdn_qo"] = STATS.get("gdn_qo", 0) + 1
     elif not t["covered"]:
         # decode-only / warmup: exactly the stock FlashInfer kernel, into the
         # static buffers

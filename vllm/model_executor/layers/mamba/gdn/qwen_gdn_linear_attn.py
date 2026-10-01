@@ -2517,6 +2517,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             return
         self._forward_core_fused_norm_packed_impl(mixed_qkvz, ba, core_attn_out)
+        gdn_out_alloc.zero_pad_rows_late(core_attn_out, False)
 
     def _forward_core_fused_norm_packed_impl(
         self,
