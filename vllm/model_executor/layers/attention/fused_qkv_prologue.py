@@ -350,6 +350,12 @@ def configure_attention(mod) -> None:
     why = _eligible(mod)
     mod._ews_qkv_on = why is None
     if mod._ews_qkv_on:
+        if GLUE_EWS_CUDA:
+            # gb300 glue: build/load the CUDA QKV prologue extension eagerly at model construction, never lazily in
+            # the step loop (shared-Lustre JIT build locks stall every run that reaches load() meanwhile)
+            from vllm.model_executor.layers.attention import glue_ews_cuda as GC
+
+            GC.load()
         _CFG[mod.attn.layer_name] = {"mod": mod}
         mod.attn._ews_prefused = True
         STATS["layers"] += 1
