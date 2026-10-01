@@ -7,8 +7,9 @@ vocabulary through the target's BF16 lm_head (``248320 x 2048``, 1 GB): about
 77 us per draft step on VR, three steps per decode iteration. The proposals
 only decide which tokens the target verifies, so this head runs the draft
 logits as an MXFP8 GEMM (FlashInfer CuTe-DSL, the backend of the model's other
-MXFP8 linears) on a once-quantized copy of the weight: 42-50 us for M <= 128
-rows. Larger M keeps the BF16 GEMM (the MXFP8 tile choice is slower there).
+MXFP8 linears) on a once-quantized copy of the weight: 41 us for M <= 32 rows
+in the served model. Larger M keeps the BF16 GEMM: in serving, the GEMM tactic
+picked for 40-176 draft rows took 83-114 us, slower than BF16 (78-80 us).
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# Largest draft row count served by the MXFP8 GEMM (measured on SM107).
-_MXFP8_MAX_M = 128
+# Largest draft row count served by the MXFP8 GEMM (Nsight A/B on SM107).
+_MXFP8_MAX_M = 32
 
 
 def mtp_draft_logits_mxfp8_impl(

@@ -24,7 +24,7 @@ def head():
     return w, Mxfp8DraftLmHead(w)
 
 
-@pytest.mark.parametrize("m", [1, 4, 32, 128])
+@pytest.mark.parametrize("m", [1, 4, 16, 32])
 def test_mxfp8_logits_track_bf16(head, m: int):
     w, mx = head
     torch.manual_seed(m)
@@ -44,5 +44,5 @@ def test_mxfp8_logits_track_bf16(head, m: int):
 
 def test_large_m_keeps_bf16(head):
     w, mx = head
-    x = torch.randn(129, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(mx(x, w), F.linear(x, w))
