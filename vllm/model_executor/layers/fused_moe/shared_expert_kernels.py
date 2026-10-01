@@ -195,15 +195,75 @@ def _route_fold_packed_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
     tl.store(w_ptr + offs, p.to(w_ptr.dtype.element_ty), mask=om)
 
 
+@triton.jit
+def _route_fold_packed_pad_kernel(lg_ptr, pad_ptr, cnt_ptr, ids_ptr, w_ptr, M, stride_l,
+                                  E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr,
+                                  PROBE: tl.constexpr):
+    # Same instructions as _route_fold_packed_kernel for rows with pad[row] == False (ids / weights of real rows are
+    # bit-identical). Rows with pad[row] == True (CUDA-graph padding rows, vLLM's forward_context.is_padding) get
+    # expert id -1 in all K+1 slots and weight 0: the trtllm routing kernels (block / cluster / coop and the exact
+    # single-CTA routing) treat -1 as a non-local expert, so the row is not permuted, reads no expert weights, and the
+    # finalize (trtllm or the QGF gather, idx >= 0) gives it a zero MoE output.
+    pid = tl.program_id(0)
+    rows = pid * BT + tl.arange(0, BT)
+    rmask = rows < M
+    cols = tl.arange(0, E)
+    v = tl.load(lg_ptr + rows[:, None] * stride_l + cols[None, :], mask=rmask[:, None], other=0.0).to(tl.float32)
+    b = v.to(tl.int32, bitcast=True)
+    key = b ^ ((b >> 31) & 0x7FFFFFFF)
+    key = (key & -65536) | (E - 1 - cols)[None, :]
+    kidx = tl.arange(0, KP)
+    sel_v = tl.zeros([BT, KP], dtype=tl.float32)
+    sel_i = tl.zeros([BT, KP], dtype=tl.int32)
+    for j in tl.static_range(K):
+        kmax = tl.max(key, axis=1)
+        i = (E - 1) - (kmax & 0xFFFF)
+        hb = kmax & -65536
+        vb = (hb ^ ((hb >> 31) & 0x7FFFFFFF)) & -65536
+        val = vb.to(tl.float32, bitcast=True)
+        sel_v = tl.where(kidx[None, :] == j, val[:, None], sel_v)
+        sel_i = tl.where(kidx[None, :] == j, i[:, None], sel_i)
+        key = tl.where(key == kmax[:, None], -2147483647 - 1, key)
+    mx = tl.max(sel_v, axis=1)
+    p = tl.where(kidx[None, :] < K, tl.exp(sel_v - mx[:, None]), 0.0)
+    p = p / tl.sum(p, axis=1)[:, None]
+    gs = tl.load(lg_ptr + rows * stride_l + E, mask=rmask, other=0.0).to(tl.float32)
+    s = _ld.div_rn(1.0, 1.0 + _ld.exp(-gs))
+    p = tl.where(kidx[None, :] == K, s[:, None], p)
+    sel_i = tl.where(kidx[None, :] == K, E, sel_i)
+    pad = tl.load(pad_ptr + rows, mask=rmask, other=0).to(tl.int32) != 0
+    sel_i = tl.where(pad[:, None], -1, sel_i)
+    p = tl.where(pad[:, None], 0.0, p)
+    om = rmask[:, None] & (kidx[None, :] <= K)
+    offs = rows[:, None] * (K + 1) + kidx[None, :]
+    tl.store(ids_ptr + offs, sel_i, mask=om)
+    tl.store(w_ptr + offs, p.to(w_ptr.dtype.element_ty), mask=om)
+    if PROBE:
+        npad = tl.sum((pad & rmask).to(tl.int32), axis=0)
+        nreal = tl.sum(((pad == 0) & rmask).to(tl.int32), axis=0)
+        tl.atomic_add(cnt_ptr, npad)
+        tl.atomic_add(cnt_ptr + 1, nreal)
+
+
 _ROUTE_PLAIN = False  # tests: force the unpacked reference kernel
 
 
-def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torch.dtype = torch.bfloat16):
+def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torch.dtype = torch.bfloat16,
+                   pad: torch.Tensor | None = None, cnt: torch.Tensor | None = None):
     """logits [M, >=E+1] (bf16/fp32, row stride arbitrary, unit col stride) -> ids int32 [M,K+1], w [M,K+1] (w_dtype:
-    bf16 for the trtllm routed MoE, fp32 for consumers that take fp32 routing weights)."""
+    bf16 for the trtllm routed MoE, fp32 for consumers that take fp32 routing weights).
+    pad: optional bool [>= M] device mask (True = CUDA-graph padding row -> ids -1, weights 0; bf16 logits only);
+    cnt: optional int32 [2] device counters (padded rows, real rows) for an engage probe."""
     M = logits.shape[0]
     ids = torch.empty(M, K + 1, dtype=torch.int32, device=logits.device)
     w = torch.empty(M, K + 1, dtype=w_dtype, device=logits.device)
+    if M and pad is not None and logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
+        BT = 8 if M >= 4096 else 4
+        _route_fold_packed_pad_kernel[(triton.cdiv(M, BT),)](logits, pad, cnt if cnt is not None else ids, ids, w, M,
+                                                             logits.stride(0), E=E, K=K,
+                                                             KP=triton.next_power_of_2(K + 1), BT=BT,
+                                                             PROBE=cnt is not None, num_warps=4)
+        return ids, w
     if M:
         if logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
             BT = 8 if M >= 4096 else 4

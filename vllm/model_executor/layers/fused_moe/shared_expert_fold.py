@@ -41,6 +41,18 @@ weights. Every other block keeps the stock path.
 
 Env: SEG_FOLD=1 enables the fold (default off).
 
+Padded-row drop (F121=1, default off; needs SEG_FOLD=1 and
+VLLM_MOE_SKIP_PADDING=1, the vLLM default): the V2 model runner keeps a
+per-token device mask of CUDA-graph padding rows
+(forward_context.is_padding, a view of a persistent input buffer, so graph
+replays read the live mask). With F121=1 the fused routing writes expert id
+-1 / weight 0 for those rows, so padded rows are not permuted, read no expert
+weights and get a zero MoE output; real rows are bit-identical to F121=0.
+Target-model MoE layers only (drafter / MTP layers keep the stock routing).
+F121_PROBE=1 adds device counters of dropped / real rows, logged by a
+reporter thread (first read after F121_PROBE_DELAY_S, default 900 s, then
+every F121_PROBE_S, default 120 s) and at exit.
+
 Numerics: not bit-exact vs the unfolded path. The shared expert runs in the
 routed MoE GEMMs and its output is summed with the routed output in fp32
 inside the trtllm finalize (stock: separate dense GEMMs, sigmoid * out and a
@@ -62,6 +74,12 @@ from vllm.model_executor.layers import lcd2_bf16 as _lcd2
 logger = init_logger(__name__)
 
 SEG_FOLD = os.environ.get("SEG_FOLD", "0") == "1"
+F121 = os.environ.get("F121", "0") == "1"
+F121_PROBE = os.environ.get("F121_PROBE", "0") == "1"
+F121_PROBE_S = float(os.environ.get("F121_PROBE_S", "120"))
+F121_PROBE_DELAY_S = float(os.environ.get("F121_PROBE_DELAY_S", "900"))
+F121_STATS = {"mask_calls": 0, "nomask_calls": 0, "excluded_calls": 0}
+_F121_CNT: dict = {}
 
 E_ROUTED, TOPK, E_PAD = 256, 8, 260
 STATS = {"stash": 0, "folded": 0, "skipped": 0, "calls": 0}
@@ -114,7 +132,8 @@ def _fold_moe_impl(x: torch.Tensor, layer_name, no_finalize: bool) -> torch.Tens
         logits = _lcd2.router_logits(x, st)
     else:
         logits = F.linear(x, st["w264"])
-    ids, wts = seg_route_fold(logits, E_ROUTED, TOPK)
+    pad, cnt = _f121_mask(L, M) if F121 else (None, None)
+    ids, wts = seg_route_fold(logits, E_ROUTED, TOPK, pad=pad, cnt=cnt)
     from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
     qc = st["qc"]
@@ -166,6 +185,104 @@ def _fold_moe_impl(x: torch.Tensor, layer_name, no_finalize: bool) -> torch.Tens
     handle = torch.empty_like(x)
     norm_quant.fin_produce(handle, g2, w_used, idx)
     return handle
+
+
+def _f121_counter(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    c = _F121_CNT.get(key)
+    if c is None:
+        c = torch.zeros(2, dtype=torch.int32, device=device)
+        _F121_CNT[key] = c
+        _f121_start_reporter()
+    return c
+
+
+def _f121_report(tag: str, stream=None) -> None:
+    for key, c in list(_F121_CNT.items()):
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                h = c.to("cpu", non_blocking=True)
+            stream.synchronize()
+        else:
+            h = c.to("cpu")
+        logger.info(
+            "[f121] probe%s pid %d dev %s: padded_rows_dropped=%d real_rows=%d "
+            "host_calls=%s",
+            tag,
+            os.getpid(),
+            key[1],
+            int(h[0]),
+            int(h[1]),
+            F121_STATS,
+        )
+
+
+def _f121_start_reporter() -> None:
+    import atexit
+    import threading
+    import time
+
+    def at_exit():
+        try:
+            _f121_report("-exit")
+        except Exception as e:  # the process is exiting; only report
+            logger.info("[f121] probe-exit error %r", e)
+
+    atexit.register(at_exit)
+
+    def run():
+        s = None
+        time.sleep(F121_PROBE_DELAY_S)  # never read while graphs are captured
+        while True:
+            time.sleep(F121_PROBE_S)
+            try:
+                if s is None and _F121_CNT:
+                    s = torch.cuda.Stream(device=next(iter(_F121_CNT.values())).device)
+                _f121_report("", s)
+            except Exception as e:  # probe only; never disturb serving
+                logger.info("[f121] probe error %r", e)
+
+    threading.Thread(target=run, name="f121-probe", daemon=True).start()
+
+
+def _f121_mask(L, M: int):
+    """(padding mask [M] bool on device, probe counters or None) for this
+    MoE call, or (None, None): drafter/MTP layer, no forward context, or no
+    usable mask -> stock routing."""
+    if not getattr(L, "_f121_ok", False):
+        F121_STATS["excluded_calls"] += 1
+        return None, None
+    try:
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            F121_STATS["nomask_calls"] += 1
+            return None, None
+        p = get_forward_context().is_padding
+    except Exception:
+        p = None
+    if (
+        p is None
+        or p.dtype != torch.bool
+        or p.dim() != 1
+        or p.shape[0] < M
+        or not p.is_cuda
+    ):
+        F121_STATS["nomask_calls"] += 1
+        return None, None
+    F121_STATS["mask_calls"] += 1
+    if F121_STATS["mask_calls"] == 1:
+        logger.info(
+            "[f121] padded-row MoE drop ENGAGED (first masked call M=%d, mask "
+            "len %d) pid %d",
+            M,
+            p.shape[0],
+            os.getpid(),
+        )
+    return p[:M], (_f121_counter(p.device) if F121_PROBE else None)
 
 
 def _fold_moe_fake(x: torch.Tensor, layer_name) -> torch.Tensor:
@@ -347,6 +464,18 @@ def fold_model(model: torch.nn.Module) -> None:
     ]
     if not blocks:
         return
+    global F121
+    if F121:
+        from vllm import envs as _envs
+
+        if not bool(_envs.VLLM_MOE_SKIP_PADDING):
+            # Without it the V2 runner never refreshes is_padding (all-True
+            # since capture), so the mask must not be used.
+            F121 = False
+            logger.warning(
+                "[f121] DISABLED: VLLM_MOE_SKIP_PADDING is off, "
+                "forward_context.is_padding is not maintained"
+            )
     register_op()
     from vllm.config import get_current_vllm_config
 
@@ -371,8 +500,27 @@ def fold_model(model: torch.nn.Module) -> None:
             _ZEROS[key] = torch.zeros(
                 mx, H, dtype=torch.bfloat16, device=b.gate.weight.device
             )
+        if F121 and F121_PROBE:
+            _f121_counter(b.gate.weight.device)  # before any graph capture
         fold_block(b, n, _ZEROS[key])
     torch.cuda.empty_cache()
+    if F121:
+        is_mtp = "mtp" in type(model).__name__.lower()
+        for n, b in blocks:
+            r = b.experts
+            if getattr(r, "_seg_fold_on", False):
+                ln = str(getattr(r, "layer_name", "") or "")
+                r._f121_ok = not (is_mtp or "mtp" in n.lower() or "mtp" in ln.lower())
+        ok = [n for n, b in blocks if getattr(b.experts, "_f121_ok", False)]
+        logger.info(
+            "[f121] model %s: padded-row drop on %d/%d folded MoE blocks "
+            "(mtp excluded, probe=%s) pid %d",
+            type(model).__name__,
+            len(ok),
+            len(blocks),
+            F121_PROBE,
+            os.getpid(),
+        )
     logger.info(
         "shared_expert_fold enabled: folded %d MoE blocks (skipped %d, stashed %d)",
         STATS["folded"],
