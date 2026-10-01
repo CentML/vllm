@@ -1757,6 +1757,9 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
 #if GSC_GB
 #ifndef GB_KH
 #define GB_KH 0  // 1: one CTA per (request, KEY head) runs both value heads (VPK = 2): shared q/k prep, no K-log atomic
+#endif           // 2: auto - key-head CTAs when the call has >= GB_KH_MIN requests (half the CTAs; wins at large N)
+#ifndef GB_KH_MIN
+#define GB_KH_MIN 48
 #endif
 #if GB_KH
 // slot n of a pass = value head vh0 + n (same rows); per-slot decay / beta / v / out; act[n] = slot takes this token
@@ -3281,7 +3284,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
   }
 #if GSC_GB
 #if GB_KH
-  if (!sbf && vpk == 2) {  // GB300 fp32 kernel, one CTA per (request, key head)
+  if (!sbf && vpk == 2 && (GB_KH == 1 || n >= GB_KH_MIN)) {  // GB300 fp32 kernel, one CTA per (request, key head)
     static bool gbk_attr[2] = {};
     const dim3 kgrid(n, H);
 #define GSC_GBK_LAUNCH(SIG_)                                                                                      \
