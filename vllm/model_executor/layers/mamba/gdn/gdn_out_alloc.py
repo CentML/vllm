@@ -101,13 +101,16 @@ def gdn_out_alloc_impl(like: torch.Tensor, h: int, d: int) -> torch.Tensor:
 
 
 def _full_graph_forward() -> bool:
-    """True inside a FULL-cudagraph forward (decode-only batches in FULL_AND_PIECEWISE)."""
+    """True while a FULL CUDA graph is being captured (decode-only batches in FULL_AND_PIECEWISE). The model
+    runner captures FULL graphs with the forward context in mode NONE inside torch.cuda.graph(), and PIECEWISE
+    graphs with mode PIECEWISE; eager forwards are not capturing."""
     try:
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import get_forward_context, is_forward_context_available
 
-        return (is_forward_context_available()
-                and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL)
+        return (torch.cuda.is_current_stream_capturing()
+                and is_forward_context_available()
+                and get_forward_context().cudagraph_runtime_mode not in (CUDAGraphMode.PIECEWISE,))
     except Exception:  # no forward context: keep the zeroing
         return False
 

@@ -296,13 +296,127 @@ def _glue_ews_qkv_kernel(
                              mask=head_mask)
 
 
+# == fused_qkv_prologue._ews_qkv_kernel (verbatim) + GATE_COPY (0: no contiguous gate copy)
+@triton.jit
+def _glue_ews1_qkv_kernel(
+    qkv_ptr, qkv_stride_t,
+    q8_ptr, k_out_ptr, gate_out_ptr,
+    q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr, positions_ptr,
+    q8_stride_t, k_out_stride_t, gate_out_stride_t, cache_stride_p,
+    positions_stride_m, positions_stride_t,
+    slot_ptr, k_cache_ptr, v_cache_ptr, block_size,
+    kc_stride_b, kc_stride_p, kc_stride_h, vc_stride_b, vc_stride_p, vc_stride_h,
+    q_scale_ptr, k_scale_ptr, v_scale_ptr,
+    n_tokens, n_slots,
+    num_q_heads: tl.constexpr, num_kv_heads: tl.constexpr, head_dim: tl.constexpr,
+    rotary_dim: tl.constexpr, half_rotary: tl.constexpr, eps: tl.constexpr, norm_beta: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROT_HALF_BLOCK: tl.constexpr,
+    HAS_PASS: tl.constexpr, HAS_MROPE: tl.constexpr, MROPE_SECTION_H: tl.constexpr,
+    MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr, GATE_COPY: tl.constexpr,
+):
+    head = tl.program_id(1)
+    is_k = head >= num_q_heads
+    local_head = tl.where(is_k, head - num_q_heads, head)
+    k_off: tl.constexpr = num_q_heads * 2 * head_dim
+    v_off: tl.constexpr = num_q_heads * 2 * head_dim + num_kv_heads * head_dim
+    for tt in tl.static_range(TPP):
+        token = tl.program_id(0) * TPP + tt
+        if token < n_tokens:
+            row = qkv_ptr + token.to(tl.int64) * qkv_stride_t
+            if is_k:
+                in_base = row + k_off + local_head * head_dim
+                w_ptr = k_weight_ptr
+            else:
+                in_base = row + local_head * 2 * head_dim
+                w_ptr = q_weight_ptr
+
+            # --- RMSNorm (stock code) ---
+            head_offs = tl.arange(0, HEAD_BLOCK)
+            head_mask = head_offs < head_dim
+            x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+            var = tl.sum(x * x, axis=0) / head_dim
+            inv_rms = tl.rsqrt(var + eps)
+            w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32) + norm_beta
+            x_norm = (x * inv_rms * w).to(INPUT_DTYPE).to(tl.float32)
+
+            # --- partial RoPE (stock code) ---
+            rot_offs = tl.arange(0, ROT_HALF_BLOCK)
+            rot_mask = rot_offs < half_rotary
+            x_rot1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+            x_rot2 = tl.load(in_base + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+            w_rot1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32) + norm_beta
+            w_rot2 = tl.load(w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(tl.float32) + norm_beta
+            x_rot1 = (x_rot1 * inv_rms * w_rot1).to(INPUT_DTYPE).to(tl.float32)
+            x_rot2 = (x_rot2 * inv_rms * w_rot2).to(INPUT_DTYPE).to(tl.float32)
+            pos_t = tl.load(positions_ptr + token * positions_stride_t).to(tl.int64)
+            if HAS_MROPE:
+                pos_h = tl.load(positions_ptr + positions_stride_m + token * positions_stride_t).to(tl.int64)
+                pos_w = tl.load(positions_ptr + 2 * positions_stride_m + token * positions_stride_t).to(tl.int64)
+                is_h = (rot_offs % 3 == 1) & (rot_offs < 3 * MROPE_SECTION_H)
+                is_w = (rot_offs % 3 == 2) & (rot_offs < 3 * MROPE_SECTION_W)
+                pos = tl.where(is_h, pos_h, tl.where(is_w, pos_w, pos_t))
+            else:
+                pos = pos_t
+            cache_offset = pos * cache_stride_p
+            cos = tl.load(cos_sin_cache_ptr + cache_offset + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
+            sin = tl.load(cos_sin_cache_ptr + cache_offset + half_rotary + rot_offs, mask=rot_mask,
+                          other=0.0).to(tl.float32)
+            # stock stores o1/o2 (fp32) into a bf16 tensor -> RTNE rounding; do it explicitly
+            o1 = (x_rot1 * cos - x_rot2 * sin).to(INPUT_DTYPE).to(tl.float32)
+            o2 = (x_rot2 * cos + x_rot1 * sin).to(INPUT_DTYPE).to(tl.float32)
+
+            if is_k:
+                # bf16 k_out (unchanged semantics) + fp8 paged-cache write of K and V
+                ko = k_out_ptr + token * k_out_stride_t + local_head * head_dim
+                if HAS_PASS:
+                    tl.store(ko + head_offs, x_norm, mask=head_mask & (head_offs >= rotary_dim))
+                tl.store(ko + rot_offs, o1, mask=rot_mask)
+                tl.store(ko + half_rotary + rot_offs, o2, mask=rot_mask)
+                if WRITE_KV:
+                  if token < n_slots:
+                      slot = tl.load(slot_ptr + token).to(tl.int64)
+                      if slot >= 0:
+                          blk = slot // block_size
+                          off = slot - blk * block_size
+                          k_scale = tl.load(k_scale_ptr)
+                          v_scale = tl.load(v_scale_ptr)
+                          kd = k_cache_ptr + blk * kc_stride_b + off * kc_stride_p + local_head * kc_stride_h
+                          if HAS_PASS:
+                              tl.store(kd + head_offs, tl.math.div_rn(x_norm, k_scale).to(tl.float8e4nv),
+                                       mask=head_mask & (head_offs >= rotary_dim))
+                          tl.store(kd + rot_offs, tl.math.div_rn(o1, k_scale).to(tl.float8e4nv), mask=rot_mask)
+                          tl.store(kd + half_rotary + rot_offs, tl.math.div_rn(o2, k_scale).to(tl.float8e4nv),
+                                   mask=rot_mask)
+                          vv = tl.load(row + v_off + local_head * head_dim + head_offs, mask=head_mask,
+                                       other=0.0).to(tl.float32)
+                          vd = v_cache_ptr + blk * vc_stride_b + off * vc_stride_p + local_head * vc_stride_h
+                          tl.store(vd + head_offs, tl.math.div_rn(vv, v_scale).to(tl.float8e4nv), mask=head_mask)
+            else:
+                # q -> fp8 exactly as Inductor's triton_poi_fused__to_copy_clamp_mul_reciprocal
+                q_scale = tl.load(q_scale_ptr)
+                r = 1.0 / q_scale
+                qo = q8_ptr + token * q8_stride_t + local_head * head_dim
+                if HAS_PASS:
+                    qp = tl.minimum(tl.maximum(x_norm * r, -448.0, tl.PropagateNan.ALL), 448.0, tl.PropagateNan.ALL)
+                    tl.store(qo + head_offs, qp.to(tl.float8e4nv), mask=head_mask & (head_offs >= rotary_dim))
+                q1 = tl.minimum(tl.maximum(o1 * r, -448.0, tl.PropagateNan.ALL), 448.0, tl.PropagateNan.ALL)
+                q2 = tl.minimum(tl.maximum(o2 * r, -448.0, tl.PropagateNan.ALL), 448.0, tl.PropagateNan.ALL)
+                tl.store(qo + rot_offs, q1.to(tl.float8e4nv), mask=rot_mask)
+                tl.store(qo + half_rotary + rot_offs, q2.to(tl.float8e4nv), mask=rot_mask)
+                if GATE_COPY:
+                    # gate copy (verbatim, stock)
+                    g = tl.load(in_base + head_dim + head_offs, mask=head_mask, other=0.0)
+                    tl.store(gate_out_ptr + token * gate_out_stride_t + local_head * head_dim + head_offs, g,
+                             mask=head_mask)
+
+
 def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, num_kv_heads, head_dim,
                rotary_dim, mrope_section, norm_beta, q_scale, k_scale, v_scale, slot_mapping, k_cache, v_cache,
                tpp=1, hg=2, gate_copy=True, num_warps=None):
     """Same contract as fused_qkv_prologue.launch; gate_copy=False returns gate=None (read it from qkv)."""
     T = qkv.shape[0]
     dev = qkv.device
-    assert num_q_heads % hg == 0 and num_kv_heads <= hg
+    assert hg == 0 or (num_q_heads % hg == 0 and num_kv_heads <= hg)
     q8 = torch.empty((T, num_q_heads * head_dim), dtype=torch.float8_e4m3fn, device=dev)
     k_out = torch.empty((T, num_kv_heads * head_dim), dtype=qkv.dtype, device=dev)
     gate = torch.empty((T, num_q_heads * head_dim), dtype=qkv.dtype, device=dev) if gate_copy else None
@@ -329,8 +443,21 @@ def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_hea
         kcs = vcs = (0, 0, 0)
         sm = q8
     head_block = triton.next_power_of_2(head_dim)
-    nw = num_warps or max(1, head_block // 64) * hg
     g_out = gate if gate is not None else k_out
+    if hg == 0:  # 1-D port kernel (one head per program) + optional gate copy
+        _glue_ews1_qkv_kernel[(triton.cdiv(T, tpp), num_q_heads + num_kv_heads)](
+            qkv, qkv.stride(0), q8, k_out, g_out, q_weight, k_weight, cos_sin_cache, positions,
+            q8.stride(0), k_out.stride(0), g_out.stride(0), cos_sin_cache.stride(0), pm, pt,
+            sm, kc, vc, block_size, kcs[0], kcs[1], kcs[2], vcs[0], vcs[1], vcs[2],
+            q_scale, k_scale, v_scale, T, sm.shape[0] if write_kv else 0,
+            num_q_heads, num_kv_heads, head_dim, rotary_dim, rotary_dim // 2, eps, norm_beta=norm_beta,
+            INPUT_DTYPE=tl.bfloat16 if qkv.dtype == torch.bfloat16 else tl.float16,
+            HEAD_BLOCK=head_block, ROT_HALF_BLOCK=triton.next_power_of_2(rotary_dim // 2),
+            HAS_PASS=rotary_dim < head_dim, HAS_MROPE=has_mrope, MROPE_SECTION_H=mh, MROPE_SECTION_W=mw,
+            WRITE_KV=write_kv, TPP=tpp, GATE_COPY=gate_copy, num_warps=max(1, head_block // 64), num_stages=2,
+        )
+        return q8, k_out, gate
+    nw = num_warps or max(1, head_block // 64) * hg
     grid = (triton.cdiv(T, tpp), num_q_heads // hg + 1)
     _glue_ews_qkv_kernel[grid](
         qkv, qkv.stride(0), q8, k_out, g_out, q_weight, k_weight, cos_sin_cache, positions,

@@ -57,9 +57,9 @@ TPP = int(os.environ.get("EWS_QKV_TPP", "1"))  # tokens per program (static unro
 # 4*n warps, same per-head reduction layout -> bit-identical); GLUE_EWS_TPP tokens per program (default 1).
 GLUE_EWS_HG = int(os.environ.get("GLUE_EWS_HG", "0"))
 GLUE_EWS_TPP = int(os.environ.get("GLUE_EWS_TPP", "1"))
-# GLUE_EWS_NOGATE=1 (with GLUE_EWS_HG > 0, NQF=1): no contiguous gate copy; the o_proj gate-mul + MXFP8 op reads the
-# gate straight from the [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv).
-GLUE_EWS_NOGATE = GLUE_EWS_HG > 0 and os.environ.get("GLUE_EWS_NOGATE", "0") == "1"
+# GLUE_EWS_NOGATE=1 (NQF=1): no contiguous gate copy (port kernel + GATE_COPY=0 when GLUE_EWS_HG=0); the o_proj
+# gate-mul + MXFP8 op reads the gate straight from the [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv).
+GLUE_EWS_NOGATE = os.environ.get("GLUE_EWS_NOGATE", "0") == "1"
 # GLUE_EWS_TPP_SPLIT=<n> (> 0): tokens per program 1 for T <= n, else EWS_QKV_TPP (same kernel and per-token math;
 # GB300 bench: TPP 1 is 0.4-1.1 us faster at decode T, TPP 2 4-5 % faster at T >= 3K)
 GLUE_EWS_TPP_SPLIT = int(os.environ.get("GLUE_EWS_TPP_SPLIT", "0"))
@@ -247,7 +247,7 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
         # identical views to FlashInferImpl.do_kv_cache_update: (B, H, N, 2*hs) -> (B, N, H, hs) x2
         k_cache, v_cache = kv_cache.transpose(1, 2).split(m.head_dim, dim=-1)
     STATS["calls"] += 1
-    if GLUE_EWS_HG > 0:
+    if GLUE_EWS_HG > 0 or GLUE_EWS_NOGATE:
         from vllm.model_executor.layers.fusion import glue_kernels as G
 
         STATS["glue"] = STATS.get("glue", 0) + 1
@@ -256,7 +256,8 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
             m.q_norm.variance_epsilon, m.num_heads, m.num_kv_heads, m.head_dim, m.rotary_emb.rotary_dim,
             getattr(m.rotary_emb, "mrope_section", None) if positions.ndim == 2 else None, 1.0,
             attn_layer._q_scale, attn_layer._k_scale, attn_layer._v_scale, slot_mapping, k_cache, v_cache,
-            tpp=GLUE_EWS_TPP, hg=GLUE_EWS_HG, gate_copy=not GLUE_EWS_NOGATE)
+            tpp=1 if 0 < qkv.shape[0] <= GLUE_EWS_TPP_SPLIT else (GLUE_EWS_TPP if GLUE_EWS_HG else TPP),
+            hg=GLUE_EWS_HG, gate_copy=not GLUE_EWS_NOGATE)
         if gate is None:  # GLUE_EWS_NOGATE: zero-width placeholder (the gate is read from qkv)
             gate = qkv.new_empty((qkv.shape[0], 0))
         return q8, k_out, gate
@@ -354,6 +355,6 @@ def project_qkv_gate(mod, qkv, positions):
 
 if ENABLED:
     register_op()
-    if GLUE_EWS_TPP_SPLIT or GLUE_EWS_HG:
+    if GLUE_EWS_TPP_SPLIT or GLUE_EWS_HG or GLUE_EWS_NOGATE:
         logger.info("[glue] QKV prologue: tokens/program 1 up to T=%d (else %d); heads/program %d, gate copy %s",
                     GLUE_EWS_TPP_SPLIT, TPP, GLUE_EWS_HG, not GLUE_EWS_NOGATE)
