@@ -671,6 +671,51 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     assert num_computed == 112
 
 
+def test_pin_own_checkpoint_pins_exported_checkpoint_after_partial_hit(monkeypatch):
+    """VLLM_MAMBA_PIN_OWN_CKPT: a prefill that resumed from a partial hit and
+    exported its checkpoint into its CoW block pins that checkpoint (the state
+    its next turn resumes from), not the shallower source it resumed from.
+    The export is re-keyed in place, not registered as a partial-tail hit.
+    """
+    monkeypatch.setenv("VLLM_MAMBA_PIN_OWN_CKPT", "1")
+    hash_block_size = 2
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=4,
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
+        prefill_checkpoint_reuses_initial_block=True,
+    )
+    manager.coordinator.retention_interval = 0
+    mamba_manager = manager.coordinator.single_type_managers[1]
+
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 7, num_computed, computed_blocks)
+    manager.free(owner)
+    manager.new_step_starts()
+
+    replay = make_request(
+        "replay", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], hash_block_size, sha256
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 6
+    assert manager.allocate_slots(replay, 6, num_computed, computed_blocks)
+    cow_block = manager.get_blocks(replay.request_id).blocks[1][1]
+    assert cow_block.block_hash_num_tokens == 10
+
+    assert mamba_manager._own_pin[replay.request_id] is cow_block
+    held = cow_block.ref_cnt
+    manager.free(replay)
+    # Freeing drops the table reference and the pin (the pending CoW copy
+    # keeps its own until the worker has run it).
+    assert cow_block.ref_cnt == held - 2
+    checkpoint_hit = manager.block_pool.get_cached_block(replay.block_hashes[4], [1])
+    assert checkpoint_hit is not None and checkpoint_hit[0] is cow_block
+
+
 @pytest.mark.parametrize(
     "retention_interval,transient_published",
     [(None, True), (0, False)],
