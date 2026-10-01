@@ -31,6 +31,12 @@
 #include <cuda_fp16.h>
 #include <algorithm>
 #include <cstdint>
+#ifndef GSC_QO
+#define GSC_QO 0
+#endif
+#if GSC_QO
+#include <cuda_fp8.h>
+#endif
 
 namespace gsc {
 
@@ -128,6 +134,75 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_xor_sync(0xffffffffu, value, offset);
   return value;
 }
+#if GSC_QO
+// gb300 glue (GSC_QO=1): the decode kernel also writes the MXFP8 (E4M3 data + E8M0 scale per 32 values,
+// 128x4-swizzled scales) quantization of its bf16 output for the GDN out_proj (K = HV * 128), bit-identical
+// to FlashInfer mxfp8_quantize(out, is_sf_swizzled_layout=True), and zeroes the data / scales of the rows no
+// request owns (graph padding rows [cu_seqlens[n], T) and the scale padding rows [T, pm)).
+struct QoArgs {
+  uint8_t* q;       // [>= pm, HV*128] e4m3 bytes, row stride stride_q (nullptr: QO off)
+  uint8_t* sf;      // swizzled e8m0 scales of [pm, HV*4] (padded cols psc)
+  int stride_q;     // row stride of q in bytes (q offsets fit in int32: rows <= 32768, K <= 65536)
+  int psc;          // padded scale columns ((HV*4 + 3) / 4 * 4)
+  int T;            // rows of out (graph size)
+  int pm;           // T rounded up to 128
+};
+__device__ __forceinline__ float qo_mul_rn(float a, float b) {  // IEEE mul, no FTZ / no contraction
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ int qo_sf_word(int row, int head, int psc) {
+  // byte offset of scale column j = head * 4 (+0..3) of `row` in FlashInfer's 128x4 swizzled layout (32-bit math)
+  return head * 512 + (row & 31) * 16 + ((row & 127) >> 5) * 4 + (row >> 7) * (128 * psc);
+}
+// e8m0 exponent of a 32-value block whose |max| is amax (FlashInfer cute-dsl rule)
+__device__ __forceinline__ uint32_t qo_e8m0(float amax) {
+  const float nm = qo_mul_rn(amax, 1.0f / 448.0f);
+  const uint32_t bits = __float_as_uint(nm);
+  const uint32_t e = (bits >> 23) & 255u;
+  const uint32_t mant = bits & 0x7FFFFFu;
+  const uint32_t bump = (mant != 0u && !(e == 0u && mant <= 0x400000u)) ? 1u : 0u;
+  uint32_t e2 = e + bump < 254u ? e + bump : 254u;
+  if (!(nm > 0.0f)) e2 = 0u;
+  return e2;
+}
+__device__ __forceinline__ uint8_t qo_e4m3(float y, uint32_t e2) {
+  const float inv = e2 == 0u ? 0.0f : __uint_as_float((254u - e2) << 23);
+  float v = qo_mul_rn(y, inv);
+  v = fminf(fmaxf(v, -448.0f), 448.0f);
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
+}
+// one 32-value block (value = lane + 32 * i) of one (token row, head): warp |max|, e8m0, e4m3 byte store;
+// returns the e8m0 byte (all lanes)
+__device__ __forceinline__ uint32_t qo_block(const QoArgs& qo, int row, int head, int lane, int i, float y) {
+  float am = fabsf(y);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, off));
+  const uint32_t e2 = qo_e8m0(am);
+  qo.q[row * qo.stride_q + head * kDimV + lane + 32 * i] = qo_e4m3(y, e2);
+  return e2;
+}
+// zero q (rows < T) / scales (rows < pm) of the rows [n_tok, pm) assigned to this CTA (row = n_tok + request + k *
+// n_req), spread over all threads (32 q words per row, 1 scale word per row)
+__device__ __forceinline__ void qo_zero_pad_rows(const QoArgs& qo, int n_tok, int request, int n_req, int head, int tid) {
+  const int first = n_tok + request;
+  if (first >= qo.pm) return;
+  const int nq = first < qo.T ? (qo.T - first + n_req - 1) / n_req : 0;
+  for (int idx = tid; idx < nq * 32; idx += kThreads) {
+    const int row = first + (idx >> 5) * n_req;
+    reinterpret_cast<uint32_t*>(qo.q + row * qo.stride_q + head * kDimV)[idx & 31] = 0u;
+  }
+  const int ns = (qo.pm - first + n_req - 1) / n_req;
+  for (int r = tid; r < ns; r += kThreads)
+    *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(first + r * n_req, head, qo.psc)) = 0u;
+}
+#define GSC_QO_PARAM , QoArgs qo
+#define GSC_QO_ARG , qo
+#else
+#define GSC_QO_PARAM
+#define GSC_QO_ARG
+#endif
 struct Sum2 { float x; float y; };
 __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
 #pragma unroll
@@ -1009,7 +1084,7 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
     const int* __restrict__ num_accepted_tokens, S* __restrict__ state,
     const __nv_bfloat16* __restrict__ output_gate, const void* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ out, int H, int HV, int dt_bias_type, bool norm_weight_is_bf16, float scale,
-    float norm_eps, Strides strides) {
+    float norm_eps, Strides strides GSC_QO_PARAM) {
   const int request = blockIdx.x;
   const int value_head = blockIdx.y;
   const int key_head = value_head / VPK;
@@ -1018,6 +1093,9 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
   const int warp = tid >> 5;
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
+#if GSC_QO
+  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid);
+#endif
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gsc_dyn_smem[];
   S* shared_state = reinterpret_cast<S*>(gsc_dyn_smem);  // [kNumChunks][kChunkV][kDimK]
@@ -1072,6 +1150,16 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
       const int token = bos + linear / kDimV;
       out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + linear % kDimV] = __float2bfloat16(0.0f);
     }
+#if GSC_QO
+    if (qo.q != nullptr) {  // zero rows quantize to zero data and zero scales
+      for (int linear = tid; linear < num_tokens * (kDimV / 4); linear += kThreads) {
+        const int row = bos + linear / (kDimV / 4);
+        reinterpret_cast<uint32_t*>(qo.q + row * qo.stride_q + value_head * kDimV)[linear % (kDimV / 4)] = 0u;
+      }
+      for (int t = tid; t < num_tokens; t += kThreads)
+        *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(bos + t, value_head, qo.psc)) = 0u;
+    }
+#endif
     return;
   }
   const LogLayout ll = log_layout(H, HV);
@@ -1319,6 +1407,9 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
     sum_square = warp_reduce_sum(sum_square);
     const float rstd = rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
     const int token = bos + t;
+#if GSC_QO
+    float yq[4];
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int value = lane + i * 32;
@@ -1331,9 +1422,20 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
       const float gate = SigmoidGate ? sigmoid_fast(gate_input) : silu_fast(gate_input);
       const float weight = norm_weight_is_bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(norm_weight)[value])
                                                : static_cast<const float*>(norm_weight)[value];
-      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] =
-          __float2bfloat16(output_values[i] * rstd * weight * gate);
+      const __nv_bfloat16 yb = __float2bfloat16(output_values[i] * rstd * weight * gate);
+      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] = yb;
+#if GSC_QO
+      yq[i] = __bfloat162float(yb);
+#endif
     }
+#if GSC_QO
+    if (qo.q != nullptr) {  // after the output loop (keeps the loop's register allocation)
+      uint32_t sfw = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) sfw |= qo_block(qo, token, value_head, lane, i, yq[i]) << (8 * i);
+      if (lane == 0) *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(token, value_head, qo.psc)) = sfw;
+    }
+#endif
   }
 }
 
@@ -3208,10 +3310,19 @@ __device__ __forceinline__ void mat_item(const MatArgs& args, const int item, co
   if (tid == 0) *dst_ctr = 0;
 }
 
+#if GSC_QO
+static void decode_core(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
+            torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
+            torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
+            bool sigmoid_gate, QoArgs qo) {
+  TORCH_CHECK(qo.q == nullptr || (!GSC_PERSIST && !(GSC_CK == 3 && state.scalar_type() == at::kBFloat16)),
+              "gdn_state_commit: fused out_proj quant (GSC_QO) needs the deferred_decode_kernel path");
+#else
 void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
             torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
             torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
             bool sigmoid_gate) {
+#endif
   TORCH_CHECK((state.scalar_type() == at::kFloat || state.scalar_type() == at::kBFloat16) && state.dim() == 4 &&
               state.size(2) == kDimV &&
               state.size(3) == kDimK && state.stride(1) == kDimV * kDimK && state.stride(3) == 1);
@@ -3280,7 +3391,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
                                           cudaFuncAttributePreferredSharedMemoryCarveout, 100));                  \
       attr_set[kB][VPK_ - 1][SIG_] = true;                                                                            \
     }                                                                                                             \
-    deferred_decode_kernel<ST_, VPK_, SIG_><<<grid, kThreads, kDyn, stream>>>(GSC_ARGS(ST_));                              \
+    deferred_decode_kernel<ST_, VPK_, SIG_><<<grid, kThreads, kDyn, stream>>>(GSC_ARGS(ST_) GSC_QO_ARG);                              \
   }
 #if GSC_GB
 #if GB_KH
@@ -3364,6 +3475,36 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
 #undef GSC_LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+#if GSC_QO
+void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
+            torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
+            torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
+            bool sigmoid_gate) {
+  decode_core(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, output_gate,
+              norm_weight, out, scale, norm_eps, sigmoid_gate, QoArgs{nullptr, nullptr, 0, 0, 0, 0});
+}
+// decode + MXFP8 quantization of out ([T, HV, 128] bf16) into q ([>= T, HV*128] e4m3 / uint8, row-contiguous) and
+// sf (128x4-swizzled e8m0 scales of pm = roundup(T, 128) rows, psc padded columns); padding rows zeroed (see QoArgs).
+void decode_qo(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
+               torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
+               torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
+               bool sigmoid_gate, torch::Tensor q, torch::Tensor sf, int64_t psc) {
+  const int64_t T = out.size(0);
+  const int64_t K = out.size(1) * out.size(2);
+  const int64_t pm = (T + 127) / 128 * 128;
+  TORCH_CHECK(out.dim() == 3 && out.size(2) == kDimV && out.is_contiguous());
+  TORCH_CHECK(q.element_size() == 1 && q.dim() == 2 && q.size(1) == K && q.stride(1) == 1 && q.size(0) >= T);
+  TORCH_CHECK(sf.element_size() == 1 && sf.is_contiguous() && sf.numel() >= pm * psc && psc == (K / 32 + 3) / 4 * 4);
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(sf.data_ptr()) % 4 == 0 && reinterpret_cast<uintptr_t>(q.data_ptr()) % 4 == 0 &&
+              q.stride(0) % 4 == 0);
+  TORCH_CHECK(pm <= 32768 && q.stride(0) * pm < (int64_t(1) << 31) && pm * psc < (int64_t(1) << 31));
+  QoArgs qo{reinterpret_cast<uint8_t*>(q.data_ptr()), reinterpret_cast<uint8_t*>(sf.data_ptr()),
+            static_cast<int>(q.stride(0)), static_cast<int>(psc), static_cast<int>(T), static_cast<int>(pm)};
+  decode_core(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, output_gate,
+              norm_weight, out, scale, norm_eps, sigmoid_gate, qo);
+}
+#endif
 
 static void materialize_impl(int64_t compact, int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0,
                  c10::optional<torch::Tensor> a1,
@@ -3537,6 +3678,9 @@ int64_t log_bytes(int64_t H, int64_t HV) { return log_layout(static_cast<int>(H)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &gsc::decode);
+#if GSC_QO
+  m.def("decode_qo", &gsc::decode_qo);
+#endif
   m.def("materialize", &gsc::materialize);
   m.def("materialize_compact", &gsc::materialize_compact);
   m.def("occupancy_mat", &gsc::occupancy_mat);
