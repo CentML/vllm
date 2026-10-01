@@ -158,15 +158,17 @@ def check_num_speculative_tokens(num_spec, site: str) -> int:
     return t
 
 
-def load(minb=None):
-    """minb: CTAs/SM launch bound of the decode kernel (env GDN_STATE_COMMIT_MINB, default 2)."""
+def load(minb=None, gb=None):
+    """minb: CTAs/SM launch bound of the decode kernel (env GDN_STATE_COMMIT_MINB, default 2).
+    gb: override GDN_STATE_COMMIT_GB (the in-serving check loads the CK0 reference with gb=0)."""
     global _ext
     if minb is None:
         minb = int(os.environ.get("GDN_STATE_COMMIT_MINB", "2"))
-        if _ext is not None:
+        if _ext is not None and gb is None:
             return _ext
-    if minb in _exts:
-        return _exts[minb]
+    key = minb if gb is None else (minb, int(gb))
+    if key in _exts:
+        return _exts[key]
     import torch.utils.cpp_extension as cpp
 
     build = os.environ.get(
@@ -197,6 +199,15 @@ def load(minb=None):
     matc_f32 = int(os.environ.get("GDN_STATE_COMMIT_MATC_MINB_F32", "3"))
     if matc_f32 != 3:
         tag += f"_matc{matc_f32}"
+    # GB300 fp32 decode kernel (GDN_STATE_COMMIT_GB=1): bit-exact with CK=0, used for the fp32 state only
+    gb_env = gb
+    gb = int(os.environ.get("GDN_STATE_COMMIT_GB", "0")) if gb_env is None else int(gb_env)
+    gbo = {k: int(os.environ.get(f"GDN_STATE_COMMIT_GB_{k}", v))
+           for k, v in (("W", "8"), ("D", "2"), ("NS", "1"), ("F2", "1"), ("MINB", "4"), ("KREG", "1"))}
+    gb_flags = []
+    if gb:
+        tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k".format(**gbo)
+        gb_flags = ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -207,7 +218,7 @@ def load(minb=None):
             name=f"_gdn_state_commit_{tag}",
             sources=[os.path.join(_HERE, "gdn_state_commit.cu")],
             # --use_fast_math: same as vLLM's build of fused_gdn_decode_kernel.cu (bit-exactness)
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}", f"-DGSC_CK3_REMAP={c3r}", f"-DGSC_MATC_MINB_F32={matc_f32}"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}", f"-DGSC_CK3_REMAP={c3r}", f"-DGSC_MATC_MINB_F32={matc_f32}"] + gb_flags,
             extra_cflags=["-O3", "-std=c++20"],
             build_directory=build,
             verbose=False,
@@ -215,8 +226,8 @@ def load(minb=None):
     finally:
         cpp._get_cuda_arch_flags = orig
     assert ext.log_bytes(16, 32) == log_bytes(16, 32)
-    _exts[minb] = ext
-    if minb == int(os.environ.get("GDN_STATE_COMMIT_MINB", "2")):
+    _exts[key] = ext
+    if gb_env is None and minb == int(os.environ.get("GDN_STATE_COMMIT_MINB", "2")):
         _ext = ext
     logger.info_once("gdn_state_commit enabled: deferred GDN state commit kernel loaded (%s)", tag)
     return ext
@@ -225,6 +236,58 @@ def load(minb=None):
 # ----------------------------------------------------------------------------------------------
 # kernels (python entry points)
 # ----------------------------------------------------------------------------------------------
+# GB300 fp32 kernel in-serving check (GDN_STATE_COMMIT_GB_CHECK=N, diagnostics only): every decode call
+# (eager or CUDA-graph replay) also runs the CK0 reference kernel on a gathered copy of the rows' pages
+# (ssm state + token log) and counts mismatching state/log words and output elements on the device; every
+# N-th eager call logs the counters. Doubles the decode traffic: never use it in a scored run.
+_GB_CHECK = int(os.environ.get("GDN_STATE_COMMIT_GB_CHECK", "0"))
+_GB_CHK = {}
+
+
+def _gb_check_counters(device):
+    c = _GB_CHK.get("cnt")
+    if c is None:
+        c = _GB_CHK["cnt"] = torch.zeros(4, dtype=torch.int64, device=device)
+    return c
+
+
+def _gb_checked_decode(ext, args, state, state_indices, cu_seqlens, out):
+    """Run the GB kernel (ext) and the CK0 reference on a gathered page copy; accumulate mismatches."""
+    ref = load(gb=0)
+    n = state_indices.size(0)
+    HV = state.size(1)
+    H = (args[0].size(1) - HV * 128) // 256  # mixed_qkv = [q (H*128) | k (H*128) | v (HV*128)]
+    words = (state[0].numel() * state.element_size() + log_bytes(H, HV)) // 4
+    raw = torch.as_strided(state.view(torch.int32) if state.dtype == torch.float32 else state, (state.size(0), words),
+                           (state.stride(0), 1))
+    idx = state_indices[:, 0].long()
+    valid = idx > 0
+    gidx = torch.where(valid, idx, torch.zeros_like(idx))
+    sp = torch.empty((n + 1, words), dtype=raw.dtype, device=raw.device)
+    sp[1:] = raw[gidx]
+    sstate = torch.as_strided(sp.view(state.dtype), (n + 1,) + tuple(state.shape[1:]),
+                              (words,) + tuple(state.stride()[1:]))
+    sidx = torch.where(valid, torch.arange(1, n + 1, device=idx.device, dtype=torch.int32),
+                       torch.zeros(n, device=idx.device, dtype=torch.int32))[:, None].contiguous()
+    out2 = torch.empty_like(out)
+    a = list(args)
+    a[5], a[8], a[11] = sidx, sstate, out2
+    ref.decode(*a)
+    ext.decode(*args)
+    cnt = _gb_check_counters(out.device)
+    cnt[0] += 1
+    cnt[1] += ((raw[gidx] != sp[1:]) & valid[:, None]).sum()
+    tok = torch.arange(out.size(0), device=out.device) < cu_seqlens[n].long()
+    cnt[2] += ((out.view(torch.int16) != out2.view(torch.int16)).flatten(1).any(1) & tok).sum()
+    cnt[3] += valid.sum()
+    if not torch.cuda.is_current_stream_capturing():
+        _GB_CHK["eager"] = _GB_CHK.get("eager", 0) + 1
+        if _GB_CHK["eager"] % _GB_CHECK == 0:
+            c = cnt.tolist()
+            logger.warning("gdn_state_commit GB check: kernel calls %d, rows %d, state/log word mismatches %d, "
+                           "output token-row mismatches %d", c[0], c[3], c[1], c[2])
+
+
 def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens, state,
            output_gate, norm_weight, out=None, scale=128**-0.5, norm_eps=1e-5,
            output_gate_activation="silu"):
@@ -233,9 +296,14 @@ def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accep
     if not state_indices.is_contiguous():
         state_indices = state_indices[:, :1].contiguous()
     STATS["decode_calls"] += 1
-    load().decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens,
-                  state, output_gate, norm_weight, out, float(scale), float(norm_eps),
-                  output_gate_activation == "sigmoid")
+    args = (mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens,
+            state, output_gate, norm_weight, out, float(scale), float(norm_eps),
+            output_gate_activation == "sigmoid")
+    if _GB_CHECK and state.dtype == torch.float32 and os.environ.get("GDN_STATE_COMMIT_GB", "0") == "1" \
+            and state_indices.size(0) > 0:
+        _gb_checked_decode(load(), args, state, state_indices, cu_seqlens, out)
+    else:
+        load().decode(*args)
     _dbg(f"decode N={state_indices.size(0)} w={state_indices.size(1)}")
     return out
 
