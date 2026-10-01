@@ -27,10 +27,16 @@ def load(mixed_add=None):
         return _exts[mixed_add]
     import torch.utils.cpp_extension as cpp
 
+    requested = mixed_add
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}{'a' if major >= 9 else ''}"
     if mixed_add and (major, minor) != (10, 7):
         mixed_add = 0
+    if mixed_add in _exts:
+        # MIXED_ADD auto-disabled off sm_107: serve the requested key from the
+        # cache too (otherwise every call re-runs cpp.load on the build dir)
+        _exts[requested] = _exts[mixed_add]
+        return _exts[mixed_add]
     build = os.path.join(
         os.environ.get("GDN_CONV_CUDA_BUILD_DIR", os.path.expanduser("~/.cache/gdn_conv_cuda")),
         f"sm{arch}_ma{mixed_add}",
@@ -51,6 +57,7 @@ def load(mixed_add=None):
     finally:
         cpp._get_cuda_arch_flags = orig
     _exts[mixed_add] = ext
+    _exts[requested] = ext
     return ext
 
 
