@@ -63,6 +63,13 @@ _ext = None
 _exts = {}
 MAX_T = 4
 _DEBUG = os.environ.get("GDN_STATE_COMMIT_DEBUG", "0") == "1"
+# gb300 glue: fuse the GDN out_proj MXFP8 input quant (+ padding-row zeroing) into the decode kernel
+QO_ENV = os.environ.get("GLUE_GSC_QO", "0") == "1"
+# only up to this many rows (decode tokens): the fused epilogue costs ~1-3 % kernel time at large batches
+QO_MAXT = int(os.environ.get("GLUE_GSC_QO_MAXT", "256"))
+# gsc2: also let gscd's GB300 fp32 decode kernels (GDN_STATE_COMMIT_GB=1: gb_decode_kernel / gb_kh_kernel) write the
+# fused quant (same epilogue rule as deferred_decode_kernel; bitwise vs FlashInfer's mxfp8 quant). Default off.
+QO_GB = os.environ.get("GDN_STATE_COMMIT_GB_QO", "0") == "1"
 
 
 def _dbg(what):
@@ -226,10 +233,12 @@ def load(minb=None, gb=None):
     gbo = {k: int(os.environ.get(f"GDN_STATE_COMMIT_GB_{k}", v))
            for k, v in (("W", "8"), ("D", "1"), ("NS", "2"), ("F2", "1"), ("MINB", "3"), ("KREG", "1"),
                         ("SPEC", "1"), ("KH", "2"), ("KH_MIN", "48"))}
-    gb_flags = []
+    gb_flags = ["-DGSC_QO=1"] if QO_ENV else []
+    if QO_ENV:
+        tag += "_qo1"
     if gb:
         tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k{SPEC}s{KH}h{KH_MIN}".format(**gbo)
-        gb_flags = ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
+        gb_flags += ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -329,6 +338,34 @@ class _CheckedExt:
             self._raw.decode(*args)
 
 
+def _qo_target(out, state):
+    """gb300 glue (GLUE_GSC_QO=1): the GDN out_proj MXFP8 target of norm_quant.gdn_forward_core_fused_norm_packed
+    when this decode call writes the WHOLE core_attn_out of that layer (decode-only step; mixed steps pass a row
+    slice) on a decode kernel that carries GSC_QO; else None."""
+    if not QO_ENV or out is None:
+        return None
+    from vllm.model_executor.layers.fusion import norm_quant
+
+    t = getattr(norm_quant, "_GDN_TGT", [None])[0]
+    gb = os.environ.get("GDN_STATE_COMMIT_GB", "0") not in ("0", "")
+    if (
+        t is None
+        or out.dim() != 3
+        or not out.is_contiguous()
+        or out.data_ptr() != t["base"]
+        or out.shape[0] != t.get("T", -1)
+        or out.shape[0] > QO_MAXT
+        or out.shape[1] * out.shape[2] != t["K"]
+        or os.environ.get("GDN_STATE_COMMIT_PERSIST", "0") != "0"
+        # GB kernels carry the fused quant only with GDN_STATE_COMMIT_GB_QO=1 (and not under the in-serving check)
+        or (gb and (not QO_GB or _GB_CHECK))
+        or (os.environ.get("GDN_STATE_COMMIT_CK", "0") == "3" and state.dtype == torch.bfloat16)
+        or state.dtype != torch.float32 and gb
+    ):
+        return None
+    return t
+
+
 def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens, state,
            output_gate, norm_weight, out=None, scale=128**-0.5, norm_eps=1e-5,
            output_gate_activation="silu"):
@@ -340,7 +377,14 @@ def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accep
     args = (mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens,
             state, output_gate, norm_weight, out, float(scale), float(norm_eps),
             output_gate_activation == "sigmoid")
-    load().decode(*args)  # (checked when GDN_STATE_COMMIT_GB_CHECK is set: see _CheckedExt)
+    t = _qo_target(out, state) if state_indices.size(0) > 0 else None
+    if t is not None:
+        load().decode_qo(*args, t["q"], t["sf"], int(t["psc"]))
+        t["qo"] = True
+        STATS["decode_qo_calls"] = STATS.get("decode_qo_calls", 0) + 1
+        logger.info_once("gdn_state_commit: GDN out_proj MXFP8 quant fused into the decode kernel (GLUE_GSC_QO)")
+    else:
+        load().decode(*args)  # (checked when GDN_STATE_COMMIT_GB_CHECK is set: see _CheckedExt)
     _dbg(f"decode N={state_indices.size(0)} w={state_indices.size(1)}")
     return out
 

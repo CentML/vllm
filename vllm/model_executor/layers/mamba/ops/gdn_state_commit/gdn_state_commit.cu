@@ -1643,7 +1643,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
     const int* __restrict__ num_accepted_tokens, float* __restrict__ state,
     const __nv_bfloat16* __restrict__ output_gate, const void* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ out, int H, int HV, int dt_bias_type, bool norm_weight_is_bf16, float scale,
-    float norm_eps, Strides strides) {
+    float norm_eps, Strides strides GSC_QO_PARAM) {
   const int request = blockIdx.x;
   const int value_head = blockIdx.y;
   const int key_head = value_head / VPK;
@@ -1654,6 +1654,10 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
   const int rq = lane >> 3;
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
+#if GSC_QO
+  static_assert(kGbThreads == kThreads, "GSC_QO pad-row zeroing assumes 256-thread CTAs");
+  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid);
+#endif
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gb_dyn_smem[];
   float* ring = reinterpret_cast<float*>(gb_dyn_smem) + warp * (kGbD * kGbPassFloats);
@@ -1669,6 +1673,16 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
       const int token = bos + linear / kDimV;
       out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + linear % kDimV] = __float2bfloat16(0.0f);
     }
+#if GSC_QO
+    if (qo.q != nullptr) {  // zero rows quantize to zero data and zero scales (as deferred_decode_kernel)
+      for (int linear = tid; linear < num_tokens * (kDimV / 4); linear += kGbThreads) {
+        const int row = bos + linear / (kDimV / 4);
+        reinterpret_cast<uint32_t*>(qo.q + row * qo.stride_q + value_head * kDimV)[linear % (kDimV / 4)] = 0u;
+      }
+      for (int t = tid; t < num_tokens; t += kGbThreads)
+        *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(bos + t, value_head, qo.psc)) = 0u;
+    }
+#endif
     return;
   }
   const LogLayout ll = log_layout(H, HV);
@@ -1845,13 +1859,27 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
     sum_square = warp_reduce_sum(sum_square);
     const float rstd = rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
     const int token = bos + t;
+#if GSC_QO
+    float yq[4];
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) {  // g_pre / w_pre: prefetched by this warp (its first prep task is token t = warp)
       const int value = lane + i * 32;
       const float gate = SigmoidGate ? sigmoid_fast(g_pre[i]) : silu_fast(g_pre[i]);
-      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] =
-          __float2bfloat16(output_values[i] * rstd * w_pre[i] * gate);
+      const __nv_bfloat16 yb = __float2bfloat16(output_values[i] * rstd * w_pre[i] * gate);
+      out[(static_cast<int64_t>(token) * HV + value_head) * kDimV + value] = yb;
+#if GSC_QO
+      yq[i] = __bfloat162float(yb);
+#endif
     }
+#if GSC_QO
+    if (qo.q != nullptr) {  // fused GDN out_proj MXFP8 input (glue's QO epilogue, same rule as deferred_decode_kernel)
+      uint32_t sfw = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) sfw |= qo_block(qo, token, value_head, lane, i, yq[i]) << (8 * i);
+      if (lane == 0) *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(token, value_head, qo.psc)) = sfw;
+    }
+#endif
   }
 }
 #endif  // GSC_GB
@@ -1968,7 +1996,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
     const int* __restrict__ num_accepted_tokens, float* __restrict__ state,
     const __nv_bfloat16* __restrict__ output_gate, const void* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ out, int H, int HV, int dt_bias_type, bool norm_weight_is_bf16, float scale,
-    float norm_eps, Strides strides) {
+    float norm_eps, Strides strides GSC_QO_PARAM) {
   const int request = blockIdx.x;
   const int key_head = blockIdx.y;
   const int vh0 = key_head * 2;
@@ -1979,6 +2007,12 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
   const int rq = lane >> 3;
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
+#if GSC_QO
+  if (qo.q != nullptr) {  // the pad rows of both value heads (same row partition as the value-head kernels)
+    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0, tid);
+    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0 + 1, tid);
+  }
+#endif
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gbk_dyn_smem[];
   float* ring = reinterpret_cast<float*>(gbk_dyn_smem) + warp * (kGbkRing * 2 * 4 * kDimK);
@@ -1995,6 +2029,19 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
       const int r = linear % (2 * kDimV);
       out[(static_cast<int64_t>(token) * HV + vh0 + r / kDimV) * kDimV + r % kDimV] = __float2bfloat16(0.0f);
     }
+#if GSC_QO
+    if (qo.q != nullptr) {
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        for (int linear = tid; linear < num_tokens * (kDimV / 4); linear += kGbThreads) {
+          const int row = bos + linear / (kDimV / 4);
+          reinterpret_cast<uint32_t*>(qo.q + row * qo.stride_q + (vh0 + hh) * kDimV)[linear % (kDimV / 4)] = 0u;
+        }
+        for (int t = tid; t < num_tokens; t += kGbThreads)
+          *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(bos + t, vh0 + hh, qo.psc)) = 0u;
+      }
+    }
+#endif
     return;
   }
   const LogLayout ll = log_layout(H, HV);
@@ -2171,13 +2218,27 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
     }
     sum_square = warp_reduce_sum(sum_square);
     const float rstd = rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
+#if GSC_QO
+    float yq[4];
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int value = lane + i * 32;
       const float gate = SigmoidGate ? sigmoid_fast(g_pre[i]) : silu_fast(g_pre[i]);
-      out[(static_cast<int64_t>(bos + et) * HV + eh) * kDimV + value] =
-          __float2bfloat16(output_values[i] * rstd * w_pre[i] * gate);
+      const __nv_bfloat16 yb = __float2bfloat16(output_values[i] * rstd * w_pre[i] * gate);
+      out[(static_cast<int64_t>(bos + et) * HV + eh) * kDimV + value] = yb;
+#if GSC_QO
+      yq[i] = __bfloat162float(yb);
+#endif
     }
+#if GSC_QO
+    if (qo.q != nullptr) {
+      uint32_t sfw = 0u;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) sfw |= qo_block(qo, bos + et, eh, lane, i, yq[i]) << (8 * i);
+      if (lane == 0) *reinterpret_cast<uint32_t*>(qo.sf + qo_sf_word(bos + et, eh, qo.psc)) = sfw;
+    }
+#endif
   }
 }
 #endif  // GB_KH
@@ -3316,7 +3377,7 @@ static void decode_core(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor 
             torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
             bool sigmoid_gate, QoArgs qo) {
   TORCH_CHECK(qo.q == nullptr || (!GSC_PERSIST && !(GSC_CK == 3 && state.scalar_type() == at::kBFloat16)),
-              "gdn_state_commit: fused out_proj quant (GSC_QO) needs the deferred_decode_kernel path");
+              "gdn_state_commit: fused out_proj quant (GSC_QO) needs the deferred_decode_kernel or GB kernel path");
 #else
 void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
             torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
@@ -3404,7 +3465,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
       C10_CUDA_CHECK(cudaFuncSetAttribute(gb_kh_kernel<SIG_>, cudaFuncAttributePreferredSharedMemoryCarveout, 100)); \
       gbk_attr[SIG_] = true;                                                                                      \
     }                                                                                                             \
-    gb_kh_kernel<SIG_><<<kgrid, kGbThreads, kGbkDyn, stream>>>(GSC_ARGS(float));
+    gb_kh_kernel<SIG_><<<kgrid, kGbThreads, kGbkDyn, stream>>>(GSC_ARGS(float) GSC_QO_ARG);
     if (sigmoid_gate) { GSC_GBK_LAUNCH(true); } else { GSC_GBK_LAUNCH(false); }
 #undef GSC_GBK_LAUNCH
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -3419,7 +3480,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
       C10_CUDA_CHECK(cudaFuncSetAttribute(gb_decode_kernel<VPK_, SIG_>, cudaFuncAttributePreferredSharedMemoryCarveout, 100)); \
       gb_attr[VPK_ - 1][SIG_] = true;                                                                             \
     }                                                                                                             \
-    gb_decode_kernel<VPK_, SIG_><<<grid, kGbThreads, kGbDyn, stream>>>(GSC_ARGS(float));
+    gb_decode_kernel<VPK_, SIG_><<<grid, kGbThreads, kGbDyn, stream>>>(GSC_ARGS(float) GSC_QO_ARG);
     if (vpk == 2) {
       if (sigmoid_gate) { GSC_GB_LAUNCH(2, true); } else { GSC_GB_LAUNCH(2, false); }
     } else {
