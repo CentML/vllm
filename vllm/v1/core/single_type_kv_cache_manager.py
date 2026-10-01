@@ -1686,6 +1686,7 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(self.kv_cache_spec, MambaSpec)
         checkpoint_idx = cdiv(query_end, self.block_size) - 2
         blocks = self.req_to_blocks[request_id]
+        reuse_initial_block = self.kv_cache_spec.prefill_checkpoint_reuses_initial_block
         return (
             self.has_prefill_checkpoint_blocks
             and is_mamba_prefill_checkpoint_valid(
@@ -1695,6 +1696,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 hash_block_size=self.block_pool.hash_block_size,
                 mamba_block_size=self.block_size,
                 checkpoint_alignment=(self.kv_cache_spec.prefill_checkpoint_alignment),
+                reuse_initial_block=reuse_initial_block,
             )
             and checkpoint_idx >= 0
             and (
@@ -1703,6 +1705,15 @@ class MambaManager(SingleTypeKVCacheManager):
                 or (
                     request_id in self._allocated_block_reqs
                     and checkpoint_idx >= len(blocks) - self.num_speculative_blocks
+                )
+                # The validity check only lets the checkpoint alias the
+                # initial-state column when the query starts mid-block, so
+                # that block is this request's own running block or a CoW
+                # copy of a partial hit: private, and the align pre-copy has
+                # already moved its state into the running column.
+                or (
+                    reuse_initial_block
+                    and checkpoint_idx == (query_start - 1) // self.block_size
                 )
             )
         )

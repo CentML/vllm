@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import dataclasses
 import os
 from typing import Literal
 
@@ -85,7 +86,11 @@ from vllm.utils.torch_utils import (
     aux_stream,
     direct_register_custom_op,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNPrefillCheckpointMetadata,
+)
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -465,6 +470,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.conv_kernel_size,
             self.num_spec,
+        )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if not (
+            envs.VLLM_GDN_PREFILL_CHECKPOINT
+            and isinstance(spec, MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and current_platform.is_cuda()
+        ):
+            return spec
+        if vllm_config.cache_config.prefix_cache_retention_interval != 0:
+            # With retained interior states, a single forward that skips a
+            # block boundary would leave that boundary's slot unwritten.
+            logger.warning_once(
+                "VLLM_GDN_PREFILL_CHECKPOINT needs "
+                "prefix_cache_retention_interval=0; keeping split prefills."
+            )
+            return spec
+        # The prefill forward splits each checkpointed sequence at the
+        # checkpoint (_chunk_prefill_with_checkpoint), so any offset works.
+        return dataclasses.replace(
+            spec,
+            num_prefill_checkpoint_blocks=1,
+            prefill_checkpoint_alignment=1,
+            prefill_checkpoint_reuses_initial_block=True,
         )
 
     def __init__(
@@ -1468,6 +1499,142 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    @staticmethod
+    def _store_conv_checkpoint(
+        conv_input: torch.Tensor,
+        conv_state: torch.Tensor,
+        checkpoint: GDNPrefillCheckpointMetadata,
+    ) -> None:
+        """Write each checkpoint's conv state, the ``width - 1`` conv inputs
+        before the checkpoint token, into its checkpoint slot.
+
+        ``conv_input``: the non-spec conv input rows ``[tokens, dim]``;
+        ``conv_state``: the ``[..., dim, width - 1]`` view of the conv pool.
+        """
+        state_len = conv_state.shape[-1]
+        offsets = torch.arange(-state_len, 0, device=conv_input.device)
+        rows = checkpoint.conv_token_indices.unsqueeze(1) + offsets
+        conv_state[checkpoint.checkpoint_state_indices_i64] = (
+            conv_input[rows].transpose(1, 2).to(conv_state.dtype)
+        )
+
+    def _run_prefill_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        state_indices_i64: torch.Tensor,
+        has_initial_state: torch.Tensor | None,
+        no_initial_state: torch.Tensor | None,
+        chunk_indices: torch.Tensor | None,
+        chunk_offsets: torch.Tensor | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One chunk-kernel call that reads and writes the ssm pool rows at
+        ``state_indices``. ``has_initial_state``/``no_initial_state`` None:
+        every sequence starts from its pool row.
+        """
+        if self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
+            if has_initial_state is not None:
+                zero_fresh_state_rows(ssm_state, state_indices, has_initial_state)
+            o, _ = self.chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=ssm_state,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=False,
+                core_attn_out=out,
+                state_indices=state_indices,
+            )
+            return o
+        initial_state = ssm_state[state_indices_i64]
+        if no_initial_state is not None:
+            initial_state[no_initial_state, ...] = 0
+        o, last_state = self.chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=query_start_loc,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            use_qk_l2norm_in_kernel=False,
+            core_attn_out=out,
+        )
+        ssm_state[state_indices_i64] = last_state.to(ssm_state.dtype)
+        return o
+
+    def _chunk_prefill_with_checkpoint(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_state: torch.Tensor,
+        checkpoint: GDNPrefillCheckpointMetadata,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Prefill chunk whose checkpointed sequences also leave their state at
+        the checkpoint in the checkpoint slots (see
+        ``GDNPrefillCheckpointMetadata``). Same results as running each
+        checkpointed sequence as two consecutive chunks split there.
+        """
+        # 1. Heads (and unsplit sequences) from their initial state; the tails
+        # here are throwaway sequences on the checkpoint slots.
+        o = self._run_prefill_chunk(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_state,
+            checkpoint.split_query_start_loc,
+            checkpoint.split_state_indices,
+            checkpoint.split_state_indices_i64,
+            checkpoint.split_has_initial_state,
+            checkpoint.split_no_initial_state,
+            checkpoint.split_chunk_indices,
+            checkpoint.split_chunk_offsets,
+            out,
+        )
+        # 2. The running slots now hold the checkpoint states: snapshot them.
+        ssm_state[checkpoint.checkpoint_state_indices_i64] = ssm_state[
+            checkpoint.tail_state_indices_i64
+        ]
+        # 3. Rerun the tails from the checkpoint states.
+        idx = checkpoint.tail_token_indices
+        o_tail = self._run_prefill_chunk(
+            q.index_select(1, idx),
+            k.index_select(1, idx),
+            v.index_select(1, idx),
+            g.index_select(1, idx),
+            beta.index_select(1, idx),
+            ssm_state,
+            checkpoint.tail_query_start_loc,
+            checkpoint.tail_state_indices,
+            checkpoint.tail_state_indices_i64,
+            None,
+            None,
+            checkpoint.tail_chunk_indices,
+            checkpoint.tail_chunk_offsets,
+            None,
+        )
+        o.index_copy_(1, idx, o_tail.to(o.dtype))
+        return o
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1605,6 +1772,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
+            if attn_metadata.prefill_checkpoint is not None:
+                self._store_conv_checkpoint(
+                    mixed_qkv_non_spec, conv_state, attn_metadata.prefill_checkpoint
+                )
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
@@ -1768,7 +1939,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             non_spec_out = (
                 None if non_spec_slice is None else core_attn_out[non_spec_slice]
             )
-            if self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
+            if attn_metadata.prefill_checkpoint is not None:
+                core_attn_out_non_spec = self._chunk_prefill_with_checkpoint(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state,
+                    attn_metadata.prefill_checkpoint,
+                    non_spec_out,
+                )
+            elif self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
                 # FlashInfer reads and updates the pool rows in place through
                 # state_indices; only the rows of sequences without initial
                 # state are zeroed first. Batches without spec rows index

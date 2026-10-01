@@ -998,6 +998,12 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     num_prefill_checkpoint_blocks: int = 0
     prefill_checkpoint_alignment: int | None = None
+    # The internal prefill checkpoint may land in the block that holds the
+    # chunk's initial state when that block is private to the request (the
+    # chunk starts mid-block: a CoW'd partial hit or the request's own
+    # running block). The backend reads the initial state from the running
+    # block, which the align pre-copy filled, so overwriting it is safe.
+    prefill_checkpoint_reuses_initial_block: bool = False
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
@@ -1063,6 +1069,8 @@ class MambaSpec(KVCacheSpec):
             and spec.num_speculative_blocks == self.num_speculative_blocks
             and spec.num_prefill_checkpoint_blocks == self.num_prefill_checkpoint_blocks
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
+            and spec.prefill_checkpoint_reuses_initial_block
+            == self.prefill_checkpoint_reuses_initial_block
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
@@ -1088,17 +1096,30 @@ def is_mamba_prefill_checkpoint_valid(
     hash_block_size: int,
     mamba_block_size: int,
     checkpoint_alignment: int | None,
+    reuse_initial_block: bool = False,
 ) -> bool:
-    """Whether a backend can export the checkpoint in this query."""
+    """Whether a backend can export the checkpoint in this query.
+
+    The checkpoint goes to block column ``cdiv(query_end, mamba_block_size) -
+    2``. It must not alias the column holding the initial state, unless
+    ``reuse_initial_block`` and the query starts mid-block (then that block is
+    private to the request and its state was already copied to the running
+    column before the forward).
+    """
     if checkpoint_alignment is None:
         return False
     assert checkpoint_alignment > 0
 
     initial_state_col = (query_start - 1) // mamba_block_size
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
+    column_ok = checkpoint_col > initial_state_col or (
+        reuse_initial_block
+        and checkpoint_col == initial_state_col
+        and query_start % mamba_block_size != 0
+    )
     return (
         query_start % hash_block_size == 0
-        and checkpoint_col > initial_state_col
+        and column_ok
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
