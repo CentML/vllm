@@ -7,6 +7,7 @@ import json
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import MultiModalConfig
 from vllm.kernels.triton.qkv_padded_fp8_quant import (
     quantize_fp8_maybe_pad_head_dim,
@@ -36,6 +37,7 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
     vit_aiter_fp8_attn_wrapper,
     vit_flash_attn_wrapper,
     vit_flashinfer_wrapper,
+    vit_rubin_cutedsl_wrapper,
     vit_torch_sdpa_wrapper,
     vit_triton_attn_wrapper,
 )
@@ -238,7 +240,10 @@ class MMEncoderAttention(CustomOp):
             and len(cu_seqlens) >= 2
         ):
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-        if attn_backend == AttentionBackendEnum.FLASHINFER:
+        if (
+            attn_backend == AttentionBackendEnum.FLASHINFER
+            and not envs.VLLM_RUBIN_CUTEDSL_VIT
+        ):
             max_seqlen = bucket_flashinfer_max_seqlen(max_seqlen)
         return max_seqlen
 
@@ -252,7 +257,10 @@ class MMEncoderAttention(CustomOp):
         if (oot_class := maybe_get_oot_by_class(cls)) is not cls:
             return oot_class.maybe_compute_seq_lens(attn_backend, cu_seqlens, device)  # type: ignore[attr-defined]
 
-        if attn_backend != AttentionBackendEnum.FLASHINFER:
+        if (
+            attn_backend != AttentionBackendEnum.FLASHINFER
+            or envs.VLLM_RUBIN_CUTEDSL_VIT
+        ):
             return None
 
         sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -281,7 +289,10 @@ class MMEncoderAttention(CustomOp):
                 fp8_padded_hidden_size=fp8_padded_hidden_size,
             )
 
-        if attn_backend == AttentionBackendEnum.FLASHINFER:
+        if (
+            attn_backend == AttentionBackendEnum.FLASHINFER
+            and not envs.VLLM_RUBIN_CUTEDSL_VIT
+        ):
             batch_size = len(cu_seqlens) - 1
 
             if fp8_padded_hidden_size is not None:
@@ -366,7 +377,10 @@ class MMEncoderAttention(CustomOp):
             else None
         )
 
-        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+        if (
+            self.attn_backend == AttentionBackendEnum.FLASHINFER
+            and not envs.VLLM_RUBIN_CUTEDSL_VIT
+        ):
             _get_flashinfer_workspace_buffer()
 
         logger.info_once(f"Using {self.attn_backend} for MMEncoderAttention.")
@@ -384,11 +398,46 @@ class MMEncoderAttention(CustomOp):
         self.fp8_enabled = False
         self._fp8_dynamic_scale = False
         self.fp8_quant: QuantFP8 | None = None
+        self.use_rubin_cutedsl_vit = (
+            envs.VLLM_RUBIN_CUTEDSL_VIT
+            and self.attn_backend == AttentionBackendEnum.FLASHINFER
+        )
+        self._cutedsl_qkv_scales = (1.0, 1.0, 1.0)
         self.skip_scale_q = False
         self.skip_scale_k = False
         self.skip_scale_v = False
 
         mm_cfg = get_multimodal_config()
+        if self.use_rubin_cutedsl_vit:
+            if (
+                mm_cfg is None
+                or mm_cfg.mm_encoder_attn_dtype != "fp8"
+                or mm_cfg.mm_encoder_fp8_scale_path is None
+            ):
+                raise ValueError(
+                    "VLLM_RUBIN_CUTEDSL_VIT requires FP8 vision attention "
+                    "and static Q/K/V scales (--mm-encoder-fp8-scale-path)."
+                )
+            if (
+                self.head_size != 72
+                or self.num_heads != self.num_kv_heads
+                or self.dtype != torch.bfloat16
+                or not current_platform.is_cuda()
+                or not current_platform.is_device_capability(107)
+            ):
+                raise ValueError(
+                    "VLLM_RUBIN_CUTEDSL_VIT requires Rubin SM107, logical "
+                    "head dimension 72, equal Q/KV heads and BF16 output."
+                )
+            try:
+                from flashinfer.attention.cute_dsl import (
+                    cute_dsl_fmha_vit,  # noqa: F401
+                )
+            except ImportError as exc:
+                raise ValueError(
+                    "Install FlashInfer with the Rubin AOT ViT interface "
+                    "and matching D72/D80 artifacts."
+                ) from exc
         if mm_cfg is None or mm_cfg.mm_encoder_attn_dtype != "fp8":
             return
 
@@ -412,7 +461,10 @@ class MMEncoderAttention(CustomOp):
                     "flash_attn_varlen_fp8_pertensor_func."
                 ) from exc
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:
-            if not is_flashinfer_cudnn_fp8_prefill_attn_supported():
+            if (
+                not self.use_rubin_cutedsl_vit
+                and not is_flashinfer_cudnn_fp8_prefill_attn_supported()
+            ):
                 raise ValueError(
                     "mm_encoder_attn_dtype='fp8' requires the FlashInfer "
                     "cuDNN backend with cuDNN >= 9.17.1 on Blackwell (SM 100) "
@@ -495,6 +547,11 @@ class MMEncoderAttention(CustomOp):
         self.skip_scale_q = layer_scales["q"] == 1.0
         self.skip_scale_k = layer_scales["k"] == 1.0
         self.skip_scale_v = layer_scales["v"] == 1.0
+        self._cutedsl_qkv_scales = (
+            layer_scales["q"],
+            layer_scales["k"],
+            layer_scales["v"],
+        )
 
         logger.debug(
             "FP8 attention enabled for %s: q=%.4f, k=%.4f, v=%.4f",
@@ -708,6 +765,20 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         if self.fp8_enabled:
             query, key, value = self._quantize_qkv_fp8(query, key, value)
+
+        if self.use_rubin_cutedsl_vit:
+            assert cu_seqlens is not None and max_seqlen is not None
+            output = vit_rubin_cutedsl_wrapper(
+                query,
+                key,
+                value,
+                cu_seqlens,
+                max_seqlen,
+                self.head_size,
+                self.scale,
+                *self._cutedsl_qkv_scales,
+            )
+            return output[..., : self.head_size].contiguous()
 
         output = vit_flashinfer_wrapper(
             q=query,

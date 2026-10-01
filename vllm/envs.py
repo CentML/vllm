@@ -222,6 +222,8 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+    VLLM_RUBIN_CUTEDSL_VIT: bool = False
+    VLLM_RUBIN_CUTEDSL_PREFILL: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1763,6 +1765,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Override the hostname the rank registers as a Mooncake requester.
     "MOONCAKE_REQUESTER_LOCAL_HOSTNAME": lambda: os.getenv(
         "MOONCAKE_REQUESTER_LOCAL_HOSTNAME"
+    ),
+    # Opt in to the published Rubin CuTeDSL attention specializations.
+    # Requires matching FlashInfer wrappers/artifacts; defaults are unchanged.
+    "VLLM_RUBIN_CUTEDSL_VIT": lambda: bool(
+        int(os.getenv("VLLM_RUBIN_CUTEDSL_VIT", "0"))
+    ),
+    "VLLM_RUBIN_CUTEDSL_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_RUBIN_CUTEDSL_PREFILL", "0"))
     ),
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(

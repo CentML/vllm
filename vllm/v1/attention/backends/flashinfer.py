@@ -86,6 +86,7 @@ from vllm.v1.attention.ops.dcp import (
     dcp_a2a_lse_reduce,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.rubin_cutedsl_prefill import try_rubin_cutedsl_prefill
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
@@ -607,6 +608,9 @@ class TRTLLMPrefill:
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
 
+    cutedsl_kv_token_indptr: torch.Tensor | None = None
+    """Cumulative KV token counts (cum_seq_lens_kv counts pages instead)."""
+
 
 @dataclass
 class FlashInferTrtllmAPIDecode:
@@ -912,6 +916,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Preparing persistent buffers
         self.paged_kv_indptr = CpuGpuBuffer(
             max_num_reqs + 1, dtype=torch.int32, device=self.device, pin_memory=False
+        )
+        self.cutedsl_kv_token_indptr = (
+            torch.empty(max_num_reqs + 1, dtype=torch.int32, device=self.device)
+            if envs.VLLM_RUBIN_CUTEDSL_PREFILL
+            else None
         )
         self.paged_kv_indices = torch.zeros(
             max_num_pages, dtype=torch.int32, device=self.device
@@ -1605,6 +1614,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     dim=0,
                     out=paged_kv_indptr_prefill_gpu[1:],
                 )
+                cutedsl_kv_token_indptr = None
+                if self.cutedsl_kv_token_indptr is not None:
+                    cutedsl_kv_token_indptr = self.cutedsl_kv_token_indptr[
+                        : num_prefills + 1
+                    ]
+                    cutedsl_kv_token_indptr[:1] = 0
+                    torch.cumsum(
+                        prefill_seq_lens,
+                        dim=0,
+                        out=cutedsl_kv_token_indptr[1:],
+                    )
                 # Compute max_q_len for prefill requests
                 query_lens_prefill_cpu = (
                     qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
@@ -1639,6 +1659,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     cum_seq_lens_kv=paged_kv_indptr_prefill_gpu,
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
+                    cutedsl_kv_token_indptr=cutedsl_kv_token_indptr,
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -2056,6 +2077,15 @@ class FlashInferImpl(AttentionImpl):
                 self.bmm2_scale *= layer._v_scale_float
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
+        if (
+            envs.VLLM_RUBIN_CUTEDSL_PREFILL
+            and attn_metadata.num_prefills > 0
+            and (not prefill_use_trtllm or attn_metadata.use_cascade)
+        ):
+            logger.warning_once(
+                "Rubin CuTeDSL prefill requires the non-cascade TRTLLM metadata "
+                "route; this batch retains the existing FlashInfer backend."
+            )
         decode_kernel = (
             attn_metadata.decode.kernel
             if isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode)
@@ -2384,25 +2414,50 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
 
-                trtllm_batch_context_with_kv_cache(
-                    query=prefill_query,
-                    kv_cache=mock_kv_cache,
-                    workspace_buffer=workspace_buffer,
-                    block_tables=mock_block_table,
-                    seq_lens=seq_lens_prefill,
-                    max_q_len=attn_metadata.prefill.max_q_len,
-                    max_kv_len=attn_metadata.prefill.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    batch_size=attn_metadata.num_prefills,
-                    cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
-                    cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    kv_cache_sf=prefill_kv_block_scales,
-                )
+                used_cutedsl = False
+                if envs.VLLM_RUBIN_CUTEDSL_PREFILL and not self.is_kvcache_nvfp4:
+                    kv_token_indptr = attn_metadata.prefill.cutedsl_kv_token_indptr
+                    assert kv_token_indptr is not None
+                    used_cutedsl = try_rubin_cutedsl_prefill(
+                        query=prefill_query,
+                        kv_cache=mock_kv_cache,
+                        output=out.data if isinstance(out, FP4Tensor) else out,
+                        output_block_scale=output_block_scale,
+                        o_sf_scale=self.o_sf_scale,
+                        o_sf_start_index=num_decode_tokens,
+                        block_tables=mock_block_table,
+                        seq_lens=seq_lens_prefill,
+                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=kv_token_indptr,
+                        max_q_len=attn_metadata.prefill.max_q_len,
+                        max_kv_len=attn_metadata.prefill.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        causal=attn_metadata.causal,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        logits_soft_cap=self.logits_soft_cap,
+                    )
+                if not used_cutedsl:
+                    trtllm_batch_context_with_kv_cache(
+                        query=prefill_query,
+                        kv_cache=mock_kv_cache,
+                        workspace_buffer=workspace_buffer,
+                        block_tables=mock_block_table,
+                        seq_lens=seq_lens_prefill,
+                        max_q_len=attn_metadata.prefill.max_q_len,
+                        max_kv_len=attn_metadata.prefill.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        batch_size=attn_metadata.num_prefills,
+                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        kv_cache_sf=prefill_kv_block_scales,
+                    )
 
                 if needs_fp8_out:
                     output[

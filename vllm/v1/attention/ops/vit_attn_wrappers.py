@@ -18,9 +18,97 @@ import torch
 import torch.nn.functional as F
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+
+def rubin_cutedsl_vit_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    logical_head_dim: int,
+    sm_scale: float,
+    q_scale: float,
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    from flashinfer.attention.cute_dsl import cute_dsl_fmha_vit
+
+    original_shape = q.shape
+    q, k, v = (x.reshape(-1, x.shape[-2], x.shape[-1]) for x in (q, k, v))
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    with gpu_sync_allowed():
+        max_seqlen_int = int(max_seqlen.item())
+    cute_dsl_fmha_vit(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens,
+        max_seqlen_int,
+        logical_head_dim=logical_head_dim,
+        sm_scale=sm_scale,
+        scale_q=q_scale,
+        scale_k=k_scale,
+        scale_v=v_scale,
+        use_fp16_softmax=True,
+    )
+    logger.info_once("Rubin CuTeDSL ViT active: FP8 D72/storage D80 -> BF16.")
+    return out.reshape(original_shape)
+
+
+def rubin_cutedsl_vit_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    logical_head_dim: int,
+    sm_scale: float,
+    q_scale: float,
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    return torch.empty_like(q, dtype=torch.bfloat16)
+
+
+direct_register_custom_op(
+    op_name="rubin_cutedsl_vit_wrapper",
+    op_func=rubin_cutedsl_vit_wrapper,
+    fake_impl=rubin_cutedsl_vit_wrapper_fake,
+)
+
+
+def vit_rubin_cutedsl_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    logical_head_dim: int,
+    sm_scale: float,
+    q_scale: float,
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor:
+    return torch.ops.vllm.rubin_cutedsl_vit_wrapper(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen,
+        logical_head_dim,
+        sm_scale,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
 
 
 def flash_attn_maxseqlen_wrapper(
