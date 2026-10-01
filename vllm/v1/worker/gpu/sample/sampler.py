@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.spec_topk_topp import MAX_TOP_K
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
@@ -233,6 +234,35 @@ class Sampler:
             sampling_mask_tensors=sampling_mask_tensors,
         )
         return sampler_output
+
+    def fused_spec_sampling_params(
+        self, idx_mapping_np: np.ndarray
+    ) -> tuple[int, bool, bool] | None:
+        """(max_top_k, use_top_p, use_penalties) when apply_sampling_params
+        would only apply penalties, temperature and top-k/top-p with every
+        1 <= top_k <= MAX_TOP_K, the case fused_rejection_sample handles.
+        None when any other logits processor is active for the batch.
+        """
+        states = self.sampling_states
+        top_k = states.top_k.np[idx_mapping_np]
+        # Disabled top-k is stored as vocab_size, so this also requires top-k.
+        max_top_k = int(top_k.max()) if top_k.size else 0
+        if not 0 < max_top_k <= MAX_TOP_K:
+            return None
+        thinking = self.thinking_budget_state
+        if (
+            np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
+            or int(self.bad_words_state.num_bad_words.np[idx_mapping_np].max()) > 0
+            or (
+                thinking.enabled
+                and np.any(thinking.use_thinking_budget[idx_mapping_np])
+            )
+            or np.any(states.min_p.np[idx_mapping_np] != 0.0)
+        ):
+            return None
+        use_top_p = bool(np.any(states.top_p.np[idx_mapping_np] != 1.0))
+        use_penalties = bool(np.any(self.penalties_state.use_penalty[idx_mapping_np]))
+        return max_top_k, use_top_p, use_penalties
 
     def apply_sampling_params(
         self,

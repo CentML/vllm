@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode.fused_rejection import fused_rejection_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
@@ -345,6 +346,27 @@ class RejectionSampler:
         num_sampled = torch.cat(num_sampled_chunks)
         return sampled, num_sampled, logprobs_tensors
 
+    def _fused_spec_params(
+        self,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        max_num_logprobs: int,
+    ) -> tuple[int, bool, bool] | None:
+        """Params of fused_rejection_sample when it covers this batch: one-hot
+        drafts, standard verification, no logprobs, and only penalties,
+        temperature and bounded top-k/top-p as logits processing.
+        """
+        if (
+            draft_logits is not None
+            or self.synthetic_conditional_rates is not None
+            or self.use_block_verification
+            or self.watermark_key is not None
+            or self.enable_adaptive_verification
+            or max_num_logprobs != NO_LOGPROBS
+        ):
+            return None
+        return self.sampler.fused_spec_sampling_params(input_batch.idx_mapping_np)
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -355,13 +377,57 @@ class RejectionSampler:
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
+        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+            input_batch.idx_mapping_np
+        )
+        fused = self._fused_spec_params(input_batch, draft_logits, max_num_logprobs)
+        if fused is not None:
+            max_top_k, use_top_p, use_penalties = fused
+            states = self.sampler.sampling_states
+            penalties = self.sampler.penalties_state
+            fused_sampled, fused_num_sampled, fused_num_rejected = (
+                fused_rejection_sample(
+                    logits,
+                    input_batch.input_ids,
+                    input_batch.positions,
+                    input_batch.logits_indices,
+                    input_batch.cu_num_logits,
+                    input_batch.idx_mapping,
+                    input_batch.seq_lens,
+                    input_batch.expanded_idx_mapping,
+                    input_batch.expanded_local_pos,
+                    self.sampler.req_states.prefill_len.gpu,
+                    states.temperature.gpu,
+                    states.seeds.gpu,
+                    states.top_k.gpu,
+                    states.top_p.gpu,
+                    (
+                        penalties.repetition_penalty.gpu,
+                        penalties.frequency_penalty.gpu,
+                        penalties.presence_penalty.gpu,
+                        penalties.prompt_bin_mask,
+                        penalties.output_bin_counts,
+                    )
+                    if use_penalties
+                    else None,
+                    max_top_k,
+                    use_top_p,
+                    self.num_speculative_steps,
+                    use_fp64=self.sampler.use_fp64_gumbel,
+                )
+            )
+            return SamplerOutput(
+                sampled_token_ids=fused_sampled,
+                logprobs_tensors=None,
+                num_nans=num_nans,
+                num_sampled=fused_num_sampled,
+                num_rejected=fused_num_rejected,
+            )
+
         draft_sampled, pos = _gather_draft_and_pos(
             input_batch.input_ids, input_batch.positions, input_batch.logits_indices
         )
 
-        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
-            input_batch.idx_mapping_np
-        )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
         # Fold get_num_sampled_and_rejected into the last rejection kernel when
         # one chunk covers the batch and no logprobs read the raw num_sampled.
