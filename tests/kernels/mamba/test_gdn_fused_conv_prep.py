@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""gdn_fused_conv_prep is bitwise equal to causal_conv1d_fn followed by
-fused_post_conv_prep(output_g_exp=True), conv state included.
+"""gdn_fused_conv_prep (Triton kernel, and the CUDA kernel on SM10x) is bitwise
+equal to causal_conv1d_fn followed by fused_post_conv_prep(output_g_exp=True),
+conv state included.
 """
 
 import types
@@ -9,6 +10,7 @@ import types
 import pytest
 import torch
 
+import vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep as fcp
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     gdn_fused_conv_prep,
@@ -29,6 +31,18 @@ WIDTH = 4
 STATE_LEN = WIDTH - 1 + 3  # conv state rows incl. 3 spec tokens
 
 
+@pytest.fixture(params=["triton", "cuda"])
+def kernel(request, monkeypatch):
+    if request.param == "triton":
+        monkeypatch.setattr(fcp, "_cuda_kernel_ready", [])
+    else:
+        if not current_platform.is_device_capability_family(100):
+            pytest.skip("The CUDA kernel is SM10x-only.")
+        fcp.enable_cuda_kernel()
+        assert fcp._cuda_kernel_ready, "CUDA kernel build failed"
+    return request.param
+
+
 @pytest.mark.parametrize(
     "seqlens",
     [
@@ -40,7 +54,7 @@ STATE_LEN = WIDTH - 1 + 3  # conv state rows incl. 3 spec tokens
 )
 @pytest.mark.parametrize("dim_first", [False, True])
 @pytest.mark.parametrize("index_stride", [1, 7])  # block_table[:, 0] is strided
-def test_fused_conv_prep_bitwise(seqlens, dim_first, index_stride):
+def test_fused_conv_prep_bitwise(seqlens, dim_first, index_stride, kernel):
     torch.manual_seed(len(seqlens))
     n, total = len(seqlens), sum(seqlens)
     # x: q/k/v columns of the [T, DIM + HV * V] in_proj output; a/b: columns

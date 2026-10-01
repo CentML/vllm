@@ -59,6 +59,8 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     FUSED_CONV_MAX_SEQS,
     FUSED_CONV_TILE_LONG,
     FUSED_CONV_TILE_SHORT,
+    GDN_CONV_CUDA,
+    enable_cuda_kernel,
     gdn_fused_conv_prep,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
@@ -1558,7 +1560,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if not is_conv_state_dim_first():
                 conv_state = conv_state.transpose(-1, -2)
             ba = torch.zeros(T, 2 * num_v_heads, device=device, dtype=dtype)
-            for tile in (FUSED_CONV_TILE_SHORT, FUSED_CONV_TILE_LONG):
+            if GDN_CONV_CUDA and current_platform.is_device_capability_family(100):
+                enable_cuda_kernel()
+            # tile=None: the CUDA kernel once enabled.
+            for tile in (FUSED_CONV_TILE_SHORT, FUSED_CONV_TILE_LONG, None):
                 gdn_fused_conv_prep(
                     x=qkv_or_qkvz[:T, :conv_dim],
                     conv_weights=self.conv1d.weight.view(
