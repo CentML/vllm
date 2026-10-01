@@ -1078,6 +1078,42 @@ class EngineCore:
         raise NotImplementedError
 
 
+
+def _maybe_pin_engine_main_thread() -> None:
+    """GB300 study (fix-host): opt-in pinning of the EngineCore MAIN thread only.
+
+    VLLM_ENGINE_MAIN_CPU_MAP="<worker>:<cpus>[,<worker>:<cpus>...]" (cpus = "134" or
+    "130-135"); <worker> is the DP4 worker index (DYN_SYSTEM_PORT - 18081 in the
+    study launcher, else VLLM_ENGINE_WORKER_INDEX). Called at the start of the busy
+    loop, after every helper thread exists, so only this thread moves (Linux
+    sched_setaffinity on the calling thread). Default off. Used to run the engine
+    loop on the node's faster Grace socket (the L3 slow mode is socket-specific).
+    """
+    spec = os.environ.get("VLLM_ENGINE_MAIN_CPU_MAP")
+    if not spec:
+        return
+    port = os.environ.get("DYN_SYSTEM_PORT", "")
+    idx = os.environ.get("VLLM_ENGINE_WORKER_INDEX") or (
+        str(int(port) - 18081) if port.isdigit() else ""
+    )
+    for item in spec.split(","):
+        w, _, cpus = item.partition(":")
+        if w.strip() != idx or not cpus:
+            continue
+        cpu_set: set[int] = set()
+        for part in cpus.split("+"):
+            lo, _, hi = part.partition("-")
+            cpu_set.update(range(int(lo), int(hi or lo) + 1))
+        before = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, cpu_set)
+        logger.info(
+            "EngineCore main thread pinned to CPUs %s (worker %s; was %d CPUs)",
+            sorted(cpu_set),
+            idx,
+            len(before),
+        )
+        return
+
 class EngineShutdownState(IntEnum):
     RUNNING = 0
     REQUESTED = 1
@@ -1468,6 +1504,7 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        _maybe_pin_engine_main_thread()
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
@@ -2245,6 +2282,7 @@ class DPEngineCoreProc(EngineCoreProc):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+        _maybe_pin_engine_main_thread()
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
