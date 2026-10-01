@@ -123,6 +123,62 @@ GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS",
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
 # (2144 tokens: 96 vs 76 us).
 GDN_FI_NON_CP_MAX_TOKENS = int(os.environ.get("VLLM_GDN_FI_NON_CP_MAX_TOKENS", "4608"))
+# Non-CP FlashInfer GDN prefill on the in-place state pool: steps whose
+# (sequence x value head) grid under-fills the GPU run the V-split copy of the
+# kernel (vllm/third_party/flashinfer_gdn_vsplit: one CTA per (sequence, head,
+# 64-row V slice)), bitwise identical to FlashInfer's non-CP kernel. The rule
+# (choose_vsplit) uses host ints only. The kernel is compiled by the prefill
+# warmup; it stays off in a process whose warmup did not compile it.
+GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "1") == "1"
+_gdn_vsplit_ready: list = []  # [module] once the warmup compiled the kernel
+_gdn_vsplit_tried: list = []
+
+
+def _gdn_vsplit_warmup(
+    num_k_heads: int, num_v_heads: int, head_dim: int, dtype: torch.dtype, device
+) -> None:
+    """Compile the V-split kernel for the one variant serving uses (fp32 pool
+    with int32 state_indices, initial and final state) on a dummy pool and
+    enable it; once per process. cute.compile keeps no on-disk cache: without
+    this, the first eligible prefill of each worker would stall for seconds on
+    the compile. A failed compile leaves FlashInfer's kernel in place.
+    """
+    if _gdn_vsplit_tried:
+        return
+    _gdn_vsplit_tried.append(True)
+    try:
+        import vllm.third_party.flashinfer_gdn_vsplit as gdn_vsplit
+
+        T = 2 * FLA_CHUNK_SIZE
+        q = torch.zeros(T, num_k_heads, head_dim, device=device, dtype=dtype)
+        v = torch.zeros(T, num_v_heads, head_dim, device=device, dtype=dtype)
+        gate = torch.ones(T, num_v_heads, device=device, dtype=torch.float32)
+        pool = torch.zeros(
+            2, num_v_heads, head_dim, head_dim, device=device, dtype=torch.float32
+        )
+        gdn_vsplit.chunk_gated_delta_rule_vsplit(
+            q,
+            q,
+            v,
+            gate,
+            gate,
+            torch.empty_like(v),
+            torch.tensor([0, T], device=device, dtype=torch.int32),
+            pool,
+            pool,
+            head_dim**-0.5,
+            state_indices=torch.ones(1, device=device, dtype=torch.int32),
+            v_split=2,
+        )
+    except Exception:
+        logger.warning(
+            "GDN V-split prefill kernel failed to compile; FlashInfer's non-CP "
+            "kernel stays in use.",
+            exc_info=True,
+        )
+        return
+    _gdn_vsplit_ready.append(gdn_vsplit)
+    logger.info("GDN prefill: V-split FlashInfer kernel compiled and enabled.")
 
 
 def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
@@ -254,6 +310,8 @@ def fi_chunk_gated_delta_rule(
     g_is_exp: bool = False,
     output: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
+    max_seqlen: int = 0,
+    cu_seqlens_i32: torch.Tensor | None = None,
 ):
     """FlashInfer chunked GDN prefill.
 
@@ -262,6 +320,8 @@ def fi_chunk_gated_delta_rule(
     elements that FlashInfer writes into instead of allocating.
     ``state_indices``: contiguous int32 slot ids; ``initial_state`` is then the
     fp32 SSM state pool, read from and updated in place at those rows (SM10x).
+    ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
+    copy of ``cu_seqlens``) feed the V-split path; both are optional.
     """
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -287,6 +347,42 @@ def fi_chunk_gated_delta_rule(
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
     num_seqs = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+    use_non_cp = num_seqs > 1 or q.shape[0] <= GDN_FI_NON_CP_MAX_TOKENS
+    if (
+        _gdn_vsplit_ready
+        and use_non_cp
+        and state_indices is not None
+        and g_is_exp
+        and output_final_state
+        and fi_state.dtype == torch.float32
+    ):
+        gdn_vsplit = _gdn_vsplit_ready[0]
+        v_split = gdn_vsplit.choose_vsplit(
+            num_seqs,
+            q.shape[0],
+            q.shape[0] if num_seqs == 1 else max_seqlen,
+            hv=v.shape[1],
+        )
+        if v_split > 1:
+            out = torch.empty_like(v) if output is None else output.view(v.shape)
+            if cu_seqlens_i32 is None:
+                assert cu_seqlens is not None
+                cu_seqlens_i32 = cu_seqlens.to(torch.int32)
+            gdn_vsplit.chunk_gated_delta_rule_vsplit(
+                q,
+                k,
+                v,
+                fi_g,
+                fi_beta,
+                out,
+                cu_seqlens_i32,
+                fi_state,
+                fi_state,
+                q.shape[-1] ** -0.5,
+                state_indices=state_indices,
+                v_split=v_split,
+            )
+            return out.unsqueeze(0), fi_state
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -366,6 +462,8 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
         state_indices: torch.Tensor | None = None,
+        max_seqlen: int = 0,
+        cu_seqlens_i32: torch.Tensor | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -380,6 +478,8 @@ class ChunkGatedDeltaRule(CustomOp):
             g_is_exp=self.expects_exp_g,
             output=core_attn_out,
             state_indices=state_indices,
+            max_seqlen=max_seqlen,
+            cu_seqlens_i32=cu_seqlens_i32,
         )
         return o, final_state
 
@@ -1432,6 +1532,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     chunk_offsets,
                 )
 
+        if (
+            GDN_FI_VSPLIT
+            and self.chunk_gated_delta_rule.updates_state_in_place(state_dtype)
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+        ):
+            _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
+
         torch.accelerator.empty_cache()
 
     def _forward_core_rocm(
@@ -1979,6 +2087,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=False,
                     core_attn_out=non_spec_out,
                     state_indices=prefill_state_indices,
+                    max_seqlen=attn_metadata.prefill_max_seqlen,
+                    cu_seqlens_i32=attn_metadata.prefill_query_start_loc,
                 )
             else:
                 if attn_metadata.prefill_state_indices_i64 is not None:
