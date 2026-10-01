@@ -155,7 +155,28 @@ def check_num_speculative_tokens(num_spec, site: str) -> int:
             t,
             MAX_T,
         )
+    if site == "GDNAttentionMetadataBuilder":  # worker side, device set: build the kernels now
+        eager_load(site)
     return t
+
+
+_EAGER = {}
+
+
+def eager_load(site: str) -> None:
+    """Build / load the decode + materialize extension at engine start, never first inside the step loop:
+    the JIT build takes ~1 min and holds the file lock of GDN_STATE_COMMIT_BUILD_DIR (GB300 study, COMMON
+    16:08 UTC stall root cause). A failure here only defers the load to first use."""
+    if _EAGER.get("done") or not enabled() or layout_only():
+        return
+    try:
+        load()
+        if _GB_CHECK and os.environ.get("GDN_STATE_COMMIT_GB", "0") == "1":
+            load(gb=0)
+        _EAGER["done"] = True
+        logger.info("gdn_state_commit: decode extension loaded eagerly (%s)", site)
+    except Exception as e:  # noqa: BLE001 - never block start-up on the eager path
+        logger.warning("gdn_state_commit: eager load at %s failed (%r); loading at first use", site, e)
 
 
 def load(minb=None, gb=None):
