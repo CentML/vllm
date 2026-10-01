@@ -222,6 +222,9 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        # GB300 study (fix-repin): adaptive main-thread re-pin watchdog, created
+        # on the busy-loop thread (VLLM_ENGINE_MAIN_REPIN); None = off.
+        self._main_repin = None
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -631,6 +634,10 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        repin = self._main_repin
+        if repin is not None:
+            repin.note_launch(scheduler_output)
+            t_wait0 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -638,6 +645,8 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        if repin is not None:
+            repin.on_cycle(t_wait0, time.perf_counter(), scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -711,6 +720,8 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
+            if self._main_repin is not None:
+                self._main_repin.note_launch(scheduler_output)
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -729,6 +740,9 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        repin = self._main_repin
+        if repin is not None:
+            t_wait0 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -739,6 +753,8 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        if repin is not None:
+            repin.on_cycle(t_wait0, time.perf_counter(), scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -1504,6 +1520,9 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        from vllm.v1.engine import main_repin
+
+        self._main_repin = main_repin.maybe_create()
         _maybe_pin_engine_main_thread()
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
@@ -2282,6 +2301,9 @@ class DPEngineCoreProc(EngineCoreProc):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+        from vllm.v1.engine import main_repin
+
+        self._main_repin = main_repin.maybe_create()
         _maybe_pin_engine_main_thread()
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
