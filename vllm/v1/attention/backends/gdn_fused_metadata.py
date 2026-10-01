@@ -52,6 +52,7 @@ bit-exact on 588 unit cases and 73,901 in-serving checked builds.
 
 import os
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -203,18 +204,19 @@ def _pad(n, lo=16):
     return p
 
 
-def _counts(qsl_cpu, mask_cpu, nr):
-    """The regular build's CPU arithmetic of the spec branch."""
-    non_spec_mask_cpu = ~mask_cpu
-    query_lens_cpu = qsl_cpu[1:] - qsl_cpu[:-1]
-    non_spec_query_lens_cpu = query_lens_cpu[non_spec_mask_cpu]
-    num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-    num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
-    num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
+def _counts(ql, nr):
+    """The regular build's CPU arithmetic of the spec branch, for a batch whose
+    spec rows are exactly [0, nr) (ql = numpy query lengths): the non-spec
+    query lengths are ql[nr:].
+    """
+    ns = ql[nr:]
+    num_decodes = int((ns == 1).sum())
+    num_zero_len = int((ns == 0).sum())
+    num_prefills = int(ns.size) - num_decodes - num_zero_len
     num_decode_tokens = num_decodes
-    num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+    num_prefill_tokens = int(ns.sum(dtype=np.int64)) - num_decode_tokens
     num_spec_decode_tokens = (
-        query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+        int(ql.sum(dtype=np.int64)) - num_prefill_tokens - num_decode_tokens
     )
     if num_decodes > 0 and nr > 0:
         num_prefills += num_decodes
@@ -222,8 +224,7 @@ def _counts(qsl_cpu, mask_cpu, nr):
         num_decodes = 0
         num_decode_tokens = 0
     return (
-        non_spec_mask_cpu,
-        query_lens_cpu,
+        ns,
         num_decodes,
         num_prefills,
         num_decode_tokens,
@@ -272,14 +273,22 @@ def _fast(b, m, num_accepted_tokens, ndd):
     ):
         _fb("layout")
         return None
-    mask_cpu = ndd >= 0
-    nr = mask_cpu.sum().item()
-    if nr == 0 or ndd[mask_cpu].sum().item() == 0:
+    # host ints via numpy views of the CPU tensors (same integer arithmetic as the
+    # regular build's torch CPU ops, a fraction of the dispatch cost)
+    nd = ndd.numpy()
+    msk = nd >= 0
+    nr = int(msk.sum())
+    if nr == 0:
         _fb("no_spec_rows")
         return None
-    if not bool(mask_cpu[:nr].all().item()):
+    if not msk[:nr].all():
         _fb("spec_not_prefix")
         return None
+    if int(nd[:nr].sum(dtype=np.int64)) == 0:
+        _fb("no_spec_rows")
+        return None
+    qn = qsl_cpu.numpy()
+    ql = qn[1:] - qn[:-1]
     spec = b.kv_cache_spec
     mode = b.vllm_config.cache_config.mamba_cache_mode
     if mode in ("all", "none"):
@@ -296,14 +305,13 @@ def _fast(b, m, num_accepted_tokens, ndd):
         bt_cols = 1 + spec.num_speculative_blocks
     W = min(b.num_spec + 1, bt_cols)
     (
-        non_spec_mask_cpu,
-        query_lens_cpu,
+        ns_ql,
         num_decodes,
         num_prefills,
         num_decode_tokens,
         num_prefill_tokens,
         num_spec_decode_tokens,
-    ) = _counts(qsl_cpu, mask_cpu, nr)
+    ) = _counts(ql, nr)
     dev = qsl.device
     BS = spec.block_size
     gsc = ga._GDN_STATE_COMMIT_DEFERRED
@@ -325,7 +333,7 @@ def _fast(b, m, num_accepted_tokens, ndd):
         if W != 1 and W != WF:
             _fb("spec_width")
             return None
-        sts = min(nr * (b.num_spec + 1), qsl_cpu[-1].item())
+        sts = min(nr * (b.num_spec + 1), int(qn[-1]))
         ssi_b = b.spec_state_indices_tensor
         if (
             ssi_b.stride(1) != 1
@@ -394,7 +402,7 @@ def _fast(b, m, num_accepted_tokens, ndd):
     if "mixed" not in MODES:
         _fb("mode_off_mixed")
         return None
-    N = qsl_cpu[-1].item()
+    N = int(qn[-1])
     n_ns_tok = num_prefill_tokens + num_decode_tokens
     nns = R - nr
     smask = torch.empty(R, dtype=torch.bool, device=dev)
@@ -435,17 +443,13 @@ def _fast(b, m, num_accepted_tokens, ndd):
     )
     non_spec_token_indx = index[:n_ns_tok]
     spec_token_indx = index[n_ns_tok:]
-    # CPU side: the regular build's code
-    non_spec_query_start_loc_cpu = torch.zeros(
-        query_lens_cpu.size(0) - nr + 1, dtype=torch.int32
-    )
-    torch.cumsum(
-        query_lens_cpu[non_spec_mask_cpu], dim=0, out=non_spec_query_start_loc_cpu[1:]
-    )
+    # CPU side: the regular build's values (int32 zero + cumsum of the non-spec
+    # query lengths, their max)
+    cs = np.zeros(nns + 1, dtype=np.int32)
+    np.cumsum(ns_ql, out=cs[1:])
+    non_spec_query_start_loc_cpu = torch.from_numpy(cs)
     prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
-    prefill_max_seqlen = int(
-        (prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]).max()
-    )
+    prefill_max_seqlen = int(ns_ql.max())
     from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
 
     lazy: list | None = [] if gdn_step_plan.LAZY else None
