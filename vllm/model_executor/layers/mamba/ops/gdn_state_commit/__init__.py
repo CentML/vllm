@@ -227,6 +227,8 @@ def load(minb=None, gb=None):
     finally:
         cpp._get_cuda_arch_flags = orig
     assert ext.log_bytes(16, 32) == log_bytes(16, 32)
+    if gb and gb_env is None and _GB_CHECK:
+        ext = _CheckedExt(ext)  # every decode entry (incl. the step plan's direct calls) runs the check
     _exts[key] = ext
     if gb_env is None and minb == int(os.environ.get("GDN_STATE_COMMIT_MINB", "2")):
         _ext = ext
@@ -289,6 +291,23 @@ def _gb_checked_decode(ext, args, state, state_indices, cu_seqlens, out):
                            "output token-row mismatches %d", c[0], c[3], c[1], c[2])
 
 
+class _CheckedExt:
+    """GDN_STATE_COMMIT_GB_CHECK: the GB extension with a checked decode(); everything else delegates."""
+
+    def __init__(self, ext):
+        self._raw = ext
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def decode(self, *args):
+        state, state_indices, cu_seqlens, out = args[8], args[5], args[6], args[11]
+        if state.dtype == torch.float32 and state_indices.size(0) > 0:
+            _gb_checked_decode(self._raw, args, state, state_indices, cu_seqlens, out)
+        else:
+            self._raw.decode(*args)
+
+
 def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens, state,
            output_gate, norm_weight, out=None, scale=128**-0.5, norm_eps=1e-5,
            output_gate_activation="silu"):
@@ -300,11 +319,7 @@ def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accep
     args = (mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens,
             state, output_gate, norm_weight, out, float(scale), float(norm_eps),
             output_gate_activation == "sigmoid")
-    if _GB_CHECK and state.dtype == torch.float32 and os.environ.get("GDN_STATE_COMMIT_GB", "0") == "1" \
-            and state_indices.size(0) > 0:
-        _gb_checked_decode(load(), args, state, state_indices, cu_seqlens, out)
-    else:
-        load().decode(*args)
+    load().decode(*args)  # (checked when GDN_STATE_COMMIT_GB_CHECK is set: see _CheckedExt)
     _dbg(f"decode N={state_indices.size(0)} w={state_indices.size(1)}")
     return out
 

@@ -1754,6 +1754,324 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
 }
 #endif  // GSC_GB
 
+#if GSC_GB
+#ifndef GB_KH
+#define GB_KH 0  // 1: one CTA per (request, KEY head) runs both value heads (VPK = 2): shared q/k prep, no K-log atomic
+#endif
+#if GB_KH
+// slot n of a pass = value head vh0 + n (same rows); per-slot decay / beta / v / out; act[n] = slot takes this token
+template <bool kOut>
+__device__ __forceinline__ void gbk_token(gb2 (&hp)[2][4][2], const float* skp, const float* sqp,
+                                          const __nv_bfloat16* sv0, const __nv_bfloat16* sv1, float d0, float d1,
+                                          float b0, float b1, bool act0, bool act1, int row, int seg,
+                                          __nv_bfloat16* so0, __nv_bfloat16* so1) {
+  gb2 kp[4][2];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const float4 k4 = *reinterpret_cast<const float4*>(&skp[e * 32 + seg * 4]);
+    kp[e][0] = gb_pack(k4.x, k4.y);
+    kp[e][1] = gb_pack(k4.z, k4.w);
+  }
+  const gb2 dd[2] = {gb_pack(d0, d0), gb_pack(d1, d1)};
+  const bool act[2] = {act0, act1};
+  float dot[2];
+#pragma unroll
+  for (int n = 0; n < 2; ++n) {
+    if (!act[n]) { dot[n] = 0.0f; continue; }  // warp-uniform
+    gb2 a0 = gb_pack(0.0f, 0.0f), a1 = gb_pack(0.0f, 0.0f);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      hp[n][e][0] = gb_mul(hp[n][e][0], dd[n]);
+      hp[n][e][1] = gb_mul(hp[n][e][1], dd[n]);
+      a0 = gb_fma(hp[n][e][0], kp[e][0], a0);
+      a1 = gb_fma(hp[n][e][1], kp[e][1], a1);
+    }
+    const gb2 s1 = gb_add(a0, a1);
+    dot[n] = gb_lo(s1) + gb_hi(s1);
+  }
+#pragma unroll
+  for (int m = 4; m >= 1; m >>= 1) {
+#pragma unroll
+    for (int n = 0; n < 2; ++n) dot[n] += __shfl_xor_sync(0xffffffffu, dot[n], m);
+  }
+  const float bt[2] = {b0, b1};
+  const __nv_bfloat16* sv[2] = {sv0, sv1};
+#pragma unroll
+  for (int n = 0; n < 2; ++n) {
+    if (!act[n]) continue;
+    const float delta = (__bfloat162float(sv[n][row]) - dot[n]) * bt[n];
+    const gb2 dl = gb_pack(delta, delta);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      hp[n][e][0] = gb_fma(kp[e][0], dl, hp[n][e][0]);
+      hp[n][e][1] = gb_fma(kp[e][1], dl, hp[n][e][1]);
+    }
+  }
+  if constexpr (kOut) {  // new tokens: both slots always active
+    gb2 qp[4][2];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const float4 q4 = *reinterpret_cast<const float4*>(&sqp[e * 32 + seg * 4]);
+      qp[e][0] = gb_pack(q4.x, q4.y);
+      qp[e][1] = gb_pack(q4.z, q4.w);
+    }
+    float o[2];
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+      gb2 a0 = gb_pack(0.0f, 0.0f), a1 = gb_pack(0.0f, 0.0f);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        a0 = gb_fma(hp[n][e][0], qp[e][0], a0);
+        a1 = gb_fma(hp[n][e][1], qp[e][1], a1);
+      }
+      const gb2 s1 = gb_add(a0, a1);
+      o[n] = gb_lo(s1) + gb_hi(s1);
+    }
+#pragma unroll
+    for (int m = 4; m >= 1; m >>= 1) {
+#pragma unroll
+      for (int n = 0; n < 2; ++n) o[n] += __shfl_xor_sync(0xffffffffu, o[n], m);
+    }
+    if (seg == 0) {
+      so0[row] = __float2bfloat16(o[0]);
+      so1[row] = __float2bfloat16(o[1]);
+    }
+  }
+}
+
+constexpr int kGbkPasses = kDimV / (4 * kGbW);  // passes per warp (one 4-row slot per value head each)
+constexpr int kGbkDyn = kGbW * 2 * (2 * 4 * kDimK) * 4;  // ring of 2 passes x (2 heads x 2 KB) per warp
+
+__device__ __forceinline__ void gbk_issue_pass(float* buf, const float* hs0, const float* hs1, int p, int warp,
+                                               int rq, int seg) {
+  const int m = p * kGbW + warp;
+#pragma unroll
+  for (int n = 0; n < 2; ++n) {
+    const float* src = (n == 0 ? hs0 : hs1) + (4 * m + rq) * kDimK + seg * 4;
+    float* dst = buf + n * (4 * kDimK) + rq * kDimK + seg * 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) gb_cp_async_16b(dst + j * 32, src + j * 32);
+  }
+}
+
+template <bool SigmoidGate>
+__global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
+    const __nv_bfloat16* __restrict__ mixed_qkv, const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b, const float* __restrict__ a_log, const void* __restrict__ dt_bias,
+    const int* __restrict__ state_indices, int state_indices_width, const int* __restrict__ cu_seqlens,
+    const int* __restrict__ num_accepted_tokens, float* __restrict__ state,
+    const __nv_bfloat16* __restrict__ output_gate, const void* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ out, int H, int HV, int dt_bias_type, bool norm_weight_is_bf16, float scale,
+    float norm_eps, Strides strides) {
+  const int request = blockIdx.x;
+  const int key_head = blockIdx.y;
+  const int vh0 = key_head * 2;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int seg = lane & 7;
+  const int rq = lane >> 3;
+  const int bos = cu_seqlens[request];
+  const int num_tokens = cu_seqlens[request + 1] - bos;
+  if (num_tokens <= 0) return;
+  extern __shared__ __align__(16) unsigned char gbk_dyn_smem[];
+  float* ring = reinterpret_cast<float*>(gbk_dyn_smem) + warp * (2 * 2 * 4 * kDimK);
+  __shared__ __align__(16) float s_kp[kMaxTok][kDimK];
+  __shared__ __align__(16) float s_qp[kMaxT][kDimK];
+  __shared__ __align__(16) __nv_bfloat16 s_v[2][kMaxTok][kDimV];
+  __shared__ __align__(16) __nv_bfloat16 s_out[2][kMaxT][kDimV];
+  __shared__ float s_decay[2][kMaxTok];
+  __shared__ float s_beta[2][kMaxTok];
+  const int base_slot = state_indices[static_cast<int64_t>(request) * state_indices_width];
+  if (base_slot <= 0 || num_tokens > kMaxT) {
+    for (int linear = tid; linear < num_tokens * 2 * kDimV; linear += kGbThreads) {
+      const int token = bos + linear / (2 * kDimV);
+      const int r = linear % (2 * kDimV);
+      out[(static_cast<int64_t>(token) * HV + vh0 + r / kDimV) * kDimV + r % kDimV] = __float2bfloat16(0.0f);
+    }
+    return;
+  }
+  const LogLayout ll = log_layout(H, HV);
+  float* slot_state = state + static_cast<int64_t>(base_slot) * strides.state_slot;
+  char* log = reinterpret_cast<char*>(slot_state + static_cast<int64_t>(HV) * kDimV * kDimK);
+  __nv_bfloat16* log_k = reinterpret_cast<__nv_bfloat16*>(log + ll.k_off);
+  __nv_bfloat16* log_v = reinterpret_cast<__nv_bfloat16*>(log + ll.v_off);
+  __nv_bfloat16* log_ab = reinterpret_cast<__nv_bfloat16*>(log + ll.ab_off);
+  int* log_flag = reinterpret_cast<int*>(log + ll.l_off) + vh0;
+  const float* hs0 = slot_state + static_cast<int64_t>(vh0) * kDimV * kDimK;
+  const float* hs1 = hs0 + kDimV * kDimK;
+  if (!GB_NOIO) gbk_issue_pass(ring, hs0, hs1, 0, warp, rq, seg);
+  cp_async_commit();
+  const int flag0 = log_flag[0], flag1 = log_flag[1];
+  int accepted = num_accepted_tokens[request];
+  accepted = accepted < 0 ? 0 : (accepted > kMaxT ? kMaxT : accepted);
+  const int R0 = flag0 != 0 ? accepted : 0, R1 = flag1 != 0 ? accepted : 0;
+  const int Rmax = R0 > R1 ? R0 : R1;
+  // epilogue task of this warp: value head vh0 + (warp >> 2), token warp & 3 (prefetch gate + norm weight)
+  const int et = warp & 3, eh = vh0 + ((warp >> 2) & 1);
+  const bool has_epi = warp < 2 * kMaxT && et < num_tokens;
+  float g_pre[4] = {0.f, 0.f, 0.f, 0.f};
+  float w_pre[4] = {0.f, 0.f, 0.f, 0.f};
+  if (has_epi) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int dim = lane + i * 32;
+      g_pre[i] = __bfloat162float(output_gate[static_cast<int64_t>(bos + et) * strides.gate_row + eh * kDimV + dim]);
+      w_pre[i] = norm_weight_is_bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(norm_weight)[dim])
+                                     : static_cast<const float*>(norm_weight)[dim];
+    }
+  }
+  for (int task = warp; task < 2 * kMaxT; task += kGbW) {
+    if (task < num_tokens) {  // new token t: q / k of the key head, v / a / b of both value heads
+      const int t = task;
+      const int token = bos + t;
+      const int64_t mixed_base = static_cast<int64_t>(token) * strides.mixed_row;
+      float qv[4], kv[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int dim = lane + i * 32;
+        qv[i] = __bfloat162float(mixed_qkv[mixed_base + key_head * kDimK + dim]);
+        kv[i] = __bfloat162float(mixed_qkv[mixed_base + H * kDimK + key_head * kDimK + dim]);
+        s_v[0][kMaxT + t][dim] = mixed_qkv[mixed_base + 2 * H * kDimK + vh0 * kDimV + dim];
+        s_v[1][kMaxT + t][dim] = mixed_qkv[mixed_base + 2 * H * kDimK + (vh0 + 1) * kDimV + dim];
+      }
+      float q_square = 0.0f, k_square = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        q_square += qv[i] * qv[i];
+        k_square += kv[i] * kv[i];
+      }
+      const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
+      const float q_scale = __shfl_sync(0xffffffffu, lane == 0 ? rsqrtf(qk_sums.x + 1.0e-6f) * scale : 0.0f, 0);
+      const float k_scale = __shfl_sync(0xffffffffu, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int dim = lane + i * 32;
+        s_qp[t][gb_perm(dim)] = qv[i] * q_scale;
+        s_kp[kMaxT + t][gb_perm(dim)] = kv[i] * k_scale;
+      }
+      if (lane < 2) {
+        const int vh = vh0 + lane;
+        prep_gate(__bfloat162float(a[static_cast<int64_t>(token) * strides.a_row + vh]),
+                  __bfloat162float(b[static_cast<int64_t>(token) * strides.b_row + vh]), a_log[vh],
+                  load_dt_bias(dt_bias, vh, dt_bias_type), &s_decay[lane][kMaxT + t], &s_beta[lane][kMaxT + t]);
+      }
+    } else if (task >= kMaxT && task - kMaxT < (GB_SPEC ? accepted : Rmax)) {  // replay token j from the log
+      const int j = task - kMaxT;
+      const __nv_bfloat16* kr = log_k + (static_cast<int64_t>(j) * H + key_head) * kDimK;
+      const __nv_bfloat16* vr = log_v + (static_cast<int64_t>(j) * HV + vh0) * kDimV;
+      float kv[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        kv[i] = __bfloat162float(kr[lane + i * 32]);
+        s_v[0][j][lane + i * 32] = vr[lane + i * 32];
+        s_v[1][j][lane + i * 32] = vr[kDimV + lane + i * 32];
+      }
+      float q_square = 0.0f, k_square = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        q_square += 0.0f * 0.0f;
+        k_square += kv[i] * kv[i];
+      }
+      const Sum2 qk_sums = warp_reduce_sum_pair(q_square, k_square);
+      const float k_scale = __shfl_sync(0xffffffffu, lane == 0 ? rsqrtf(qk_sums.y + 1.0e-6f) : 0.0f, 0);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) s_kp[j][gb_perm(lane + i * 32)] = kv[i] * k_scale;
+      if (lane < 2) {
+        const int vh = vh0 + lane;
+        prep_gate(__bfloat162float(log_ab[(j * HV + vh) * 2]), __bfloat162float(log_ab[(j * HV + vh) * 2 + 1]),
+                  a_log[vh], load_dt_bias(dt_bias, vh, dt_bias_type), &s_decay[lane][j], &s_beta[lane][j]);
+      }
+    }
+  }
+  __syncthreads();  // token tables ready; the log reads of this (request, key head) are complete
+  // log update: this CTA owns the key head (no counter handshake)
+  for (int linear = tid; linear < num_tokens * kDimK; linear += kGbThreads) {
+    const int t = linear / kDimK, d = linear % kDimK;
+    log_k[(static_cast<int64_t>(t) * H + key_head) * kDimK + d] =
+        mixed_qkv[static_cast<int64_t>(bos + t) * strides.mixed_row + H * kDimK + key_head * kDimK + d];
+  }
+  for (int linear = tid; linear < num_tokens * 2 * kDimV; linear += kGbThreads) {
+    const int t = linear / (2 * kDimV), r = linear % (2 * kDimV);
+    log_v[(static_cast<int64_t>(t) * HV + vh0) * kDimV + r] = s_v[r / kDimV][kMaxT + t][r % kDimV];
+  }
+  if (tid < 2 * num_tokens) {
+    const int t = tid >> 1, vh = vh0 + (tid & 1);
+    log_ab[(t * HV + vh) * 2] = a[static_cast<int64_t>(bos + t) * strides.a_row + vh];
+    log_ab[(t * HV + vh) * 2 + 1] = b[static_cast<int64_t>(bos + t) * strides.b_row + vh];
+  }
+  if (tid < 2) log_flag[tid] = 1;
+  float* hsw[2] = {slot_state + static_cast<int64_t>(vh0) * kDimV * kDimK,
+                   slot_state + static_cast<int64_t>(vh0 + 1) * kDimV * kDimK};
+#pragma unroll
+  for (int p = 0; p < kGbkPasses; ++p) {
+    cp_async_wait_group<0>();
+    const float* buf = ring + (p & 1) * (2 * 4 * kDimK);
+    const int row = 4 * (p * kGbW + warp) + rq;
+    gb2 hp[2][4][2];
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+      float4 x[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        x[j] = *reinterpret_cast<const float4*>(buf + n * (4 * kDimK) + rq * kDimK + j * 32 + seg * 4);
+      hp[n][0][0] = gb_pack(x[0].x, x[1].x); hp[n][0][1] = gb_pack(x[2].x, x[3].x);
+      hp[n][1][0] = gb_pack(x[0].y, x[1].y); hp[n][1][1] = gb_pack(x[2].y, x[3].y);
+      hp[n][2][0] = gb_pack(x[0].z, x[1].z); hp[n][2][1] = gb_pack(x[2].z, x[3].z);
+      hp[n][3][0] = gb_pack(x[0].w, x[1].w); hp[n][3][1] = gb_pack(x[2].w, x[3].w);
+    }
+    // next pass into the other ring buffer (consumed one pass ago)
+    if (p + 1 < kGbkPasses && !GB_NOIO)
+      gbk_issue_pass(ring + ((p + 1) & 1) * (2 * 4 * kDimK), hs0, hs1, p + 1, warp, rq, seg);
+    cp_async_commit();
+    if (!GB_NOMATH)
+      for (int j = 0; j < Rmax; ++j)
+        gbk_token<false>(hp, s_kp[j], nullptr, s_v[0][j], s_v[1][j], s_decay[0][j], s_decay[1][j], s_beta[0][j],
+                         s_beta[1][j], j < R0, j < R1, row, seg, nullptr, nullptr);
+    if (!GB_NOIO) {
+#pragma unroll
+      for (int n = 0; n < 2; ++n) {
+        if ((n == 0 ? R0 : R1) <= 0) continue;
+        float* dst = hsw[n] + row * kDimK + seg * 4;
+#pragma unroll
+        for (int jp = 0; jp < 2; ++jp) {
+          *reinterpret_cast<float4*>(dst + (2 * jp) * 32) =
+              make_float4(gb_lo(hp[n][0][jp]), gb_lo(hp[n][1][jp]), gb_lo(hp[n][2][jp]), gb_lo(hp[n][3][jp]));
+          *reinterpret_cast<float4*>(dst + (2 * jp + 1) * 32) =
+              make_float4(gb_hi(hp[n][0][jp]), gb_hi(hp[n][1][jp]), gb_hi(hp[n][2][jp]), gb_hi(hp[n][3][jp]));
+        }
+      }
+    }
+    if (!GB_NOMATH)
+      for (int t = 0; t < num_tokens; ++t)
+        gbk_token<true>(hp, s_kp[kMaxT + t], s_qp[t], s_v[0][kMaxT + t], s_v[1][kMaxT + t], s_decay[0][kMaxT + t],
+                        s_decay[1][kMaxT + t], s_beta[0][kMaxT + t], s_beta[1][kMaxT + t], true, true, row, seg,
+                        s_out[0][t], s_out[1][t]);
+  }
+  __syncthreads();
+  if (has_epi) {
+    const int n = (warp >> 2) & 1;
+    float output_values[4];
+    float sum_square = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      output_values[i] = __bfloat162float(s_out[n][et][lane + i * 32]);
+      sum_square += output_values[i] * output_values[i];
+    }
+    sum_square = warp_reduce_sum(sum_square);
+    const float rstd = rsqrtf(sum_square / static_cast<float>(kDimV) + norm_eps);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int value = lane + i * 32;
+      const float gate = SigmoidGate ? sigmoid_fast(g_pre[i]) : silu_fast(g_pre[i]);
+      out[(static_cast<int64_t>(bos + et) * HV + eh) * kDimV + value] =
+          __float2bfloat16(output_values[i] * rstd * w_pre[i] * gate);
+    }
+  }
+}
+#endif  // GB_KH
+#endif  // GSC_GB
+
 // ---------------------------------------------------------------------------------------------
 // GSC_CK == 3 (bf16 state): GSC_CK == 2 math, bit-identical per element (same fp32 op sequence as
 // mm_replay / mm_new / ck_gram / ck_coef_*_par / prep_*), restructured for issue and latency:
@@ -2956,6 +3274,23 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
     deferred_decode_kernel<ST_, VPK_, SIG_><<<grid, kThreads, kDyn, stream>>>(GSC_ARGS(ST_));                              \
   }
 #if GSC_GB
+#if GB_KH
+  if (!sbf && vpk == 2) {  // GB300 fp32 kernel, one CTA per (request, key head)
+    static bool gbk_attr[2] = {};
+    const dim3 kgrid(n, H);
+#define GSC_GBK_LAUNCH(SIG_)                                                                                      \
+    if (!gbk_attr[SIG_]) {                                                                                        \
+      C10_CUDA_CHECK(cudaFuncSetAttribute(gb_kh_kernel<SIG_>, cudaFuncAttributeMaxDynamicSharedMemorySize, kGbkDyn)); \
+      C10_CUDA_CHECK(cudaFuncSetAttribute(gb_kh_kernel<SIG_>, cudaFuncAttributePreferredSharedMemoryCarveout, 100)); \
+      gbk_attr[SIG_] = true;                                                                                      \
+    }                                                                                                             \
+    gb_kh_kernel<SIG_><<<kgrid, kGbThreads, kGbkDyn, stream>>>(GSC_ARGS(float));
+    if (sigmoid_gate) { GSC_GBK_LAUNCH(true); } else { GSC_GBK_LAUNCH(false); }
+#undef GSC_GBK_LAUNCH
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+#endif
   if (!sbf) {  // GB300 fp32 kernel (bit-exact with GSC_CK=0)
     static bool gb_attr[2][2] = {};
 #define GSC_GB_LAUNCH(VPK_, SIG_)                                                                                 \
@@ -3168,11 +3503,17 @@ int64_t occupancy_ck3() {
 // GB300 fp32 kernel: local bytes * 1e9 + blocks/SM * 1e6 + regs * 1e3 + static smem KB (-1 if not built)
 int64_t occupancy_gb() {
 #if GSC_GB
+#if GB_KH
+  auto fn = gb_kh_kernel<false>;
+  constexpr int dyn = kGbkDyn;
+#else
   auto fn = gb_decode_kernel<2, false>;
-  C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kGbDyn));
+  constexpr int dyn = kGbDyn;
+#endif
+  C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
   C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   int n = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, kGbThreads, kGbDyn));
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, kGbThreads, dyn));
   cudaFuncAttributes fa;
   C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, fn));
   return static_cast<int64_t>(fa.localSizeBytes) * 1000000000LL + n * 1000000 + fa.numRegs * 1000 + fa.sharedSizeBytes / 1024;
