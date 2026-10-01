@@ -394,6 +394,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(num_reqs)
         if self.draft_vocab_head is not None and not dummy_run:
+            draft_vocab_head.observe_target(
+                self.draft_vocab_head,
+                last_sampled,
+                input_batch.idx_mapping,
+                num_sampled,
+            )
             draft_vocab_head.maybe_log(self.draft_vocab_head)
 
         return self.draft_tokens[:num_reqs]

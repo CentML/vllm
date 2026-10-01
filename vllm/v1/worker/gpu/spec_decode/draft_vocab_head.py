@@ -212,24 +212,54 @@ class DraftVocabHead(nn.Module):
 
 
 class _Diag:
-    """Device-side count of draft tokens that differ from the full argmax."""
+    """Device-side diagnostics (VLLM_DRAFT_LMH_DIAG=1; not for scored runs).
 
-    def __init__(self, device: torch.device) -> None:
-        # [rows, rows whose draft differs, rows whose full argmax is outside]
-        self.counts = torch.zeros(3, dtype=torch.int64, device=device)
+    counts = [draft rows, rows whose draft differs from the full argmax,
+    rows whose full argmax is outside the subset, target-sampled tokens
+    observed, target-sampled tokens outside the subset]. Draft rows include
+    CUDA-graph padding rows and rows of still-prefilling requests (discarded
+    drafts); the target-token counts are free of both. Histograms of the
+    outside ids (draft full argmax / target samples) name what the subset
+    misses.
+    """
+
+    def __init__(self, device: torch.device, vocab_size: int) -> None:
+        self.counts = torch.zeros(5, dtype=torch.int64, device=device)
+        self.hist_draft = torch.zeros(vocab_size, dtype=torch.int32, device=device)
+        self.hist_target = torch.zeros(vocab_size, dtype=torch.int32, device=device)
         self.t_last = time.monotonic()
-        self.last = [0, 0, 0]
+        self.last = [0] * 5
+
+    @staticmethod
+    def _outside(head: DraftVocabHead, tok: torch.Tensor) -> torch.Tensor:
+        outside = torch.ones_like(tok, dtype=torch.bool)
+        for a, b in head.ranges:
+            outside &= (tok < a) | (tok >= b)
+        return outside
 
     def observe(
         self, head: DraftVocabHead, full_logits: torch.Tensor, sub_tokens: torch.Tensor
     ) -> None:
         full = full_logits.argmax(dim=-1)
-        outside = torch.ones_like(full, dtype=torch.bool)
-        for a, b in head.ranges:
-            outside &= (full < a) | (full >= b)
+        outside = self._outside(head, full)
         self.counts[0] += full.numel()
         self.counts[1] += (full != sub_tokens).sum()
         self.counts[2] += outside.sum()
+        self.hist_draft.index_add_(0, full, outside.to(torch.int32))
+
+    def observe_target(
+        self,
+        head: DraftVocabHead,
+        last_sampled: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+    ) -> None:
+        tok = last_sampled[idx_mapping.long()].long()
+        valid = num_sampled > 0
+        outside = self._outside(head, tok) & valid
+        self.counts[3] += valid.sum()
+        self.counts[4] += outside.sum()
+        self.hist_target.index_add_(0, tok, outside.to(torch.int32))
 
     def maybe_log(self, head: DraftVocabHead, force: bool = False) -> None:
         now = time.monotonic()
@@ -239,18 +269,32 @@ class _Diag:
         c = self.counts.tolist()
         d = [x - y for x, y in zip(c, self.last)]
         self.last = c
+
+        def top(h):
+            v, i = h.topk(12)
+            return [(int(x), int(y)) for x, y in zip(i.tolist(), v.tolist()) if y > 0]
+
         logger.info(
-            "[draft-lmh] diag: window rows=%d differ=%d (%.4f%%) full-argmax-outside=%d "
-            "| total rows=%d differ=%d (%.4f%%) | eager calls=%d captured=%d",
+            "[draft-lmh] diag: window draft rows=%d differ=%d (%.4f%%) | target "
+            "tokens=%d outside=%d (%.4f%%) | total draft rows=%d differ=%d "
+            "(%.4f%%) target tokens=%d outside=%d (%.4f%%) | eager calls=%d "
+            "captured=%d | top outside draft ids %s | top outside target ids %s",
             d[0],
             d[1],
             100.0 * d[1] / max(1, d[0]),
-            d[2],
+            d[3],
+            d[4],
+            100.0 * d[4] / max(1, d[3]),
             c[0],
             c[1],
             100.0 * c[1] / max(1, c[0]),
+            c[3],
+            c[4],
+            100.0 * c[4] / max(1, c[3]),
             head.eager_calls,
             head.captured_calls,
+            top(self.hist_draft),
+            top(self.hist_target),
         )
 
 
@@ -299,7 +343,7 @@ def maybe_build(draft_model: nn.Module) -> DraftVocabHead | None:
         _DIAG,
     )
     if _DIAG:
-        m.diag = _Diag(weight.device)
+        m.diag = _Diag(weight.device, weight.shape[0])
     else:
         m.diag = None
     return m
@@ -312,6 +356,17 @@ def sample(
     if head.diag is not None:
         head.diag.observe(head, draft_model.compute_logits(hidden_states), tokens)
     return tokens
+
+
+def observe_target(
+    head: DraftVocabHead | None,
+    last_sampled: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_sampled: torch.Tensor,
+) -> None:
+    """Diagnostics only: count target-sampled tokens outside the subset."""
+    if head is not None and head.diag is not None:
+        head.diag.observe_target(head, last_sampled, idx_mapping, num_sampled)
 
 
 def maybe_log(head: DraftVocabHead | None) -> None:
