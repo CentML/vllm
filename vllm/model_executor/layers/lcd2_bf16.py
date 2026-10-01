@@ -44,7 +44,7 @@ BA = ENABLED and os.environ.get("LCD2_BA", "1") == "1"
 MAXM = int(os.environ.get("LCD2_MAXM", "64"))
 PDL = os.environ.get("LCD2_PDL", "0") == "1"
 
-STATS = {"rtr_tiny": 0, "rtr_stock": 0, "ba_tiny": 0, "ba_stock": 0}
+STATS = {"router_tiny": 0, "router_stock": 0, "ba_tiny": 0, "ba_stock": 0}
 _SEEN: set = set()
 _STATE = {"ok": None}
 
