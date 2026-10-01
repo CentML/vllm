@@ -17,11 +17,20 @@ norm, and libdevice ``expf`` for exp(g).
 
 Only the final conv state of each sequence is written (no APC intermediate
 states) and the conv has no bias; callers fall back to the pair otherwise.
+
+On SM10x, once ``enable_cuda_kernel()`` built it (the GDN prefill warmup does),
+the CUDA version in gdn_conv_cuda.py runs instead: same outputs bit for bit,
+faster (VLLM_GDN_CONV_CUDA=0 keeps the Triton kernel).
 """
+
+import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
+
+logger = init_logger(__name__)
 
 # Tile configs (VR sweep), (BT, ST): BT tokens of one sequence per program,
 # processed in ST-token sub-tiles. Long rows: 32-token tiles. Short batches
@@ -33,6 +42,31 @@ FUSED_CONV_WARPS = 4
 FUSED_CONV_STAGES = 1
 # One compiled variant serves every batch with <= MAX_SEQS sequences.
 FUSED_CONV_MAX_SEQS = 64
+
+GDN_CONV_CUDA = os.environ.get("VLLM_GDN_CONV_CUDA", "1") == "1"
+_cuda_kernel_ready: list = []
+_cuda_kernel_tried: list = []
+
+
+def enable_cuda_kernel() -> None:
+    """Build (JIT, nvcc) and enable the CUDA kernel; once per process. A
+    failed build logs a warning and keeps the Triton kernel.
+    """
+    if _cuda_kernel_tried:
+        return
+    _cuda_kernel_tried.append(True)
+    try:
+        from vllm.model_executor.layers.mamba.ops import gdn_conv_cuda
+
+        gdn_conv_cuda.load()
+    except Exception:
+        logger.warning(
+            "GDN prefill: CUDA conv kernel build failed; using the Triton kernel.",
+            exc_info=True,
+        )
+        return
+    _cuda_kernel_ready.append(gdn_conv_cuda.gdn_conv_cuda_prep)
+    logger.info("GDN prefill: CUDA fused conv kernel built and enabled.")
 
 
 @triton.jit
@@ -405,7 +439,8 @@ def gdn_fused_conv_prep(
     FUSED_CONV_MAX_SEQS. a, b: [P, HV] (row-strided).
 
     Returns q, k: [P, H, K]; v: [P, HV, V] (x dtype); exp(g), beta: [P, HV] fp32.
-    ``tile`` overrides the (BT, ST) choice (warmup compiles both).
+    ``tile`` forces the Triton kernel with that (BT, ST) (the warmup compiles
+    both).
     """
     P = x.shape[0]
     H, K, V = num_k_heads, head_k_dim, head_v_dim
@@ -415,6 +450,24 @@ def gdn_fused_conv_prep(
     assert x.stride(1) == 1 and x.shape[1] == 2 * H * K + HV * V
     assert num_seqs <= FUSED_CONV_MAX_SEQS
     assert cu_seqlens.dtype == torch.int32
+    if _cuda_kernel_ready and tile is None:
+        out = _cuda_kernel_ready[0](
+            x,
+            conv_weights,
+            conv_state,
+            cache_indices,
+            has_initial_state,
+            cu_seqlens,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        if out is not None:
+            return out
     q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
     k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
     v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
