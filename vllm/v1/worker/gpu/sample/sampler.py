@@ -63,7 +63,7 @@ class Sampler:
 
         self.req_states = req_states
         self._lowc2_dirty = True  # see apply_staged_writes (VLLM_SAMPLER_STATE_DIRTY)
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, device)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)

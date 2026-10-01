@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import DeviceParamTable, StagedWriteTensor
 
 
 class RequestState:
@@ -46,8 +46,13 @@ class RequestState:
         # preemption, prefill_len may be greater. Differentiating between these values
         # is crucial, as certain features such as prompt logprobs or frequency penalties
         # must treat prompt and output tokens separately.
-        self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
-        self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.lens = DeviceParamTable(
+            self.max_num_reqs,
+            {"prompt_len": torch.int32, "prefill_len": torch.int32},
+            device,
+        )
+        self.prompt_len = self.lens["prompt_len"]
+        self.prefill_len = self.lens["prefill_len"]
         # total_len = prompt_len + output_len. It grows as the request progresses.
         self.total_len = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
@@ -129,8 +134,7 @@ class RequestState:
         self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:
-        self.prompt_len.copy_to_uva()
-        self.prefill_len.copy_to_uva()
+        self.lens.sync()
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()

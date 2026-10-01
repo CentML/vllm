@@ -6,7 +6,7 @@ import torch
 import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import DeviceParamTable
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.spec_topk_topp import (
@@ -20,25 +20,37 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 
 class SamplingStates:
-    def __init__(self, max_num_reqs: int, vocab_size: int):
+    def __init__(self, max_num_reqs: int, vocab_size: int, device: torch.device):
         self.max_num_reqs = max_num_reqs
         self.use_split_row_top_k = envs.VLLM_SAMPLER_SPLIT_ROW_TOPK
         self.vocab_size = vocab_size
 
-        self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.top_k = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
-        self.top_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.min_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
-        self.seeds = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        # Device-resident, so that the sampling kernels (and the drafter graphs)
+        # read them from HBM at a fixed address instead of from host memory.
+        self.params = DeviceParamTable(
+            max_num_reqs,
+            {
+                "temperature": torch.float32,
+                "top_k": torch.int32,
+                "top_p": torch.float32,
+                "min_p": torch.float32,
+                "seeds": torch.int64,
+            },
+            device,
+        )
+        self.temperature = self.params["temperature"]
+        self.top_k = self.params["top_k"]
+        self.top_p = self.params["top_p"]
+        self.min_p = self.params["min_p"]
+        self.seeds = self.params["seeds"]
         # Tracks whether `seed` was set explicitly by the user, so callers
         # can fall back from RNG paths that don't honor per-request seeds.
         self.seeds_set = np.zeros(max_num_reqs, dtype=bool)
 
         # Initialize top_k and top_p manually because 0 is an invalid value for them.
         self.top_k.np.fill(self.vocab_size)
-        self.top_k.copy_to_uva()
         self.top_p.np.fill(1.0)
-        self.top_p.copy_to_uva()
+        self.params.sync()
 
         self.num_logprobs = np.empty(self.max_num_reqs, dtype=np.int32)
         # -1 means no logprobs are requested.
@@ -67,11 +79,7 @@ class SamplingStates:
         self.num_logprobs[req_idx] = num_logprobs
 
     def apply_staged_writes(self) -> None:
-        self.temperature.copy_to_uva()
-        self.top_p.copy_to_uva()
-        self.top_k.copy_to_uva()
-        self.min_p.copy_to_uva()
-        self.seeds.copy_to_uva()
+        self.params.sync()
 
     def apply_temperature(
         self,
