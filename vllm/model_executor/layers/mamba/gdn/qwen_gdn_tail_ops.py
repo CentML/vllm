@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     mxfp8_quantize_row,
     mxfp8_store_swizzled_scales,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -46,7 +47,10 @@ def _gdn_gated_norm_mxfp8_kernel(
     BLOCK_H: tl.constexpr,
     VALID_FROM_PTR: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
 ):
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     K: tl.constexpr = HEADS * HEAD_DIM
     BLOCK: tl.constexpr = BLOCK_H * HEAD_DIM
@@ -162,6 +166,8 @@ def gdn_gated_norm_mxfp8(
     num_warps = _gdn_norm_mxfp8_num_warps(
         norm_rows[1] - norm_rows[0], block_h, x.device
     )
+    # PDL below 4096 rows, as the fused RMSNorm -> MXFP8 producer.
+    launch_pdl = num_rows < 4096 and current_platform.is_arch_support_pdl()
     _gdn_gated_norm_mxfp8_kernel[(padded_rows,)](
         x,
         z,
@@ -181,6 +187,8 @@ def gdn_gated_norm_mxfp8(
         BLOCK_H=block_h,
         VALID_FROM_PTR=valid_from_ptr,
         ACTIVATION=activation,
+        LAUNCH_PDL=launch_pdl,
+        launch_pdl=launch_pdl,
         num_warps=num_warps,
     )
 
