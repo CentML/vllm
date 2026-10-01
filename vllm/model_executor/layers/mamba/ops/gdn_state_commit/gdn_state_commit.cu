@@ -1840,7 +1840,8 @@ __device__ __forceinline__ void gbk_token(gb2 (&hp)[2][4][2], const float* skp, 
 }
 
 constexpr int kGbkPasses = kDimV / (4 * kGbW);  // passes per warp (one 4-row slot per value head each)
-constexpr int kGbkDyn = kGbW * 2 * (2 * 4 * kDimK) * 4;  // ring of 2 passes x (2 heads x 2 KB) per warp
+constexpr int kGbkRing = GB_D >= 2 ? 2 : 1;  // passes staged per warp (1: refill after the replay, as gb_decode_kernel)
+constexpr int kGbkDyn = kGbW * kGbkRing * (2 * 4 * kDimK) * 4;  // ring x (2 heads x 2 KB) per warp
 
 __device__ __forceinline__ void gbk_issue_pass(float* buf, const float* hs0, const float* hs1, int p, int warp,
                                                int rq, int seg) {
@@ -1875,7 +1876,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
   const int num_tokens = cu_seqlens[request + 1] - bos;
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gbk_dyn_smem[];
-  float* ring = reinterpret_cast<float*>(gbk_dyn_smem) + warp * (2 * 2 * 4 * kDimK);
+  float* ring = reinterpret_cast<float*>(gbk_dyn_smem) + warp * (kGbkRing * 2 * 4 * kDimK);
   __shared__ __align__(16) float s_kp[kMaxTok][kDimK];
   __shared__ __align__(16) float s_qp[kMaxT][kDimK];
   __shared__ __align__(16) __nv_bfloat16 s_v[2][kMaxTok][kDimV];
@@ -2006,7 +2007,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
 #pragma unroll
   for (int p = 0; p < kGbkPasses; ++p) {
     cp_async_wait_group<0>();
-    const float* buf = ring + (p & 1) * (2 * 4 * kDimK);
+    const float* buf = ring + (p % kGbkRing) * (2 * 4 * kDimK);
     const int row = 4 * (p * kGbW + warp) + rq;
     gb2 hp[2][4][2];
 #pragma unroll
@@ -2020,10 +2021,11 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
       hp[n][2][0] = gb_pack(x[0].z, x[1].z); hp[n][2][1] = gb_pack(x[2].z, x[3].z);
       hp[n][3][0] = gb_pack(x[0].w, x[1].w); hp[n][3][1] = gb_pack(x[2].w, x[3].w);
     }
-    // next pass into the other ring buffer (consumed one pass ago)
-    if (p + 1 < kGbkPasses && !GB_NOIO)
-      gbk_issue_pass(ring + ((p + 1) & 1) * (2 * 4 * kDimK), hs0, hs1, p + 1, warp, rq, seg);
-    cp_async_commit();
+    // ring of 2: next pass into the other buffer (consumed one pass ago), issued before the replay
+    if (kGbkRing == 2) {
+      if (p + 1 < kGbkPasses && !GB_NOIO) gbk_issue_pass(ring + ((p + 1) & 1) * (2 * 4 * kDimK), hs0, hs1, p + 1, warp, rq, seg);
+      cp_async_commit();
+    }
     if (!GB_NOMATH)
       for (int j = 0; j < Rmax; ++j)
         gbk_token<false>(hp, s_kp[j], nullptr, s_v[0][j], s_v[1][j], s_decay[0][j], s_decay[1][j], s_beta[0][j],
@@ -2041,6 +2043,10 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
               make_float4(gb_hi(hp[n][0][jp]), gb_hi(hp[n][1][jp]), gb_hi(hp[n][2][jp]), gb_hi(hp[n][3][jp]));
         }
       }
+    }
+    if (kGbkRing == 1) {  // ring of 1: refill this buffer (now in registers) after the replay / commit
+      if (p + 1 < kGbkPasses && !GB_NOIO) gbk_issue_pass(ring, hs0, hs1, p + 1, warp, rq, seg);
+      cp_async_commit();
     }
     if (!GB_NOMATH)
       for (int t = 0; t < num_tokens; ++t)
