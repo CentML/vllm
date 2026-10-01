@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -1788,6 +1789,47 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
+# GB300 study (fix-host): opt-in persistent trtllm-gen multi-CTA KV counter buffer.
+# FlashInfer allocates (torch.zeros) a fresh semaphore buffer on every eager
+# trtllm_batch_{context,decode}_with_kv_cache call when none is passed; the
+# kernels reset the semaphores to zero at the end of every launch, so one
+# zero-initialized buffer per device can be reused (FlashInfer's own wrappers do
+# the same). Saves an allocation + memset launch per eager attention call
+# (mixed / piecewise steps). Default off: VLLM_FI_PERSISTENT_KV_COUNTER=1.
+_FI_KV_COUNTER_ENABLED = os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER", "0") == "1"
+_FI_KV_COUNTER_BYTES = int(
+    os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
+)
+_FI_KV_COUNTER_BUFS: dict[torch.device, torch.Tensor] = {}
+
+
+def _fi_kv_counter_buffer(device: torch.device) -> torch.Tensor | None:
+    if not _FI_KV_COUNTER_ENABLED:
+        return None
+    buf = _FI_KV_COUNTER_BUFS.get(device)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Never create the persistent buffer inside a graph capture (it
+            # would live in the graph's private pool); FlashInfer allocates.
+            return None
+        buf = torch.zeros(_FI_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
+        _FI_KV_COUNTER_BUFS[device] = buf
+    return buf
+
+
+def _fi_kv_counter_kwargs(
+    device: torch.device, batch_size: int, num_qo_heads: int
+) -> dict:
+    buf = _fi_kv_counter_buffer(device)
+    if buf is None:
+        return {}
+    # FlashInfer needs round_up(max(batch * heads, sm_count), 8) int32 semaphores.
+    need = (max(batch_size * num_qo_heads, 1024) + 7) // 8 * 8 * 4
+    if need > buf.numel():
+        return {}
+    return {"multi_ctas_kv_counter_buffer": buf}
+
+
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -2380,6 +2422,11 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
+                    **_fi_kv_counter_kwargs(
+                        prefill_query.device,
+                        attn_metadata.num_prefills,
+                        prefill_query.shape[1],
+                    ),
                 )
 
                 if needs_fp8_out:
@@ -2611,6 +2658,11 @@ class FlashInferImpl(AttentionImpl):
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
+                    **_fi_kv_counter_kwargs(
+                        decode_query.device,
+                        decode_query.shape[0],
+                        decode_query.shape[1],
+                    ),
                 )
 
                 if use_dcp:
