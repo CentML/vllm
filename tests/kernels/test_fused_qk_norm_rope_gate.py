@@ -191,12 +191,16 @@ def test_fused_qk_rmsnorm_rope_matches_gate_kernel_bitwise(
 )
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "auto"])
 @pytest.mark.parametrize("num_tokens,num_slots", [(1, 1), (13, 9), (300, 300)])
+# General scales take the IEEE division; power-of-two scales (the default 1.0)
+# the exact multiplication by the reciprocal.
+@pytest.mark.parametrize("kv_scales", [(0.37, 7.0), (1.0, 1.0), (0.25, 0.5)])
 @torch.inference_mode()
 def test_fused_qk_rmsnorm_rope_kv_write_matches_reshape_and_cache_flash(
     default_vllm_config,
     num_tokens: int,
     num_slots: int,
     kv_cache_dtype: str,
+    kv_scales: tuple[float, float],
 ) -> None:
     """The paged-cache write equals reshape_and_cache_flash of the op's k and v
     (padding slots -1 and rows past slot_mapping untouched), byte for byte.
@@ -217,14 +221,19 @@ def test_fused_qk_rmsnorm_rope_kv_write_matches_reshape_and_cache_flash(
     qkv = (torch.randn(num_tokens, width, device=device) * magnitude).to(DTYPE)
     q_size, kv_size = num_q_heads * HEAD_DIM, num_kv_heads * HEAD_DIM
     q_gate, k, v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
+    # 7 * 0.390625 and 7 * 0.78125: divided by 7.0 they are exact e4m3 ties
+    # (0.375 / 0.75, round to even); multiplied by fp32(1 / 7) they round up.
+    v[:, 0:4] = 2.734375
+    v[:, 4:8] = -5.46875
+    v[:, 8:12] = 4096.0  # saturates under every scale
     q_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
     k_weight = (torch.randn(HEAD_DIM, device=device) * 0.1).to(DTYPE)
     cos_sin_cache = torch.randn(4096, ROTARY_DIM, device=device).to(DTYPE)
     positions = torch.randint(0, 4096, (num_tokens,), device=device)
     slots = torch.randperm(num_blocks * block_size, device=device)[:num_slots]
     slots[1::5] = -1
-    k_scale = torch.tensor(0.37, dtype=torch.float32, device=device)
-    v_scale = torch.tensor(1.9, dtype=torch.float32, device=device)
+    k_scale = torch.tensor(kv_scales[0], dtype=torch.float32, device=device)
+    v_scale = torch.tensor(kv_scales[1], dtype=torch.float32, device=device)
     # The FlashInfer backend's cache (B, H, N, 2 * D) and its write views.
     cache_dtype = torch.uint8 if kv_cache_dtype == "fp8" else DTYPE
     caches = []

@@ -339,14 +339,39 @@ def _static_fp8_quant(x, inv_scale):
 
 
 @triton.jit
-def _kv_cache_value(x, scale, KV_FP8: tl.constexpr):
+def _kv_cache_scale(scale_ptr):
+    """Load a per-tensor KV-cache scale: ``(scale, 1 / scale, exact)``.
+
+    ``exact`` when ``scale`` is a positive power of two with a normal
+    reciprocal: then ``x * (1 / scale)`` is ``x / scale`` exactly, and the
+    reciprocal is built from the exponent bits (no division).
+    """
+    scale = tl.load(scale_ptr)
+    bits = scale.to(tl.int32, bitcast=True)
+    exponent = (bits >> 23) & 255
+    exact = ((bits & 0x7FFFFF) == 0) & (bits > 0) & (exponent <= 253)
+    inv_scale = ((254 - exponent) << 23).to(tl.float32, bitcast=True)
+    return scale, inv_scale, exact
+
+
+@triton.jit
+def _kv_cache_value(x, scale, inv_scale, exact, KV_FP8: tl.constexpr):
     """The paged-cache value ``reshape_and_cache_flash`` stores for ``x``.
 
     FP8 caches hold ``__nv_cvt_float_to_fp8(float(x) / scale, SATFINITE, E4M3)``
     (IEEE division, round-to-nearest, saturating); other caches hold ``x``.
+    The division is a multiplication when ``exact`` (power-of-two scale, e.g.
+    the default 1.0): ``div_rn`` costs a multi-instruction sequence (and a
+    slow path for zeros) per element. Any fp32 result a flush-to-zero could
+    change is below e4m3's smallest subnormal, so both store the same byte.
     """
-    if KV_FP8:  # noqa: SIM108 (statically resolved constexpr branch)
-        y = tl.math.div_rn(x.to(tl.float32), scale).to(tl.float8e4nv)
+    if KV_FP8:
+        xf = x.to(tl.float32)
+        if exact:  # noqa: SIM108 (a runtime branch: only one side executes)
+            y = xf * inv_scale
+        else:
+            y = tl.math.div_rn(xf, scale)
+        y = y.to(tl.float8e4nv)
     else:
         y = x
     return y
@@ -427,9 +452,15 @@ def _store_v_cache_rows(
         other=0.0,
     )
     scale = 1.0
+    inv_scale = 1.0
+    exact = True
     if KV_FP8:
-        scale = tl.load(v_scale_ptr)
-    tl.store(dst[:, None] + cols[None, :], _kv_cache_value(v, scale, KV_FP8), mask=mask)
+        scale, inv_scale, exact = _kv_cache_scale(v_scale_ptr)
+    tl.store(
+        dst[:, None] + cols[None, :],
+        _kv_cache_value(v, scale, inv_scale, exact, KV_FP8),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -570,8 +601,10 @@ def _norm_rope_head_rows(
             cache_head_stride,
         )
         kv_scale = 1.0
+        kv_inv_scale = 1.0
+        kv_exact = True
         if KV_FP8:
-            kv_scale = tl.load(kv_scale_ptr)
+            kv_scale, kv_inv_scale, kv_exact = _kv_cache_scale(kv_scale_ptr)
 
     # --- Pass-through tail [rotary_dim, head_dim): RMSNorm-only ---
     if HAS_PASS:
@@ -584,7 +617,7 @@ def _norm_rope_head_rows(
         if KV_CACHE:
             tl.store(
                 kv_row[:, None, None] + head_offs[None, :, :],
-                _kv_cache_value(x_pass, kv_scale, KV_FP8),
+                _kv_cache_value(x_pass, kv_scale, kv_inv_scale, kv_exact, KV_FP8),
                 mask=pass_mask & kv_mask[:, None, None],
             )
 
@@ -611,10 +644,14 @@ def _norm_rope_head_rows(
     if KV_CACHE:
         kv_rot = kv_row[:, None] + rot_offs[None, :]
         kv_rot_mask = rot_mask2 & kv_mask[:, None]
-        tl.store(kv_rot, _kv_cache_value(o1, kv_scale, KV_FP8), mask=kv_rot_mask)
+        tl.store(
+            kv_rot,
+            _kv_cache_value(o1, kv_scale, kv_inv_scale, kv_exact, KV_FP8),
+            mask=kv_rot_mask,
+        )
         tl.store(
             kv_rot + half_rotary,
-            _kv_cache_value(o2, kv_scale, KV_FP8),
+            _kv_cache_value(o2, kv_scale, kv_inv_scale, kv_exact, KV_FP8),
             mask=kv_rot_mask,
         )
 
@@ -668,19 +705,23 @@ def _fused_qk_rmsnorm_rope_tokens_kernel(
     MROPE_SECTION_W: tl.constexpr,
     Q_TOKENS: tl.constexpr,
     K_TOKENS: tl.constexpr,
+    V_TOKENS: tl.constexpr,
     Q_ROWS_BLOCK: tl.constexpr,
     K_ROWS_BLOCK: tl.constexpr,
+    V_ROWS_BLOCK: tl.constexpr,
     Q_FP8: tl.constexpr,
     STORE_GATE: tl.constexpr,
     KV_CACHE: tl.constexpr,
     KV_FP8: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
 ):
-    # CTAs [0, cdiv(n, Q_TOKENS)) take all q heads of Q_TOKENS tokens; the rest
-    # take all kv heads of K_TOKENS tokens (and, with KV_CACHE, write their
-    # k and v rows into the paged cache).
+    # CTAs [0, cdiv(n, Q_TOKENS)) take all q heads of Q_TOKENS tokens; the next
+    # cdiv(n, K_TOKENS) all kv heads of K_TOKENS tokens (with KV_CACHE also
+    # writing their k rows into the paged cache); with KV_CACHE, the last
+    # cdiv(n, V_TOKENS) copy the v rows of V_TOKENS tokens into the cache.
     pid = tl.program_id(0)
     num_q_ctas = tl.cdiv(num_tokens, Q_TOKENS)
+    num_k_ctas = tl.cdiv(num_tokens, K_TOKENS)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
     if pid < num_q_ctas:
@@ -729,7 +770,7 @@ def _fused_qk_rmsnorm_rope_tokens_kernel(
             False,
             False,
         )
-    else:
+    elif pid < num_q_ctas + num_k_ctas:
         _norm_rope_head_rows(
             k_ptr,
             k_stride_t,
@@ -775,38 +816,50 @@ def _fused_qk_rmsnorm_rope_tokens_kernel(
             KV_CACHE,
             KV_FP8,
         )
-        if KV_CACHE:
-            _store_v_cache_rows(
-                v_ptr,
-                v_stride_t,
-                slot_mapping_ptr,
-                num_slots,
-                v_cache_ptr,
-                block_size,
-                cache_block_stride,
-                cache_page_stride,
-                cache_head_stride,
-                v_scale_ptr,
-                (pid - num_q_ctas) * K_TOKENS,
-                num_tokens,
-                num_kv_heads,
-                K_TOKENS,
-                K_ROWS_BLOCK,
-                head_dim,
-                HEAD_BLOCK,
-                KV_FP8,
-            )
+    elif KV_CACHE:
+        _store_v_cache_rows(
+            v_ptr,
+            v_stride_t,
+            slot_mapping_ptr,
+            num_slots,
+            v_cache_ptr,
+            block_size,
+            cache_block_stride,
+            cache_page_stride,
+            cache_head_stride,
+            v_scale_ptr,
+            (pid - num_q_ctas - num_k_ctas) * V_TOKENS,
+            num_tokens,
+            num_kv_heads,
+            V_TOKENS,
+            V_ROWS_BLOCK,
+            head_dim,
+            HEAD_BLOCK,
+            KV_FP8,
+        )
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
 
 def _tokens_launch_config(
-    num_q_heads: int, num_kv_heads: int, head_block: int
+    num_q_heads: int, num_kv_heads: int, head_block: int, kv_write: bool = False
 ) -> tuple[int, int, int]:
-    """(Q_TOKENS, K_TOKENS, num_warps): 16 head rows on the warps of one head."""
+    """(Q_TOKENS, K_TOKENS, num_warps): 16 head rows on the warps of one head.
+
+    With the KV write, k CTAs take 4 head rows and v moves to its own CTAs of
+    ``_V_CACHE_ROWS`` rows: 16-row k CTAs that also copy v are the critical
+    path. On VR (2 kv heads, fp8 cache, scale 1.0) 2-token k CTAs + 8-token v
+    CTAs cost at most 0.2 us over no KV write up to 512 tokens, and are 2.0-2.3x
+    faster than qk-norm-RoPE + reshape_and_cache_flash from 512 tokens up.
+    The reduction layout along a head does not depend on the row count.
+    """
     q_tokens = max(1, 16 // num_q_heads)
-    k_tokens = max(1, 16 // num_kv_heads)
+    k_tokens = max(1, (4 if kv_write else 16) // num_kv_heads)
     return q_tokens, k_tokens, head_block // 64
+
+
+# Head rows per v-copy CTA of the KV write.
+_V_CACHE_ROWS = 16
 
 
 class PagedKVWrite(NamedTuple):
@@ -928,12 +981,16 @@ def fused_qk_rmsnorm_rope(
         return q_out, k_out, gate_out
 
     q_tokens, k_tokens, num_warps = launch_config or _tokens_launch_config(
-        num_q_heads, num_kv_heads, head_block
+        num_q_heads, num_kv_heads, head_block, kv_write is not None
     )
+    v_tokens = max(1, _V_CACHE_ROWS // num_kv_heads)
     if launch_pdl is None:
         # As the fused RMSNorm -> MXFP8 producer: PDL below 4096 tokens.
         launch_pdl = n_tokens < 4096 and current_platform.is_arch_support_pdl()
-    grid = (triton.cdiv(n_tokens, q_tokens) + triton.cdiv(n_tokens, k_tokens),)
+    num_ctas = triton.cdiv(n_tokens, q_tokens) + triton.cdiv(n_tokens, k_tokens)
+    if kv_write is not None:
+        num_ctas += triton.cdiv(n_tokens, v_tokens)
+    grid = (num_ctas,)
     _fused_qk_rmsnorm_rope_tokens_kernel[grid](
         q_gate,
         k,
@@ -982,8 +1039,10 @@ def fused_qk_rmsnorm_rope(
         MROPE_SECTION_W=mrope_section_w,
         Q_TOKENS=q_tokens,
         K_TOKENS=k_tokens,
+        V_TOKENS=v_tokens,
         Q_ROWS_BLOCK=triton.next_power_of_2(q_tokens * num_q_heads),
         K_ROWS_BLOCK=triton.next_power_of_2(k_tokens * num_kv_heads),
+        V_ROWS_BLOCK=triton.next_power_of_2(v_tokens * num_kv_heads),
         Q_FP8=q_scale is not None,
         STORE_GATE=store_gate,
         KV_CACHE=kv_write is not None,
