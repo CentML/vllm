@@ -82,6 +82,21 @@ GLUE_GMRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_GMRR_CFG", "1,8").spl
 GLUE_NQRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_NQRR_CFG", "1,4").split(","))
 # GLUE_FNQ_XB=1: fused finalize + pre-norm + MXFP8 with 1 row x 4 warps per program (same kernel, same per-row layout)
 GLUE_FNQ_XB = int(os.environ.get("GLUE_FNQ_XB", "0"))
+# GLUE_FNQ_F0=1: the fused finalize + pre-norm skips reading its shared-expert input when that input is the SEG-fold
+# +0.0 buffer ((s + 0.0) + (a + r), bit-identical); rows/program GLUE_FNQ_XB (or 1)
+GLUE_FNQ_F0 = os.environ.get("GLUE_FNQ_F0", "0") == "1"
+
+
+def _is_seg_zeros(f) -> bool:
+    try:
+        from vllm.model_executor.layers.fused_moe import shared_expert_fold as SEG
+
+        return any(
+            f.data_ptr() == z.data_ptr() and f.stride() == z.stride() and f.dtype == z.dtype
+            for z in SEG._ZEROS.values()
+        )
+    except Exception:  # unknown buffer: keep the load
+        return False
 # GLUE_LAZY=1: the o_proj gate-mul and the GDN gated RMSNorm do not write their bf16 output (only the fp8 data +
 # scales the next linear reads from the stash). A consumer that misses the stash on such a tensor first materializes
 # the bf16 values (same kernel, store on), counts lazy_miss and logs a warning; GLUE_LAZY_CHECK=1 raises instead.
@@ -224,7 +239,13 @@ def _pre_norm(
         # weight the expert outputs here (== trtllm finalize, then pre_norm).
         g2, wts, idx = e[1], e[2], e[3].view(-1)
         if s.shape[0] <= QGF_FIN_MAXM:
-            if GLUE_FNQ_XB > 0:
+            if GLUE_FNQ_F0 and _is_seg_zeros(f):
+                from vllm.model_executor.layers.fusion import glue_kernels as G
+
+                xb = max(1, GLUE_FNQ_XB)
+                out, res, q, swz = G.fin_norm_quant_f0(g2, wts, idx, a, r, w, eps, xb, 4 * xb)
+                STATS["fin_f0"] = STATS.get("fin_f0", 0) + 1
+            elif GLUE_FNQ_XB > 0:
                 from vllm.model_executor.layers.fusion import glue_kernels as G
 
                 out, res, q, swz = G.fin_norm_quant_rr(
@@ -765,7 +786,7 @@ def compile_hash_factors() -> list[str]:
         f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
         f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
         f"glue-v3-nqrr{int(GLUE_NQRR)}{GLUE_NQRR_CFG}-gmrr{int(GLUE_GMRR)}{GLUE_GMRR_CFG}-fnq{GLUE_FNQ_XB}"
-        f"-lazy{int(GLUE_LAZY)}-gg{GLUE_GG_CFG}",
+        f"-lazy{int(GLUE_LAZY)}-gg{GLUE_GG_CFG}-f0{int(GLUE_FNQ_F0)}",
     ]
 
 

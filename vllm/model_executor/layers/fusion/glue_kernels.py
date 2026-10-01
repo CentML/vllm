@@ -20,7 +20,12 @@ Env gates (read by the callers, default off): GLUE_NQRR=1 (norm_quant_rr), GLUE_
 # fmt: off
 import torch
 
-from vllm.model_executor.layers.fusion.norm_quant_kernels import INV_E4M3_MAX_C, _mx_epilogue
+from vllm.model_executor.layers.fusion.norm_quant_kernels import (
+    INV_E4M3_MAX_C,
+    _mx_epilogue,
+    _qgf_fin_gather,
+    _qgf_norm_out,
+)
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
 
@@ -538,6 +543,67 @@ def fin_norm_quant_rr(g2, wts, idx, f, a, r, w, eps, xblock=1, num_warps=4):
     K._qgf_fin_norm_quant_kernel[(triton.cdiv(pm, xblock),)](
         g2, wts, idx, f, a, r, w, out, res, q, sf, M, pm, eps,
         g2.stride(0), f.stride(0), a.stride(0), r.stride(0), out.stride(0), res.stride(0), q.stride(0),
+        H=H, XBLOCK=xblock, RB=RB, TOPK=idx.numel() // M, PADDED_SF_COLS=psc, USE_FMA=K.FIN_FMA,
+        num_warps=num_warps, num_stages=1)
+    return out, res, q, sf
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Finalize fold + pre-norm + MXFP8 with the shared-expert input F known to be the SEG-fold zeros buffer (+0.0 values):
+# (s + f) + (a + r) with f == +0.0 is computed as (s + 0.0) + (a + r) without loading f (identical IEEE result, incl.
+# -0 + +0 = +0). Saves M x H x 2 bytes of reads. Same per-row layout / reduction as _qgf_fin_norm_quant_kernel.
+# ------------------------------------------------------------------------------------------------------------------
+@triton.jit
+def _glue_fin_x_f0(G, WT, IDX, A, R, row, xmask, cols, stride_g, stride_a, stride_r,
+                   TOPK: tl.constexpr, USE_FMA: tl.constexpr, XB: tl.constexpr, BH: tl.constexpr):
+    s = _qgf_fin_gather(G, WT, IDX, row, xmask, cols, stride_g, TOPK, USE_FMA, XB, BH).to(tl.float32)
+    a = tl.load(A + row * stride_a + cols, xmask, eviction_policy='evict_first', other=0.0).to(tl.float32)
+    r = tl.load(R + row * stride_r + cols, xmask, eviction_policy='evict_first', other=0.0).to(tl.float32)
+    return (s + 0.0) + (a + r)
+
+
+@triton.jit(do_not_specialize=["M", "PADDED_M"])
+def _glue_fin_norm_quant_f0_kernel(G, WT, IDX, A, R, W, OUT, RES_OUT, Q, SF_SWZ, M, PADDED_M, eps,
+                                   stride_g, stride_a, stride_r, stride_out, stride_res, stride_q,
+                                   H: tl.constexpr, XBLOCK: tl.constexpr, RB: tl.constexpr, TOPK: tl.constexpr,
+                                   PADDED_SF_COLS: tl.constexpr, USE_FMA: tl.constexpr):
+    """== _qgf_fin_norm_quant_kernel with F == +0.0 (not loaded)."""
+    row = tl.program_id(0).to(tl.int64) * XBLOCK + tl.arange(0, XBLOCK)[:, None]
+    xmask = row < M
+    rbase = tl.arange(0, RB)[None, :]
+    cols0 = rbase
+    cols1 = RB + rbase
+    x0 = _glue_fin_x_f0(G, WT, IDX, A, R, row, xmask, cols0, stride_g, stride_a, stride_r, TOPK, USE_FMA, XBLOCK, RB)
+    x1 = _glue_fin_x_f0(G, WT, IDX, A, R, row, xmask, cols1, stride_g, stride_a, stride_r, TOPK, USE_FMA, XBLOCK, RB)
+    acc = tl.full([XBLOCK, RB], 0, tl.float32)
+    acc = tl.where(xmask, acc + x0 * x0, acc)
+    tl.store(RES_OUT + row * stride_res + cols0, x0.to(tl.bfloat16), xmask)
+    acc = tl.where(xmask, acc + x1 * x1, acc)
+    tl.store(RES_OUT + row * stride_res + cols1, x1.to(tl.bfloat16), xmask)
+    ssum = tl.sum(acc, 1)[:, None]
+    rs = libdevice.rsqrt(ssum / tl.full([1, 1], H, tl.float32) + eps)
+    _qgf_norm_out(x0, rs, row, xmask, cols0, W, OUT, Q, SF_SWZ, PADDED_M, stride_out, stride_q, 0,
+                  XBLOCK, RB, PADDED_SF_COLS)
+    _qgf_norm_out(x1, rs, row, xmask, cols1, W, OUT, Q, SF_SWZ, PADDED_M, stride_out, stride_q, RB,
+                  XBLOCK, RB, PADDED_SF_COLS)
+
+
+def fin_norm_quant_f0(g2, wts, idx, a, r, w, eps, xblock=1, num_warps=4):
+    """fin_norm_quant(g2, wts, idx, f=<+0.0 buffer>, a, r, w, eps) without reading f (bit-identical)."""
+    from vllm.model_executor.layers.fusion import norm_quant_kernels as K
+    M, H = a.shape
+    RB = K.CONFIG["RB"]
+    assert g2.dim() == 2 and M and idx.numel() % M == 0 and wts.numel() == idx.numel() and H == 2 * RB
+    dev = a.device
+    out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+    res = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+    psc = (H // 32 + 3) // 4 * 4
+    pm = (M + 127) // 128 * 128
+    q = torch.empty((M, H), dtype=torch.float8_e4m3fn, device=dev)
+    sf = torch.empty((pm * psc,), dtype=torch.uint8, device=dev)
+    _glue_fin_norm_quant_f0_kernel[(triton.cdiv(pm, xblock),)](
+        g2, wts, idx, a, r, w, out, res, q, sf, M, pm, eps,
+        g2.stride(0), a.stride(0), r.stride(0), out.stride(0), res.stride(0), q.stride(0),
         H=H, XBLOCK=xblock, RB=RB, TOPK=idx.numel() // M, PADDED_SF_COLS=psc, USE_FMA=K.FIN_FMA,
         num_warps=num_warps, num_stages=1)
     return out, res, q, sf
