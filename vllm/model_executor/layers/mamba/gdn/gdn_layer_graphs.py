@@ -86,6 +86,11 @@ FIX_PROFILE = os.environ.get(_P + "_FIX_PROFILE", "1") == "1"
 # behaviour; piece mode always needs NONE). Layer graphs are then captured
 # only inside vLLM's capture phase (never while serving an unpacked step).
 KEEP_PW = os.environ.get(_P + "_KEEP_PIECEWISE", "1") == "1"
+# In-serving check: the first N layer replays of packed steps also run the
+# eager path on the same inputs / state pages (restored in between) and compare
+# outputs, MXFP8 stash buffers and the touched state pages bitwise; a mismatch
+# keeps the eager result and disables the layer graphs.
+_CHECK = [int(os.environ.get(_P + "_CHECK", "0"))]
 MTPW = 4  # 1 + num_speculative_tokens (checked against the metadata)
 
 _GB: dict = {}  # group key (layer names) -> _GroupBufs
@@ -94,6 +99,8 @@ _SHARED: dict = {}  # conv-output buffers, shared by all groups (layers run in o
 _CAP: list = [None, None]  # layer mode: capture stream, private graph pool
 _PHASE = ["real"]
 _IN_CAPTURE = [False]  # inside GPUModelRunner.capture_model (both phases)
+_BYPASS = [False]  # check mode: the eager re-run of a layer
+_OFF = [False]  # disabled after a check mismatch
 _GRAPH = "_step_plan_graph"  # md flag: this step was packed for the graphs
 _ZEROED = "_step_plan_zeroed"  # md flag: fresh slots already zeroed
 _VSF = "_step_plan_vsf"  # md: the step's v_split
@@ -448,6 +455,8 @@ def after_build(builder, md) -> None:
 
 
 def _after_build(builder, md):
+    if _OFF[0]:
+        return
     mod = gdn_step_plan._gdn()
     gsc = gdn_step_plan._gsc()
     if not isinstance(md, mod.GDNAttentionMetadata):
@@ -697,7 +706,9 @@ def forward_packed(layer, mixed_qkvz, ba, core_attn_out) -> bool:
     # piecewise graphs) ----
     fc = get_forward_context()
     if (
-        getattr(fc, "cudagraph_runtime_mode", None) != CUDAGraphMode.PIECEWISE
+        _BYPASS[0]
+        or _OFF[0]
+        or getattr(fc, "cudagraph_runtime_mode", None) != CUDAGraphMode.PIECEWISE
         or torch.cuda.is_current_stream_capturing()
     ):
         return False
@@ -771,9 +782,96 @@ def forward_packed(layer, mixed_qkvz, ba, core_attn_out) -> bool:
         # vLLM's own capture phase (dummy metadata) or a step that was not packed:
         # the regular path
         return False
-    ent[0].replay()
+    if _CHECK[0] > 0:
+        _CHECK[0] -= 1
+        _check(layer, md, mixed_qkvz, ba, core_attn_out, ent[0])
+    else:
+        ent[0].replay()
     STATS["layer_replays"] = STATS.get("layer_replays", 0) + 1
     return True
+
+
+def _pages_u8(layer):
+    """uint8 [n_slots, page] view of the layer's GDN state pages (conv | ssm |
+    deferred-commit log), or None.
+    """
+    conv, ssm = layer.kv_cache[0], layer.kv_cache[1]
+    page = ssm.stride(0) * ssm.element_size()
+    if conv.stride(0) * conv.element_size() != page:
+        return None
+    st = ssm.untyped_storage()
+    off = min(conv.data_ptr(), ssm.data_ptr()) - st.data_ptr()
+    n = min(ssm.size(0), (st.nbytes() - off) // page)
+    v = torch.empty(0, dtype=torch.uint8, device=ssm.device)
+    v.set_(st, off, (n, page), (page, 1))
+    return v
+
+
+def _check(layer, md, mixed_qkvz, ba, core_attn_out, graph):
+    """VLLM_GDN_LAYER_GRAPHS_CHECK: graph replay vs the eager path, bitwise."""
+    from vllm.model_executor.layers.fusion import norm_quant
+
+    T = core_attn_out.size(0)
+    HV = layer.num_v_heads // layer.tp_size
+    qb, sf, psc = norm_quant._gdn_bufs(HV * layer.head_v_dim, core_attn_out.device)
+    pm = (T + 127) // 128 * 128
+    nr, npf = md.num_spec_decodes, md.num_prefills
+    parts = []
+    if nr > 0:
+        parts.append(md.spec_state_indices_tensor[:nr, 0].long())
+    parts.append(md.prefill_state_indices[:npf].long())
+    slots = torch.unique(torch.cat(parts))
+    pages = _pages_u8(layer)
+    bufs = [mixed_qkvz, ba, core_attn_out, qb[:T], sf[: pm * psc]]
+    pre = [t.clone() for t in bufs]
+    pre_pages = pages[slots].clone() if pages is not None else None
+    graph.replay()
+    got = [t.clone() for t in bufs]
+    got_pages = pages[slots].clone() if pages is not None else None
+    for t, x in zip(bufs, pre):
+        t.copy_(x)
+    if pages is not None:
+        pages[slots] = pre_pages
+    _BYPASS[0] = True
+    try:
+        layer._forward_core_fused_norm_packed(mixed_qkvz, ba, core_attn_out)
+    finally:
+        _BYPASS[0] = False
+    bad = []
+    for name, t, g in zip(("qkvz", "ba", "out", "q", "sf"), bufs, got):
+        a8 = t.contiguous().view(torch.uint8)
+        b8 = g.contiguous().view(torch.uint8)
+        if not torch.equal(a8, b8):
+            bad.append(f"{name}:{int((a8 != b8).sum())}")
+    if pages is not None:
+        now = pages[slots]
+        if not torch.equal(now, got_pages):
+            rows = (now != got_pages).any(dim=1).nonzero().flatten()[:4].tolist()
+            bad.append(f"pages:rows{rows}")
+    n = STATS["graph_check"] = STATS.get("graph_check", 0) + 1
+    if bad:
+        STATS["graph_check_fail"] = STATS.get("graph_check_fail", 0) + 1
+        _OFF[0] = True
+        logger.warning(
+            "GDN layer graphs: CHECK MISMATCH %s T=%d S=%d P=%d nseq=%d %s; keeping "
+            "the eager result, layer graphs disabled",
+            layer.prefix,
+            T,
+            md.num_spec_decode_tokens,
+            md.num_prefill_tokens,
+            npf,
+            bad,
+        )
+    elif n in (1, 10, 100, 1000) or _CHECK[0] == 0:
+        logger.info(
+            "GDN layer graphs: check ok #%d (%s T=%d S=%d P=%d nseq=%d)",
+            n,
+            layer.prefix,
+            T,
+            md.num_spec_decode_tokens,
+            md.num_prefill_tokens,
+            npf,
+        )
 
 
 def _capture(layer, gb, mixed_qkvz, ba, core_attn_out, only_vsf=None):
