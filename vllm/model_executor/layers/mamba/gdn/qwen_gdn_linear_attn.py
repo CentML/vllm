@@ -26,6 +26,10 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+    lowm_bf16_gemm_out,
+    maybe_use_lowm_bf16_gemm,
+)
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
@@ -528,10 +532,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        # Decode-size BA GEMM: one kernel instead of cuBLAS split-K + reduce
+        # (SM107 only; no-op elsewhere).
+        ba_lowm = maybe_use_lowm_bf16_gemm(self.in_proj_ba)
         # in_proj_ba only reads the layer input, so it runs on the aux stream
         # concurrently with the in_proj_qkvz GEMM (which leaves SMs idle at
         # decode sizes). Only the plain bf16 GEMM qualifies: the aux stream
-        # then issues the same torch.mm(out=) call Inductor emits for it.
+        # then issues the low-M kernel (when opted in above and M is in its
+        # range) or the same torch.mm(out=) call Inductor emits for it.
         self._ba_stream: torch.cuda.Stream | None = None
         self._ba_stream_max_tokens = envs.VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD
         self._ba_pending = False
@@ -540,7 +548,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self._ba_stream_max_tokens > 0
             and not envs.VLLM_BATCH_INVARIANT
             and type(self.in_proj_ba.quant_method) is UnquantizedLinearMethod
-            and self.in_proj_ba.quant_method._gemm_impl is default_unquantized_gemm
+            and (
+                ba_lowm
+                or self.in_proj_ba.quant_method._gemm_impl is default_unquantized_gemm
+            )
             and self.in_proj_ba.bias is None
         ):
             self._ba_stream = aux_stream()
@@ -761,8 +772,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         torch.ops.vllm.gdn_in_proj_ba_join(ba, hidden_states, mixed_qkvz, layer_name)
         return mixed_qkvz, ba
 
+    def _in_proj_ba_gemm(self, hidden_states: torch.Tensor, ba: torch.Tensor) -> None:
+        if not lowm_bf16_gemm_out(self.in_proj_ba, hidden_states, ba):
+            torch.mm(hidden_states, self.in_proj_ba.weight.t(), out=ba)
+
     def _in_proj_ba_fork(self, hidden_states: torch.Tensor, ba: torch.Tensor) -> None:
-        weight = self.in_proj_ba.weight
         stream = self._ba_stream
         if (
             hidden_states.size(0) > self._ba_stream_max_tokens
@@ -770,14 +784,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             stream = None
         if stream is None:
-            torch.mm(hidden_states, weight.t(), out=ba)
+            self._in_proj_ba_gemm(hidden_states, ba)
             return
         main_stream = torch.cuda.current_stream()
         fork_event, join_event = self._ba_events
         fork_event.record(main_stream)
         with torch.cuda.stream(stream):
             fork_event.wait(stream)
-            torch.mm(hidden_states, weight.t(), out=ba)
+            self._in_proj_ba_gemm(hidden_states, ba)
             join_event.record(stream)
         self._ba_pending = True
 
