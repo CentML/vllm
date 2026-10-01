@@ -12,7 +12,10 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
+    eager_break_during_capture,
+)
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -29,6 +32,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
@@ -52,6 +56,7 @@ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.layers.utils import default_unquantized_gemm
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
@@ -73,6 +78,7 @@ from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
     _resolve_layer_name,
+    aux_stream,
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -522,6 +528,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+        # in_proj_ba only reads the layer input, so it runs on the aux stream
+        # concurrently with the in_proj_qkvz GEMM (which leaves SMs idle at
+        # decode sizes). Only the plain bf16 GEMM qualifies: the aux stream
+        # then issues the same torch.mm(out=) call Inductor emits for it.
+        self._ba_stream: torch.cuda.Stream | None = None
+        self._ba_stream_max_tokens = envs.VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD
+        self._ba_pending = False
+        if (
+            current_platform.is_cuda()
+            and self._ba_stream_max_tokens > 0
+            and not envs.VLLM_BATCH_INVARIANT
+            and type(self.in_proj_ba.quant_method) is UnquantizedLinearMethod
+            and self.in_proj_ba.quant_method._gemm_impl is default_unquantized_gemm
+            and self.in_proj_ba.bias is None
+        ):
+            self._ba_stream = aux_stream()
+            self._ba_events = (torch.cuda.Event(), torch.cuda.Event())
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -714,6 +737,54 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
         return b, a
+
+    def _in_projections(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """in_proj_qkvz and in_proj_ba; in_proj_ba overlaps on the aux stream
+        when enabled.
+        """
+        if self._ba_stream is None:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            return mixed_qkvz, ba
+        layer_name = _encode_layer_name(self.prefix)
+        ba = torch.empty(
+            (hidden_states.size(0), self.in_proj_ba.weight.size(0)),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        torch.ops.vllm.gdn_in_proj_ba_fork(hidden_states, ba, layer_name)
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        # Passing hidden_states and mixed_qkvz keeps the aux-stream input alive
+        # until the join and keeps in_proj_qkvz scheduled between the two ops.
+        torch.ops.vllm.gdn_in_proj_ba_join(ba, hidden_states, mixed_qkvz, layer_name)
+        return mixed_qkvz, ba
+
+    def _in_proj_ba_fork(self, hidden_states: torch.Tensor, ba: torch.Tensor) -> None:
+        weight = self.in_proj_ba.weight
+        stream = self._ba_stream
+        if (
+            hidden_states.size(0) > self._ba_stream_max_tokens
+            or BreakableCUDAGraphCapture.is_active()
+        ):
+            stream = None
+        if stream is None:
+            torch.mm(hidden_states, weight.t(), out=ba)
+            return
+        main_stream = torch.cuda.current_stream()
+        fork_event, join_event = self._ba_events
+        fork_event.record(main_stream)
+        with torch.cuda.stream(stream):
+            fork_event.wait(stream)
+            torch.mm(hidden_states, weight.t(), out=ba)
+            join_event.record(stream)
+        self._ba_pending = True
+
+    def _in_proj_ba_join(self) -> None:
+        if self._ba_pending:
+            self._ba_events[1].wait(torch.cuda.current_stream())
+            self._ba_pending = False
 
     def fix_query_key_value_ordering(
         self,
@@ -987,8 +1058,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._in_projections(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
@@ -2396,6 +2466,48 @@ direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed",
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out", "out_q", "out_scale"],
+)
+
+
+def gdn_in_proj_ba_fork(
+    hidden_states: torch.Tensor,
+    ba: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Writes ``ba = hidden_states @ in_proj_ba.weight.T``, on the aux stream
+    when enabled; ``gdn_in_proj_ba_join`` makes the current stream wait for it.
+    """
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._in_proj_ba_fork(hidden_states, ba)
+
+
+direct_register_custom_op(
+    op_name="gdn_in_proj_ba_fork",
+    op_func=gdn_in_proj_ba_fork,
+    mutates_args=["ba"],
+)
+
+
+def gdn_in_proj_ba_join(
+    ba: torch.Tensor,
+    hidden_states: torch.Tensor,
+    mixed_qkvz: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Current stream waits for ``gdn_in_proj_ba_fork``'s aux-stream GEMM.
+    ``ba`` is declared mutated to order its readers after the join;
+    ``hidden_states`` and ``mixed_qkvz`` are only dependencies.
+    """
+    layer_name = _resolve_layer_name(layer_name)
+    self = get_forward_context().no_compile_layers[layer_name]
+    self._in_proj_ba_join()
+
+
+direct_register_custom_op(
+    op_name="gdn_in_proj_ba_join",
+    op_func=gdn_in_proj_ba_join,
+    mutates_args=["ba"],
 )
 
 

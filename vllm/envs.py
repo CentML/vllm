@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD: int = 8192
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1213,6 +1214,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["cuda", "triton"],
         case_sensitive=False,
+    ),
+    # Run the GDN in_proj_ba GEMM on the aux CUDA stream, overlapped with
+    # in_proj_qkvz, for batches of at most this many tokens; 0 disables.
+    "VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD", "8192")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
