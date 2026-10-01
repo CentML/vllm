@@ -208,12 +208,22 @@ def _rows(num_reqs: int, rows: int = STEPS + 1) -> list[int]:
     return [rows] * num_reqs
 
 
+def _request_logits(rows_per_req: list[int], vocab_size: int, scale: float):
+    """bf16 logits whose rows within a request are close, as for consecutive
+    positions: the drafts (top tokens of the previous row) are then also top
+    tokens of the later rows, where the draft-prefix penalties hit them.
+    """
+    base = torch.randn(len(rows_per_req), vocab_size, device=DEVICE) * scale
+    base = base.repeat_interleave(torch.tensor(rows_per_req, device=DEVICE), dim=0)
+    return (base + 0.3 * torch.randn_like(base)).bfloat16()
+
+
 @pytest.mark.parametrize("vocab_size", [248320, 50000, 3000])
 @pytest.mark.parametrize("penalties", [False, True])
 def test_survivors_bitwise_unfused(vocab_size: int, penalties: bool):
     torch.manual_seed(0)
     num_reqs = 12
-    logits = (torch.randn(num_reqs * 4, vocab_size, device=DEVICE) * 3).bfloat16()
+    logits = _request_logits(_rows(num_reqs), vocab_size, 3.0)
     b = _make_batch(
         logits,
         _rows(num_reqs),
@@ -304,9 +314,7 @@ def test_rejection_matches_unfused(penalties: bool):
     # drafts (2 rows), one chunked-prefill request; greedy and sampled rows.
     rows_per_req = [4, 4, 1, 4, 2, 4, 1, 4] * 6
     num_reqs = len(rows_per_req)
-    logits = (
-        torch.randn(sum(rows_per_req), vocab_size, device=DEVICE) * 2.5
-    ).bfloat16()
+    logits = _request_logits(rows_per_req, vocab_size, 2.5)
     chunked = [r == 2 for r in range(num_reqs)]
     totals = {"accepted": 0, "steps": 0, "bonus": 0}
     for trial in range(4):
