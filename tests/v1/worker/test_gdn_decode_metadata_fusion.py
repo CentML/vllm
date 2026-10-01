@@ -70,6 +70,13 @@ SPEC_STEPS = [
     Step([_decode(3, 70), _decode(1, 64), _decode(2, 5), _decode(3, 129)], 4, False),
     # Chunked prefill tail after spec decodes: build()'s own path.
     Step([_decode(3, 90), _decode(3, 91), (7, 0, 200, True)], 3, False),
+    # Two chunked prefills after spec decodes: one shared mixed build.
+    Step(
+        [_decode(3, 90), _decode(3, 40), (7, 0, 200, True), (5, 0, 64, True)], 4, False
+    ),
+    # A prefill row first: the spec and non-spec tokens still form two blocks,
+    # in the other order.
+    Step([(6, 0, 120, True), _decode(3, 70), _decode(3, 71)], 3, False),
     # A non-spec decode among spec decodes is reclassified as a prefill.
     Step([_decode(3, 48), (1, 0, 49, False), _decode(2, 50)], 3, False),
     # Spec decode after the mixed steps, with padding again.

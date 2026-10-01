@@ -126,6 +126,10 @@ class GDNSharedBuild:
     num_accepted_tokens: torch.Tensor | None
     spec_token_start: int | None
     non_spec_token_start: int | None
+    # Set when the batch has spec rows: device row indices of the spec requests
+    # and (with prefills or decodes) of all other rows.
+    spec_rows: torch.Tensor | None = None
+    non_spec_rows: torch.Tensor | None = None
     # Set when num_prefills > 0.
     # First non-spec row of the prefill block (decodes peeled off in front).
     prefill_row_start: int = 0
@@ -410,15 +414,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
         else:
-            # Filter by spec_sequence_masks to exclude padded sequences
+            # Rows of the spec / non-spec requests (padded sequences excluded),
+            # as device indices shared by every group.
+            assert shared.spec_rows is not None
             spec_state_indices_tensor = block_table_tensor[
-                spec_sequence_masks_cpu, : self.num_spec + 1
+                shared.spec_rows, : self.num_spec + 1
             ]
             if num_prefills == 0 and num_decodes == 0:
                 non_spec_state_indices_tensor = None
             else:
+                assert shared.non_spec_rows is not None
                 non_spec_state_indices_tensor = block_table_tensor[
-                    split.non_spec_sequence_masks_cpu, 0
+                    shared.non_spec_rows, 0
                 ]
 
         prefill_state_indices: torch.Tensor | None = None
@@ -577,6 +584,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens_cpu = split.query_lens_cpu
             assert non_spec_sequence_masks_cpu is not None
             assert query_lens_cpu is not None
+            # Request rows of the spec / non-spec masks as device indices, so
+            # neither this build nor the per-group state-index gathers index
+            # device tensors with a CPU mask (a host nonzero + copy each).
+            spec_rows_cpu = spec_sequence_masks_cpu.nonzero().squeeze(1)
+            spec_rows: torch.Tensor
+            non_spec_rows: torch.Tensor | None = None
+            if num_prefills == 0 and num_decodes == 0:
+                spec_rows = async_tensor_h2d(
+                    spec_rows_cpu, device=query_start_loc.device
+                )
+            else:
+                rows = async_tensor_h2d(
+                    torch.cat(
+                        [
+                            spec_rows_cpu,
+                            non_spec_sequence_masks_cpu.nonzero().squeeze(1),
+                        ]
+                    ),
+                    device=query_start_loc.device,
+                )
+                spec_rows = rows[:num_spec_decodes]
+                non_spec_rows = rows[num_spec_decodes:]
 
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = self._spec_token_size(split, m)
@@ -622,7 +651,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[spec_sequence_masks_cpu],
+                    query_lens[spec_rows],
                     dim=0,
                     out=spec_query_start_loc[1:],
                 )
@@ -631,8 +660,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
+                assert non_spec_rows is not None
                 torch.cumsum(
-                    query_lens[non_spec_sequence_masks_cpu],
+                    query_lens[non_spec_rows],
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )
@@ -647,7 +677,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            num_accepted_tokens = num_accepted_tokens[spec_rows]
 
         shared = GDNSharedBuild(
             spec_sequence_masks=spec_sequence_masks,
@@ -659,6 +689,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_start=spec_token_start,
             non_spec_token_start=non_spec_token_start,
         )
+        if spec_sequence_masks_cpu is not None:
+            shared.spec_rows = spec_rows
+            shared.non_spec_rows = non_spec_rows
         if num_prefills == 0:
             return shared
 
@@ -689,7 +722,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         context_lens_tensor = m.compute_num_computed_tokens()
         has_initial_state = context_lens_tensor > 0
         if spec_sequence_masks_cpu is not None:
-            has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+            has_initial_state = has_initial_state[non_spec_rows]
         shared.has_initial_state = has_initial_state
         shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
             compute_causal_conv1d_metadata(
