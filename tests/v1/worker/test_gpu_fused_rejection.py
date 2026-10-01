@@ -333,3 +333,60 @@ def test_rejection_matches_unfused(penalties: bool):
     # The batch must exercise acceptance, rejection and the bonus token.
     assert 0 < totals["accepted"] < totals["steps"]
     assert totals["bonus"] > 0
+
+
+def _sampler_stub(num_reqs: int, vocab_size: int = 1000):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    def arr(fill, dtype):
+        return SimpleNamespace(np=np.full(num_reqs, fill, dtype=dtype))
+
+    s = object.__new__(Sampler)
+    s.sampling_states = SimpleNamespace(
+        top_k=arr(20, np.int32), top_p=arr(0.95, np.float32), min_p=arr(0, np.float32)
+    )
+    s.logit_bias_state = SimpleNamespace(use_logit_bias=np.zeros(num_reqs, bool))
+    s.bad_words_state = SimpleNamespace(num_bad_words=arr(0, np.int32))
+    s.thinking_budget_state = SimpleNamespace(
+        enabled=False, use_thinking_budget=np.zeros(num_reqs, bool)
+    )
+    s.penalties_state = SimpleNamespace(use_penalty=np.zeros(num_reqs, bool))
+    return s, vocab_size
+
+
+def test_fused_dispatch_predicate():
+    import numpy as np
+
+    batch = np.array([0, 2])
+    s, vocab_size = _sampler_stub(4)
+    s.sampling_states.top_p.np[:] = 1.0
+    assert s.fused_spec_sampling_params(batch) == (20, False, False)
+    s.penalties_state.use_penalty[2] = True
+    s.sampling_states.top_p.np[0] = 0.9
+    s.sampling_states.top_k.np[2] = 64
+    assert s.fused_spec_sampling_params(batch) == (64, True, True)
+    # Requests outside the batch do not matter.
+    s.sampling_states.top_k.np[1] = vocab_size
+    s.sampling_states.min_p.np[3] = 0.1
+    assert s.fused_spec_sampling_params(batch) is not None
+    # Anything the fused kernels do not implement keeps the unfused path.
+    for case in ("no_top_k", "top_k_65", "min_p", "logit_bias", "bad_words", "think"):
+        s, _ = _sampler_stub(4)
+        if case == "no_top_k":
+            s.sampling_states.top_k.np[2] = vocab_size
+        elif case == "top_k_65":
+            s.sampling_states.top_k.np[0] = 65
+        elif case == "min_p":
+            s.sampling_states.min_p.np[0] = 0.05
+        elif case == "logit_bias":
+            s.logit_bias_state.use_logit_bias[2] = True
+        elif case == "bad_words":
+            s.bad_words_state.num_bad_words.np[0] = 1
+        else:
+            s.thinking_budget_state.enabled = True
+            s.thinking_budget_state.use_thinking_budget[2] = True
+        assert s.fused_spec_sampling_params(batch) is None, case
