@@ -126,10 +126,10 @@ class GDNSharedBuild:
     num_accepted_tokens: torch.Tensor | None
     spec_token_start: int | None
     non_spec_token_start: int | None
-    # Set when the batch has spec rows: device row indices of the spec requests
-    # and (with prefills or decodes) of all other rows.
-    spec_rows: torch.Tensor | None = None
-    non_spec_rows: torch.Tensor | None = None
+    # Set when the batch has spec rows: the rows of the spec requests and (with
+    # prefills or decodes) of all other rows, as a slice or device indices.
+    spec_rows: torch.Tensor | slice | None = None
+    non_spec_rows: torch.Tensor | slice | None = None
     # Set when num_prefills > 0.
     # First non-spec row of the prefill block (decodes peeled off in front).
     prefill_row_start: int = 0
@@ -235,7 +235,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc: torch.Tensor,
         prefill_query_start_loc_cpu: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if self.gdn_prefill_backend == "flashinfer":
+            # ChunkGatedDeltaRule.forward_cuda (FlashInfer) takes cu_seqlens
+            # only; the FLA chunk indices would be computed and uploaded unused.
+            return None, None
         from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 
         if self.gdn_prefill_backend == "cutedsl":
@@ -414,19 +418,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
         else:
-            # Rows of the spec / non-spec requests (padded sequences excluded),
-            # as device indices shared by every group.
+            # Spec / non-spec rows shared by every group: a slice when the spec
+            # rows lead the batch, else device indices. contiguous() makes the
+            # slice case match the (contiguous) gather result.
             assert shared.spec_rows is not None
             spec_state_indices_tensor = block_table_tensor[
                 shared.spec_rows, : self.num_spec + 1
-            ]
+            ].contiguous()
             if num_prefills == 0 and num_decodes == 0:
                 non_spec_state_indices_tensor = None
             else:
                 assert shared.non_spec_rows is not None
                 non_spec_state_indices_tensor = block_table_tensor[
                     shared.non_spec_rows, 0
-                ]
+                ].contiguous()
 
         prefill_state_indices: torch.Tensor | None = None
         prefill_state_indices_i64: torch.Tensor | None = None
@@ -579,26 +584,32 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks = async_tensor_h2d(
                 spec_sequence_masks_cpu, device=query_start_loc.device
             )
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
             non_spec_sequence_masks_cpu = split.non_spec_sequence_masks_cpu
             query_lens_cpu = split.query_lens_cpu
             assert non_spec_sequence_masks_cpu is not None
             assert query_lens_cpu is not None
-            # Request rows of the spec / non-spec masks as device indices, so
-            # neither this build nor the per-group state-index gathers index
-            # device tensors with a CPU mask (a host nonzero + copy each).
-            spec_rows_cpu = spec_sequence_masks_cpu.nonzero().squeeze(1)
-            spec_rows: torch.Tensor
-            non_spec_rows: torch.Tensor | None = None
-            if num_prefills == 0 and num_decodes == 0:
+            # Rows of the spec / non-spec requests. The V2 runner orders the
+            # draft carriers first, so the spec rows normally lead the batch
+            # and are a slice; otherwise they are uploaded once as device
+            # indices. Either way no device tensor is indexed with a CPU mask
+            # (a host nonzero and copy each), here or in the per-group gathers.
+            spec_rows_lead = bool(spec_sequence_masks_cpu[:num_spec_decodes].all())
+            spec_rows: torch.Tensor | slice
+            non_spec_rows: torch.Tensor | slice | None = None
+            if spec_rows_lead:
+                spec_rows = slice(0, num_spec_decodes)
+                if num_prefills > 0 or num_decodes > 0:
+                    non_spec_rows = slice(num_spec_decodes, None)
+            elif num_prefills == 0 and num_decodes == 0:
                 spec_rows = async_tensor_h2d(
-                    spec_rows_cpu, device=query_start_loc.device
+                    spec_sequence_masks_cpu.nonzero().squeeze(1),
+                    device=query_start_loc.device,
                 )
             else:
                 rows = async_tensor_h2d(
                     torch.cat(
                         [
-                            spec_rows_cpu,
+                            spec_sequence_masks_cpu.nonzero().squeeze(1),
                             non_spec_sequence_masks_cpu.nonzero().squeeze(1),
                         ]
                     ),
@@ -623,7 +634,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
+            elif spec_rows_lead:
+                # Spec tokens first, then the non-spec ones: what the stable
+                # argsort below returns for this layout, without the sort.
+                num_tokens = num_spec_decode_tokens + num_prefill_tokens
+                num_tokens += num_decode_tokens
+                index = torch.arange(
+                    num_tokens, dtype=torch.int64, device=query_start_loc.device
+                )
+                spec_token_indx = index[:num_spec_decode_tokens]
+                non_spec_token_indx = index[num_spec_decode_tokens:]
+                spec_token_start = 0
+                non_spec_token_start = num_spec_decode_tokens
+                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                non_spec_query_start_loc = (
+                    query_start_loc[num_spec_decodes:]
+                    - query_start_loc[num_spec_decodes]
+                )
             else:
+                query_lens = query_start_loc[1:] - query_start_loc[:-1]
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
                     query_lens,
@@ -635,9 +664,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 # Spec and non-spec tokens are two contiguous blocks iff the
-                # spec mask of the non-empty requests flips exactly once. The
-                # V2 runner orders draft carriers first, so this normally
-                # holds. CPU-only; otherwise the forward keeps the index path.
+                # spec mask of the non-empty requests flips exactly once.
+                # CPU-only; otherwise the forward keeps the index path.
                 active_spec_mask = spec_sequence_masks_cpu[query_lens_cpu > 0]
                 num_flips = (active_spec_mask[1:] != active_spec_mask[:-1]).sum()
                 if num_flips.item() == 1:
@@ -666,6 +694,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )
+            if num_prefills > 0 or num_decodes > 0:
                 non_spec_query_start_loc_cpu = torch.zeros(
                     query_lens_cpu.size(0) - num_spec_decodes + 1,
                     dtype=torch.int32,
