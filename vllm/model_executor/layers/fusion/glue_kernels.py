@@ -150,7 +150,7 @@ def norm_quant_rr(a, r, w, eps, s=None, f=None, emit_q=True, emit_swz=True, emit
 @triton.jit
 def _glue_gate_mul_quant_kernel(A, G, OUT, Q, SF_SWZ, M, PADDED_M, stride_a, stride_g, stride_o, stride_q,
                                 N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, GATE_D: tl.constexpr,
-                                PADDED_SF_COLS: tl.constexpr):
+                                PADDED_SF_COLS: tl.constexpr, STORE_OUT: tl.constexpr = True):
     """== _nqf_gate_mul_quant_kernel (out = bf16(f32(attn) * tl.sigmoid(f32(gate))) + MXFP8), XB rows per program,
     every chunk's loads issued before the first store. GATE_D > 0: gate read from the interleaved QKV rows."""
     row = tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
@@ -163,11 +163,12 @@ def _glue_gate_mul_quant_kernel(A, G, OUT, Q, SF_SWZ, M, PADDED_M, stride_a, str
         gcols = cols
     g = tl.load(G + row * stride_g + gcols, rmask, other=0.0).to(tl.float32)
     yb = (a * tl.sigmoid(g)).to(tl.bfloat16)
-    tl.store(OUT + row * stride_o + cols, yb, rmask)
+    if STORE_OUT:
+        tl.store(OUT + row * stride_o + cols, yb, rmask)
     _mx_epilogue(yb, row, cols, rmask, row < PADDED_M, Q, SF_SWZ, stride_q, 0, XB, N, PADDED_SF_COLS)
 
 
-def gate_mul_quant_rr(a, g, gate_d=0, xb=1, num_warps=8):
+def gate_mul_quant_rr(a, g, gate_d=0, xb=1, num_warps=8, store_out=True, out=None):
     """Drop-in for norm_quant_kernels.gate_mul_quant. g: [M, N] contiguous-last-dim gate (gate_d=0), or the
     interleaved [M, >= 2N] QKV projection rows with per-head [q (gate_d) | gate (gate_d)] (gate_d = head dim)."""
     M, N = a.shape
@@ -175,14 +176,59 @@ def gate_mul_quant_rr(a, g, gate_d=0, xb=1, num_warps=8):
     nsf = N // 32
     psc = (nsf + 3) // 4 * 4
     pm = (M + 127) // 128 * 128
-    out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
+    if out is None:
+        out = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
     q = torch.empty((M, N), dtype=torch.float8_e4m3fn, device=a.device)
     sf = torch.empty((pm * psc,), dtype=torch.uint8, device=a.device)
     if pm:
         _glue_gate_mul_quant_kernel[(triton.cdiv(pm, xb),)](
             a, g, out, q, sf, M, pm, a.stride(0), g.stride(0), out.stride(0), q.stride(0),
-            N=N, BN=N, XB=xb, GATE_D=gate_d, PADDED_SF_COLS=psc, num_warps=num_warps)
+            N=N, BN=N, XB=xb, GATE_D=gate_d, PADDED_SF_COLS=psc, STORE_OUT=store_out, num_warps=num_warps)
     return out, q, sf
+
+
+# == norm_quant_kernels._nqf_gdn_gated_rmsnorm_quant_kernel (verbatim math) + STORE_Y (0: the bf16 gated-norm output
+# is not written back; out_proj consumes the stashed fp8 / scales) and a launch config parameter (BT rows x num_warps)
+@triton.jit(do_not_specialize=["T", "ROW0"])
+def _glue_gdn_gated_rmsnorm_quant_kernel(x_ptr, z_ptr, w_ptr, y_ptr, Q, SF_SWZ, T, ROW0, stride_z_tok, stride_q, eps,
+                                         HV: tl.constexpr, D: tl.constexpr, BT: tl.constexpr,
+                                         SIGMOID_GATE: tl.constexpr, PADDED_SF_COLS: tl.constexpr,
+                                         STORE_Y: tl.constexpr):
+    i_t = tl.program_id(0)
+    i_h = tl.program_id(1)
+    offs_t = i_t * BT + tl.arange(0, BT)
+    offs_d = tl.arange(0, D)
+    mask = (offs_t < T)[:, None]
+    row = offs_t.to(tl.int64)[:, None]
+    xo = row * (HV * D) + i_h * D + offs_d[None, :]
+    x = tl.load(x_ptr + xo, mask=mask, other=0.0).to(tl.float32)
+    z = tl.load(z_ptr + row * stride_z_tok + i_h * D + offs_d[None, :], mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs_d).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / D
+    rstd = tl.rsqrt(var + eps)
+    y = x * rstd[:, None] * w[None, :]
+    if SIGMOID_GATE:
+        y = y * tl.sigmoid(z)
+    else:
+        y = y * (z * tl.sigmoid(z))
+    yb = y.to(y_ptr.dtype.element_ty)
+    if STORE_Y:
+        tl.store(y_ptr + xo, yb, mask=mask)
+    grow = row + ROW0
+    _mx_epilogue(yb, grow, i_h * D + offs_d[None, :], mask, mask, Q, SF_SWZ, stride_q, i_h * (D // 32), BT, D, PADDED_SF_COLS)
+
+
+def gdn_gated_rmsnorm_quant_(x, z, weight, eps, activation, q, sf, row0, padded_sf_cols, bt=16, num_warps=4,
+                             store_y=True):
+    """norm_quant_kernels.gdn_gated_rmsnorm_quant_ with a launch config and an optional bf16 write-back."""
+    T, HV, D = x.shape
+    if T == 0:
+        return
+    assert x.is_contiguous() and z.stride(2) == 1 and z.stride(1) == D
+    _glue_gdn_gated_rmsnorm_quant_kernel[(triton.cdiv(T, bt), HV)](
+        x, z, weight, x, q, sf, T, row0, z.stride(0), q.stride(0), eps,
+        HV=HV, D=D, BT=bt, SIGMOID_GATE=(activation == "sigmoid"), PADDED_SF_COLS=padded_sf_cols, STORE_Y=store_y,
+        num_warps=num_warps)
 
 
 # ------------------------------------------------------------------------------------------------------------------

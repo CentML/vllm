@@ -82,6 +82,13 @@ GLUE_GMRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_GMRR_CFG", "1,8").spl
 GLUE_NQRR_CFG = tuple(int(x) for x in os.environ.get("GLUE_NQRR_CFG", "1,4").split(","))
 # GLUE_FNQ_XB=1: fused finalize + pre-norm + MXFP8 with 1 row x 4 warps per program (same kernel, same per-row layout)
 GLUE_FNQ_XB = int(os.environ.get("GLUE_FNQ_XB", "0"))
+# GLUE_LAZY=1: the o_proj gate-mul and the GDN gated RMSNorm do not write their bf16 output (only the fp8 data +
+# scales the next linear reads from the stash). A consumer that misses the stash on such a tensor first materializes
+# the bf16 values (same kernel, store on), counts lazy_miss and logs a warning; GLUE_LAZY_CHECK=1 raises instead.
+GLUE_LAZY = os.environ.get("GLUE_LAZY", "0") == "1"
+GLUE_LAZY_CHECK = os.environ.get("GLUE_LAZY_CHECK", "0") == "1"
+# GLUE_GG_CFG=bt,warps: GDN gated RMSNorm + MXFP8 launch config via glue_kernels (0,0 = port kernel)
+GLUE_GG_CFG = tuple(int(x) for x in os.environ.get("GLUE_GG_CFG", "0,0").split(","))
 QGF_GDNM = EMIT and os.environ.get("QGF_GDNM", "0") == "1"
 QGF_FIN_MAXM = int(os.environ.get("VLLM_MOE_FINALIZE_FOLD_MAX_M", "1024"))
 QGF_FIN = EMIT and os.environ.get("QGF_FIN", "0") == "1"
@@ -142,12 +149,34 @@ def lookup(x, is_sf_swizzled_layout, alignment):
     return _STASH["q"], sf.view(x.size(0), -1)
 
 
+_LAZY: dict = {}  # gb300 glue: stash key of a lazily produced bf16 tensor -> fn that writes its values
+
+
+def _lazy_set(t, fn) -> None:
+    _LAZY[_key(t)] = fn
+    while len(_LAZY) > 8:  # never expected (every lazy tensor is consumed by the next linear)
+        _LAZY.pop(next(iter(_LAZY)))
+
+
 def consume_stash(x, is_sf_swizzled_layout=False, alignment=0):
     """Called first by the vllm.mxfp8_quantize implementation when NQF=1:
     the pre-computed (fp8, scales) of x, or None (then the stock quant runs)."""
     hit = lookup(x, is_sf_swizzled_layout, alignment)
     if hit is None:
         STATS["miss"] += 1
+        if _LAZY and isinstance(x, torch.Tensor):
+            fn = _LAZY.pop(_key(x), None)
+            if fn is not None:
+                STATS["lazy_miss"] = STATS.get("lazy_miss", 0) + 1
+                if GLUE_LAZY_CHECK:
+                    raise RuntimeError("[glue] stash miss on a lazily produced bf16 tensor (GLUE_LAZY_CHECK=1)")
+                logger.warning(
+                    "[glue] stash miss on a lazily produced bf16 tensor: materializing it (lazy_miss=%d)",
+                    STATS["lazy_miss"],
+                )
+                fn()
+    elif _LAZY:
+        _LAZY.pop(_key(x), None)
     return hit
 
 
@@ -254,7 +283,13 @@ def _gate_mul_mxfp8(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         from vllm.model_executor.layers.fusion import glue_kernels as G
 
         STATS["glue_gmrr"] = STATS.get("glue_gmrr", 0) + 1
-        out, q, sf = G.gate_mul_quant_rr(a, g, 0, GLUE_GMRR_CFG[0], GLUE_GMRR_CFG[1])
+        xb, nw = GLUE_GMRR_CFG
+        out, q, sf = G.gate_mul_quant_rr(a, g, 0, xb, nw, store_out=not GLUE_LAZY)
+        if GLUE_LAZY:
+            _stash_set(out, q, sf, None)
+            _lazy_set(out, lambda: G.gate_mul_quant_rr(a, g, 0, xb, nw, out=out))
+            STATS["gate"] = STATS.get("gate", 0) + 1
+            return out
     else:
         out, q, sf = K.gate_mul_quant(a, g)
     _stash_set(out, q, sf, None)
@@ -271,8 +306,11 @@ def _gate_mul_mxfp8_qkv(a: torch.Tensor, g: torch.Tensor, head_dim: int) -> torc
     row stride of the QKV projection output): gate column c = g[:, (c // D) * 2D + D + c % D]."""
     from vllm.model_executor.layers.fusion import glue_kernels as G
 
-    out, q, sf = G.gate_mul_quant_rr(a, g, head_dim, GLUE_GMRR_CFG[0], GLUE_GMRR_CFG[1])
+    xb, nw = GLUE_GMRR_CFG
+    out, q, sf = G.gate_mul_quant_rr(a, g, head_dim, xb, nw, store_out=not GLUE_LAZY)
     _stash_set(out, q, sf, None)
+    if GLUE_LAZY:
+        _lazy_set(out, lambda: G.gate_mul_quant_rr(a, g, head_dim, xb, nw, out=out))
     STATS["gate_qkv"] = STATS.get("gate_qkv", 0) + 1
     return out
 
@@ -558,9 +596,25 @@ def gdn_gated_rmsnorm_into_target(x, z, weight, eps, activation) -> bool:
         rb = t["K"] * x.element_size()
         if off % rb == 0 and z.stride(2) == 1 and z.stride(1) == x.shape[2]:
             r0 = off // rb
-            K.gdn_gated_rmsnorm_quant_(
-                x, z, weight, eps, activation, t["q"], t["sf"], r0, t["psc"]
-            )
+            if GLUE_GG_CFG[0] > 0 or GLUE_LAZY:
+                from vllm.model_executor.layers.fusion import glue_kernels as G
+
+                bt, nw = GLUE_GG_CFG if GLUE_GG_CFG[0] > 0 else (16, 4)
+                G.gdn_gated_rmsnorm_quant_(
+                    x, z, weight, eps, activation, t["q"], t["sf"], r0, t["psc"], bt, nw,
+                    store_y=not GLUE_LAZY,
+                )
+                if GLUE_LAZY:
+                    q_, sf_, psc_ = t["q"], t["sf"], t["psc"]
+                    t["lazy"].append(
+                        lambda: G.gdn_gated_rmsnorm_quant_(
+                            x, z, weight, eps, activation, q_, sf_, r0, psc_, bt, nw
+                        )
+                    )
+            else:
+                K.gdn_gated_rmsnorm_quant_(
+                    x, z, weight, eps, activation, t["q"], t["sf"], r0, t["psc"]
+                )
             t["covered"].append((r0, r0 + x.shape[0]))
             return True
     return False
@@ -652,6 +706,7 @@ def gdn_forward_core_fused_norm_packed(
         "psc": psc,
         "covered": [],
         "T": T,  # gb300 glue: rows of core_attn_out (GLUE_GSC_QO target check)
+        "lazy": [],  # gb300 glue (GLUE_LAZY): recompute fns of the gated-norm row ranges not written back
         "qo": False,  # set by the gdn_state_commit decode when it wrote q / sf of every row
     }
     _GDN_TGT[0] = t
@@ -693,6 +748,9 @@ def gdn_forward_core_fused_norm_packed(
             x2, q, sf, gdn_uncovered_row_ranges(t["covered"], pm), T, psc
         )
     _stash_set(x2, q[:T], sf[: pm * psc], None)
+    if t["lazy"]:
+        fns = t["lazy"]
+        _lazy_set(x2, lambda: [f() for f in fns])
     STATS["gdn"] = STATS.get("gdn", 0) + 1
     STATS["gdn_fused_rows"] = STATS.get("gdn_fused_rows", 0) + sum(
         b - a for a, b in t["covered"]
@@ -706,17 +764,20 @@ def compile_hash_factors() -> list[str]:
     return [
         f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
         f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
-        f"glue-v2-nqrr{int(GLUE_NQRR)}{GLUE_NQRR_CFG}-gmrr{int(GLUE_GMRR)}{GLUE_GMRR_CFG}-fnq{GLUE_FNQ_XB}",
+        f"glue-v3-nqrr{int(GLUE_NQRR)}{GLUE_NQRR_CFG}-gmrr{int(GLUE_GMRR)}{GLUE_GMRR_CFG}-fnq{GLUE_FNQ_XB}"
+        f"-lazy{int(GLUE_LAZY)}-gg{GLUE_GG_CFG}",
     ]
 
 
 if NQF:
     register_ops()
     logger.info("norm_quant_fusion enabled (emit=%s)", EMIT)
-    if GLUE_NQRR or GLUE_GMRR or GLUE_FNQ_XB:
+    if GLUE_NQRR or GLUE_GMRR or GLUE_FNQ_XB or GLUE_LAZY or GLUE_GG_CFG[0]:
         logger.info(
-            "[glue] norm_quant_rr=%s cfg=%s gate_mul_rr=%s cfg=%s fin_norm_quant rows/program=%s",
-            GLUE_NQRR, GLUE_NQRR_CFG, GLUE_GMRR, GLUE_GMRR_CFG, GLUE_FNQ_XB,
+            "[glue] norm_quant_rr=%s cfg=%s gate_mul_rr=%s cfg=%s fin_norm_quant rows/program=%s lazy=%s "
+            "(check=%s) gdn gated cfg=%s",
+            GLUE_NQRR, GLUE_NQRR_CFG, GLUE_GMRR, GLUE_GMRR_CFG, GLUE_FNQ_XB, GLUE_LAZY, GLUE_LAZY_CHECK,
+            GLUE_GG_CFG,
         )
     if QGF_FIN:
         logger.info("norm_quant_fusion: MoE finalize fold enabled (QGF_FIN)")
