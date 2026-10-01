@@ -110,6 +110,37 @@ class GDNBatchSplit:
     query_lens_cpu: torch.Tensor | None = None
 
 
+@dataclass
+class GDNSharedBuild:
+    """The block-table-independent part of GDNAttentionMetadataBuilder.build()
+    for one batch, shared by the GDN builders of a GDNFusedDecodeStep. Every
+    tensor is read-only in the forward, as it already is across the layers of
+    one KV-cache group.
+    """
+
+    spec_sequence_masks: torch.Tensor | None
+    spec_token_indx: torch.Tensor | None
+    non_spec_token_indx: torch.Tensor | None
+    spec_query_start_loc: torch.Tensor | None
+    non_spec_query_start_loc: torch.Tensor | None
+    num_accepted_tokens: torch.Tensor | None
+    spec_token_start: int | None
+    non_spec_token_start: int | None
+    # Set when num_prefills > 0.
+    # First non-spec row of the prefill block (decodes peeled off in front).
+    prefill_row_start: int = 0
+    prefill_query_start_loc: torch.Tensor | None = None
+    chunk_indices: torch.Tensor | None = None
+    chunk_offsets: torch.Tensor | None = None
+    has_initial_state: torch.Tensor | None = None
+    prefill_has_initial_state: torch.Tensor | None = None
+    prefill_no_initial_state: torch.Tensor | None = None
+    prefill_query_start_loc_i64: torch.Tensor | None = None
+    nums_dict: dict | None = None
+    batch_ptr: torch.Tensor | None = None
+    token_chunk_offset_ptr: torch.Tensor | None = None
+
+
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -357,190 +388,56 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 return self._decode_buffers_metadata(split, m)
             num_accepted_tokens = fused_decode.num_accepted_tokens()
 
-        query_start_loc = m.query_start_loc
-        query_start_loc_cpu = m.query_start_loc_cpu
-        nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        shared = None if fused_decode is None else fused_decode.shared_build
+        if shared is None:
+            shared = self._build_shared(split, m, num_accepted_tokens)
+            if fused_decode is not None:
+                fused_decode.shared_build = shared
+
+        num_decodes = split.num_decodes
+        num_prefills = split.num_prefills
+        num_spec_decodes = split.num_spec_decodes
+        spec_sequence_masks_cpu = split.spec_sequence_masks_cpu
+        # The state indices are the only metadata read from this group's block
+        # table; everything else is in the shared part.
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-
-        spec_token_start: int | None = None
-        non_spec_token_start: int | None = None
-        num_decodes = split.num_decodes
-        num_decode_tokens = split.num_decode_tokens
-        num_prefills = split.num_prefills
-        num_prefill_tokens = split.num_prefill_tokens
-        num_spec_decodes = split.num_spec_decodes
-        num_spec_decode_tokens = split.num_spec_decode_tokens
-        spec_sequence_masks_cpu = split.spec_sequence_masks_cpu
         if spec_sequence_masks_cpu is None:
-            spec_sequence_masks = None
-            spec_token_indx = None
-            non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
-            spec_query_start_loc = None
-            non_spec_query_start_loc = query_start_loc
-            non_spec_query_start_loc_cpu = query_start_loc_cpu
-            num_accepted_tokens = None
         else:
-            spec_sequence_masks = async_tensor_h2d(
-                spec_sequence_masks_cpu, device=query_start_loc.device
-            )
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
-            non_spec_sequence_masks_cpu = split.non_spec_sequence_masks_cpu
-            query_lens_cpu = split.query_lens_cpu
-            assert non_spec_sequence_masks_cpu is not None
-            assert query_lens_cpu is not None
-
+            # Filter by spec_sequence_masks to exclude padded sequences
+            spec_state_indices_tensor = block_table_tensor[
+                spec_sequence_masks_cpu, : self.num_spec + 1
+            ]
             if num_prefills == 0 and num_decodes == 0:
-                spec_token_size = self._spec_token_size(split, m)
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
-                # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
                 non_spec_state_indices_tensor = None
-                # Padded sequences are always at the back, so the first
-                # num_spec_decodes + 1 entries of query_start_loc already
-                # contain the correct cumulative token counts.
-                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
-                non_spec_query_start_loc = None
-                non_spec_query_start_loc_cpu = None
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
-                )
-                index = torch.argsort(spec_token_masks, stable=True)
-                num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-                non_spec_token_indx = index[:num_non_spec_tokens]
-                spec_token_indx = index[num_non_spec_tokens:]
-
-                # Spec and non-spec tokens are two contiguous blocks iff the
-                # spec mask of the non-empty requests flips exactly once. The
-                # V2 runner orders draft carriers first, so this normally
-                # holds. CPU-only; otherwise the forward keeps the index path.
-                active_spec_mask = spec_sequence_masks_cpu[query_lens_cpu > 0]
-                num_flips = (active_spec_mask[1:] != active_spec_mask[:-1]).sum()
-                if num_flips.item() == 1:
-                    spec_first = bool(active_spec_mask[0].item())
-                    spec_token_start = 0 if spec_first else num_non_spec_tokens
-                    non_spec_token_start = num_spec_decode_tokens if spec_first else 0
-
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
                 non_spec_state_indices_tensor = block_table_tensor[
-                    non_spec_sequence_masks_cpu, 0
+                    split.non_spec_sequence_masks_cpu, 0
                 ]
 
-                spec_query_start_loc = torch.zeros(
-                    num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                torch.cumsum(
-                    query_lens[spec_sequence_masks_cpu],
-                    dim=0,
-                    out=spec_query_start_loc[1:],
-                )
-                non_spec_query_start_loc = torch.zeros(
-                    query_lens.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                torch.cumsum(
-                    query_lens[non_spec_sequence_masks_cpu],
-                    dim=0,
-                    out=non_spec_query_start_loc[1:],
-                )
-                non_spec_query_start_loc_cpu = torch.zeros(
-                    query_lens_cpu.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                )
-                torch.cumsum(
-                    query_lens_cpu[non_spec_sequence_masks_cpu],
-                    dim=0,
-                    out=non_spec_query_start_loc_cpu[1:],
-                )
-
-            assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
-
-        chunk_indices: torch.Tensor | None = None
-        chunk_offsets: torch.Tensor | None = None
-        prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
-        prefill_has_initial_state: torch.Tensor | None = None
-        if num_prefills > 0:
-            # In a mixed non-spec batch, decodes are peeled off to the recurrent
-            # kernel (decode-first front slice), so build chunk metadata from the
-            # rebased prefill-only cu_seqlens; otherwise use the full non-spec one.
-            # _forward_core keys off the same condition, so they agree.
-            if spec_sequence_masks is None and num_decodes > 0:
-                assert non_spec_query_start_loc is not None
-                assert non_spec_query_start_loc_cpu is not None
-                assert non_spec_state_indices_tensor is not None
-                prefill_query_start_loc = (
-                    non_spec_query_start_loc[num_decodes:] - num_decode_tokens
-                )
-                prefill_query_start_loc_cpu = (
-                    non_spec_query_start_loc_cpu[num_decodes:] - num_decode_tokens
-                )
-                prefill_state_indices = non_spec_state_indices_tensor[num_decodes:]
-            else:
-                prefill_query_start_loc = non_spec_query_start_loc
-                prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
-                prefill_state_indices = non_spec_state_indices_tensor
-
-            chunk_indices, chunk_offsets = self._build_chunk_metadata(
-                prefill_query_start_loc,
-                prefill_query_start_loc_cpu,
-                query_start_loc.device,
-            )
-
-        if num_prefills > 0:
-            context_lens_tensor = m.compute_num_computed_tokens()
-            has_initial_state = context_lens_tensor > 0
-            if spec_sequence_masks_cpu is not None:
-                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
-                assert non_spec_query_start_loc_cpu is not None
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
-                    device=query_start_loc.device,
-                )
-            )
-            if spec_sequence_masks is None and num_decodes > 0:
-                prefill_has_initial_state = has_initial_state[num_decodes:]
-            else:
-                prefill_has_initial_state = has_initial_state
-        else:
-            has_initial_state = None
-
         prefill_state_indices_i64: torch.Tensor | None = None
-        prefill_no_initial_state: torch.Tensor | None = None
-        prefill_query_start_loc_i64: torch.Tensor | None = None
         if num_prefills > 0:
-            assert prefill_state_indices is not None
-            assert prefill_has_initial_state is not None
-            assert prefill_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+            prefill_state_indices = non_spec_state_indices_tensor
+            if shared.prefill_row_start:
+                prefill_state_indices = prefill_state_indices[
+                    shared.prefill_row_start :
+                ]
             prefill_state_indices_i64 = prefill_state_indices.to(torch.int64)
-            prefill_no_initial_state = ~prefill_has_initial_state
-            if self.gdn_prefill_backend == "flashinfer":
-                prefill_query_start_loc_i64 = prefill_query_start_loc.to(torch.int64)
+
+        spec_sequence_masks = shared.spec_sequence_masks
+        spec_token_indx = shared.spec_token_indx
+        non_spec_token_indx = shared.non_spec_token_indx
+        spec_query_start_loc = shared.spec_query_start_loc
+        non_spec_query_start_loc = shared.non_spec_query_start_loc
+        num_accepted_tokens = shared.num_accepted_tokens
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -611,18 +508,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
+            num_prefill_tokens=split.num_prefill_tokens,
             num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
+            num_decode_tokens=split.num_decode_tokens,
             num_spec_decodes=num_spec_decodes,
-            num_spec_decode_tokens=num_spec_decode_tokens,
+            num_spec_decode_tokens=split.num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
-            has_initial_state=has_initial_state,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            prefill_query_start_loc=prefill_query_start_loc,
+            has_initial_state=shared.has_initial_state,
+            chunk_indices=shared.chunk_indices,
+            chunk_offsets=shared.chunk_offsets,
+            prefill_query_start_loc=shared.prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
-            prefill_has_initial_state=prefill_has_initial_state,
+            prefill_has_initial_state=shared.prefill_has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
@@ -631,16 +528,184 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
+            nums_dict=shared.nums_dict,
+            batch_ptr=shared.batch_ptr,
+            token_chunk_offset_ptr=shared.token_chunk_offset_ptr,
             prefill_state_indices_i64=prefill_state_indices_i64,
-            prefill_no_initial_state=prefill_no_initial_state,
-            prefill_query_start_loc_i64=prefill_query_start_loc_i64,
+            prefill_no_initial_state=shared.prefill_no_initial_state,
+            prefill_query_start_loc_i64=shared.prefill_query_start_loc_i64,
+            spec_token_start=shared.spec_token_start,
+            non_spec_token_start=shared.non_spec_token_start,
+        )
+        return attn_metadata
+
+    def _build_shared(
+        self,
+        split: "GDNBatchSplit",
+        m: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+    ) -> "GDNSharedBuild":
+        """The part of build() that does not read the block table. It depends
+        only on the batch (query/seq lens, spec rows) and the builder config, so
+        GDN builders fused by one GDNFusedDecodeStep compute it once per step.
+        """
+        query_start_loc = m.query_start_loc
+        query_start_loc_cpu = m.query_start_loc_cpu
+        num_decodes = split.num_decodes
+        num_decode_tokens = split.num_decode_tokens
+        num_prefills = split.num_prefills
+        num_prefill_tokens = split.num_prefill_tokens
+        num_spec_decodes = split.num_spec_decodes
+        num_spec_decode_tokens = split.num_spec_decode_tokens
+        spec_sequence_masks_cpu = split.spec_sequence_masks_cpu
+        spec_token_start: int | None = None
+        non_spec_token_start: int | None = None
+        if spec_sequence_masks_cpu is None:
+            spec_sequence_masks = None
+            spec_token_indx = None
+            non_spec_token_indx = None
+            spec_query_start_loc = None
+            non_spec_query_start_loc = query_start_loc
+            non_spec_query_start_loc_cpu = query_start_loc_cpu
+            num_accepted_tokens = None
+        else:
+            spec_sequence_masks = async_tensor_h2d(
+                spec_sequence_masks_cpu, device=query_start_loc.device
+            )
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            non_spec_sequence_masks_cpu = split.non_spec_sequence_masks_cpu
+            query_lens_cpu = split.query_lens_cpu
+            assert non_spec_sequence_masks_cpu is not None
+            assert query_lens_cpu is not None
+
+            if num_prefills == 0 and num_decodes == 0:
+                spec_token_size = self._spec_token_size(split, m)
+                spec_token_indx = torch.arange(
+                    spec_token_size,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                non_spec_token_indx = torch.empty(
+                    0, dtype=torch.int32, device=query_start_loc.device
+                )
+                # Padded sequences are always at the back, so the first
+                # num_spec_decodes + 1 entries of query_start_loc already
+                # contain the correct cumulative token counts.
+                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                non_spec_query_start_loc = None
+                non_spec_query_start_loc_cpu = None
+            else:
+                spec_token_masks = torch.repeat_interleave(
+                    spec_sequence_masks,
+                    query_lens,
+                    output_size=query_start_loc_cpu[-1].item(),
+                )
+                index = torch.argsort(spec_token_masks, stable=True)
+                num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
+                non_spec_token_indx = index[:num_non_spec_tokens]
+                spec_token_indx = index[num_non_spec_tokens:]
+
+                # Spec and non-spec tokens are two contiguous blocks iff the
+                # spec mask of the non-empty requests flips exactly once. The
+                # V2 runner orders draft carriers first, so this normally
+                # holds. CPU-only; otherwise the forward keeps the index path.
+                active_spec_mask = spec_sequence_masks_cpu[query_lens_cpu > 0]
+                num_flips = (active_spec_mask[1:] != active_spec_mask[:-1]).sum()
+                if num_flips.item() == 1:
+                    spec_first = bool(active_spec_mask[0].item())
+                    spec_token_start = 0 if spec_first else num_non_spec_tokens
+                    non_spec_token_start = num_spec_decode_tokens if spec_first else 0
+
+                spec_query_start_loc = torch.zeros(
+                    num_spec_decodes + 1,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                torch.cumsum(
+                    query_lens[spec_sequence_masks_cpu],
+                    dim=0,
+                    out=spec_query_start_loc[1:],
+                )
+                non_spec_query_start_loc = torch.zeros(
+                    query_lens.size(0) - num_spec_decodes + 1,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                torch.cumsum(
+                    query_lens[non_spec_sequence_masks_cpu],
+                    dim=0,
+                    out=non_spec_query_start_loc[1:],
+                )
+                non_spec_query_start_loc_cpu = torch.zeros(
+                    query_lens_cpu.size(0) - num_spec_decodes + 1,
+                    dtype=torch.int32,
+                )
+                torch.cumsum(
+                    query_lens_cpu[non_spec_sequence_masks_cpu],
+                    dim=0,
+                    out=non_spec_query_start_loc_cpu[1:],
+                )
+
+            assert num_accepted_tokens is not None
+            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+
+        shared = GDNSharedBuild(
+            spec_sequence_masks=spec_sequence_masks,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            num_accepted_tokens=num_accepted_tokens,
             spec_token_start=spec_token_start,
             non_spec_token_start=non_spec_token_start,
         )
-        return attn_metadata
+        if num_prefills == 0:
+            return shared
+
+        # In a mixed non-spec batch, decodes are peeled off to the recurrent
+        # kernel (decode-first front slice), so build chunk metadata from the
+        # rebased prefill-only cu_seqlens; otherwise use the full non-spec one.
+        # _forward_core keys off the same condition, so they agree.
+        assert non_spec_query_start_loc is not None
+        assert non_spec_query_start_loc_cpu is not None
+        if spec_sequence_masks is None and num_decodes > 0:
+            shared.prefill_row_start = num_decodes
+            prefill_query_start_loc = (
+                non_spec_query_start_loc[num_decodes:] - num_decode_tokens
+            )
+            prefill_query_start_loc_cpu = (
+                non_spec_query_start_loc_cpu[num_decodes:] - num_decode_tokens
+            )
+        else:
+            prefill_query_start_loc = non_spec_query_start_loc
+            prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
+        shared.prefill_query_start_loc = prefill_query_start_loc
+        shared.chunk_indices, shared.chunk_offsets = self._build_chunk_metadata(
+            prefill_query_start_loc,
+            prefill_query_start_loc_cpu,
+            query_start_loc.device,
+        )
+
+        context_lens_tensor = m.compute_num_computed_tokens()
+        has_initial_state = context_lens_tensor > 0
+        if spec_sequence_masks_cpu is not None:
+            has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+        shared.has_initial_state = has_initial_state
+        shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
+            compute_causal_conv1d_metadata(
+                non_spec_query_start_loc_cpu,
+                device=query_start_loc.device,
+            )
+        )
+        if spec_sequence_masks is None and num_decodes > 0:
+            prefill_has_initial_state = has_initial_state[num_decodes:]
+        else:
+            prefill_has_initial_state = has_initial_state
+        shared.prefill_has_initial_state = prefill_has_initial_state
+        shared.prefill_no_initial_state = ~prefill_has_initial_state
+        if self.gdn_prefill_backend == "flashinfer":
+            shared.prefill_query_start_loc_i64 = prefill_query_start_loc.to(torch.int64)
+        return shared
 
     def _decode_buffers_metadata(
         self, split: "GDNBatchSplit", m: CommonAttentionMetadata
@@ -862,7 +927,8 @@ class GDNFusedDecodeStep:
     The first builder to build classifies the batch and, if the batch takes one
     of build()'s FULL cudagraph decode paths, launches the kernel that writes the
     persistent buffers of every fused builder. The other builders reuse both.
-    Other batches fall back to build()'s own path.
+    Other batches fall back to build()'s own path, whose block-table-independent
+    part (GDNSharedBuild) the first builder computes for all of them.
     """
 
     def __init__(
@@ -888,6 +954,7 @@ class GDNFusedDecodeStep:
         self._split: GDNBatchSplit | None = None
         self._split_key: tuple[int, int, int] | None = None
         self._decode_buffers_written: bool | None = None
+        self.shared_build: GDNSharedBuild | None = None
 
     def fuses(self, builder: AttentionMetadataBuilder) -> bool:
         return self._fusion.fuses(builder)
