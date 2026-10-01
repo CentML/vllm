@@ -1979,17 +1979,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and non_spec_query_start_loc is not None
             and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
         )
+        if attn_metadata.num_prefills > 0 and attn_metadata.prefill_checkpoint is not None:
+            # Both prefill conv paths read the pre-conv inputs; the checkpoint's
+            # conv window is taken from them before either conv runs.
+            assert mixed_qkv_non_spec is not None
+            self._store_conv_checkpoint(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights.size(-1),
+                attn_metadata.prefill_checkpoint,
+            )
         if fused_conv_prep:
             pass  # mixed_qkv_non_spec stays pre-conv for gdn_fused_conv_prep
         elif attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
-            if attn_metadata.prefill_checkpoint is not None:
-                self._store_conv_checkpoint(
-                    mixed_qkv_non_spec,
-                    conv_state,
-                    conv_weights.size(-1),
-                    attn_metadata.prefill_checkpoint,
-                )
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
