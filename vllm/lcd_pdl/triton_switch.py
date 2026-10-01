@@ -25,6 +25,10 @@ def lcd_pdl_triton_on() -> bool:
     try:
         import torch
 
-        return torch.cuda.get_device_capability()[0] >= 9
+        on = torch.cuda.get_device_capability()[0] >= 9
     except Exception:
         return False
+    import sys
+
+    print(f"[lcd-pdl] Triton PDL launch {'ON' if on else 'OFF (cc < 9)'} (pid {os.getpid()})", file=sys.stderr, flush=True)
+    return on
