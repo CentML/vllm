@@ -314,24 +314,32 @@ def _warm_causal_conv1d_fwd_kernel(
         dtype=config.conv_dtype,
         device=device,
     )
-    cache_indices = torch.full((1,), NULL_BLOCK_ID, dtype=torch.int32, device=device)
-    has_initial_state = torch.empty(1, dtype=torch.bool, device=device)
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
-
-    causal_conv1d_fn(
-        x,
-        weight,
-        None,
-        config.conv_state,
-        query_start_loc,
-        cache_indices=cache_indices,
-        has_initial_state=has_initial_state,
-        activation="silu",
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
-        metadata=None,
-        validate_data=False,
-    )
+    # Triton specializes pointers on 16-byte alignment. In spec-decode batches
+    # the prefill's has_initial_state (and possibly its state indices) are
+    # slices of per-batch tensors at a row offset, so warm the unaligned
+    # variants too (offset 1 element), or they JIT at the first such batch.
+    for state_offset, index_offset in itertools.product((0, 1), (0, 1)):
+        cache_indices = torch.full(
+            (2,), NULL_BLOCK_ID, dtype=torch.int32, device=device
+        )[index_offset : index_offset + 1]
+        has_initial_state = torch.zeros(2, dtype=torch.bool, device=device)[
+            state_offset : state_offset + 1
+        ]
+        causal_conv1d_fn(
+            x,
+            weight,
+            None,
+            config.conv_state,
+            query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation="silu",
+            pad_slot_id=PAD_SLOT_ID,
+            null_block_id=NULL_BLOCK_ID,
+            metadata=None,
+            validate_data=False,
+        )
 
 
 def _warm_fused_post_conv_kernel(
