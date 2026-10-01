@@ -34,6 +34,34 @@ MXFP8_BLOCK = 32
 
 
 @triton.jit
+def _ue8m0_scale(amax):
+    """FlashInfer's UE8M0 exponent of each 32-group's ``amax`` (uint32) and the
+    fp32 reciprocal scale, including zero/subnormal scales.
+    """
+    normalized = amax * (1.0 / 448.0)
+    bits = normalized.to(tl.uint32, bitcast=True)
+    exponent = (bits >> 23) & 255
+    mantissa = bits & 0x7FFFFF
+    bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
+    sf = tl.minimum(exponent + bump, 254)
+    sf = tl.where(normalized <= 0, 0, sf)
+    inv_bits = tl.where(sf == 0, 0, (254 - sf) << 23)
+    return sf, inv_bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _swizzled_scale_offsets(row, groups, PADDED_GROUPS: tl.constexpr):
+    # F8_128x4: [row/128, group/4, row%32, row%128/32, group%4].
+    return (
+        row // 128 * (128 * PADDED_GROUPS)
+        + groups // 4 * 512
+        + row % 32 * 16
+        + row % 128 // 32 * 4
+        + groups % 4
+    )
+
+
+@triton.jit
 def mxfp8_quantize_row(y, BLOCK: tl.constexpr):
     """FlashInfer-exact MXFP8 of one row of bf16-representable fp32 values.
 
@@ -42,18 +70,19 @@ def mxfp8_quantize_row(y, BLOCK: tl.constexpr):
     FlashInfer does) and the uint32 UE8M0 exponent of each 32-element group.
     """
     grouped = tl.reshape(y, (BLOCK // 32, 32))
-    amax = tl.max(tl.abs(grouped), 1)
-    normalized = amax * (1.0 / 448.0)
-    bits = normalized.to(tl.uint32, bitcast=True)
-    exponent = (bits >> 23) & 255
-    mantissa = bits & 0x7FFFFF
-    bump = (mantissa != 0) & ~((exponent == 0) & (mantissa <= 0x400000))
-    sf = tl.minimum(exponent + bump, 254)
-    sf = tl.where(normalized <= 0, 0, sf)
-    # Match FlashInfer's UE8M0 conversion, including zero/subnormal scales.
-    inv_bits = tl.where(sf == 0, 0, (254 - sf) << 23)
-    inv_scale = inv_bits.to(tl.float32, bitcast=True)
+    sf, inv_scale = _ue8m0_scale(tl.max(tl.abs(grouped), 1))
     quantized = tl.reshape(grouped * inv_scale[:, None], (BLOCK,))
+    return quantized, sf
+
+
+@triton.jit
+def mxfp8_quantize_rows(y, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    """``mxfp8_quantize_row`` of each row of ``y`` ``(ROWS, BLOCK)``; ``sf`` is
+    ``(ROWS, BLOCK // 32)``.
+    """
+    grouped = tl.reshape(y, (ROWS, BLOCK // 32, 32))
+    sf, inv_scale = _ue8m0_scale(tl.max(tl.abs(grouped), 2))
+    quantized = tl.reshape(grouped * inv_scale[:, :, None], (ROWS, BLOCK))
     return quantized, sf
 
 
@@ -66,15 +95,22 @@ def mxfp8_store_swizzled_scales(scale_ptr, row, groups, sf, NUM_GROUPS: tl.const
     """
     PADDED_GROUPS: tl.constexpr = (NUM_GROUPS + 3) // 4 * 4
     sf = tl.where(groups < NUM_GROUPS, sf, 0)
-    # F8_128x4: [row/128, group/4, row%32, row%128/32, group%4].
-    offsets = (
-        row // 128 * (128 * PADDED_GROUPS)
-        + groups // 4 * 512
-        + row % 32 * 16
-        + row % 128 // 32 * 4
-        + groups % 4
-    )
+    offsets = _swizzled_scale_offsets(row, groups, PADDED_GROUPS)
     tl.store(scale_ptr + offsets, sf.to(tl.uint8), mask=groups < PADDED_GROUPS)
+
+
+@triton.jit
+def mxfp8_store_swizzled_scales_rows(
+    scale_ptr, rows, groups, sf, NUM_GROUPS: tl.constexpr
+):
+    """``mxfp8_store_swizzled_scales`` of ``sf`` ``(ROWS, G)`` for ``rows``
+    ``(ROWS,)`` and ``groups`` ``(G,)``.
+    """
+    PADDED_GROUPS: tl.constexpr = (NUM_GROUPS + 3) // 4 * 4
+    g = groups[None, :]
+    sf = tl.where(g < NUM_GROUPS, sf, 0)
+    offsets = _swizzled_scale_offsets(rows[:, None], g, PADDED_GROUPS)
+    tl.store(scale_ptr + offsets, sf.to(tl.uint8), mask=g < PADDED_GROUPS)
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
