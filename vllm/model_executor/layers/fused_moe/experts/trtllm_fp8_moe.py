@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -37,6 +40,36 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
 logger = init_logger(__name__)
+
+
+@contextlib.contextmanager
+def _sm107_moe_pdl(num_tokens: int, num_experts: int, hidden_size: int):
+    """Opt into PDL for one small trtllm-gen MoE call on SM107.
+
+    FlashInfer 0.6.18 (PR #4806) forces ``enable_pdl=False`` for the whole
+    trtllm-gen MoE pipeline on CC 10.7 after crashes in Cluster routing. Up to
+    16 tokens with <= 512 experts the pipeline is Block/DynBlock routing, bmm
+    FC1/FC2 and finalizeKernel (not finalizeKernelVecLoad), which all wait on
+    their producer before reading it. Enabled by
+    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS (default 0: FlashInfer behaviour).
+    """
+    if not (
+        0 < num_tokens <= envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+        and num_experts <= 512
+        and (hidden_size + 255) // 256 * num_tokens < 1184
+        and current_platform.is_device_capability(107)
+    ):
+        yield
+        return
+    import flashinfer.fused_moe.core as fi_moe_core
+    from flashinfer.utils import device_support_pdl
+
+    gate = fi_moe_core._device_support_moe_pdl
+    fi_moe_core._device_support_moe_pdl = device_support_pdl
+    try:
+        yield
+    finally:
+        fi_moe_core._device_support_moe_pdl = gate
 
 
 def prepare_deepseek_fp8_x_sf(x: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
@@ -517,7 +550,8 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
         if defer:
             kwargs["do_finalize"] = False
-        result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        with _sm107_moe_pdl(num_tokens, global_num_experts, hidden_states.shape[-1]):
+            result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
         self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
         if defer:
             return convert_flashinfer_moe_output(
