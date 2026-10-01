@@ -231,6 +231,8 @@ class MainThreadRepin:
         self._remote_cache_t = -1.0
         self._remote_cache: list[dict] = []
         self.own_disabled = False
+        self.cur_cpu = _current_cpu()
+        self.main_tid = threading.get_native_id()
         self.own_failed_episodes = 0
         self.episode_tiers: list[str] = []
         logger.info(
@@ -349,7 +351,7 @@ class MainThreadRepin:
         self.episode_moves = 0
         self.episode_own = 0
         self.episode_tiers = []
-        self.episode_from = _current_cpu()
+        self.episode_from = self.cur_cpu = _current_cpu()
         self._log_episode(now, ratio)
         if self.observe:
             self.slow_since = None
@@ -540,6 +542,7 @@ class MainThreadRepin:
             logger.info("%s sched_setaffinity(%d) failed: %s", self.tag, target, e)
             self.next_episode_t = now + self.cooldown_s
             return
+        self.cur_cpu = target
         self.moves += 1
         self.episode_moves += 1
         self.episode_tiers.append(tier)
@@ -623,8 +626,42 @@ class MainThreadRepin:
         self.ref_peer = ref
         self._remote_cache_t = -1.0
 
+    def _bg_affinity(self) -> None:
+        """Helper threads inherit the creator's affinity: keep them off the
+        main thread's core (they run on the worker's own mask)."""
+        try:
+            cur = self.cur_cpu
+            os.sched_setaffinity(0, set(self.home) - {cur} or set(self.home))
+        except OSError:
+            pass
+
     def _snap_ipi_bg(self) -> None:
+        self._bg_affinity()
         self.snap_ipi = _proc_ipis()
+
+    def _fix_inherited_bg(self, main_tid: int, cpu: int) -> None:
+        """Threads created by the main thread after a move inherited its
+        single-core mask; give them the worker's own mask back."""
+        self._bg_affinity()
+        fixed = []
+        for path in glob.glob("/proc/self/task/*"):
+            try:
+                tid = int(os.path.basename(path))
+                if tid in (main_tid, threading.get_native_id()):
+                    continue
+                if os.sched_getaffinity(tid) == {cpu}:
+                    os.sched_setaffinity(tid, set(self.home))
+                    fixed.append(tid)
+            except (OSError, ValueError):
+                continue
+        if fixed:
+            logger.info(
+                "%s reset %d helper thread(s) that inherited the main thread's "
+                "core %d to the worker mask",
+                self.tag,
+                len(fixed),
+                cpu,
+            )
 
     def _log_episode(self, now: float, ratio: float) -> None:
         cur = self.episode_from
@@ -649,6 +686,7 @@ class MainThreadRepin:
 
     def _diag_bg(self, cur: int, snap: dict[str, list[int]], t0: float) -> None:
         """IPI rates on the slow core since slow onset + threads last on it."""
+        self._bg_affinity()
         try:
             ipi = _proc_ipis()
             dt = max(time.perf_counter() - t0, 1e-3)
@@ -678,6 +716,13 @@ class MainThreadRepin:
 
     def _status(self, now: float) -> None:
         self.next_status_t = now + self.status_s
+        if self.moves:
+            threading.Thread(
+                target=self._fix_inherited_bg,
+                args=(self.main_tid, self.cur_cpu),
+                name="main-repin-fix",
+                daemon=True,
+            ).start()
         refs = " ".join(
             f"B{b}:{self.ref_own[b]:.2f}" for b in sorted(self.ref_own)[:4]
         )
