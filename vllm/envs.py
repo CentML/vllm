@@ -2050,9 +2050,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # SM107 only: launch the FlashInfer trtllm-gen MoE pipeline with PDL for
     # calls of at most this many tokens (clamped to 16; 0 = FlashInfer default,
-    # which disables MoE PDL on SM107). Up to 16 tokens the pipeline runs only
-    # Block/DynBlock routing, bmm FC1/FC2 and finalizeKernel, which all wait on
-    # their producer before reading it.
+    # which disables MoE PDL on SM107). Applies only to routingCustom-family
+    # routing (no expert groups; top_k <= 22 for DeepSeekV3 / MiniMax2), where
+    # up to 16 tokens the pipeline runs Block/DynBlock routing, bmm FC1/FC2 and
+    # finalizeKernel, which all wait on their producer before reading it.
     "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: min(
         int(os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")), 16
     ),
