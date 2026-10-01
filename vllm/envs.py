@@ -2117,13 +2117,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_MTP_DRAFT_LM_HEAD_MXFP8", "0"))
     ),
     # SM107 only: launch the FlashInfer trtllm-gen MoE pipeline with PDL for
-    # calls of at most this many tokens (clamped to 16; 0 = FlashInfer default,
-    # which disables MoE PDL on SM107). Applies only to routingCustom-family
-    # routing (no expert groups; top_k <= 22 for DeepSeekV3 / MiniMax2), where
-    # up to 16 tokens the pipeline runs Block/DynBlock routing, bmm FC1/FC2 and
-    # finalizeKernel, which all wait on their producer before reading it.
-    "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: min(
-        int(os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")), 16
+    # calls of at most this many tokens (0 = FlashInfer default, which disables
+    # MoE PDL on SM107). Applies only to routingCustom-family routing (no expert
+    # groups; top_k <= 22 for DeepSeekV3 / MiniMax2), where up to 16 tokens the
+    # pipeline runs Block/DynBlock routing, bmm FC1/FC2 and finalizeKernel,
+    # which all wait on their producer before reading it. Larger calls also
+    # need the single-CTA routing permutation (GS2_ROUTE,
+    # flashinfer_exact_routing) to replace Cluster/Coop for them; calls it does
+    # not cover keep PDL off.
+    "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")
     ),
     # SM107 only: run the small unquantized BF16 decode projections (MoE router,
     # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.

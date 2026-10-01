@@ -15,6 +15,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.flashinfer_exact_routing import (
+    single_cta_routing_covers,
+)
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
     convert_flashinfer_moe_output,
@@ -70,24 +73,42 @@ def _sm107_moe_pdl_allowed(
     routing_method: RoutingMethodType,
     n_group: int | None,
     top_k: int,
+    deferred: bool = False,
 ) -> bool:
     """Whether one trtllm-gen MoE call stays on the kernels the SM107 PDL
     opt-in was validated for (see ``_sm107_moe_pdl``); platform not checked.
+
+    ``deferred``: this call skips FlashInfer's finalize (``do_finalize=False``),
+    so finalizeKernelVecLoad (reads routing outputs before its wait) cannot run
+    and the finalize-grid bound does not apply.
     """
     if not (
         0 < num_tokens <= envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
         and num_experts <= 512
-        and (hidden_size + 255) // 256 * num_tokens < 1184
+        and (deferred or (hidden_size + 255) // 256 * num_tokens < 1184)
         and routing_method in _SM107_MOE_PDL_ROUTING
     ):
         return False
     if routing_method == RoutingMethodType.DeepSeekV3 and (n_group or 0) > 1:
         return False
-    sigmoid_bias = routing_method in (
-        RoutingMethodType.DeepSeekV3,
-        RoutingMethodType.MiniMax2,
-    )
-    return not sigmoid_bias or top_k <= _SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K
+    if num_tokens <= 16:
+        sigmoid_bias = routing_method in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+        )
+        return not sigmoid_bias or top_k <= _SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K
+    # Above 16 tokens the stock permutation is the Cluster / cooperative kernel.
+    # Only calls whose permutation the single-CTA kernel of the patched module
+    # runs instead (flashinfer_exact_routing; hooked in routingCustom with the
+    # Renormalize policy) keep a pipeline of kernels that all wait first:
+    # BlockScores / HistogramScores, single-CTA permutation, FC1, FC2, and
+    # finalizeKernel or no FlashInfer finalize.
+    if routing_method not in (
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+    ):
+        return False
+    return single_cta_routing_covers(num_tokens, num_experts, top_k)
 
 
 @contextlib.contextmanager
@@ -98,8 +119,9 @@ def _sm107_moe_pdl(
     routing_method: RoutingMethodType,
     n_group: int | None,
     top_k: int,
+    deferred: bool = False,
 ):
-    """Opt into PDL for one small trtllm-gen MoE call on SM107.
+    """Opt into PDL for one trtllm-gen MoE call on SM107.
 
     FlashInfer 0.6.18 (PR #4806) forces ``enable_pdl=False`` for the whole
     trtllm-gen MoE pipeline on CC 10.7 after crashes in Cluster routing. With
@@ -107,12 +129,20 @@ def _sm107_moe_pdl(
     SigmoidBias policy), up to 16 tokens and <= 512 experts, routing runs the
     Block/DynBlock kernels (not Cluster/Coop) and finalize runs finalizeKernel
     (not finalizeKernelVecLoad); together with bmm FC1/FC2 they all wait on
-    their producer before reading it. Enabled by
-    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS (default 0: FlashInfer behaviour).
+    their producer before reading it. Larger calls qualify only where the
+    single-CTA routing permutation replaces Cluster/Coop (see
+    ``_sm107_moe_pdl_allowed``). Enabled by VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+    (default 0: FlashInfer behaviour).
     """
     if not (
         _sm107_moe_pdl_allowed(
-            num_tokens, num_experts, hidden_size, routing_method, n_group, top_k
+            num_tokens,
+            num_experts,
+            hidden_size,
+            routing_method,
+            n_group,
+            top_k,
+            deferred=deferred,
         )
         and current_platform.is_device_capability(107)
     ):
@@ -614,6 +644,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             self.routing_method_type,
             n_group,
             self.topk,
+            deferred=defer,
         ):
             result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
         self._maybe_dispatch_routing_replay(routing_replay_out, num_tokens=num_tokens)
