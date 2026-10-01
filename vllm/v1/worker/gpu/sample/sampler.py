@@ -49,7 +49,7 @@ class Sampler:
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, device)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)

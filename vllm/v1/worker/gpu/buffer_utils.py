@@ -139,6 +139,67 @@ class UvaBackedTensor:
         return self.gpu
 
 
+class DeviceParam:
+    """One field of a `DeviceParamTable`: `np` is the host source of truth,
+    `gpu` a fixed device tensor that `DeviceParamTable.sync` keeps equal to it.
+    """
+
+    def __init__(self, np_view: np.ndarray, gpu_view: torch.Tensor):
+        self.np = np_view
+        self.gpu = gpu_view
+
+
+class DeviceParamTable:
+    """Per-request scalars (e.g. sampling parameters) kept in device memory.
+
+    A `UvaBackedTensor` makes every kernel that reads a parameter load it from
+    host memory, and its address rotates every step. Here the fields share one
+    device buffer at a fixed address, and `sync` uploads the whole table with
+    a single stream-ordered copy, only on steps where the host values changed
+    (request admission). Reads issued earlier on the stream see the old values,
+    so an in-flight step is not affected by the next step's writes.
+    """
+
+    _ALIGN = 8
+
+    def __init__(
+        self,
+        num_rows: int,
+        fields: dict[str, torch.dtype],
+        device: torch.device,
+        max_concurrency: int | None = None,
+    ):
+        offsets: dict[str, int] = {}
+        nbytes = 0
+        for name, dtype in fields.items():
+            offsets[name] = nbytes
+            size = num_rows * dtype.itemsize
+            nbytes += (size + self._ALIGN - 1) // self._ALIGN * self._ALIGN
+        self._host = np.zeros(nbytes, dtype=np.uint8)
+        self._uploaded = np.zeros(nbytes, dtype=np.uint8)
+        self._gpu = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        self._pool = UvaBufferPool(nbytes, torch.uint8, max_concurrency)
+        self.fields: dict[str, DeviceParam] = {}
+        for name, dtype in fields.items():
+            start = offsets[name]
+            end = start + num_rows * dtype.itemsize
+            np_dtype = torch.empty(0, dtype=dtype).numpy().dtype
+            self.fields[name] = DeviceParam(
+                self._host[start:end].view(np_dtype),
+                self._gpu[start:end].view(dtype),
+            )
+
+    def __getitem__(self, name: str) -> DeviceParam:
+        return self.fields[name]
+
+    def sync(self) -> None:
+        """Upload the table if any host value changed since the last upload."""
+        if np.array_equal(self._host, self._uploaded):
+            return
+        np.copyto(self._uploaded, self._host)
+        self._pool.copy_to_gpu(self._host, out=self._gpu)
+
+
 class StagedWriteTensor:
     def __init__(
         self,
