@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.spec_decode import (
@@ -500,6 +501,22 @@ class DraftModelSpeculator(BaseSpeculator):
             return
         self.draft_watermarker.prepare(contexts, watermarking)
 
+    def use_request_params(
+        self, temperature: torch.Tensor, seeds: torch.Tensor
+    ) -> None:
+        """Read the per-request temperature and seeds straight from these
+        [max_num_reqs] device tensors, instead of copying them every step.
+
+        They must keep their address for the life of the drafter (its CUDA
+        graphs read them), and be updated in stream order. Call before capture.
+        """
+        assert temperature.shape == self.temperature.shape
+        assert temperature.dtype == self.temperature.dtype
+        assert seeds.shape == self.seeds.shape and seeds.dtype == self.seeds.dtype
+        assert temperature.device == self.temperature.device == seeds.device
+        self.temperature = temperature
+        self.seeds = seeds
+
     def _copy_request_inputs(
         self,
         num_reqs: int,
@@ -516,12 +533,19 @@ class DraftModelSpeculator(BaseSpeculator):
         # for simplicity and performance.
         # While this may slightly degrade the acceptance rate, it does not
         # affect the output distribution after rejection sampling.
-        self.temperature.copy_(temperature)
-        self.seeds.copy_(seeds)
-        self.idx_mapping[:num_reqs].copy_(idx_mapping)
+        if temperature is not self.temperature:
+            self.temperature.copy_(temperature)
+        if seeds is not self.seeds:
+            self.seeds.copy_(seeds)
         # idx_mapping for CG padded requests points to -1, which is ignored
         # during sampling to prevent writing stale values to draft logits.
-        self.idx_mapping[num_reqs:].fill_(-1)
+        _copy_idx_mapping_kernel[(1,)](
+            self.idx_mapping,
+            idx_mapping,
+            num_reqs,
+            self.max_num_reqs,
+            BLOCK_SIZE=triton.next_power_of_2(self.max_num_reqs),
+        )
 
     def _build_uniform_batch_dp_sync(
         self,
@@ -562,3 +586,17 @@ class DraftModelSpeculator(BaseSpeculator):
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def _copy_idx_mapping_kernel(
+    out_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    max_num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # out[:num_reqs] = idx_mapping; out[num_reqs:max_num_reqs] = -1
+    offs = tl.arange(0, BLOCK_SIZE)
+    idx = tl.load(idx_mapping_ptr + offs, mask=offs < num_reqs, other=-1)
+    tl.store(out_ptr + offs, idx.to(out_ptr.dtype.element_ty), mask=offs < max_num_reqs)
