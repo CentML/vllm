@@ -64,6 +64,7 @@ from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
@@ -446,6 +447,19 @@ class Qwen3NextAttention(nn.Module):
             and isinstance(o_proj_kernel, Mxfp8LinearKernel)
             and o_proj_kernel.input_quant_key() == kMxfp8Dynamic
         )
+        # The token-tile kernel also writes k and v into the paged KV cache
+        # (replacing the backend's reshape_and_cache_flash launch) when the
+        # backend exposes its cache views and stores e4m3 with per-tensor
+        # scales or the model dtype.
+        attn_impl = self.attn.impl
+        self.qk_norm_rope_kv_cache = (
+            self.use_qk_norm_rope_tokens
+            and hasattr(attn_impl, "kv_cache_write_views")
+            and not getattr(attn_impl, "is_kvcache_nvfp4", True)
+            and self.attn.kv_cache_dtype in ("auto", "fp8", "fp8_e4m3")
+            and self.attn.kv_sharing_target_layer_name is None
+            and not self.attn.attn_backend.forward_includes_kv_cache_update
+        )
 
     def _project_qkv_gate(
         self,
@@ -525,9 +539,7 @@ class Qwen3NextAttention(nn.Module):
         mrope_section = getattr(self.rotary_emb, "mrope_section", None)
         if positions.ndim == 2 and not mrope_section:
             positions = positions[0]
-        q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope(
-            q_gate,
-            k,
+        args = (
             self.q_norm.weight,
             self.k_norm.weight,
             self.rotary_emb.cos_sin_cache,
@@ -538,10 +550,18 @@ class Qwen3NextAttention(nn.Module):
             self.num_kv_heads,
             self.head_dim,
             self.rotary_emb.rotary_dim,
+        )
+        tail = (
             list(mrope_section) if positions.ndim == 2 else None,
             1.0,
             not self.attn_gate_mxfp8,
         )
+        if self.qk_norm_rope_kv_cache:
+            q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope_kv_cache(
+                q_gate, k, v, *args, _encode_layer_name(self.attn.layer_name), *tail
+            )
+        else:
+            q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope(q_gate, k, *args, *tail)
         if self.attn_gate_mxfp8:
             gate = q_gate.view(-1, self.num_heads, 2, self.head_dim)[:, :, 1]
         return q, k, v, gate
@@ -555,7 +575,13 @@ class Qwen3NextAttention(nn.Module):
         if self.use_qk_norm_rope_tokens:
             q, k, v, gate = self._project_qkv_gate_tokens(qkv, positions)
             # An FP8 q skips the attention layer's own query quant.
-            attn_output = self.attn(q, k, v, output_dtype=qkv.dtype)
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                output_dtype=qkv.dtype,
+                kv_cache_written=self.qk_norm_rope_kv_cache,
+            )
             attn_output = attn_output.view(gate.shape) * torch.sigmoid(gate)
             output, _ = self.o_proj(attn_output.flatten(1))
             return output
