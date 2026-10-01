@@ -229,6 +229,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
     VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
     VLLM_FI_PERSISTENT_KV_COUNTER_BYTES: int = 1 << 20
+    VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
+    VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1815,6 +1817,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Size in bytes of that buffer; launches needing more keep FlashInfer's own.
     "VLLM_FI_PERSISTENT_KV_COUNTER_BYTES": lambda: int(
         os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
+    ),
+    # MTP draft prefill: compute the FlashInfer prefill attention of the draft
+    # layer only for each prefill request's last (sampled) row; the other rows'
+    # outputs are discarded by the speculator.
+    "VLLM_MTP_DRAFT_PREFILL_PRUNE": lambda: bool(
+        int(os.getenv("VLLM_MTP_DRAFT_PREFILL_PRUNE", "0"))
+    ),
+    # Debug: for the first N pruned draft prefill calls (per layer), also run
+    # the regular prefill attention and log the difference on the kept rows.
+    "VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK": lambda: int(
+        os.getenv("VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK", "0")
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for

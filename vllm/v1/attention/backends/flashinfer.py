@@ -2180,6 +2180,10 @@ class FlashInferImpl(AttentionImpl):
             )
             self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
         self._device_sm_count: int | None = None
+        # Set by the MTP speculator on its draft attention layers when
+        # VLLM_MTP_DRAFT_PREFILL_PRUNE=1 (see _draft_prefill_last_rows).
+        self.draft_prefill_prune = False
+        self._draft_prefill_prune_checks_left = envs.VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK
         # Opt-in routing of eligible FP8 context launches to the trtllm-gen
         # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
         # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
@@ -2282,6 +2286,105 @@ class FlashInferImpl(AttentionImpl):
             get_trtllm_gen_multi_ctas_kv_counter_bytes(
                 batch_size, query.size(1), self._device_sm_count
             ),
+        )
+
+    def _draft_prefill_last_rows(
+        self,
+        prefill_query: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        workspace_buffer: torch.Tensor,
+        prefill: "TRTLLMPrefill",
+        num_prefills: int,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill attention of an MTP draft layer, last row of each request only.
+
+        The draft prefill samples one row per request (the speculator's
+        ``last_token_indices``); for a prefill request that is the last token of
+        its chunk, whose causal KV is the whole sequence. The draft model has a
+        single layer whose KV comes from its input, not from attention outputs,
+        and the other rows' outputs are discarded, so only those rows need
+        attention. They run as one q_len 1 trtllm-gen decode launch with the
+        decode split-KV policy (_trtllm_gen_decode_launch_config); the other
+        prefill rows are zero-filled. Decode rows are not touched. Returns the
+        last-row indices into ``out``.
+        """
+        last_rows = (prefill.cum_seq_lens_q[1:] - 1).long()
+        query_last = prefill_query.index_select(0, last_rows)
+        out_last = torch.empty(
+            (num_prefills, self.num_heads, self.head_size),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
+            num_prefills, 1, prefill.max_seq_len, query_last, workspace_buffer
+        )
+        with _flashinfer_decode_sm_count(sm_count):
+            trtllm_batch_decode_with_kv_cache(
+                query=query_last,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                block_tables=prefill.block_tables,
+                seq_lens=prefill.seq_lens,
+                max_seq_len=prefill.max_seq_len,
+                bmm1_scale=self.bmm1_scale,
+                bmm2_scale=self.bmm2_scale,
+                window_left=self.window_left,
+                sinks=self.sinks,
+                out=out_last,
+                kv_layout="HND",
+                backend="trtllm-gen",
+                q_len_per_req=1,
+                multi_ctas_kv_counter_buffer=counter_buffer,
+            )
+        out.zero_()
+        out.index_copy_(0, last_rows, out_last)
+        return last_rows
+
+    def _check_draft_prefill_last_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: "FlashInferMetadata",
+        out: torch.Tensor,
+        last_rows: torch.Tensor,
+    ) -> None:
+        """VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: compare the pruned rows with the
+        regular prefill attention (debug only; syncs).
+        """
+        self._draft_prefill_prune_checks_left -= 1
+        ref = torch.empty(
+            (query.shape[0], self.num_heads, self.head_size),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        self.draft_prefill_prune = False
+        try:
+            self.forward(layer, query, key, value, kv_cache, attn_metadata, ref)
+        finally:
+            self.draft_prefill_prune = True
+        prefill = attn_metadata.prefill
+        assert isinstance(prefill, TRTLLMPrefill)
+        start = attn_metadata.num_decode_tokens
+        ref_last = ref[start : start + attn_metadata.num_prefill_tokens][last_rows]
+        diff = (ref_last.float() - out[last_rows].float()).abs()
+        row_max = diff.amax(dim=(1, 2))
+        logger.info(
+            "draft prefill pruning check: num_prefills=%d num_decodes=%d "
+            "max_q=%d max_seq=%d gen_sm_count=%s bitwise_rows=%d/%d "
+            "max_abs=%.3e ref_max=%.3e",
+            attn_metadata.num_prefills,
+            attn_metadata.num_decodes,
+            prefill.max_q_len,
+            prefill.max_seq_len,
+            prefill.gen_sm_count,
+            int((row_max == 0).sum()),
+            row_max.numel(),
+            float(diff.max()),
+            float(ref_last.float().abs().max()),
         )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
@@ -2722,6 +2825,33 @@ class FlashInferImpl(AttentionImpl):
 
                 gen_sm_count = attn_metadata.prefill.gen_sm_count
                 if (
+                    self.draft_prefill_prune
+                    and isinstance(out, torch.Tensor)
+                    and out.dtype == torch.bfloat16
+                    and mock_kv_cache is kv_cache_tuple
+                ):
+                    # MTP draft layer: only each prefill request's last row is
+                    # sampled (see _draft_prefill_last_rows).
+                    last_rows = self._draft_prefill_last_rows(
+                        prefill_query,
+                        kv_cache_tuple,
+                        workspace_buffer,
+                        attn_metadata.prefill,
+                        attn_metadata.num_prefills,
+                        out,
+                    )
+                    if self._draft_prefill_prune_checks_left > 0:
+                        self._check_draft_prefill_last_rows(
+                            layer,
+                            query,
+                            key,
+                            value,
+                            kv_cache,
+                            attn_metadata,
+                            out,
+                            last_rows,
+                        )
+                elif (
                     gen_sm_count is not None
                     and isinstance(out, torch.Tensor)
                     and out.dtype == torch.bfloat16
