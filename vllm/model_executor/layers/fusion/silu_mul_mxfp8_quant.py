@@ -40,6 +40,7 @@ def _silu_mul_mxfp8_kernel(
     groups = tl.arange(0, BLOCK // 32)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         a = tl.load(x_ptr + row * x_stride + cols, mask=mask, other=0.0)
         b = tl.load(x_ptr + row * x_stride + D + cols, mask=mask, other=0.0)

@@ -51,6 +51,7 @@ def _gdn_gated_norm_mxfp8_kernel(
 ):
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     K: tl.constexpr = HEADS * HEAD_DIM
     BLOCK: tl.constexpr = BLOCK_H * HEAD_DIM
