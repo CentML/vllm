@@ -143,6 +143,20 @@ GDN_FUSED_CONV_PREP = os.environ.get("VLLM_GDN_FUSED_CONV_PREP", "1") == "1"
 GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "1") == "1"
 _gdn_vsplit_ready: list = []  # [module] once the warmup compiled the kernel
 _gdn_vsplit_tried: list = []
+# With V-split, the non-CP kernel beats CP for single sequences up to ~8.5k
+# tokens on VR (us, CP -> V-split: 5120 130 -> 107, 6144 138 -> 127, 8192
+# 167 -> 166; 10240 196 -> 205), so the CP threshold moves up while V-split is
+# enabled.
+GDN_FI_VSPLIT_NON_CP_MAX_TOKENS = int(
+    os.environ.get("VLLM_GDN_FI_VSPLIT_NON_CP_MAX_TOKENS", "8192")
+)
+
+
+def _gdn_fi_non_cp_max_tokens() -> int:
+    """Longest single sequence that runs FlashInfer's non-CP prefill."""
+    if _gdn_vsplit_ready:
+        return GDN_FI_VSPLIT_NON_CP_MAX_TOKENS
+    return GDN_FI_NON_CP_MAX_TOKENS
 
 
 def _gdn_vsplit_warmup(
@@ -358,7 +372,8 @@ def fi_chunk_gated_delta_rule(
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
     num_seqs = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
-    use_non_cp = num_seqs > 1 or q.shape[0] <= GDN_FI_NON_CP_MAX_TOKENS
+    non_cp_max_tokens = _gdn_fi_non_cp_max_tokens()
+    use_non_cp = num_seqs > 1 or q.shape[0] <= non_cp_max_tokens
     if (
         _gdn_vsplit_ready
         and use_non_cp
@@ -406,11 +421,7 @@ def fi_chunk_gated_delta_rule(
         output=None if output is None else output.view(v.shape),
         output_state=fi_state if state_indices is not None else None,
         state_indices=state_indices,
-        use_cp=(
-            False
-            if num_seqs == 1 and q.shape[0] <= GDN_FI_NON_CP_MAX_TOKENS
-            else "auto"
-        ),
+        use_cp=(False if num_seqs == 1 and q.shape[0] <= non_cp_max_tokens else "auto"),
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -1444,17 +1455,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
+        if (
+            GDN_FI_VSPLIT
+            and self.chunk_gated_delta_rule.updates_state_in_place(state_dtype)
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+        ):
+            _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
+
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
         # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
         # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         # One chunk compiles the kernels of short prefills. FlashInfer runs
-        # single sequences above GDN_FI_NON_CP_MAX_TOKENS through its CP
+        # single sequences above _gdn_fi_non_cp_max_tokens() through its CP
         # kernels instead; warm them too, or they JIT-compile (seconds) at the
-        # first long prefill under load.
+        # first long prefill under load. (The V-split warmup above sets that
+        # threshold.)
         warmup_lengths = [FLA_CHUNK_SIZE]
-        if self.gdn_prefill_backend == "flashinfer" and GDN_FI_NON_CP_MAX_TOKENS > 0:
-            warmup_lengths.append(GDN_FI_NON_CP_MAX_TOKENS + FLA_CHUNK_SIZE)
+        non_cp_max_tokens = _gdn_fi_non_cp_max_tokens()
+        if self.gdn_prefill_backend == "flashinfer" and non_cp_max_tokens > 0:
+            warmup_lengths.append(non_cp_max_tokens + FLA_CHUNK_SIZE)
         for T in warmup_lengths:
             dummy_mixed_qkv = torch.randn(
                 T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
@@ -1583,14 +1604,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     tile=tile,
                 )
             del conv_state, ba
-
-        if (
-            GDN_FI_VSPLIT
-            and self.chunk_gated_delta_rule.updates_state_in_place(state_dtype)
-            and self.head_k_dim == 128
-            and self.head_v_dim == 128
-        ):
-            _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
 
         torch.accelerator.empty_cache()
 
