@@ -51,6 +51,18 @@ Environment (read at import):
   ``FMHA_GEN_MAX_VSM`` (default: 8x the device SM count; bounds the
   multi-CTA scratch in the trtllm workspace), ``FMHA_GEN_REAL_B1_MAXQ`` (512),
   ``FMHA_GEN_PDL`` (0).
+* ``FMHA_GEN_RULE`` selects which eligible launches take the ``gen`` route:
+  ``rubin`` (default; every eligible launch, the behaviour measured on SM107)
+  or ``gb300`` (selective; measured on SM103 where the arch-specific context
+  kernel wins on large chunks). With ``gb300`` the default
+  ``FMHA_GEN_TARGET`` is 450 and a launch goes to ``gen`` only if
+
+  - one request with ``max_q < FMHA_GEN_B1_STOCK_Q`` (800), or
+  - several requests with ``T <= FMHA_GEN_MULTI_MAX_T`` (1280), or
+  - several requests whose mean query length ``T / B`` is at most
+    ``FMHA_GEN_MULTI_MAX_MEANQ`` (96), i.e. many tiny chunks;
+
+  every other launch keeps the stock context kernel.
 
 Scratch bound: the multi-CTA partial O / stats of the generation kernels live
 in the trtllm workspace and are sized by the passed ``sm_count``; FlashInfer
@@ -89,7 +101,15 @@ _MAX_T = int(os.environ.get("FMHA107_MAX_TOKENS", "1000000000"))
 _MAX_KV = int(os.environ.get("FMHA107_MAX_KV", "1000000000"))
 _GEN = os.environ.get("FMHA_GEN", "0") == "1"
 _GEN_MAX_T = int(os.environ.get("FMHA_GEN_MAX_T", "1000000000"))
-_GEN_TARGET = float(os.environ.get("FMHA_GEN_TARGET", "768"))
+_GEN_RULE = os.environ.get("FMHA_GEN_RULE", "rubin").strip().lower()
+if _GEN_RULE not in ("rubin", "gb300"):
+    raise ValueError(f"FMHA_GEN_RULE must be 'rubin' or 'gb300', got {_GEN_RULE!r}")
+_GEN_TARGET = float(
+    os.environ.get("FMHA_GEN_TARGET", "450" if _GEN_RULE == "gb300" else "768")
+)
+_GEN_B1_STOCK_Q = int(os.environ.get("FMHA_GEN_B1_STOCK_Q", "800"))
+_GEN_MULTI_MAX_T = int(os.environ.get("FMHA_GEN_MULTI_MAX_T", "1280"))
+_GEN_MULTI_MAX_MEANQ = int(os.environ.get("FMHA_GEN_MULTI_MAX_MEANQ", "96"))
 _GEN_MAX_S = int(os.environ.get("FMHA_GEN_MAX_S", "8"))
 # None: 8x the device SM count, resolved on the first ``gen`` launch.
 _GEN_MAX_VSM: int | None = (
@@ -113,9 +133,10 @@ _state: dict[str, Any] = {
 
 if ENABLED:
     logger.info(
-        "trtllm-gen prefill routing enabled (gen=%s gen_max_t=%s gen_target=%s "
-        "max_vsm=%s, f107=%s min_tokens=%s max_b=%s)",
+        "trtllm-gen prefill routing enabled (gen=%s rule=%s gen_max_t=%s "
+        "gen_target=%s max_vsm=%s, f107=%s min_tokens=%s max_b=%s)",
         _GEN,
+        _GEN_RULE,
         _GEN_MAX_T,
         _GEN_TARGET,
         _GEN_MAX_VSM if _GEN_MAX_VSM is not None else "8x SMs",
@@ -313,6 +334,23 @@ def _gen(
     return True
 
 
+def gen_rule_accepts(T: int, B: int, max_q: int) -> bool:
+    """Whether ``FMHA_GEN_RULE`` sends an eligible launch to ``gen``.
+
+    ``rubin``: always. ``gb300`` (SM103 microbenchmarks, FP8 hd256 P32): the
+    generation kernels win on under-filled launches (one short chunk over a
+    long prefix: 1.5-12x; a few short requests: 2-5x; many tiny chunks behind
+    one long chunk: 1.5x), while the SM103 context kernel wins on large chunks
+    (single request >= ~800 new tokens: 2-30%, balanced multi-request batches
+    with longer chunks: up to 32%).
+    """
+    if _GEN_RULE != "gb300":
+        return True
+    if B <= 1:
+        return max_q < _GEN_B1_STOCK_Q
+    return T <= _GEN_MULTI_MAX_T or T <= _GEN_MULTI_MAX_MEANQ * B
+
+
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Any,
@@ -341,7 +379,8 @@ def trtllm_batch_context_with_kv_cache(
     route = "stock"
     if sup:
         if _GEN and (T <= _GEN_MAX_T or B > _MAX_B):
-            route = "gen"
+            if gen_rule_accepts(T, B, int(max_q_len)):
+                route = "gen"
         elif (
             _F107
             and T >= _MIN_TOKENS
