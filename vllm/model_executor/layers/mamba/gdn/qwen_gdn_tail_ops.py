@@ -50,6 +50,7 @@ def _gdn_gated_norm_mxfp8_kernel(
     ACTIVATION: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
     EARLY_TRIGGER: tl.constexpr,
+    STORE_8B: tl.constexpr,
 ):
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
@@ -61,45 +62,49 @@ def _gdn_gated_norm_mxfp8_kernel(
     heads = tl.arange(0, BLOCK_H)
     cols = tl.arange(0, HEAD_DIM)
     offs = heads[:, None] * HEAD_DIM + cols[None, :]
-    mask = (heads[:, None] < HEADS) & (cols[None, :] < HEAD_DIM)
-    flat = tl.arange(0, BLOCK)
-    groups = tl.arange(0, BLOCK // 32)
     n_valid = tl.load(valid_ptr).to(tl.int64) if VALID_FROM_PTR else num_valid
+    flat = tl.arange(0, BLOCK)
     sf = tl.zeros((BLOCK // 32,), dtype=tl.uint32)
-    if row < num_rows:
-        if row < n_valid:
-            x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0)
-            x = x.to(tl.float32)
-            if (row >= norm_lo) & (row < norm_hi):
-                # Same per-(token, head) math and op order as the FLA
-                # layer_norm_fwd_kernel (RMS, norm before gate).
-                xbar = tl.where(mask, x, 0.0)
-                var = tl.sum(xbar * xbar, axis=1) / HEAD_DIM
-                rstd = tl.rsqrt(var + eps)
-                w = tl.load(w_ptr + cols).to(tl.float32)
-                y = x * rstd[:, None]
-                y = y * w[None, :]
-                z = tl.load(z_ptr + row * stride_z + offs, mask=mask, other=0.0)
-                z = z.to(tl.float32)
-                if ACTIVATION == "swish" or ACTIVATION == "silu":
-                    y *= z * tl.sigmoid(z)
-                elif ACTIVATION == "sigmoid":
-                    y *= tl.sigmoid(z)
-                # Quantize the bf16 value the standalone norm would store.
-                y = y.to(tl.bfloat16).to(tl.float32)
-            else:
-                # Already normalized (fused CUDA MTP kernel): quantize as is.
-                y = x
-            quantized, sf = mxfp8_quantize_row(tl.reshape(y, (BLOCK,)), BLOCK)
-            tl.store(q_ptr + row * K + flat, quantized, mask=flat < K)
-        else:
+    if (row < num_rows) & (row < n_valid):
+        # x and z are loaded up front and the norm-or-not choice is a select,
+        # so both loads are in flight together.
+        normed = (row >= norm_lo) & (row < norm_hi)
+        mask = heads[:, None] < HEADS
+        x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0)
+        x = x.to(tl.float32)
+        z = tl.load(z_ptr + row * stride_z + offs, mask=mask & normed, other=0.0)
+        z = z.to(tl.float32)
+        # Same per-(token, head) math and op order as the FLA
+        # layer_norm_fwd_kernel (RMS, norm before gate).
+        var = tl.sum(x * x, axis=1) / HEAD_DIM
+        rstd = tl.rsqrt(var + eps)
+        w = tl.load(w_ptr + cols).to(tl.float32)
+        y = x * rstd[:, None]
+        y = y * w[None, :]
+        if ACTIVATION == "swish" or ACTIVATION == "silu":
+            y *= z * tl.sigmoid(z)
+        elif ACTIVATION == "sigmoid":
+            y *= tl.sigmoid(z)
+        # Quantize the bf16 value the standalone norm would store; rows
+        # normalized upstream (the fused CUDA MTP kernel) are quantized as is.
+        y = tl.where(normed, y.to(tl.bfloat16).to(tl.float32), x)
+        quantized, sf = mxfp8_quantize_row(tl.reshape(y, (BLOCK,)), BLOCK)
+        if STORE_8B:
+            # Address the e4m3 row as 8-byte chunks: a 16 B/thread e4m3 store
+            # would make Triton move the row through shared memory.
+            c = tl.arange(0, BLOCK // 8)[:, None] * 8 + tl.arange(0, 8)[None, :]
             tl.store(
-                q_ptr + row * K + flat,
-                tl.zeros((BLOCK,), dtype=tl.float32),
-                mask=flat < K,
+                q_ptr + row * K + c,
+                tl.reshape(quantized, (BLOCK // 8, 8)),
+                mask=c < K,
             )
+        else:
+            tl.store(q_ptr + row * K + flat, quantized, mask=flat < K)
+    elif row < num_rows:
+        # Rows >= num_valid are not read: zero values (and zero scales).
+        tl.store(q_ptr + row * K + flat, tl.zeros((BLOCK,), tl.float32), mask=flat < K)
     # Rows past num_rows only fill the 128-row scale padding (with zeros).
-    mxfp8_store_swizzled_scales(scale_ptr, row, groups, sf, K // 32)
+    mxfp8_store_swizzled_scales(scale_ptr, row, tl.arange(0, BLOCK // 32), sf, K // 32)
 
 
 def gdn_mxfp8_scale_numel(num_tokens: int, hidden: int) -> int:
@@ -194,6 +199,7 @@ def gdn_gated_norm_mxfp8(
         LAUNCH_PDL=launch_pdl,
         EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
         launch_pdl=launch_pdl,
+        STORE_8B=block_h * head_dim >= 16 * 32 * num_warps,
         num_warps=num_warps,
     )
 
