@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fusion.norm_quant_kernels import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
+from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
 
 
 @triton.jit
@@ -66,8 +67,10 @@ def _glue_norm_quant_rr_kernel(
     stride_s, stride_f, stride_a, stride_r, stride_out, stride_res, stride_q,
     H: tl.constexpr, XBLOCK: tl.constexpr, RB: tl.constexpr, NUM_IN: tl.constexpr,
     EMIT_Q: tl.constexpr, EMIT_SWZ: tl.constexpr, EMIT_LIN: tl.constexpr,
-    PADDED_SF_COLS: tl.constexpr,
-):
+    PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) * XBLOCK + tl.arange(0, XBLOCK)[:, None]   # [XBLOCK, 1]
     xmask = row < M
     rbase = tl.arange(0, RB)[None, :]
@@ -147,17 +150,19 @@ def norm_quant_rr(a, r, w, eps, s=None, f=None, emit_q=True, emit_swz=True, emit
         a.stride(0), r.stride(0), out.stride(0), res.stride(0) if res is not None else 0,
         q.stride(0) if q is not None else 0,
         H=H, XBLOCK=xb, RB=cfg["RB"], NUM_IN=num_in, EMIT_Q=emit_q, EMIT_SWZ=emit_swz, EMIT_LIN=emit_lin,
-        PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"], num_stages=1,
-    )
+        PADDED_SF_COLS=padded_sf_cols, num_warps=cfg["num_warps"], num_stages=1, launch_pdl=_lcd_pdl_on())
     return out, res, q, sf_swz, sf_lin
 
 
 @triton.jit
 def _glue_gate_mul_quant_kernel(A, G, OUT, Q, SF_SWZ, M, PADDED_M, stride_a, stride_g, stride_o, stride_q,
                                 N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, GATE_D: tl.constexpr,
-                                PADDED_SF_COLS: tl.constexpr, STORE_OUT: tl.constexpr = True):
+                                PADDED_SF_COLS: tl.constexpr, STORE_OUT: tl.constexpr = True, launch_pdl: tl.constexpr = False):
     """== _nqf_gate_mul_quant_kernel (out = bf16(f32(attn) * tl.sigmoid(f32(gate))) + MXFP8), XB rows per program,
     every chunk's loads issued before the first store. GATE_D > 0: gate read from the interleaved QKV rows."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
     rmask = row < M
     cols = tl.arange(0, N)[None, :]
@@ -188,7 +193,7 @@ def gate_mul_quant_rr(a, g, gate_d=0, xb=1, num_warps=8, store_out=True, out=Non
     if pm:
         _glue_gate_mul_quant_kernel[(triton.cdiv(pm, xb),)](
             a, g, out, q, sf, M, pm, a.stride(0), g.stride(0), out.stride(0), q.stride(0),
-            N=N, BN=N, XB=xb, GATE_D=gate_d, PADDED_SF_COLS=psc, STORE_OUT=store_out, num_warps=num_warps)
+            N=N, BN=N, XB=xb, GATE_D=gate_d, PADDED_SF_COLS=psc, STORE_OUT=store_out, num_warps=num_warps, launch_pdl=_lcd_pdl_on())
     return out, q, sf
 
 
@@ -198,7 +203,10 @@ def gate_mul_quant_rr(a, g, gate_d=0, xb=1, num_warps=8, store_out=True, out=Non
 def _glue_gdn_gated_rmsnorm_quant_kernel(x_ptr, z_ptr, w_ptr, y_ptr, Q, SF_SWZ, T, ROW0, stride_z_tok, stride_q, eps,
                                          HV: tl.constexpr, D: tl.constexpr, BT: tl.constexpr,
                                          SIGMOID_GATE: tl.constexpr, PADDED_SF_COLS: tl.constexpr,
-                                         STORE_Y: tl.constexpr):
+                                         STORE_Y: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i_t = tl.program_id(0)
     i_h = tl.program_id(1)
     offs_t = i_t * BT + tl.arange(0, BT)
@@ -233,7 +241,7 @@ def gdn_gated_rmsnorm_quant_(x, z, weight, eps, activation, q, sf, row0, padded_
     _glue_gdn_gated_rmsnorm_quant_kernel[(triton.cdiv(T, bt), HV)](
         x, z, weight, x, q, sf, T, row0, z.stride(0), q.stride(0), eps,
         HV=HV, D=D, BT=bt, SIGMOID_GATE=(activation == "sigmoid"), PADDED_SF_COLS=padded_sf_cols, STORE_Y=store_y,
-        num_warps=num_warps)
+        num_warps=num_warps, launch_pdl=_lcd_pdl_on())
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -258,8 +266,10 @@ def _glue_ews_qkv_kernel(
     INPUT_DTYPE: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROT_HALF_BLOCK: tl.constexpr,
     HAS_PASS: tl.constexpr, HAS_MROPE: tl.constexpr, MROPE_SECTION_H: tl.constexpr,
     MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr, HG: tl.constexpr,
-    GATE_COPY: tl.constexpr,
-):
+    GATE_COPY: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     NQG: tl.constexpr = num_q_heads // HG
     grp = tl.program_id(1)
     is_k = grp >= NQG
@@ -363,8 +373,10 @@ def _glue_ews1_qkv_kernel(
     rotary_dim: tl.constexpr, half_rotary: tl.constexpr, eps: tl.constexpr, norm_beta: tl.constexpr,
     INPUT_DTYPE: tl.constexpr, HEAD_BLOCK: tl.constexpr, ROT_HALF_BLOCK: tl.constexpr,
     HAS_PASS: tl.constexpr, HAS_MROPE: tl.constexpr, MROPE_SECTION_H: tl.constexpr,
-    MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr, GATE_COPY: tl.constexpr,
-):
+    MROPE_SECTION_W: tl.constexpr, WRITE_KV: tl.constexpr, TPP: tl.constexpr, GATE_COPY: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     head = tl.program_id(1)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
@@ -505,8 +517,7 @@ def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_hea
             INPUT_DTYPE=tl.bfloat16 if qkv.dtype == torch.bfloat16 else tl.float16,
             HEAD_BLOCK=head_block, ROT_HALF_BLOCK=triton.next_power_of_2(rotary_dim // 2),
             HAS_PASS=rotary_dim < head_dim, HAS_MROPE=has_mrope, MROPE_SECTION_H=mh, MROPE_SECTION_W=mw,
-            WRITE_KV=write_kv, TPP=tpp, GATE_COPY=gate_copy, num_warps=max(1, head_block // 64), num_stages=2,
-        )
+            WRITE_KV=write_kv, TPP=tpp, GATE_COPY=gate_copy, num_warps=max(1, head_block // 64), num_stages=2, launch_pdl=_lcd_pdl_on())
         return q8, k_out, gate
     nw = num_warps or max(1, head_block // 64) * hg
     grid = (triton.cdiv(T, tpp), num_q_heads // hg + 1)
@@ -519,8 +530,7 @@ def ews_launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_hea
         INPUT_DTYPE=tl.bfloat16 if qkv.dtype == torch.bfloat16 else tl.float16,
         HEAD_BLOCK=head_block, ROT_HALF_BLOCK=triton.next_power_of_2(rotary_dim // 2),
         HAS_PASS=rotary_dim < head_dim, HAS_MROPE=has_mrope, MROPE_SECTION_H=mh, MROPE_SECTION_W=mw,
-        WRITE_KV=write_kv, TPP=tpp, HG=hg, GATE_COPY=gate_copy, num_warps=nw, num_stages=2,
-    )
+        WRITE_KV=write_kv, TPP=tpp, HG=hg, GATE_COPY=gate_copy, num_warps=nw, num_stages=2, launch_pdl=_lcd_pdl_on())
     return q8, k_out, gate
 
 
@@ -566,8 +576,11 @@ def _glue_fin_x_f0(G, WT, IDX, A, R, row, xmask, cols, stride_g, stride_a, strid
 def _glue_fin_norm_quant_f0_kernel(G, WT, IDX, A, R, W, OUT, RES_OUT, Q, SF_SWZ, M, PADDED_M, eps,
                                    stride_g, stride_a, stride_r, stride_out, stride_res, stride_q,
                                    H: tl.constexpr, XBLOCK: tl.constexpr, RB: tl.constexpr, TOPK: tl.constexpr,
-                                   PADDED_SF_COLS: tl.constexpr, USE_FMA: tl.constexpr):
+                                   PADDED_SF_COLS: tl.constexpr, USE_FMA: tl.constexpr, launch_pdl: tl.constexpr = False):
     """== _qgf_fin_norm_quant_kernel with F == +0.0 (not loaded)."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64) * XBLOCK + tl.arange(0, XBLOCK)[:, None]
     xmask = row < M
     rbase = tl.arange(0, RB)[None, :]
@@ -605,5 +618,5 @@ def fin_norm_quant_f0(g2, wts, idx, a, r, w, eps, xblock=1, num_warps=4):
         g2, wts, idx, a, r, w, out, res, q, sf, M, pm, eps,
         g2.stride(0), a.stride(0), r.stride(0), out.stride(0), res.stride(0), q.stride(0),
         H=H, XBLOCK=xblock, RB=RB, TOPK=idx.numel() // M, PADDED_SF_COLS=psc, USE_FMA=K.FIN_FMA,
-        num_warps=num_warps, num_stages=1)
+        num_warps=num_warps, num_stages=1, launch_pdl=_lcd_pdl_on())
     return out, res, q, sf
