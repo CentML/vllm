@@ -1015,6 +1015,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     def capture_model(self, *, profile_only: bool = False) -> int:
+        if gdn_layer_graphs.ENABLED:
+            # GDN layer graphs: mark vLLM's capture phase
+            return gdn_layer_graphs.capture_model(
+                lambda: self._capture_model_cfix(profile_only=profile_only)
+            )
+        return self._capture_model_cfix(profile_only=profile_only)
+
+    def _capture_model_cfix(self, *, profile_only: bool = False) -> int:
         if cudagraph_profile_cleanup.ENABLED:
             # CFIX / CFIX_RESET: eager persistent-buffer allocation before the
             # real capture and post-capture diagnostics

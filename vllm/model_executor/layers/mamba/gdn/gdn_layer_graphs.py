@@ -79,6 +79,13 @@ FORCE_EAGER = os.environ.get(_P + "_FORCE_EAGER", "0") == "1"
 MODE = os.environ.get(_P + "_MODE", "piece").strip().lower()
 DEVNB = os.environ.get(_P + "_DEVICE_NB", "0") == "1"
 FIX_PROFILE = os.environ.get(_P + "_FIX_PROFILE", "1") == "1"
+# Layer mode: a PIECEWISE step whose GDN metadata was not packed (CP routing,
+# > T_MAX tokens, > NP prefill sequences, ...) keeps its PIECEWISE graphs and
+# runs the GDN core on the eager step-plan path (1, default), instead of
+# running the whole forward with cudagraph_runtime_mode NONE (0, the original
+# behaviour; piece mode always needs NONE). Layer graphs are then captured
+# only inside vLLM's capture phase (never while serving an unpacked step).
+KEEP_PW = os.environ.get(_P + "_KEEP_PIECEWISE", "1") == "1"
 MTPW = 4  # 1 + num_speculative_tokens (checked against the metadata)
 
 _GB: dict = {}  # group key (layer names) -> _GroupBufs
@@ -86,6 +93,7 @@ _L2G: dict = {}  # layer name -> _GroupBufs
 _SHARED: dict = {}  # conv-output buffers, shared by all groups (layers run in order)
 _CAP: list = [None, None]  # layer mode: capture stream, private graph pool
 _PHASE = ["real"]
+_IN_CAPTURE = [False]  # inside GPUModelRunner.capture_model (both phases)
 _GRAPH = "_step_plan_graph"  # md flag: this step was packed for the graphs
 _ZEROED = "_step_plan_zeroed"  # md flag: fresh slots already zeroed
 _VSF = "_step_plan_vsf"  # md: the step's v_split
@@ -594,6 +602,10 @@ def forward_context_mode(attn_metadata, mode):
     """
     from vllm.config import CUDAGraphMode
 
+    if MODE != "piece" and KEEP_PW and not FORCE_EAGER:
+        # layer mode: unpacked steps run the eager GDN core between the
+        # PIECEWISE graphs (the GDN op is still a splitting op)
+        return mode
     if mode == CUDAGraphMode.PIECEWISE and isinstance(attn_metadata, dict):
         GDNMD = gdn_step_plan._gdn().GDNAttentionMetadata
         seen = set()
@@ -606,6 +618,18 @@ def forward_context_mode(attn_metadata, mode):
                 return CUDAGraphMode.NONE
         STATS["graph_piecewise"] = STATS.get("graph_piecewise", 0) + 1
     return mode
+
+
+def capture_model(impl):
+    """GPUModelRunner.capture_model: marks vLLM's capture phase (profiling and
+    real), the only time layer graphs of unpacked (dummy) steps are captured
+    when KEEP_PIECEWISE=1.
+    """
+    _IN_CAPTURE[0] = True
+    try:
+        return impl()
+    finally:
+        _IN_CAPTURE[0] = False
 
 
 def _drop_graphs(reason):
@@ -683,6 +707,14 @@ def forward_packed(layer, mixed_qkvz, ba, core_attn_out) -> bool:
     if gb is None or not gb.warm or md is None:
         return False
     T = core_attn_out.size(0)
+    if T > T_MAX:
+        # MNBT > T_MAX (GB300 recipe: MNBT 32768): no graph for this size; the
+        # step is never packed (_eligible "tokens")
+        return False
+    if KEEP_PW and not md.__dict__.get(_GRAPH) and not _IN_CAPTURE[0]:
+        # unpacked step while serving: eager step-plan path, no capture
+        STATS["graph_unpacked_pw"] = STATS.get("graph_unpacked_pw", 0) + 1
+        return False
     # keyed by the input/output addresses too: vLLM may hold more than one
     # piecewise graph per size, each with its own static buffers
     vsel = (md.__dict__.get(_VSF, 2) if V2ONLY is False else 2) if VSF_KEY else None
