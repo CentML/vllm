@@ -46,6 +46,7 @@ def _attn_gate_mxfp8_kernel(
     groups = chunk * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         a = tl.load(attn_ptr + row * attn_stride_t + cols).to(tl.float32)
         gate_offs = cols // GATE_HEAD_DIM * gate_stride_h + cols % GATE_HEAD_DIM
