@@ -97,6 +97,11 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
+# FlashInfer GDN prefill: a single sequence of at most this many tokens runs
+# the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
+# single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
+# (2144 tokens: 96 vs 76 us).
+GDN_FI_NON_CP_MAX_TOKENS = int(os.environ.get("VLLM_GDN_FI_NON_CP_MAX_TOKENS", "4608"))
 
 
 def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
@@ -260,6 +265,7 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
+    num_seqs = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -272,6 +278,11 @@ def fi_chunk_gated_delta_rule(
         output=None if output is None else output.view(v.shape),
         output_state=fi_state if state_indices is not None else None,
         state_indices=state_indices,
+        use_cp=(
+            False
+            if num_seqs == 1 and q.shape[0] <= GDN_FI_NON_CP_MAX_TOKENS
+            else "auto"
+        ),
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
