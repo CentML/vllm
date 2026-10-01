@@ -40,6 +40,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa:
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (  # noqa: E402
     MambaStateShapeCalculator,
+    is_conv_state_dim_first,
 )
 from vllm.utils.math_utils import cdiv  # noqa: E402
 from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
@@ -182,11 +183,21 @@ def _slot(block_table, row, num_tokens):
     return int(block_table[row, (num_tokens - 1) // BLOCK])
 
 
+def _conv_window(conv_pool: torch.Tensor) -> torch.Tensor:
+    """The ``[..., dim, width - 1]`` part of the conv pool that the prefill and
+    decode conv kernels read as the initial state (with MTP the pool rows are
+    ``width - 1 + num_spec`` long; the extra columns are spec-decode scratch).
+    """
+    view = conv_pool if is_conv_state_dim_first() else conv_pool.transpose(-1, -2)
+    return view[..., : CONV_KERNEL - 1]
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
 @pytest.mark.parametrize("drop_eagle", [False, True])
 @pytest.mark.parametrize("num_decodes", [0, 2])
 @pytest.mark.parametrize("backend", ["auto", "triton"])
 def test_prefill_checkpoint_matches_split_prefill(
-    drop_eagle: bool, num_decodes: int, backend: str
+    drop_eagle: bool, num_decodes: int, backend: str, num_spec: int
 ) -> None:
     if backend == "triton" and current_platform.is_device_capability_family(100):
         pytest.skip("The Triton/FLA chunk kernel is unsupported on SM10x")
@@ -208,7 +219,7 @@ def test_prefill_checkpoint_matches_split_prefill(
     )
     pool_size = num_rows * max_blocks + 1
     conv_shape, ssm_shape = MambaStateShapeCalculator.gated_delta_net_state_shape(
-        1, H, HV, K, V, CONV_KERNEL, num_spec=0
+        1, H, HV, K, V, CONV_KERNEL, num_spec=num_spec
     )
     conv0 = torch.randn(pool_size, *conv_shape, dtype=torch.bfloat16, device=device)
     ssm0 = torch.randn(pool_size, *ssm_shape, dtype=torch.float32, device=device)
@@ -317,7 +328,12 @@ def test_prefill_checkpoint_matches_split_prefill(
             ckpt_slot = int(block_table[r, cdiv(e, BLOCK) - 2])
             assert ckpt_slot != running
             # Conv checkpoints are copies of the conv inputs: always exact.
-            torch.testing.assert_close(conv_c[ckpt_slot], ckpt_conv[r], atol=0, rtol=0)
+            torch.testing.assert_close(
+                _conv_window(conv_c[ckpt_slot]),
+                _conv_window(ckpt_conv[r]),
+                atol=0,
+                rtol=0,
+            )
             check(ssm_c[ckpt_slot], ckpt_ssm[r])
         else:
             ref_out = out_a[r]
