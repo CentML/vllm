@@ -179,6 +179,7 @@ class GDNSharedBuild:
     # First non-spec row of the prefill block (decodes peeled off in front).
     prefill_row_start: int = 0
     prefill_query_start_loc: torch.Tensor | None = None
+    prefill_query_start_loc_cpu: torch.Tensor | None = None
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
     has_initial_state: torch.Tensor | None = None
@@ -646,6 +647,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
         if num_prefills > 0 and self.prefill_checkpoint_enabled:
             assert prefill_state_indices is not None
+            prefill_query_start_loc_cpu = shared.prefill_query_start_loc_cpu
+            prefill_has_initial_state = shared.prefill_has_initial_state
+            assert prefill_query_start_loc_cpu is not None
             assert prefill_has_initial_state is not None
             if spec_sequence_masks_cpu is None:
                 # Decodes (if any) are the front rows; the prefills follow.
@@ -661,7 +665,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 m,
                 prefill_rows,
                 prefill_query_start_loc_cpu,
-                num_decode_tokens if spec_sequence_masks is None else 0,
+                split.num_decode_tokens if spec_sequence_masks is None else 0,
                 prefill_state_indices,
                 prefill_has_initial_state,
             )
@@ -764,6 +768,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_max_seqlen=shared.prefill_max_seqlen,
             spec_token_start=shared.spec_token_start,
             non_spec_token_start=shared.non_spec_token_start,
+            prefill_checkpoint=prefill_checkpoint,
         )
         return attn_metadata
 
@@ -933,7 +938,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens=num_accepted_tokens,
             spec_token_start=spec_token_start,
             non_spec_token_start=non_spec_token_start,
-            prefill_checkpoint=prefill_checkpoint,
         )
         if spec_sequence_masks_cpu is not None:
             shared.spec_rows = spec_rows
@@ -959,6 +963,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc = non_spec_query_start_loc
             prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
         shared.prefill_query_start_loc = prefill_query_start_loc
+        shared.prefill_query_start_loc_cpu = prefill_query_start_loc_cpu
         shared.chunk_indices, shared.chunk_offsets = self._build_chunk_metadata(
             prefill_query_start_loc,
             prefill_query_start_loc_cpu,
