@@ -58,7 +58,8 @@ def _vsplit_enabled():
         ([64], True),
         ([1000], True),
         ([3584], True),
-        ([4608], True),  # largest single sequence on the non-CP path
+        ([6144], True),
+        ([8192], True),  # largest single sequence on the non-CP path
         ([2048, 64], True),
         ([3000, 3119, 17], True),
         ([1500] * 6, False),  # cost model keeps the stock kernel (VR, 212 SMs)
