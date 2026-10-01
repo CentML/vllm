@@ -14,6 +14,7 @@ Compiles with plain cute.compile (no on-disk cache), so it works with the instal
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -22,7 +23,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from vllm.logger import init_logger
+
 from .gdn_chunked_vs import GatedDeltaNetChunkedKernel
+
+logger = init_logger(__name__)
 
 _WS = {}
 
@@ -35,6 +40,19 @@ def _num_sm(dev_index: int) -> int:
 @functools.cache
 def _cache(*key):
     return {}
+
+
+_CG0_SPLIT = os.environ.get("VLLM_GDN_VSPLIT_CG0SPLIT", "0") == "1"
+# VLLM_GDN_VSPLIT_C1REORDER=1 (default off): issue the state-update GEMM (KV) before the output GEMM (QKV) and let
+# compute group 1 drain chunk c's output after it has published state c+1 (exact: same ops, different order).
+_C1_REORDER = os.environ.get("VLLM_GDN_VSPLIT_C1REORDER", "0") == "1"
+
+
+def _cg0_split(v_split: int, use_init: bool) -> bool:
+    """VLLM_GDN_VSPLIT_CG0SPLIT=1 (default off): v_split=2 launches run as 2-CTA clusters (the two V slices of a head)
+    whose CG0 warpgroups split the V-independent WY prep (A_inv / W_qkv) by pair and share it through DSMEM.
+    Bit-identical to the unsplit kernel (same MMAs, same reduction order, same bf16 rounding points)."""
+    return _CG0_SPLIT and int(v_split) == 2 and bool(use_init)
 
 
 def _io(t):
@@ -88,17 +106,21 @@ def chunk_gated_delta_rule_vsplit(
            str(state_indices.dtype) if use_idx else "none",
            tuple(initial_state.stride()[1:]) if (use_idx and use_init) else None,
            tuple(output_state.stride()[1:]) if (use_idx and store_final) else None,
-           int(v_split), bool(device_nb))
+           int(v_split), bool(device_nb), _cg0_split(v_split, use_init), _C1_REORDER and use_init)
     c = _cache(*key)
     dv = 128 // v_split
     if "compiled" not in c:
+        if _cg0_split(v_split, use_init) or (_C1_REORDER and use_init):
+            logger.info("V-split devnb GDN chunk kernel: compiling v_split=%d device_nb=%s cg0_split=%s c1_reorder=%s",
+                        v_split, device_nb, _cg0_split(v_split, use_init), _C1_REORDER and use_init)
         gdn = GatedDeltaNetChunkedKernel(
             io_dtype=_io(q.dtype), inverse_dtype=_io(q.dtype), acc_dtype=cutlass.Float32,
             state_dtype=_st(st_dtype),
             mma_tiler_qk=(64, 64, 128), mma_tiler_qs=(dv, 64, 128), mma_tiler_qkv=(dv, 64, 64),
             mma_tiler_kv=(dv, 128, 64), max_active_clusters=num_sm, num_sm=num_sm, is_GQA=is_GQA,
             use_initial_state=use_init, store_final_state=store_final, enable_checkpoints=False,
-            is_persistent=True, v_split=v_split, device_nb=device_nb)
+            is_persistent=True, v_split=v_split, device_nb=device_nb,
+            cg0_split=_cg0_split(v_split, use_init), c1_reorder=_C1_REORDER and use_init)
 
         def dyn(t, nd):
             x = from_dlpack(t, assumed_align=16)
