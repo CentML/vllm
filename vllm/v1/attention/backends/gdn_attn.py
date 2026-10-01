@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -23,7 +24,11 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
+)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -38,6 +43,41 @@ class GDNAttentionBackend(AttentionBackend):
     @classmethod
     def is_ssm(cls) -> bool:
         return True
+
+
+@dataclass
+class GDNPrefillCheckpointMetadata:
+    """Internal prefill checkpoints of one step (align-mode prefix caching).
+
+    Each checkpointed prefill sequence is cut at its checkpoint into a head
+    (query start -> checkpoint) and a tail (checkpoint -> query end). The
+    chunk kernel first runs the split layout, where the heads leave the
+    checkpoint state in the running slots and the tails are throwaway
+    sequences on the checkpoint slots; the running slots are then copied into
+    the checkpoint slots, and the gathered tails rerun from the running slots.
+    Token indices are relative to the prefill token block of the chunk kernel.
+    """
+
+    # Split layout: cu_seqlens over the prefill tokens, one state slot and
+    # initial-state flag per (head, tail or unsplit) sequence.
+    split_query_start_loc: torch.Tensor
+    split_state_indices: torch.Tensor
+    split_state_indices_i64: torch.Tensor
+    split_has_initial_state: torch.Tensor
+    split_no_initial_state: torch.Tensor
+    split_chunk_indices: torch.Tensor | None
+    split_chunk_offsets: torch.Tensor | None
+    # Tails, gathered: token indices, cu_seqlens and their running slots.
+    tail_token_indices: torch.Tensor
+    tail_query_start_loc: torch.Tensor
+    tail_state_indices: torch.Tensor
+    tail_state_indices_i64: torch.Tensor
+    tail_chunk_indices: torch.Tensor | None
+    tail_chunk_offsets: torch.Tensor | None
+    # Checkpoint slots (same order as the tails) and, per checkpoint, the
+    # index of its first tail token in the non-spec conv input block.
+    checkpoint_state_indices_i64: torch.Tensor
+    conv_token_indices: torch.Tensor
 
 
 @dataclass
@@ -92,6 +132,8 @@ class GDNAttentionMetadata:
     # instead of gathering by spec/non_spec_token_indx.
     spec_token_start: int | None = None
     non_spec_token_start: int | None = None
+    # Set on steps where a prefill sequence exports an internal checkpoint.
+    prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +176,7 @@ class GDNSharedBuild:
     # First non-spec row of the prefill block (decodes peeled off in front).
     prefill_row_start: int = 0
     prefill_query_start_loc: torch.Tensor | None = None
+    prefill_query_start_loc_cpu: torch.Tensor | None = None
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
     has_initial_state: torch.Tensor | None = None
@@ -228,6 +271,152 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
             device=device,
+        )
+
+        # Internal prefill checkpoints: the same positional rule as the
+        # scheduler and the Mamba manager decides which prefill sequences
+        # export one and where it goes (block column cdiv(seq_len, B) - 2).
+        cache_config = vllm_config.cache_config
+        self.prefill_checkpoint_enabled: bool = (
+            cache_config.mamba_cache_mode == "align"
+            and kv_cache_spec.num_prefill_checkpoint_blocks > 0
+        )
+        self.checkpoint_hash_block_size: int = (
+            cache_config.prefix_match_unit or kv_cache_spec.block_size
+        )
+        self.checkpoint_drop_eagle_block: bool = (
+            self.speculative_config is not None
+            and self.speculative_config.use_eagle_block_drop()
+        )
+
+    def _build_prefill_checkpoint(
+        self,
+        m: CommonAttentionMetadata,
+        prefill_rows: Sequence[int],
+        prefill_query_start_loc_cpu: torch.Tensor,
+        conv_token_base: int,
+        prefill_state_indices: torch.Tensor,
+        prefill_has_initial_state: torch.Tensor,
+    ) -> GDNPrefillCheckpointMetadata | None:
+        """Checkpoint metadata for this step's prefill sequences, or None if
+        none of them exports a checkpoint. ``prefill_rows[i]`` is the batch
+        row of prefill sequence ``i``; ``conv_token_base`` is the offset of the
+        prefill tokens inside the non-spec conv input block.
+        """
+        assert m.seq_lens_cpu_upper_bound is not None
+        spec = self.kv_cache_spec
+        block_size = spec.block_size
+        hash_block_size = self.checkpoint_hash_block_size
+        seq_lens = m.seq_lens_cpu_upper_bound.tolist()
+        qsl = prefill_query_start_loc_cpu.tolist()
+        # (prefill index, batch row, offset of the checkpoint in the query,
+        # checkpoint block column)
+        checkpoints: list[tuple[int, int, int, int]] = []
+        for i, row in enumerate(prefill_rows):
+            query_len = qsl[i + 1] - qsl[i]
+            if query_len <= hash_block_size:
+                continue
+            seq_len = seq_lens[row]
+            query_start = seq_len - query_len
+            position = get_mamba_prefill_checkpoint_position(
+                seq_len,
+                hash_block_size,
+                drop_eagle_block=self.checkpoint_drop_eagle_block,
+            )
+            if is_mamba_prefill_checkpoint_valid(
+                query_start=query_start,
+                query_end=seq_len,
+                checkpoint_position=position,
+                hash_block_size=hash_block_size,
+                mamba_block_size=block_size,
+                checkpoint_alignment=spec.prefill_checkpoint_alignment,
+                reuse_initial_block=spec.prefill_checkpoint_reuses_initial_block,
+            ):
+                checkpoints.append(
+                    (i, row, position - query_start, cdiv(seq_len, block_size) - 2)
+                )
+        if not checkpoints:
+            return None
+
+        num_prefills = len(qsl) - 1
+        split_qsl = [0]
+        # Index into cat(prefill_state_indices, checkpoint slots).
+        split_slot_src: list[int] = []
+        tail_tokens: list[int] = []
+        tail_qsl = [0]
+        conv_tokens: list[int] = []
+        next_ckpt = 0
+        for i in range(num_prefills):
+            end = qsl[i + 1]
+            if next_ckpt < len(checkpoints) and checkpoints[next_ckpt][0] == i:
+                cut = qsl[i] + checkpoints[next_ckpt][2]
+                split_qsl += [cut, end]
+                split_slot_src += [i, num_prefills + next_ckpt]
+                tail_tokens.extend(range(cut, end))
+                tail_qsl.append(tail_qsl[-1] + end - cut)
+                conv_tokens.append(conv_token_base + cut)
+                next_ckpt += 1
+            else:
+                split_qsl.append(end)
+                split_slot_src.append(i)
+
+        device = prefill_state_indices.device
+
+        def h2d(data: list[int] | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+            return async_tensor_h2d(data, device=device, dtype=dtype)
+
+        num_ckpt = len(checkpoints)
+        rows = h2d([c[1] for c in checkpoints], torch.int64)
+        cols = h2d([c[3] for c in checkpoints], torch.int64)
+        checkpoint_slots = m.block_table_tensor[rows, cols].to(torch.int32)
+        slot_src = h2d(split_slot_src, torch.int64)
+        split_state_indices = torch.cat(
+            [prefill_state_indices.to(torch.int32), checkpoint_slots]
+        ).index_select(0, slot_src)
+        # The tails of the split layout are throwaway: start them from zero.
+        split_has_initial_state = torch.cat(
+            [
+                prefill_has_initial_state,
+                torch.zeros(num_ckpt, dtype=torch.bool, device=device),
+            ]
+        ).index_select(0, slot_src)
+        ckpt_prefill_idx = h2d([c[0] for c in checkpoints], torch.int64)
+        tail_state_indices = prefill_state_indices.to(torch.int32).index_select(
+            0, ckpt_prefill_idx
+        )
+
+        qsl_dtype = (
+            torch.int64 if self.gdn_prefill_backend == "flashinfer" else torch.int32
+        )
+        split_qsl_cpu = torch.tensor(split_qsl, dtype=torch.int32)
+        tail_qsl_cpu = torch.tensor(tail_qsl, dtype=torch.int32)
+        split_query_start_loc = h2d(split_qsl_cpu, qsl_dtype)
+        tail_query_start_loc = h2d(tail_qsl_cpu, qsl_dtype)
+        split_chunk_indices = split_chunk_offsets = None
+        tail_chunk_indices = tail_chunk_offsets = None
+        if self.gdn_prefill_backend != "flashinfer":
+            split_chunk_indices, split_chunk_offsets = self._build_chunk_metadata(
+                split_query_start_loc, split_qsl_cpu, device
+            )
+            tail_chunk_indices, tail_chunk_offsets = self._build_chunk_metadata(
+                tail_query_start_loc, tail_qsl_cpu, device
+            )
+        return GDNPrefillCheckpointMetadata(
+            split_query_start_loc=split_query_start_loc,
+            split_state_indices=split_state_indices,
+            split_state_indices_i64=split_state_indices.to(torch.int64),
+            split_has_initial_state=split_has_initial_state,
+            split_no_initial_state=~split_has_initial_state,
+            split_chunk_indices=split_chunk_indices,
+            split_chunk_offsets=split_chunk_offsets,
+            tail_token_indices=h2d(tail_tokens, torch.int64),
+            tail_query_start_loc=tail_query_start_loc,
+            tail_state_indices=tail_state_indices,
+            tail_state_indices_i64=tail_state_indices.to(torch.int64),
+            tail_chunk_indices=tail_chunk_indices,
+            tail_chunk_offsets=tail_chunk_offsets,
+            checkpoint_state_indices_i64=checkpoint_slots.to(torch.int64),
+            conv_token_indices=h2d(conv_tokens, torch.int64),
         )
 
     def _build_chunk_metadata(
@@ -451,6 +640,32 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         non_spec_query_start_loc = shared.non_spec_query_start_loc
         num_accepted_tokens = shared.num_accepted_tokens
 
+        prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
+        if num_prefills > 0 and self.prefill_checkpoint_enabled:
+            assert prefill_state_indices is not None
+            prefill_query_start_loc_cpu = shared.prefill_query_start_loc_cpu
+            prefill_has_initial_state = shared.prefill_has_initial_state
+            assert prefill_query_start_loc_cpu is not None
+            assert prefill_has_initial_state is not None
+            if spec_sequence_masks_cpu is None:
+                # Decodes (if any) are the front rows; the prefills follow.
+                prefill_rows: Sequence[int] = range(
+                    num_decodes, num_decodes + len(prefill_query_start_loc_cpu) - 1
+                )
+            else:
+                assert split.non_spec_sequence_masks_cpu is not None
+                prefill_rows = (
+                    split.non_spec_sequence_masks_cpu.nonzero().flatten().tolist()
+                )
+            prefill_checkpoint = self._build_prefill_checkpoint(
+                m,
+                prefill_rows,
+                prefill_query_start_loc_cpu,
+                split.num_decode_tokens if spec_sequence_masks is None else 0,
+                prefill_state_indices,
+                prefill_has_initial_state,
+            )
+
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
@@ -548,6 +763,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc_i64=shared.prefill_query_start_loc_i64,
             spec_token_start=shared.spec_token_start,
             non_spec_token_start=shared.non_spec_token_start,
+            prefill_checkpoint=prefill_checkpoint,
         )
         return attn_metadata
 
@@ -742,6 +958,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc = non_spec_query_start_loc
             prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
         shared.prefill_query_start_loc = prefill_query_start_loc
+        shared.prefill_query_start_loc_cpu = prefill_query_start_loc_cpu
         shared.chunk_indices, shared.chunk_offsets = self._build_chunk_metadata(
             prefill_query_start_loc,
             prefill_query_start_loc_cpu,

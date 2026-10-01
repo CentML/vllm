@@ -343,6 +343,14 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        self.mamba_prefill_checkpoint_reuses_initial_block = (
+            self.has_mamba_layers
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_checkpoint_reuses_initial_block
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -448,6 +456,7 @@ class Scheduler(SchedulerInterface):
                 hash_block_size=self.hash_block_size,
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                reuse_initial_block=self.mamba_prefill_checkpoint_reuses_initial_block,
             )
         )
         if use_internal_checkpoint:

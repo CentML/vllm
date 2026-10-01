@@ -99,6 +99,8 @@ def make_full_mamba_manager(
     use_eagle: bool = False,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
+    prefill_checkpoint_alignment: int = 16,
+    prefill_checkpoint_reuses_initial_block: bool = False,
 ):
     mamba_group = KVCacheGroupSpec(
         ["mamba"],
@@ -110,7 +112,12 @@ def make_full_mamba_manager(
             num_speculative_blocks=num_speculative_blocks,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
             prefill_checkpoint_alignment=(
-                16 if num_prefill_checkpoint_blocks > 0 else None
+                prefill_checkpoint_alignment
+                if num_prefill_checkpoint_blocks > 0
+                else None
+            ),
+            prefill_checkpoint_reuses_initial_block=(
+                prefill_checkpoint_reuses_initial_block
             ),
         ),
     )
@@ -573,6 +580,53 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
     mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
     assert mamba_blocks[2].block_id == checkpoint_block_id
     assert mamba_blocks[3].block_id == running_block_id
+
+
+def test_internal_checkpoint_reuses_private_initial_block():
+    """A prefill resuming mid-block from a partial hit and crossing one block
+    boundary exports its checkpoint into its CoW block (the initial-state
+    column) when the spec allows it, and publishes it at the checkpoint, not
+    at the crossed full-block boundary whose state it never held.
+    """
+    hash_block_size = 2
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=4,
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
+        prefill_checkpoint_reuses_initial_block=True,
+    )
+    manager.coordinator.retention_interval = 0
+
+    # The owner checkpoints at 6 (its last hash boundary), mid-block.
+    owner = make_request("owner", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, 7, num_computed, computed_blocks)
+    manager.free(owner)
+    manager.new_step_starts()
+    source = manager.block_pool.get_cached_block(owner.block_hashes[2], [1])
+    assert source is not None
+
+    replay = make_request(
+        "replay", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], hash_block_size, sha256
+    )
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == 6
+    new_blocks = manager.allocate_slots(replay, 6, num_computed, computed_blocks)
+    assert new_blocks is not None
+
+    mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
+    cow_block, running_block = mamba_blocks[1], mamba_blocks[2]
+    assert cow_block is not source[0] and cow_block is not running_block
+    copies, _ = manager.take_kv_cache_block_copies()
+    assert KVCacheBlockCopy(source[0].block_id, cow_block.block_id) in copies
+    # Published at the checkpoint (10), not at the crossed boundary (8).
+    checkpoint_hit = manager.block_pool.get_cached_block(replay.block_hashes[4], [1])
+    assert checkpoint_hit is not None and checkpoint_hit[0] is cow_block
+    assert cow_block.block_hash_num_tokens == 10
+    assert manager.block_pool.get_cached_block(replay.block_hashes[3], [1]) is None
 
 
 def test_internal_checkpoint_uses_partial_hash_lifecycle():
