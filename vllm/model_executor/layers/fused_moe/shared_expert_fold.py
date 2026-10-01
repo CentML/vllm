@@ -49,9 +49,11 @@ replays read the live mask). With F121=1 the fused routing writes expert id
 -1 / weight 0 for those rows, so padded rows are not permuted, read no expert
 weights and get a zero MoE output; real rows are bit-identical to F121=0.
 Target-model MoE layers only (drafter / MTP layers keep the stock routing).
-F121_PROBE=1 adds device counters of dropped / real rows, logged by a
-reporter thread (first read after F121_PROBE_DELAY_S, default 900 s, then
-every F121_PROBE_S, default 120 s) and at exit.
+F121_PROBE=1 adds device counters of dropped / real rows; every masked MoE
+call also copies them (async, captured in the CUDA graphs) into a pinned host
+mirror, which a reporter thread logs with plain CPU reads (no CUDA call, so it
+is safe during graph capture) after F121_PROBE_DELAY_S (default 60 s), then
+every F121_PROBE_S (default 120 s), and at exit.
 
 Numerics: not bit-exact vs the unfolded path. The shared expert runs in the
 routed MoE GEMMs and its output is summed with the routed output in fp32
@@ -77,9 +79,10 @@ SEG_FOLD = os.environ.get("SEG_FOLD", "0") == "1"
 F121 = os.environ.get("F121", "0") == "1"
 F121_PROBE = os.environ.get("F121_PROBE", "0") == "1"
 F121_PROBE_S = float(os.environ.get("F121_PROBE_S", "120"))
-F121_PROBE_DELAY_S = float(os.environ.get("F121_PROBE_DELAY_S", "900"))
+F121_PROBE_DELAY_S = float(os.environ.get("F121_PROBE_DELAY_S", "60"))
 F121_STATS = {"mask_calls": 0, "nomask_calls": 0, "excluded_calls": 0}
 _F121_CNT: dict = {}
+_F121_HOST: dict = {}
 
 E_ROUTED, TOPK, E_PAD = 256, 8, 260
 STATS = {"stash": 0, "folded": 0, "skipped": 0, "calls": 0}
@@ -134,6 +137,9 @@ def _fold_moe_impl(x: torch.Tensor, layer_name, no_finalize: bool) -> torch.Tens
         logits = F.linear(x, st["w264"])
     pad, cnt = _f121_mask(L, M) if F121 else (None, None)
     ids, wts = seg_route_fold(logits, E_ROUTED, TOPK, pad=pad, cnt=cnt)
+    if cnt is not None:
+        # probe only: async D2H into the pinned mirror (a memcpy node in graphs)
+        _F121_HOST[(cnt.device.type, cnt.device.index)].copy_(cnt, non_blocking=True)
     from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
     qc = st["qc"]
@@ -193,18 +199,16 @@ def _f121_counter(device: torch.device) -> torch.Tensor:
     if c is None:
         c = torch.zeros(2, dtype=torch.int32, device=device)
         _F121_CNT[key] = c
+        _F121_HOST[key] = torch.zeros(2, dtype=torch.int32, pin_memory=True)
         _f121_start_reporter()
     return c
 
 
-def _f121_report(tag: str, stream=None) -> None:
-    for key, c in list(_F121_CNT.items()):
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                h = c.to("cpu", non_blocking=True)
-            stream.synchronize()
-        else:
-            h = c.to("cpu")
+def _f121_report(tag: str) -> None:
+    # Reads the pinned host mirrors only: no CUDA API call from this thread,
+    # so it cannot disturb a stream capture in progress.
+    for key, hm in list(_F121_HOST.items()):
+        h = hm.tolist()
         logger.info(
             "[f121] probe%s pid %d dev %s: padded_rows_dropped=%d real_rows=%d "
             "host_calls=%s",
@@ -231,16 +235,13 @@ def _f121_start_reporter() -> None:
     atexit.register(at_exit)
 
     def run():
-        s = None
-        time.sleep(F121_PROBE_DELAY_S)  # never read while graphs are captured
+        time.sleep(F121_PROBE_DELAY_S)
         while True:
-            time.sleep(F121_PROBE_S)
             try:
-                if s is None and _F121_CNT:
-                    s = torch.cuda.Stream(device=next(iter(_F121_CNT.values())).device)
-                _f121_report("", s)
+                _f121_report("")
             except Exception as e:  # probe only; never disturb serving
                 logger.info("[f121] probe error %r", e)
+            time.sleep(F121_PROBE_S)
 
     threading.Thread(target=run, name="f121-probe", daemon=True).start()
 
