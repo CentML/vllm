@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warm up Qwen Triton kernels from the loaded model's compile keys."""
 
+import itertools
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
@@ -409,6 +410,110 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     )
 
 
+# Sequence counts of the FlashInfer GDN prefill warmup in the state-pool form.
+# FlashInfer specializes its context-parallel (CP) fixup kernel on indexed
+# state I/O and on its CTA shape, which it picks from num_seqs * heads (one
+# CTA wave or more), so cover single and multi-sequence CP batches.
+_FI_GDN_POOL_WARMUP_NUM_SEQS = (1, 2, 3, 4, 8, 16)
+_FI_GDN_POOL_WARMUP_MULTI_SEQ_LEN = 1024
+
+
+def _warm_fi_gdn_prefill_state_pool(runner: "GPUModelRunner") -> None:
+    """Run FlashInfer GDN prefill as serving does: through the layer's op with
+    ``state_indices`` into a scratch pool with the live pool's layout.
+
+    The layer's own warmup runs during profiling, before the state pool exists,
+    and passes a fresh state without ``state_indices``; the CP fixup kernel of
+    the indexed form then JIT-compiles at the first long prefill under load.
+    Nothing in the live cache is touched.
+    """
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        GDN_FI_NON_CP_MAX_TOKENS,
+    )
+    from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (  # noqa: E501
+        fused_post_conv_prep,
+    )
+
+    for layer in _iter_qwen_gdn_layers(
+        runner.compilation_config.static_forward_context
+    ):
+        cache = _split_qwen_gdn_cache(getattr(layer, "kv_cache", None))
+        if cache is not None:
+            pool = cache[1]
+            break
+    else:
+        return
+    op = getattr(layer, "chunk_gated_delta_rule", None)
+    if op is None or not op.updates_state_in_place(pool.dtype):
+        return
+
+    device = pool.device
+    dtype = runner.model_config.dtype
+    h = int(layer.num_k_heads) // int(layer.tp_size)
+    hv = int(layer.num_v_heads) // int(layer.tp_size)
+    k_dim, v_dim = int(layer.head_k_dim), int(layer.head_v_dim)
+    # One FLA chunk (non-CP), one sequence over the non-CP limit (CP), then
+    # multi-sequence batches (CP while FlashInfer's heuristic picks it).
+    batches = [[64]]
+    if GDN_FI_NON_CP_MAX_TOKENS > 0:
+        batches.append([GDN_FI_NON_CP_MAX_TOKENS + 64])
+    batches += [
+        [_FI_GDN_POOL_WARMUP_MULTI_SEQ_LEN] * n
+        for n in _FI_GDN_POOL_WARMUP_NUM_SEQS
+        if n > 1
+    ]
+    max_seqs = max(len(lens) for lens in batches)
+    scratch = torch.empty_strided(
+        (max_seqs + 1,) + tuple(pool.shape[1:]),
+        pool.stride(),
+        dtype=pool.dtype,
+        device=device,
+    )
+    scratch.zero_()
+    for lens in batches:
+        num_tokens = sum(lens)
+        mixed_qkv = torch.randn(
+            num_tokens, 2 * h * k_dim + hv * v_dim, device=device, dtype=dtype
+        )
+        a = torch.randn(num_tokens, hv, device=device, dtype=dtype)
+        b = torch.randn_like(a)
+        q, k, v, g, beta = fused_post_conv_prep(
+            conv_output=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            num_k_heads=h,
+            head_k_dim=k_dim,
+            head_v_dim=v_dim,
+            apply_l2norm=True,
+            output_g_exp=op.expects_exp_g,
+        )
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(lens)], dtype=torch.int32, device=device
+        )
+        state_indices = torch.arange(1, len(lens) + 1, dtype=torch.int32, device=device)
+        out = torch.empty(num_tokens, hv, v_dim, dtype=v.dtype, device=device)
+        op(
+            q=q.unsqueeze(0),
+            k=k.unsqueeze(0),
+            v=v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=scratch,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            core_attn_out=out,
+            state_indices=state_indices,
+        )
+    _synchronize_device(device)
+    logger.info(
+        "Warmed FlashInfer GDN prefill (state-pool form) for batches %s.",
+        [(len(lens), lens[0]) for lens in batches],
+    )
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -446,4 +551,5 @@ def qwen_triton_warmup(
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+    _warm_fi_gdn_prefill_state_pool(runner)
     _synchronize_device(device)
