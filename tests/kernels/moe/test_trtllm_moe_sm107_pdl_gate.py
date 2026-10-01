@@ -78,3 +78,73 @@ def test_expert_and_finalize_grid_bounds():
     # (hidden / 256 rounded up) * tokens must stay below 1184 finalize CTAs.
     assert not allowed(R.RenormalizeNaive, tokens=16, hidden=256 * 74)
     assert allowed(R.RenormalizeNaive, tokens=16, hidden=256 * 73)
+
+
+# Above 16 tokens: only where the single-CTA routing permutation
+# (flashinfer_exact_routing, GS2_ROUTE) replaces the Cluster/Coop kernels.
+@pytest.fixture
+def single_cta(monkeypatch):
+    import vllm.model_executor.layers.fused_moe.flashinfer_exact_routing as fer
+
+    monkeypatch.setenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "4096")
+    for name in (
+        "GS2_ROUTE_MAXN",
+        "GS2_ROUTE_MINTOK",
+        "GS2_ROUTE_LARGE",
+        "GS2_ROUTE_PACKED",
+        "FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GS2_ROUTE", "1")
+    monkeypatch.setattr(fer, "_installed", True)
+    return monkeypatch
+
+
+def big(tokens, deferred=True, routing=R.RenormalizeNaive, experts=256, top_k=8):
+    return _sm107_moe_pdl_allowed(
+        tokens, experts, 2048, routing, None, top_k, deferred=deferred
+    )
+
+
+def test_above_16_needs_the_loaded_patched_module(single_cta):
+    import vllm.model_executor.layers.fused_moe.flashinfer_exact_routing as fer
+
+    assert big(17)
+    single_cta.setattr(fer, "_installed", False)  # stock module: Cluster/Coop
+    assert not big(17) and big(16)
+    single_cta.setattr(fer, "_installed", True)
+    single_cta.setenv("GS2_ROUTE", "0")  # runtime switch selects the stock kernels
+    assert not big(64) and big(16)
+
+
+def test_single_cta_range(single_cta):
+    # GS2_ROUTE_MAXN default 8192 entries -> 1024 tokens at top-8.
+    assert big(17) and big(256) and big(257) and big(1024)
+    assert not big(1025)
+    single_cta.setenv("GS2_ROUTE_MAXN", "1000000")  # capped at 32768 entries
+    assert big(4096) and not big(4097)
+    single_cta.setenv("GS2_ROUTE_LARGE", "0")  # > 256 tokens keep Coop
+    assert big(256) and not big(257)
+
+
+def test_split_top_k_condition_for_17_to_256(single_cta):
+    # E < 160 runs the fused score + permutation Cluster kernel at 17-256 tokens.
+    assert not big(64, experts=128)
+    assert big(512, experts=128)  # large-batch hook covers any E <= 1024
+    single_cta.setenv("FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN", "1")
+    assert big(64, experts=128)
+    single_cta.setenv("FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN", "off")
+    assert not big(64) and big(512)
+
+
+def test_above_16_other_routing_rejected(single_cta):
+    assert not big(64, routing=R.Default)
+    assert not big(64, routing=R.TopK)
+    assert big(16, routing=R.Default)
+
+
+def test_finalize_vecload_excluded_unless_deferred(single_cta):
+    # finalizeKernelVecLoad runs from 148 tokens at hidden 2048.
+    assert big(147, deferred=False)
+    assert not big(148, deferred=False)
+    assert big(148, deferred=True)
