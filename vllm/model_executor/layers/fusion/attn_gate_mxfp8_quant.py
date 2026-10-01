@@ -15,6 +15,7 @@ import math
 
 import torch
 
+from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     MXFP8_BLOCK,
     mxfp8_quantize_row,
@@ -39,6 +40,7 @@ def _attn_gate_mxfp8_kernel(
     GATE_HEAD_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1)
@@ -46,7 +48,8 @@ def _attn_gate_mxfp8_kernel(
     groups = chunk * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         a = tl.load(attn_ptr + row * attn_stride_t + cols).to(tl.float32)
         gate_offs = cols // GATE_HEAD_DIM * gate_stride_h + cols % GATE_HEAD_DIM
@@ -121,6 +124,7 @@ def attn_gate_mxfp8_quant(
             GATE_HEAD_DIM=gate_head_dim,
             BLOCK=block,
             LAUNCH_PDL=launch_pdl,
+            EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
             launch_pdl=launch_pdl,
             num_warps=num_warps,
         )
