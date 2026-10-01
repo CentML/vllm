@@ -7,9 +7,15 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import (
+    BatchIndexUploader,
+    InputBatch,
+    InputBuffers,
+)
 
 DEVICE = current_platform.device_type
 
@@ -161,3 +167,95 @@ def test_maybe_prepare_dcp_local_seq_lens_matches_reference(
         )
         assert batch.dcp_local_seq_lens is not None
         assert torch.equal(batch.dcp_local_seq_lens.cpu(), expected.to(torch.int32))
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="needs UVA")
+@pytest.mark.parametrize(
+    ("num_reqs", "num_tokens", "num_tokens_after_padding", "mark_padding"),
+    [
+        (4, 16, 16, True),  # uniform spec decode, no padding
+        (5, 20, 32, True),  # padded to a captured size
+        (3, 9, 9, False),  # VLLM_MOE_SKIP_PADDING off
+        (1, 1, 1, True),
+        (8, 1500, 1536, True),  # padding tokens span several kernel blocks
+    ],
+)
+def test_batch_index_uploader_matches_h2d_uploads(
+    num_reqs: int, num_tokens: int, num_tokens_after_padding: int, mark_padding: bool
+):
+    """One kernel must leave the same device state as the separate uploads."""
+    device = torch.device("cuda:0")
+    max_num_reqs, max_num_tokens = 16, 2048
+    rng = np.random.default_rng(num_reqs)
+    idx_mapping_np = rng.permutation(max_num_reqs)[:num_reqs].astype(np.intp)
+    cu_num_logits_np = np.concatenate(
+        [[0], np.cumsum(rng.integers(1, 5, num_reqs))]
+    ).astype(np.int32)
+    query_start_loc_np = np.full(max_num_reqs + 1, num_tokens, dtype=np.int32)
+    query_start_loc_np[: num_reqs + 1] = np.linspace(0, num_tokens, num_reqs + 1)
+    stale_qsl = torch.randint(-9, 99, (max_num_reqs + 1,), dtype=torch.int32)
+    stale_padding = torch.rand(max_num_tokens) < 0.5
+
+    ref_qsl = stale_qsl.to(device)
+    ref_padding = stale_padding.to(device)
+    ref_idx_mapping = async_tensor_h2d(idx_mapping_np, device=device)
+    ref_cu_num_logits = async_tensor_h2d(cu_num_logits_np, device=device)
+    async_tensor_h2d(query_start_loc_np, out=ref_qsl)
+    if mark_padding:
+        ref_padding[:num_tokens].fill_(False)
+        ref_padding[num_tokens:num_tokens_after_padding].fill_(True)
+
+    new_qsl = stale_qsl.to(device)
+    new_padding = stale_padding.to(device)
+    uploader = BatchIndexUploader(max_num_reqs, device)
+    idx_mapping, cu_num_logits = uploader.upload(
+        idx_mapping_np,
+        cu_num_logits_np,
+        query_start_loc_np,
+        num_tokens,
+        new_qsl,
+        new_padding if mark_padding else None,
+        num_tokens_after_padding,
+    )
+    torch.accelerator.synchronize()
+
+    for ref, new in (
+        (ref_idx_mapping, idx_mapping),
+        (ref_cu_num_logits, cu_num_logits),
+        (ref_qsl, new_qsl),
+        (ref_padding, new_padding),
+    ):
+        assert ref.dtype == new.dtype
+        assert torch.equal(ref, new)
+
+
+@pytest.mark.skipif(not is_uva_available(), reason="needs UVA")
+def test_batch_index_uploader_keeps_staged_inputs_until_read():
+    """Wrapping the slot ring must wait for the kernel still reading a slot."""
+    device = torch.device("cuda:0")
+    uploader = BatchIndexUploader(8, device, num_slots=2)
+    steps = [
+        (np.array([3, 1, 2], dtype=np.intp), np.array([0, 4, 8, 12], dtype=np.int32)),
+        (np.array([7, 0], dtype=np.intp), np.array([0, 1, 5], dtype=np.int32)),
+        (np.array([5], dtype=np.intp), np.array([0, 4], dtype=np.int32)),
+    ]
+    # Compile the kernel first so that the uploads below outpace the sleep.
+    qsl = torch.empty(9, dtype=torch.int32, device=device)
+    uploader.upload(*steps[0], steps[0][1], 99, qsl, None, 0)
+    torch.accelerator.synchronize()
+    stream = torch.cuda.Stream(device=device)
+    outputs = []
+    with torch.cuda.stream(stream):
+        # Keep both slots' kernels pending while the third upload wraps around.
+        torch.cuda._sleep(200_000_000)
+        for idx_mapping_np, cu_np in steps:
+            qsl = torch.empty(9, dtype=torch.int32, device=device)
+            outputs.append(
+                (*uploader.upload(idx_mapping_np, cu_np, cu_np, 99, qsl, None, 0), qsl)
+            )
+    stream.synchronize()
+
+    for (idx_mapping, cu_num_logits, qsl), (idx_np, cu_np) in zip(outputs, steps):
+        assert idx_mapping.tolist() == idx_np.tolist()
+        assert cu_num_logits.tolist() == cu_np.tolist()
+        assert qsl.tolist() == cu_np.tolist() + [99] * (9 - len(cu_np))
