@@ -20,7 +20,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 32, 300, 512, 5000])
+# Both sides of the launch-config boundaries (128, 2048) and partial 128-row
+# scale padding.
+@pytest.mark.parametrize("num_tokens", [1, 32, 127, 128, 300, 2048, 2049, 5000])
 @pytest.mark.parametrize("scale", [1.0, 30.0])
 @torch.inference_mode()
 def test_silu_mul_mxfp8_quant(num_tokens: int, scale: float) -> None:

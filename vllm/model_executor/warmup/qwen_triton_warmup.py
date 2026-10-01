@@ -161,6 +161,51 @@ def _qwen_gdn_warmup_config(
     return None
 
 
+def _warm_mxfp8_producers(runner: "GPUModelRunner", device: torch.device) -> None:
+    """Every launch config of the SiLU-and-mul and attention-gate MXFP8
+    producers: their tile and warp counts switch with the token count, so the
+    dummy runs alone leave mixed-batch sizes to compile at runtime.
+    """
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+
+    silu_dims: set[int] = set()
+    gate_shapes: set[tuple[int, int]] = set()
+    for module in runner.get_model().modules():
+        down_proj = getattr(module, "down_proj", None)
+        if (
+            isinstance(getattr(module, "act_fn", None), SiluAndMul)
+            and down_proj is not None
+            and get_input_quant_key(down_proj) == kMxfp8Dynamic
+        ):
+            silu_dims.add(down_proj.input_size_per_partition)
+        if getattr(module, "attn_gate_mxfp8", False):
+            gate_shapes.add((module.num_heads, module.head_dim))
+    bf16 = torch.bfloat16
+    if silu_dims:
+        from vllm.model_executor.layers.fusion import silu_mul_mxfp8_quant as silu
+
+        for d in silu_dims:
+            for num_tokens in silu.LAUNCH_CONFIG_TOKEN_COUNTS:
+                x = torch.zeros((num_tokens, 2 * d), dtype=bf16, device=device)
+                silu.silu_mul_mxfp8_quant(x)
+    if gate_shapes:
+        from vllm.model_executor.layers.fusion import attn_gate_mxfp8_quant as gate
+
+        for heads, head_dim in gate_shapes:
+            for num_tokens in gate.LAUNCH_CONFIG_TOKEN_COUNTS:
+                shape = (num_tokens, heads, head_dim)
+                attn = torch.zeros(shape, dtype=bf16, device=device)
+                # The gate half of q_gate, read strided as the layer does.
+                q_gate = torch.zeros(
+                    (num_tokens, heads, 2, head_dim), dtype=bf16, device=device
+                )
+                gate.attn_gate_mxfp8_quant(attn, q_gate[:, :, 1])
+
+
 def _warm_gated_rms_norm_kernel(
     device: torch.device,
     config: _QwenGDNWarmupConfig,
@@ -376,12 +421,14 @@ def qwen_triton_warmup(
         return
 
     device = runner.device
+    _warm_mxfp8_producers(runner, device)
     logger.info("Warming up Qwen GDN Triton kernels for model_type=%s.", model_type)
 
     gdn_config = _qwen_gdn_warmup_config(
         runner.compilation_config.static_forward_context
     )
     if gdn_config is None:
+        _synchronize_device(device)
         return
 
     max_num_tokens = max(1, int(runner.max_num_tokens))

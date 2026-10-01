@@ -113,7 +113,7 @@ def _quant(y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 @requires_fi_mxfp8
 @pytest.mark.parametrize("tokens", TOKEN_CASES)
-@pytest.mark.parametrize("heads", [16, 32])
+@pytest.mark.parametrize("heads", [16, 24, 32])
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @torch.inference_mode()
 def test_gdn_gated_norm_mxfp8_matches_norm_then_quant(

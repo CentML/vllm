@@ -15,7 +15,9 @@ HIDDEN = HEADS * HEAD_DIM
     not (current_platform.is_cuda() and current_platform.has_device_capability(100)),
     reason="FlashInfer MXFP8 quantize needs SM100+",
 )
-@pytest.mark.parametrize("num_tokens", [1, 129, 512])
+# Both sides of the launch-config boundaries (256, 1024) and partial 128-row
+# scale padding.
+@pytest.mark.parametrize("num_tokens", [1, 129, 256, 257, 1023, 1024, 4800])
 @pytest.mark.parametrize("strided_gate", [False, True])
 @torch.inference_mode()
 def test_attn_gate_mxfp8_quant_matches_inductor_chain(
