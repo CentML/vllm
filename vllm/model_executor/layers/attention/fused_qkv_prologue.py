@@ -63,6 +63,8 @@ GLUE_EWS_NOGATE = os.environ.get("GLUE_EWS_NOGATE", "0") == "1"
 # GLUE_EWS_TPP_SPLIT=<n> (> 0): tokens per program 1 for T <= n, else EWS_QKV_TPP (same kernel and per-token math;
 # GB300 bench: TPP 1 is 0.4-1.1 us faster at decode T, TPP 2 4-5 % faster at T >= 3K)
 GLUE_EWS_TPP_SPLIT = int(os.environ.get("GLUE_EWS_TPP_SPLIT", "0"))
+# GLUE_EWS_CUDA=1: CUDA kernel (glue_ews_cuda.cu, one warp per (token, head)), bit-identical to _ews_qkv_kernel
+GLUE_EWS_CUDA = os.environ.get("GLUE_EWS_CUDA", "0") == "1"
 STATS = {"calls": 0, "layers": 0}
 
 
@@ -247,6 +249,21 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
         # identical views to FlashInferImpl.do_kv_cache_update: (B, H, N, 2*hs) -> (B, N, H, hs) x2
         k_cache, v_cache = kv_cache.transpose(1, 2).split(m.head_dim, dim=-1)
     STATS["calls"] += 1
+    if GLUE_EWS_CUDA:
+        from vllm.model_executor.layers.attention import glue_ews_cuda as GC
+
+        pos = positions
+        if GC.supported(qkv, m.head_dim, m.rotary_emb.rotary_dim, 1.0, pos, k_cache, m.rotary_emb.cos_sin_cache):
+            STATS["glue_cuda"] = STATS.get("glue_cuda", 0) + 1
+            q8, k_out, gate = GC.launch(
+                qkv, pos, m.q_norm.weight, m.k_norm.weight, m.rotary_emb.cos_sin_cache, m.q_norm.variance_epsilon,
+                m.num_heads, m.num_kv_heads,
+                getattr(m.rotary_emb, "mrope_section", None) if pos.ndim == 2 else None,
+                attn_layer._q_scale, attn_layer._k_scale, attn_layer._v_scale, slot_mapping, k_cache, v_cache,
+                gate_copy=not GLUE_EWS_NOGATE)
+            if gate is None:
+                gate = qkv.new_empty((qkv.shape[0], 0))
+            return q8, k_out, gate
     if GLUE_EWS_HG > 0 or GLUE_EWS_NOGATE:
         from vllm.model_executor.layers.fusion import glue_kernels as G
 
@@ -355,6 +372,6 @@ def project_qkv_gate(mod, qkv, positions):
 
 if ENABLED:
     register_op()
-    if GLUE_EWS_TPP_SPLIT or GLUE_EWS_HG or GLUE_EWS_NOGATE:
-        logger.info("[glue] QKV prologue: tokens/program 1 up to T=%d (else %d); heads/program %d, gate copy %s",
-                    GLUE_EWS_TPP_SPLIT, TPP, GLUE_EWS_HG, not GLUE_EWS_NOGATE)
+    if GLUE_EWS_TPP_SPLIT or GLUE_EWS_HG or GLUE_EWS_NOGATE or GLUE_EWS_CUDA:
+        logger.info("[glue] QKV prologue: cuda=%s; tokens/program 1 up to T=%d (else %d); heads/program %d, "
+                    "gate copy %s", GLUE_EWS_CUDA, GLUE_EWS_TPP_SPLIT, TPP, GLUE_EWS_HG, not GLUE_EWS_NOGATE)
