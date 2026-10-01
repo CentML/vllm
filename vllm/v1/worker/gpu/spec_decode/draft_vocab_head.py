@@ -40,6 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
@@ -88,6 +89,62 @@ def _mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x, is_sf_swizzled_layout=True, alignment=32, backend="cute-dsl"
     )
     return q, s.view(torch.float8_e8m0fnu)
+
+
+_CHUNK = 4096
+
+
+@triton.jit
+def _subset_argmax_stage1(
+    X, stride, VAL, IDX, V: tl.constexpr, CHUNK: tl.constexpr, NCH_PAD: tl.constexpr
+):
+    # Per (row, chunk): max and the lowest column index attaining it.
+    row = tl.program_id(0)
+    c = tl.program_id(1)
+    offs = c * CHUNK + tl.arange(0, CHUNK)
+    x = tl.load(
+        X + row.to(tl.int64) * stride + offs, mask=offs < V, other=-float("inf")
+    ).to(tl.float32)
+    m = tl.max(x, axis=0)
+    i = tl.min(tl.where(x == m, offs, 2147483647), axis=0)
+    tl.store(VAL + row * NCH_PAD + c, m)
+    tl.store(IDX + row * NCH_PAD + c, i)
+
+
+@triton.jit
+def _subset_argmax_stage2(
+    VAL, IDX, IDS, OUT, NCH: tl.constexpr, NCH_PAD: tl.constexpr
+):
+    # Per row: lowest column index of the row max, mapped to its token id.
+    row = tl.program_id(0)
+    j = tl.arange(0, NCH_PAD)
+    v = tl.load(VAL + row * NCH_PAD + j, mask=j < NCH, other=-float("inf"))
+    i = tl.load(IDX + row * NCH_PAD + j, mask=j < NCH, other=2147483647)
+    m = tl.max(v, axis=0)
+    best = tl.min(tl.where(v == m, i, 2147483647), axis=0)
+    tl.store(OUT + row, tl.load(IDS + best))
+
+
+def subset_argmax(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """ids[argmax(logits, -1)] for 2D CUDA logits (lowest index wins ties)."""
+    if not logits.is_cuda or logits.ndim != 2 or logits.stride(1) != 1:
+        return ids[logits.argmax(dim=-1)]
+    n, v = logits.shape
+    out = torch.empty(n, dtype=torch.int64, device=logits.device)
+    if n == 0:
+        return out
+    nch = triton.cdiv(v, _CHUNK)
+    nch_pad = triton.next_power_of_2(nch)
+    val = torch.empty((n, nch_pad), dtype=torch.float32, device=logits.device)
+    idx = torch.empty((n, nch_pad), dtype=torch.int32, device=logits.device)
+    _subset_argmax_stage1[(n, nch)](
+        logits, logits.stride(0), val, idx, V=v, CHUNK=_CHUNK, NCH_PAD=nch_pad,
+        num_warps=4,
+    )
+    _subset_argmax_stage2[(n,)](
+        val, idx, ids, out, NCH=nch, NCH_PAD=nch_pad, num_warps=1
+    )
+    return out
 
 
 class DraftVocabHead(nn.Module):
@@ -149,9 +206,9 @@ class DraftVocabHead(nn.Module):
             self.captured_calls += 1
         else:
             self.eager_calls += 1
-        # torch.argmax returns the lowest index among equal maxima and ids are
-        # ascending, so ties resolve as in the full-vocabulary argmax.
-        return self.ids[self.logits(hidden_states).argmax(dim=-1)]
+        # The lowest index among equal maxima wins and ids are ascending, so
+        # ties resolve as in the full-vocabulary argmax.
+        return subset_argmax(self.logits(hidden_states), self.ids)
 
 
 class _Diag:

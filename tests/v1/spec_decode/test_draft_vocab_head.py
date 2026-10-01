@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from vllm.v1.worker.gpu.spec_decode.draft_vocab_head import (
     DraftVocabHead,
     parse_ranges,
+    subset_argmax,
 )
 
 
@@ -59,3 +60,14 @@ def test_ties_pick_lowest_id():
     head = DraftVocabHead(w, [(2, 8)], "bf16")
     h = torch.ones(2, 4, dtype=torch.bfloat16)
     assert head(h).tolist() == [3, 3]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("n,v", [(1, 98432), (4, 98432), (7, 5000), (64, 131072)])
+def test_subset_argmax_kernel_matches_torch(n, v):
+    torch.manual_seed(1)
+    x = torch.randn(n, v, device="cuda", dtype=torch.bfloat16)
+    x[0, 17] = x[0].max() + 1
+    x[0, v - 3] = x[0, 17]  # tie: lowest index wins
+    ids = torch.arange(v, device="cuda", dtype=torch.int64) * 3 + 5
+    assert torch.equal(subset_argmax(x, ids), ids[x.argmax(-1)])
