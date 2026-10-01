@@ -1442,9 +1442,27 @@ class SpeculativeConfig:
                     draft_hf_config.architectures = [
                         "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
                     ]
-                    self.draft_model_config.quantization = (
-                        self.target_model_config.quantization
-                    )
+                    if is_v41:
+                        # DeepSeek-V4.1-Flash and its NVFP4 checkpoint use the
+                        # same FP8 DSpark draft weights. Strip target-only
+                        # NVFP4 metadata so the draft loader selects them.
+                        draft_hf_config.quantization_config = {
+                            key: copy.deepcopy(
+                                draft_hf_config.quantization_config[key]
+                            )
+                            for key in (
+                                "quant_method",
+                                "activation_scheme",
+                                "weight_block_size",
+                                "scale_fmt",
+                                "expert_dtype",
+                            )
+                        }
+                        self.draft_model_config.quantization = "deepseek_v4_fp8"
+                    else:
+                        self.draft_model_config.quantization = (
+                            self.target_model_config.quantization
+                        )
                     self.update_arch_()
                 elif (
                     self.method == "dspark"

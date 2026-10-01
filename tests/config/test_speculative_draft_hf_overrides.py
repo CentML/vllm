@@ -67,6 +67,15 @@ def _make_speculative_config(
         )
 
 
+_DEEPSEEK_DSPARK_QUANTIZATION_CONFIG = {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [32, 32],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+}
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("hf_kwargs", "n_predict", "architecture"),
@@ -130,6 +139,124 @@ def test_mtp_stages_are_independent_of_dspark_width():
         _make_speculative_config(
             hf_kwargs, "DeepSeekV4MTPModel", method="mtp", num_speculative_tokens=5
         )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "checkpoint_quantization_config",
+    [
+        pytest.param(
+            _DEEPSEEK_DSPARK_QUANTIZATION_CONFIG,
+            id="original-mxfp4-checkpoint",
+        ),
+        pytest.param(
+            {
+                **_DEEPSEEK_DSPARK_QUANTIZATION_CONFIG,
+                "config_groups": {
+                    "group_0": {
+                        "input_activations": {
+                            "dynamic": False,
+                            "group_size": 16,
+                            "num_bits": 4,
+                            "type": "float",
+                        },
+                        "targets": ["Linear"],
+                        "weights": {
+                            "dynamic": False,
+                            "group_size": 16,
+                            "num_bits": 4,
+                            "type": "float",
+                        },
+                    }
+                },
+                "group_size": 16,
+                "ignore": [
+                    "*.attn.*",
+                    "*.ffn.shared_experts.*",
+                    "head",
+                    "mtp.*",
+                ],
+                "kv_cache_quant_algo": None,
+                "moe_quant_algo": "NVFP4",
+                "producer": {
+                    "name": "modelopt",
+                    "version": "dsv4-nvfp4-experts",
+                },
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "layers.0.ffn.experts": {
+                        "group_size": 16,
+                        "quant_algo": "NVFP4",
+                    }
+                },
+            },
+            id="nvfp4-checkpoint",
+        ),
+    ],
+)
+def test_deepseek_v41_dspark_normalizes_draft_quantization_config(
+    checkpoint_quantization_config: dict[str, object],
+):
+    draft_hf_config = _make_hf_config(
+        architectures=["DeepseekV41ForCausalLM"],
+        model_type="deepseek_v41",
+        n_predict=3,
+        dspark_block_size=5,
+        quantization_config=checkpoint_quantization_config,
+    )
+    draft_model_config = MagicMock(
+        model="target",
+        hf_config=draft_hf_config,
+        architectures=draft_hf_config.architectures,
+        max_model_len=128,
+    )
+    target_model_config = MagicMock(
+        model="target",
+        max_model_len=128,
+        quantization="nvfp4",
+        hf_overrides={},
+        hf_config=_make_hf_config(model_type="deepseek_v41"),
+    )
+
+    with (
+        patch(
+            "vllm.config.speculative.ModelConfig",
+            return_value=draft_model_config,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "_verify_and_get_draft_tp",
+            return_value=1,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "_maybe_override_draft_max_model_len",
+            return_value=128,
+        ),
+        patch.object(
+            SpeculativeConfig,
+            "create_draft_parallel_config",
+            return_value=ParallelConfig(),
+        ),
+        patch.object(SpeculativeConfig, "update_arch_"),
+    ):
+        speculative_config = SpeculativeConfig(
+            model="target",
+            method="dspark",
+            num_speculative_tokens=5,
+            target_model_config=target_model_config,
+            target_parallel_config=ParallelConfig(),
+        )
+
+    assert speculative_config.draft_model_config.quantization == "deepseek_v4_fp8"
+    assert (
+        speculative_config.draft_model_config.hf_config.quantization_config
+        == _DEEPSEEK_DSPARK_QUANTIZATION_CONFIG
+    )
+    assert (
+        speculative_config.draft_model_config.hf_config.quantization_config
+        is not checkpoint_quantization_config
+    )
 
 
 @pytest.mark.cpu_test
