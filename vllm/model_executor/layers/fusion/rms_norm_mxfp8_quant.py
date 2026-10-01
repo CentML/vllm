@@ -102,6 +102,9 @@ def _add_rms_norm_mxfp8_kernel(
     NUM_GROUPS: tl.constexpr = HIDDEN // 32
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
+        # The consumer (MXFP8 GEMM) waits on this grid before reading, so let
+        # it launch and run its prologue while this one works.
+        tl.extra.cuda.gdc_launch_dependents()
     if row < num_tokens:
         x = tl.load(x_ptr + row * x_stride + cols, mask=mask, other=0.0)
         x = x.to(tl.float32)
