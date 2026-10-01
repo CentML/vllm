@@ -3,10 +3,15 @@
 
 import torch.nn as nn
 
+from vllm import envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+logger = init_logger(__name__)
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
@@ -33,6 +38,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
+            _enable_draft_prefill_prune(draft_model)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -57,3 +64,24 @@ class MTPSpeculator(AutoRegressiveSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+
+
+def _enable_draft_prefill_prune(draft_model: nn.Module) -> None:
+    """Let the draft attention layer compute prefill attention only for each
+    prefill request's last row (FlashInferImpl._draft_prefill_last_rows).
+
+    The draft prefill samples only that row, and with a single attention layer
+    the draft KV comes from the layer input, not from attention outputs. A
+    deeper draft would feed every row's attention output into the next layer's
+    KV, so pruning stays off there (and for non-FlashInfer layers).
+    """
+    layers = [m for m in draft_model.modules() if isinstance(m, Attention)]
+    if len(layers) != 1 or not hasattr(layers[0].impl, "draft_prefill_prune"):
+        logger.warning(
+            "MTP draft prefill attention pruning off: needs exactly one FlashInfer "
+            "draft attention layer, got %s",
+            [(m.layer_name, type(m.impl).__name__) for m in layers],
+        )
+        return
+    layers[0].impl.draft_prefill_prune = True
+    logger.info("MTP draft prefill attention pruning on for %s", layers[0].layer_name)
