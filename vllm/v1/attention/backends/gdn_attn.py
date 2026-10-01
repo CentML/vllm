@@ -128,6 +128,9 @@ class GDNAttentionMetadata:
     prefill_state_indices_i64: torch.Tensor | None = None
     prefill_no_initial_state: torch.Tensor | None = None
     prefill_query_start_loc_i64: torch.Tensor | None = None
+    # Longest prefill sequence (host int; FlashInfer backend), for the V-split
+    # prefill rule.
+    prefill_max_seqlen: int = 0
     # When the spec and non-spec tokens of a mixed batch form two contiguous
     # blocks (checked on the CPU), their start rows; the forward then slices
     # instead of gathering by spec/non_spec_token_indx.
@@ -184,6 +187,7 @@ class GDNSharedBuild:
     prefill_has_initial_state: torch.Tensor | None = None
     prefill_no_initial_state: torch.Tensor | None = None
     prefill_query_start_loc_i64: torch.Tensor | None = None
+    prefill_max_seqlen: int = 0
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
@@ -762,6 +766,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_state_indices_i64=prefill_state_indices_i64,
             prefill_no_initial_state=shared.prefill_no_initial_state,
             prefill_query_start_loc_i64=shared.prefill_query_start_loc_i64,
+            prefill_max_seqlen=shared.prefill_max_seqlen,
             spec_token_start=shared.spec_token_start,
             non_spec_token_start=shared.non_spec_token_start,
             prefill_checkpoint=prefill_checkpoint,
@@ -990,6 +995,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         shared.prefill_no_initial_state = ~prefill_has_initial_state
         if self.gdn_prefill_backend == "flashinfer":
             shared.prefill_query_start_loc_i64 = prefill_query_start_loc.to(torch.int64)
+            shared.prefill_max_seqlen = int(
+                torch.diff(prefill_query_start_loc_cpu).max()
+            )
         return shared
 
     def _decode_buffers_metadata(

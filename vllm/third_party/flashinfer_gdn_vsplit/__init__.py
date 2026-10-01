@@ -22,14 +22,16 @@ with few prefill sequences under-fills the GPU. With ``v_split=2`` the work item
 Output and final state are bitwise identical to the stock kernel: the V rows of the state
 evolve independently and the K-reduction order is unchanged.
 
-Dispatch (used by qwen_gdn_linear_attn.py on the non-CP state-pool path only):
-  VLLM_GDN_FI_VSPLIT=1                  enable
+Dispatch (fi_chunk_gated_delta_rule in qwen_gdn_linear_attn.py, non-CP state-pool path):
+  VLLM_GDN_FI_VSPLIT=0                  disable (default on; the prefill warmup
+                                        compiles the kernel, a failed compile keeps
+                                        it off)
   VLLM_GDN_FI_VSPLIT_RULE=r2|model|n<=K default "r2" = "model" + always split when the
                                         stock grid (num_seqs * HV) exceeds the SM count;
                                         "model" picks v_split with a persistent-schedule
                                         cost model from (num_seqs, total tokens, max seq
                                         len); "n<=3" = split iff num_seqs <= 3.
-Anything else (and any failure) falls back to the stock FlashInfer call.
+Steps the rule leaves at v_split=1 run the stock FlashInfer call.
 """
 import os
 

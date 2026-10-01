@@ -22,7 +22,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from vllm.logger import init_logger
+
 from .gdn_chunked_vs import GatedDeltaNetChunkedKernel
+
+logger = init_logger(__name__)
 
 
 @functools.cache
@@ -88,6 +92,9 @@ def chunk_gated_delta_rule_vsplit(
     c = _cache(*key)
     dv = 128 // v_split
     if "compiled" not in c:
+        # Serving must never get here after the prefill warmup; the log line
+        # makes an unwarmed variant visible.
+        logger.info("gdn_vsplit: compiling V-split kernel, key=%s", key)
         gdn = GatedDeltaNetChunkedKernel(
             io_dtype=_io(q.dtype), inverse_dtype=_io(q.dtype), acc_dtype=cutlass.Float32,
             state_dtype=_st(st_dtype),
