@@ -79,7 +79,7 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops import flashinfer_decode_splitkv
+from vllm.v1.attention.ops import attn_pd_overlap, flashinfer_decode_splitkv
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -2219,9 +2219,24 @@ class FlashInferImpl(AttentionImpl):
             assert self.o_sf_scale is None
             assert output.dtype != FP4_DTYPE
 
+        # Opt-in (VLLM_ATTN_PD_OVERLAP): run the prefill and the decode kernels
+        # of this mixed step on two streams (attn_pd_overlap.py); None = serial.
+        _pdo = (
+            attn_pd_overlap.plan(num_prefill_tokens, num_decode_tokens, query.device)
+            if attn_pd_overlap.ENABLED
+            and prefill_use_trtllm
+            and decode_with_trtllm_gen
+            and not use_dcp
+            and not self.is_kvcache_nvfp4
+            and output.dtype != FP4_DTYPE
+            else None
+        )
+
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
+            if _pdo is not None:
+                _pdo.enter("p")
             prefill_query = query[num_decode_tokens:]
             assert prefill_query.shape[0] == num_prefill_tokens
 
@@ -2329,6 +2344,8 @@ class FlashInferImpl(AttentionImpl):
                 prefill_query = prefill_query.contiguous()
                 prefill_query = canonicalize_singleton_dim_strides(prefill_query)
                 workspace_buffer = _get_trtllm_workspace_buffer()
+                if _pdo is not None:
+                    workspace_buffer = _pdo.workspace("p", workspace_buffer)
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
 
@@ -2443,7 +2460,11 @@ class FlashInferImpl(AttentionImpl):
                         num_decode_tokens : num_decode_tokens + num_prefill_tokens
                     ].copy_(out[:num_prefill_tokens])
 
+        if _pdo is not None:
+            _pdo.leave("p")
         if num_decode_tokens > 0:
+            if _pdo is not None:
+                _pdo.enter("d")
             decode_query_tokens = num_decode_tokens
             if decode_with_xqa:
                 assert isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode)
@@ -2531,6 +2552,8 @@ class FlashInferImpl(AttentionImpl):
                 decode_query = decode_query.contiguous()
                 decode_query = canonicalize_singleton_dim_strides(decode_query)
                 workspace_buffer = _get_trtllm_workspace_buffer()
+                if _pdo is not None:
+                    workspace_buffer = _pdo.workspace("d", workspace_buffer)
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
 
@@ -2667,12 +2690,17 @@ class FlashInferImpl(AttentionImpl):
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
-                    **_fi_kv_counter_kwargs(
-                        decode_query.device,
-                        decode_query.shape[0],
-                        decode_query.shape[1],
-                        "gen",
-                    ),
+                    # F's persistent "gen" counter, overridden by attn-pdo's
+                    # private one when the decode runs on the side stream (dly).
+                    **{
+                        **_fi_kv_counter_kwargs(
+                            decode_query.device,
+                            decode_query.shape[0],
+                            decode_query.shape[1],
+                            "gen",
+                        ),
+                        **(_pdo.decode_kwargs() if _pdo is not None else {}),
+                    },
                 )
 
                 if use_dcp:
@@ -2687,6 +2715,30 @@ class FlashInferImpl(AttentionImpl):
                     )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
+        if _pdo is not None:
+            _pdo.leave("d")
+            _pdo.join()
+            if attn_pd_overlap.check_due():
+                # Re-run this call serially on the same inputs and compare the
+                # output rows bitwise (the first VLLM_ATTN_PD_CHECK forks).
+                fork_out = output_padded[:num_actual_tokens].clone()
+                with attn_pd_overlap.serial_scope():
+                    self.forward(
+                        layer,
+                        query_padded,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output_padded,
+                        output_scale,
+                        output_block_scale,
+                    )
+                attn_pd_overlap.check_result(
+                    fork_out,
+                    output_padded[:num_actual_tokens],
+                    getattr(layer, "layer_name", "?"),
+                )
         return output_padded
 
     def do_kv_cache_update(
