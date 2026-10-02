@@ -187,14 +187,23 @@ __device__ __forceinline__ uint32_t qo_block(const QoArgs& qo, int row, int head
   return e2;
 }
 // zero q (rows < T) / scales (rows < pm) of the rows [n_tok, pm) assigned to this CTA (row = n_tok + request + k *
-// n_req), spread over all threads (32 q words per row, 1 scale word per row)
-__device__ __forceinline__ void qo_zero_pad_rows(const QoArgs& qo, int n_tok, int request, int n_req, int head, int tid) {
+// n_req), spread over all threads (32 q words per row, 1 scale word per row).
+// gb300-fuse (QO option b): also zero this head's bf16 output of the graph padding rows [n_tok, T) (16 x 16 B per
+// (row, head)), the rows gdn_out_alloc's _zero_pad_rows would have zeroed (slot < 0 = the suffix past the real
+// tokens) before NOZERO_FULL deferred that zeroing to the decode kernel. Same values (+0.0 bf16), same row partition.
+__device__ __forceinline__ void qo_zero_pad_rows(const QoArgs& qo, int n_tok, int request, int n_req, int head, int tid,
+                                                 __nv_bfloat16* out, int HV) {
   const int first = n_tok + request;
   if (first >= qo.pm) return;
   const int nq = first < qo.T ? (qo.T - first + n_req - 1) / n_req : 0;
   for (int idx = tid; idx < nq * 32; idx += kThreads) {
     const int row = first + (idx >> 5) * n_req;
     reinterpret_cast<uint32_t*>(qo.q + row * qo.stride_q + head * kDimV)[idx & 31] = 0u;
+  }
+  for (int idx = tid; idx < nq * (kDimV / 8); idx += kThreads) {
+    const int row = first + (idx / (kDimV / 8)) * n_req;
+    reinterpret_cast<uint4*>(out + (static_cast<int64_t>(row) * HV + head) * kDimV)[idx % (kDimV / 8)] =
+        make_uint4(0u, 0u, 0u, 0u);
   }
   const int ns = (qo.pm - first + n_req - 1) / n_req;
   for (int r = tid; r < ns; r += kThreads)
@@ -1097,7 +1106,7 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
-  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid);
+  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid, out, HV);
 #endif
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gsc_dyn_smem[];
@@ -1659,7 +1668,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
   static_assert(kGbThreads == kThreads, "GSC_QO pad-row zeroing assumes 256-thread CTAs");
-  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid);
+  if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid, out, HV);
 #endif
   if (num_tokens <= 0) return;
   extern __shared__ __align__(16) unsigned char gb_dyn_smem[];
@@ -2012,8 +2021,8 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
   if (qo.q != nullptr) {  // the pad rows of both value heads (same row partition as the value-head kernels)
-    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0, tid);
-    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0 + 1, tid);
+    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0, tid, out, HV);
+    qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0 + 1, tid, out, HV);
   }
 #endif
   if (num_tokens <= 0) return;
