@@ -203,9 +203,19 @@ def _conv_window(conv_pool: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("drop_eagle", [False, True])
 @pytest.mark.parametrize("num_decodes", [0, 2])
 @pytest.mark.parametrize("backend", ["auto", "triton"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_prefill_checkpoint_matches_split_prefill(
-    drop_eagle: bool, num_decodes: int, backend: str, num_spec: int, layout: str
+    drop_eagle: bool,
+    num_decodes: int,
+    backend: str,
+    num_spec: int,
+    layout: str,
+    state_dtype: torch.dtype,
 ) -> None:
+    """With a bf16 pool the checkpoint holds the state rounded to bf16 and the
+    tail resumes from it, exactly as the second chunk of the split prefill
+    (and a later prefix hit on the checkpoint) does.
+    """
     if backend == "triton" and current_platform.is_device_capability_family(100):
         pytest.skip("The Triton/FLA chunk kernel is unsupported on SM10x")
     torch.manual_seed(0)
@@ -230,7 +240,7 @@ def test_prefill_checkpoint_matches_split_prefill(
         1, H, HV, K, V, CONV_KERNEL, num_spec=num_spec
     )
     conv0 = torch.randn(pool_size, *conv_shape, dtype=torch.bfloat16, device=device)
-    ssm0 = torch.randn(pool_size, *ssm_shape, dtype=torch.float32, device=device)
+    ssm0 = torch.randn(pool_size, *ssm_shape, device=device).to(state_dtype)
     conv0 *= 0.05
     ssm0 *= 0.05
 
