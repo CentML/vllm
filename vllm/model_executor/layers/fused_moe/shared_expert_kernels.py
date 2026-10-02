@@ -22,6 +22,8 @@ All launches are CUDA-graph safe (no host sync, no allocation other than
 torch.empty on the current stream).
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -198,7 +200,10 @@ def _route_fold_packed_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
 @triton.jit
 def _route_fold_packed_pad_kernel(lg_ptr, pad_ptr, cnt_ptr, ids_ptr, w_ptr, M, stride_l,
                                   E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr,
-                                  PROBE: tl.constexpr):
+                                  PROBE: tl.constexpr, launch_pdl: tl.constexpr = False):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # Same instructions as _route_fold_packed_kernel for rows with pad[row] == False (ids / weights of real rows are
     # bit-identical). Rows with pad[row] == True (CUDA-graph padding rows, vLLM's forward_context.is_padding) get
     # expert id -1 in all K+1 slots and weight 0: the trtllm routing kernels (block / cluster / coop and the exact
@@ -246,6 +251,21 @@ def _route_fold_packed_pad_kernel(lg_ptr, pad_ptr, cnt_ptr, ids_ptr, w_ptr, M, s
 
 
 _ROUTE_PLAIN = False  # tests: force the unpacked reference kernel
+# Opt-in faster launch of the packed routing kernels for M >= VLLM_SEG_ROUTE_FAST_MIN tokens (0 = off): 2 rows per
+# program, 1 warp. Every (rows/program, warps) launch computes each row with identical instructions (bitwise-equal ids
+# and weights, checked for BT 1..32 x warps 1..8 at 2.4K-16K tokens on GB300); this one is ~2x faster at mixed-step sizes.
+_ROUTE_FAST_MIN = int(os.environ.get("VLLM_SEG_ROUTE_FAST_MIN", "0"))
+if _ROUTE_FAST_MIN > 0:
+    from vllm.logger import init_logger as _init_logger
+
+    _init_logger(__name__).info(
+        "SEG-fold routing: fast launch (2 rows/program, 1 warp) for M >= %d tokens", _ROUTE_FAST_MIN)
+
+
+def _route_launch(M: int) -> tuple[int, int]:
+    if _ROUTE_FAST_MIN > 0 and M >= _ROUTE_FAST_MIN:
+        return 2, 1
+    return (8 if M >= 4096 else 4), 4
 
 
 def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torch.dtype = torch.bfloat16,
@@ -258,17 +278,18 @@ def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torc
     ids = torch.empty(M, K + 1, dtype=torch.int32, device=logits.device)
     w = torch.empty(M, K + 1, dtype=w_dtype, device=logits.device)
     if M and pad is not None and logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
-        BT = 8 if M >= 4096 else 4
+        BT, NW = _route_launch(M)
         _route_fold_packed_pad_kernel[(triton.cdiv(M, BT),)](logits, pad, cnt if cnt is not None else ids, ids, w, M,
                                                              logits.stride(0), E=E, K=K,
                                                              KP=triton.next_power_of_2(K + 1), BT=BT,
-                                                             PROBE=cnt is not None, num_warps=4)
+                                                             PROBE=cnt is not None, num_warps=NW,
+                                                             launch_pdl=_lcd_pdl_on())
         return ids, w
     if M:
         if logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
-            BT = 8 if M >= 4096 else 4
+            BT, NW = _route_launch(M)
             _route_fold_packed_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
-                                                            KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4, launch_pdl=_lcd_pdl_on())
+                                                            KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=NW, launch_pdl=_lcd_pdl_on())
         else:
             BT = 4
             _route_fold_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
