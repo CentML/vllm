@@ -303,6 +303,82 @@ def _warm_zero_fresh_state_rows_kernel(
     )
 
 
+def _warm_prefill_checkpoint_kernels(
+    device: torch.device, config: _QwenGDNWarmupConfig
+) -> None:
+    """The copy kernels of GDN internal prefill checkpoints and the builder's
+    slot kernel, for every BLOCK variant a step can use (<= 64 sequences).
+    """
+    import vllm.envs as envs
+
+    if not envs.VLLM_GDN_PREFILL_CHECKPOINT:
+        return
+    from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
+        copy_state_rows,
+        gather_prefill_rows,
+        store_conv_checkpoint,
+    )
+    from vllm.v1.attention.backends.gdn_attn import _gdn_checkpoint_slots_kernel
+
+    i32 = torch.int32
+    one = torch.ones(1, dtype=torch.int64, device=device) * config.conv_kernel_size
+    # Slot 0 is the null block: writing it is harmless.
+    store_conv_checkpoint(
+        torch.zeros(
+            (config.conv_kernel_size, config.conv_dim),
+            dtype=config.conv_dtype,
+            device=device,
+        ),
+        config.conv_state,
+        config.conv_kernel_size - 1,
+        one,
+        torch.zeros(1, dtype=i32, device=device),
+    )
+    pool = torch.zeros(
+        (2, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
+    )
+    copy_state_rows(
+        pool,
+        torch.ones(1, dtype=i32, device=device),
+        torch.zeros(1, dtype=i32, device=device),
+    )
+    gather_prefill_rows(
+        torch.zeros(1, dtype=torch.int64, device=device),
+        *(
+            torch.zeros((1, 2, *shape), dtype=dtype, device=device)
+            for shape, dtype in (
+                ((config.h, config.k), config.conv_dtype),
+                ((config.h, config.k), config.conv_dtype),
+                ((config.hv, config.v), config.conv_dtype),
+                ((config.hv,), torch.float32),
+                ((config.hv,), torch.float32),
+            )
+        ),
+    )
+    block_table = torch.zeros((2, 4), dtype=i32, device=device)
+    # 2 prefills, prefill 0 checkpointed in block column 1.
+    plan = torch.tensor([0, 1, 0, 2, 0], dtype=torch.int64, device=device)
+    blocks = (16, 32, 64)
+    for block_ckpt, block_split in itertools.product(blocks, blocks):
+        if block_ckpt > block_split:
+            continue
+        _gdn_checkpoint_slots_kernel[(1,)](
+            block_table,
+            block_table.stride(0),
+            block_table[:, 0],
+            block_table.stride(0),
+            torch.ones(2, dtype=torch.bool, device=device),
+            plan,
+            torch.empty(4, dtype=i32, device=device),
+            torch.empty(4, dtype=torch.bool, device=device),
+            2,
+            1,
+            2,
+            BLOCK_CKPT=block_ckpt,
+            BLOCK_SPLIT=block_split,
+        )
+
+
 def _warm_causal_conv1d_fwd_kernel(
     device: torch.device, config: _QwenGDNWarmupConfig
 ) -> None:
@@ -554,6 +630,7 @@ def qwen_triton_warmup(
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
     _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
     _warm_zero_fresh_state_rows_kernel(device, gdn_config)
+    _warm_prefill_checkpoint_kernels(device, gdn_config)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.

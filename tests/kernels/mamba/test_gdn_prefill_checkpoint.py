@@ -71,6 +71,12 @@ PREFILLS = [
     (512, 700),  # block-aligned start, one block later: no checkpoint
 ]
 CHECKPOINTED = (0, 1, 3)
+# One checkpoint (prefill 1, after an unsplit prefill): the tail is a token
+# range, rerun on slices instead of gathered rows.
+LAYOUTS = {
+    "three": (PREFILLS, CHECKPOINTED),
+    "one": ([PREFILLS[2], PREFILLS[3], PREFILLS[4]], (1,)),
+}
 
 
 def _make_vllm_config(backend: str):
@@ -192,12 +198,13 @@ def _conv_window(conv_pool: torch.Tensor) -> torch.Tensor:
     return view[..., : CONV_KERNEL - 1]
 
 
+@pytest.mark.parametrize("layout", ["three", "one"])
 @pytest.mark.parametrize("num_spec", [0, 3])
 @pytest.mark.parametrize("drop_eagle", [False, True])
 @pytest.mark.parametrize("num_decodes", [0, 2])
 @pytest.mark.parametrize("backend", ["auto", "triton"])
 def test_prefill_checkpoint_matches_split_prefill(
-    drop_eagle: bool, num_decodes: int, backend: str, num_spec: int
+    drop_eagle: bool, num_decodes: int, backend: str, num_spec: int, layout: str
 ) -> None:
     if backend == "triton" and current_platform.is_device_capability_family(100):
         pytest.skip("The Triton/FLA chunk kernel is unsupported on SM10x")
@@ -208,7 +215,8 @@ def test_prefill_checkpoint_matches_split_prefill(
     ref_builder = _make_builder(vllm_config, False, drop_eagle, device)
 
     # Decodes (1 token, with context) first, then the prefills.
-    requests = [(63, 64)] * num_decodes + PREFILLS
+    prefills, checkpointed = LAYOUTS[layout]
+    requests = [(63, 64)] * num_decodes + prefills
     max_blocks = cdiv(max(end for _, end in requests), BLOCK)
     num_rows = len(requests)
     block_table = (
@@ -242,8 +250,8 @@ def test_prefill_checkpoint_matches_split_prefill(
     )
 
     positions = {}
-    for i in CHECKPOINTED:
-        _, end = PREFILLS[i]
+    for i in checkpointed:
+        _, end = prefills[i]
         positions[num_decodes + i] = get_mamba_prefill_checkpoint_position(
             end, UNIT, drop_eagle_block=drop_eagle
         )
@@ -261,8 +269,9 @@ def test_prefill_checkpoint_matches_split_prefill(
         x,
     )
     assert meta.prefill_checkpoint is not None
-    assert meta.prefill_checkpoint.checkpoint_state_indices_i64.numel() == len(
-        CHECKPOINTED
+    assert meta.prefill_checkpoint.checkpoint_state_indices.numel() == len(checkpointed)
+    assert (meta.prefill_checkpoint.tail_token_range is not None) == (
+        len(checkpointed) == 1
     )
 
     # ---- Reference: split at each checkpoint, two forwards ----
