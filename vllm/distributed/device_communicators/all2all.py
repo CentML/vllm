@@ -4,8 +4,8 @@ import os
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,9 @@ from vllm.utils.import_utils import (
 )
 
 from .base_device_communicator import All2AllManagerBase, Cache
+
+if TYPE_CHECKING:
+    from flashinfer.fused_moe import QuantFormat
 
 if has_flashinfer_nvlink_two_sided():
     from flashinfer.comm import Mapping  # type: ignore[import-not-found]
@@ -733,10 +736,10 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         top_k: int,
         num_experts: int,
         hidden_size: int,
-        x_bytes_per_token: int,
-        x_sf_bytes_per_token: int,
+        dispatch_format: "QuantFormat | None" = None,
+        extra_payload_bytes_per_token: int = 0,
     ) -> None:
-        """Reserve a BF16-sized row, including any additional dispatch payload."""
+        """Reserve dispatch-format rows and BF16 combine rows, growing as needed."""
         if self.initialized:
             assert top_k == self.top_k, (
                 "FlashInfer one-sided communication does not support "
@@ -748,18 +751,38 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
                 f"was built with {self.num_experts})"
             )
 
-        # Quantized activations and scales normally fit within the BF16 row.
-        extra_payload_bytes = max(
-            0, x_bytes_per_token + x_sf_bytes_per_token - hidden_size * 2
+        if extra_payload_bytes_per_token < 0:
+            raise ValueError("extra_payload_bytes_per_token must be non-negative")
+        params = MoEEpCommParams(
+            num_experts=num_experts,
+            top_k=top_k,
+            max_tokens_per_rank=max_num_tokens,
+            hidden_size=hidden_size,
+            dtype=torch.bfloat16,
+            dispatch_format=dispatch_format,
         )
         communication = self.communications.get(hidden_size)
         if communication is not None:
             previous_max = communication.params.max_tokens_per_rank
             previous_extra = communication.config.extra_payload_bytes_per_token
-            if max_num_tokens <= previous_max and extra_payload_bytes <= previous_extra:
+            previous_bytes = (
+                communication.params.dispatch_bytes_per_token + previous_extra
+            )
+            dispatch_bytes = (
+                params.dispatch_bytes_per_token + extra_payload_bytes_per_token
+            )
+            if max_num_tokens <= previous_max and dispatch_bytes <= previous_bytes:
                 return
-            max_num_tokens = max(max_num_tokens, previous_max)
-            extra_payload_bytes = max(extra_payload_bytes, previous_extra)
+            # A smaller format may need more tokens. Keep the larger row capacity
+            # for earlier layers sharing this workspace, regardless of init order.
+            if dispatch_bytes < previous_bytes:
+                params = replace(
+                    params, dispatch_format=communication.params.dispatch_format
+                )
+                extra_payload_bytes_per_token = previous_extra
+            params = replace(
+                params, max_tokens_per_rank=max(max_num_tokens, previous_max)
+            )
 
         from vllm.distributed.device_communicators.mnnvl_compat import (
             CustomCommunicator,
@@ -772,16 +795,8 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             device=torch.accelerator.current_device_index(),
             process_group=self.cpu_group,
         )
-        params = MoEEpCommParams(
-            num_experts=num_experts,
-            top_k=top_k,
-            max_tokens_per_rank=max_num_tokens,
-            hidden_size=hidden_size,
-            dtype=torch.bfloat16,
-        )
         config = NVLinkOneSidedConfig(
-            kernel="trtllm",
-            extra_payload_bytes_per_token=extra_payload_bytes,
+            extra_payload_bytes_per_token=extra_payload_bytes_per_token,
             comm_backend=CustomCommunicator(self.cpu_group),
         )
         torch.accelerator.empty_cache()

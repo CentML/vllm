@@ -322,8 +322,6 @@ def _one_sided_lifecycle_worker(rank, world_size):
         top_k=2,
         num_experts=world_size * 8,
         hidden_size=4096,
-        x_bytes_per_token=4096 * 2,
-        x_sf_bytes_per_token=0,
     )
 
     # Initialize
@@ -370,6 +368,9 @@ def test_one_sided_manager_lifecycle(world_size):
 
 
 def _one_sided_workspace_grow_worker(rank, world_size):
+    from flashinfer.comm.trtllm_moe_alltoall import moe_a2a_get_workspace_size_per_rank
+    from flashinfer.fused_moe import QuantFormat
+
     from vllm.distributed.device_communicators.all2all import (
         FlashInferNVLinkOneSidedManager,
     )
@@ -383,28 +384,32 @@ def _one_sided_workspace_grow_worker(rank, world_size):
         num_experts=world_size * 8,
         hidden_size=4096,
     )
-    nvfp4_kwargs = dict(
-        x_bytes_per_token=base_kwargs["hidden_size"] // 2,
-        x_sf_bytes_per_token=base_kwargs["hidden_size"] // 16,
-    )
-    bf16_kwargs = dict(
-        x_bytes_per_token=base_kwargs["hidden_size"] * 2,
-        x_sf_bytes_per_token=0,
-    )
+    nvfp4_kwargs = dict(dispatch_format=QuantFormat.NVFP4)
+    bf16_kwargs = dict(dispatch_format=QuantFormat.BF16)
 
-    # The wrapper reserves an unquantized row, so NVFP4 and BF16 can share it.
+    # A quantized-only layer retains the original tightly sized workspace.
     manager.initialize(**base_kwargs, **nvfp4_kwargs)
     original = manager.get_communication(4096)
+    assert original.params.dispatch_format == QuantFormat.NVFP4
+    assert original.alltoall.workspace_size_per_rank == (
+        moe_a2a_get_workspace_size_per_rank(
+            world_size, 1024, 4096 // 2 + 4096 // 16 + 2 * 8, 4096 * 2
+        )
+    )
     manager.initialize(**base_kwargs, **bf16_kwargs)
-    assert manager.get_communication(4096) is original
+    bf16 = manager.get_communication(4096)
+    assert bf16 is not original
+    assert bf16.params.dispatch_bytes_per_token == 8192
 
-    manager.initialize(**{**base_kwargs, "max_num_tokens": 2048}, **bf16_kwargs)
+    # Token growth for a smaller format must retain earlier BF16 capacity.
+    manager.initialize(**{**base_kwargs, "max_num_tokens": 2048}, **nvfp4_kwargs)
     grown = manager.get_communication(4096)
-    assert grown is not original
+    assert grown is not bf16
     assert grown.params.max_tokens_per_rank == 2048
+    assert grown.params.dispatch_bytes_per_token == 8192
 
     # A BF16 row plus scales needs additional dispatch capacity.
-    manager.initialize(**base_kwargs, x_bytes_per_token=8192, x_sf_bytes_per_token=256)
+    manager.initialize(**base_kwargs, extra_payload_bytes_per_token=256)
     with_scales = manager.get_communication(4096)
     assert with_scales is not grown
     assert with_scales.params.max_tokens_per_rank == 2048
@@ -415,8 +420,6 @@ def _one_sided_workspace_grow_worker(rank, world_size):
     # Fixed wrapper geometry must not replace a different layer's hidden size.
     manager.initialize(
         **{**base_kwargs, "hidden_size": 2048},
-        x_bytes_per_token=4096,
-        x_sf_bytes_per_token=0,
     )
     assert manager.get_communication(2048).params.hidden_size == 2048
     assert manager.get_communication(4096) is with_scales
@@ -732,16 +735,30 @@ def test_two_sided_dispatch_combine(world_size):
 # ---------------------------------------------------------------------------
 
 
-def _one_sided_data_worker(rank, world_size):
+def _one_sided_data_worker(rank, world_size, *, padded_mxfp8):
+    from flashinfer.fused_moe import QuantFormat
+
     from vllm.distributed.device_communicators.all2all import (
         FlashInferNVLinkOneSidedManager,
     )
     from vllm.forward_context import get_forward_context
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        flashinfer_one_sided_dispatch_layout,
+    )
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 
     cpu_group = get_ep_group().cpu_group
     device = torch.device(f"{DEVICE}:{rank}")
 
-    hidden_size = 256
+    hidden_size = 160 if padded_mxfp8 else 256
+    x_width = hidden_size if padded_mxfp8 else hidden_size // 2
+    scale_width = 8 if padded_mxfp8 else hidden_size // 16
+    quant_config = FusedMoEQuantConfig.make("mxfp8" if padded_mxfp8 else "nvfp4")
+    quant_config.mx_alignment = 128 if padded_mxfp8 else 0
+    layout = flashinfer_one_sided_dispatch_layout(hidden_size, quant_config)
+    assert layout.dispatch_format == (
+        QuantFormat.MXFP8 if padded_mxfp8 else QuantFormat.NVFP4
+    )
     tokens_per_rank = 32
     experts_per_token = 2
     num_experts = world_size * 8
@@ -753,12 +770,8 @@ def _one_sided_data_worker(rank, world_size):
         top_k=experts_per_token,
         num_experts=num_experts,
         hidden_size=hidden_size,
-        x_bytes_per_token=hidden_size // 2,
-        # Account for the fp8 block-scale payload (x_sf: hidden//16 bytes
-        # per token) that is dispatched alongside the nvfp4 hidden states.
-        # Without this the dispatch region is under-reserved and the combine
-        # payload overflows the per-rank workspace.
-        x_sf_bytes_per_token=hidden_size // 16,
+        dispatch_format=layout.dispatch_format,
+        extra_payload_bytes_per_token=layout.extra_payload_bytes_per_token,
     )
     assert manager.initialized
     communication = manager.get_communication(hidden_size)
@@ -770,22 +783,19 @@ def _one_sided_data_worker(rank, world_size):
             local_sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
             runtime_max_tokens = max(local_sizes)
 
-            # Create test data with raw tensors matching the nvfp4 payload
-            # sizes the workspace was allocated for:
-            #   x: (tokens, hidden_size // 2) — nvfp4 hidden states
-            #   x_sf: (tokens, hidden_size // 16) — fp8 scaling factors
+            # Exercise raw packed values and scales, including MXFP8 padding.
             torch.manual_seed(rank + 42)
             x = torch.randint(
                 0,
                 256,
-                (tokens_per_rank, hidden_size // 2),
+                (tokens_per_rank, x_width),
                 device=device,
                 dtype=torch.uint8,
             )
             x_sf = torch.randint(
                 0,
                 256,
-                (tokens_per_rank, hidden_size // 16),
+                (tokens_per_rank, scale_width),
                 device=device,
                 dtype=torch.uint8,
             )
@@ -853,9 +863,14 @@ def _one_sided_data_worker(rank, world_size):
 @requires_one_sided
 @requires_ptrace
 @pytest.mark.parametrize("world_size", [2])
-def test_one_sided_dispatch_combine(world_size):
+@pytest.mark.parametrize("padded_mxfp8", [False, True])
+def test_one_sided_dispatch_combine(world_size, padded_mxfp8):
     """Test FlashInfer one-sided dispatch/combine with actual data flow."""
-    _spawn_workers(_one_sided_data_worker, world_size, dp_size=world_size)
+    _spawn_workers(
+        partial(_one_sided_data_worker, padded_mxfp8=padded_mxfp8),
+        world_size,
+        dp_size=world_size,
+    )
 
 
 def _one_sided_prepare_finalize_worker(rank, world_size, *, empty_rank, cuda_graph):
@@ -886,8 +901,6 @@ def _one_sided_prepare_finalize_worker(rank, world_size, *, empty_rank, cuda_gra
         top_k=2,
         num_experts=local_experts * world_size,
         hidden_size=hidden,
-        x_bytes_per_token=hidden * 2,
-        x_sf_bytes_per_token=0,
     )
     quant_config = FusedMoEQuantConfig.make()
     reduce_impl = TopKWeightAndReduceNoOP()

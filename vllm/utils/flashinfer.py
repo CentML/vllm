@@ -344,15 +344,19 @@ def has_flashinfer_nvlink_one_sided() -> bool:
     if not has_flashinfer_comm():
         return False
     mod = _get_submodule("flashinfer.moe_ep")
-    return mod is not None and all(
-        hasattr(mod, name)
-        for name in (
-            "BootstrapConfig",
-            "MoEEpCommParams",
-            "NVLinkOneSidedAlltoAll",
-            "NVLinkOneSidedConfig",
-            "create_communication",
+    return (
+        mod is not None
+        and all(
+            hasattr(mod, name)
+            for name in (
+                "BootstrapConfig",
+                "MoEEpCommParams",
+                "NVLinkOneSidedAlltoAll",
+                "NVLinkOneSidedConfig",
+                "create_communication",
+            )
         )
+        and hasattr(mod.MoEEpCommParams, "dispatch_format")
     )
 
 

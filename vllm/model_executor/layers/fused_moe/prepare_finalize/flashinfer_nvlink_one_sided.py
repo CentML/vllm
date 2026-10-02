@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,6 +13,9 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+
+if TYPE_CHECKING:
+    from flashinfer.fused_moe import QuantFormat
 
 
 def get_local_sizes() -> list[int] | None:
@@ -31,8 +36,8 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         top_k: int,
         num_experts: int,
         hidden_size: int,
-        x_bytes_per_token: int,
-        x_sf_bytes_per_token: int,
+        dispatch_format: "QuantFormat | None" = None,
+        extra_payload_bytes_per_token: int = 0,
         num_dispatchers: int = 1,
     ):
         super().__init__()
@@ -52,8 +57,8 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             top_k=self.top_k,
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
-            x_bytes_per_token=x_bytes_per_token,
-            x_sf_bytes_per_token=x_sf_bytes_per_token,
+            dispatch_format=dispatch_format,
+            extra_payload_bytes_per_token=extra_payload_bytes_per_token,
         )
 
     @property
