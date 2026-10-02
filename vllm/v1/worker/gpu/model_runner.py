@@ -1031,8 +1031,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Opt-in: capture the decode verify-sampler graphs at start-up.
             if self._sampler_graphs is None:
                 self._sampler_graphs = sample_graph.SamplerGraphs(self)
-            with torch.inference_mode():
-                self._sampler_graphs.precapture()
+            try:
+                with torch.inference_mode():
+                    self._sampler_graphs.precapture()
+            except Exception as e:  # never break start-up: lazy capture remains
+                logger.warning("sampler graph pre-capture failed: %r", e)
+                torch.cuda.synchronize()
         return size
 
     def _capture_model_cfix(self, *, profile_only: bool = False) -> int:
