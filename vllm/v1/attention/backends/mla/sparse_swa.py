@@ -245,6 +245,13 @@ class DeepseekSparseSWAMetadata:
     flashinfer_sparse_index_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
+    # Per-step memo of prefill chunking derived from this metadata alone: every
+    # attention layer of a type plans the same chunks, so they are computed once
+    # per step instead of once per layer. Not an init field, so a
+    # dataclasses.replace() copy starts empty.
+    prefill_chunk_cache: dict[Any, Any] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     def get_prefill_chunk_plan(
         self,
@@ -252,11 +259,13 @@ class DeepseekSparseSWAMetadata:
         prefill_chunk_size: int,
         has_compressed: bool | None = None,
     ) -> list[tuple[int, int, int, int]]:
+        """Chunks of prefill requests whose gathered KV fits the workspace.
+
+        Returns ``(chunk_start, chunk_end, chunk_n, chunk_m)`` tuples. The list
+        is memoized per step and shared by the callers: do not modify it.
+        """
         if self.num_prefills == 0:
             return []
-
-        assert self.prefill_seq_lens_cpu is not None
-        assert self.prefill_query_lens_cpu is not None
 
         # Whether the layer gathers a compressed-KV region into the prefill
         # workspace. v4.0 callers keep the legacy default (ratio <= 1 means
@@ -264,6 +273,23 @@ class DeepseekSparseSWAMetadata:
         # compress_ratio==1 layers DO have a full-length compressed cache.
         if has_compressed is None:
             has_compressed = compress_ratio > 1
+        key = ("chunk_plan", compress_ratio, prefill_chunk_size, has_compressed)
+        chunk_plan = self.prefill_chunk_cache.get(key)
+        if chunk_plan is None:
+            chunk_plan = self._compute_prefill_chunk_plan(
+                compress_ratio, prefill_chunk_size, has_compressed
+            )
+            self.prefill_chunk_cache[key] = chunk_plan
+        return chunk_plan
+
+    def _compute_prefill_chunk_plan(
+        self,
+        compress_ratio: int,
+        prefill_chunk_size: int,
+        has_compressed: bool,
+    ) -> list[tuple[int, int, int, int]]:
+        assert self.prefill_seq_lens_cpu is not None
+        assert self.prefill_query_lens_cpu is not None
 
         # query_len <= max_num_batched_tokens and
         # gather_len <= query_len + min(prefix_len, window_size - 1) (a replay
@@ -291,21 +317,25 @@ class DeepseekSparseSWAMetadata:
             else torch.zeros_like(self.prefill_seq_lens_cpu)
         )
 
+        # Python ints: per-element .item() on CPU tensors dominated this loop.
+        compressed_lens = compressed_lens_cpu.tolist()
+        gather_lens = gather_lens_cpu.tolist()
+
         chunk_plan: list[tuple[int, int, int, int]] = []
         chunk_start = 0
         while chunk_start < self.num_prefills:
-            chunk_max_compressed = int(compressed_lens_cpu[chunk_start].item())
-            chunk_max_gather = int(gather_lens_cpu[chunk_start].item())
+            chunk_max_compressed = int(compressed_lens[chunk_start])
+            chunk_max_gather = int(gather_lens[chunk_start])
             chunk_end = chunk_start + 1
 
             while chunk_end < self.num_prefills:
                 candidate_max_compressed = max(
                     chunk_max_compressed,
-                    int(compressed_lens_cpu[chunk_end].item()),
+                    int(compressed_lens[chunk_end]),
                 )
                 candidate_max_gather = max(
                     chunk_max_gather,
-                    int(gather_lens_cpu[chunk_end].item()),
+                    int(gather_lens[chunk_end]),
                 )
                 candidate_width = candidate_max_compressed + candidate_max_gather
                 candidate_area = (chunk_end - chunk_start + 1) * candidate_width

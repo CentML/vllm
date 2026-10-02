@@ -16,7 +16,7 @@ a single ``wo_a`` einsum covers the whole step.
 """
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
 
@@ -132,6 +132,22 @@ def alloc_mega_attn_output(
         orig_shape=data.shape,
         quant_key=kMxfp8Dynamic,
     )
+
+
+class _PrefillChunk(NamedTuple):
+    """One prefill chunk's step-constant inputs, shared by all layers of a type."""
+
+    size: int  # requests
+    n: int  # compressed width
+    m: int  # gathered width (compressed + SWA)
+    qs: int  # query rows [qs, qe), relative to the first prefill row
+    qe: int
+    seq_lens: torch.Tensor
+    gather_lens: torch.Tensor
+    block_table: torch.Tensor
+    query_start_loc: torch.Tensor
+    compressed_seq_lens: torch.Tensor | None
+    compressed_block_table: torch.Tensor | None
 
 
 def _token_slice(out: QuantizedActivation, start: int, end: int) -> QuantizedActivation:
@@ -380,6 +396,75 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
             out.scale,
         )
 
+    def _prefill_chunks(
+        self,
+        flashmla_metadata: DeepseekV4FlashMLAMetadata | None,
+        swa_metadata: "DeepseekSparseSWAMetadata",
+    ) -> list[_PrefillChunk]:
+        """Slices and lengths of each prefill chunk, computed once per step.
+
+        They depend only on the step's metadata and this layer type's compress
+        ratio, so every layer of the type reuses them (values are identical to
+        recomputing them per layer).
+        """
+        swa_only = self.compress_ratio == 0
+        key = (
+            "mega_prefill_chunks",
+            self.compress_ratio,
+            self.PREFILL_CHUNK_SIZE,
+            None if swa_only else id(flashmla_metadata),
+        )
+        chunks = swa_metadata.prefill_chunk_cache.get(key)
+        if chunks is not None:
+            return chunks
+        num_decodes = swa_metadata.num_decodes
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        assert seq_lens is not None and gather_lens is not None
+        assert query_start_loc_cpu is not None and query_start_loc is not None
+        chunk_plan = swa_metadata.get_prefill_chunk_plan(
+            compress_ratio=self.compress_ratio,
+            prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
+            has_compressed=not swa_only,
+        )
+        assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
+        qsl = query_start_loc_cpu.tolist()
+        prefill_token_base = qsl[num_decodes]
+        swa_block_table = swa_metadata.block_table[num_decodes:]
+        compressed_block_table = None
+        if not swa_only:
+            assert flashmla_metadata is not None
+            compressed_block_table = flashmla_metadata.block_table[num_decodes:]
+        chunks = []
+        for chunk_start, chunk_end, chunk_n, chunk_m in chunk_plan:
+            first, last = num_decodes + chunk_start, num_decodes + chunk_end
+            chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+            chunks.append(
+                _PrefillChunk(
+                    size=chunk_end - chunk_start,
+                    n=chunk_n,
+                    m=chunk_m,
+                    qs=qsl[first] - prefill_token_base,
+                    qe=qsl[last] - prefill_token_base,
+                    seq_lens=chunk_seq_lens,
+                    gather_lens=gather_lens[chunk_start:chunk_end],
+                    block_table=swa_block_table[chunk_start:chunk_end],
+                    query_start_loc=query_start_loc[first : last + 1],
+                    compressed_seq_lens=(
+                        None if swa_only else chunk_seq_lens // self.compress_ratio
+                    ),
+                    compressed_block_table=(
+                        None
+                        if compressed_block_table is None
+                        else compressed_block_table[chunk_start:chunk_end]
+                    ),
+                )
+            )
+        swa_metadata.prefill_chunk_cache[key] = chunks
+        return chunks
+
     def _forward_prefill_mega(
         self,
         q: torch.Tensor,
@@ -390,72 +475,51 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
         token_base: int,
     ) -> None:
         swa_only = self.compress_ratio == 0
-        num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
-        seq_lens = swa_metadata.prefill_seq_lens
-        gather_lens = swa_metadata.prefill_gather_lens
-        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
-        query_start_loc = swa_metadata.query_start_loc
-        assert seq_lens is not None and gather_lens is not None
-        assert query_start_loc_cpu is not None and query_start_loc is not None
-        prefill_token_base = query_start_loc_cpu[num_decodes]
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[num_decode_tokens:][
             : swa_metadata.num_prefill_tokens
         ]
         top_k = 0 if swa_only else topk_indices.shape[-1]
-        chunk_plan = swa_metadata.get_prefill_chunk_plan(
-            compress_ratio=self.compress_ratio,
-            prefill_chunk_size=self.PREFILL_CHUNK_SIZE,
-            has_compressed=not swa_only,
-        )
-        assert chunk_plan, "prefill chunk plan must be non-empty when num_prefills > 0"
         workspace_manager = current_workspace_manager()
         combined_topk = round_up(top_k + self.window_size, 128)
-        for chunk_start, chunk_end, chunk_n, chunk_m in chunk_plan:
-            chunk_size = chunk_end - chunk_start
+        for chunk in self._prefill_chunks(flashmla_metadata, swa_metadata):
             kv_ws, idx_ws, lens_ws = workspace_manager.get_simultaneous(
-                ((chunk_size, chunk_m, q.shape[-1]), torch.bfloat16),
+                ((chunk.size, chunk.m, q.shape[-1]), torch.bfloat16),
                 ((self.max_num_batched_tokens, combined_topk), torch.int32),
                 ((self.max_num_batched_tokens,), torch.int32),
             )
             if not swa_only:
                 assert flashmla_metadata is not None
                 dequantize_and_gather_k_cache(
-                    kv_ws[:chunk_size, :chunk_n],
+                    kv_ws[: chunk.size, : chunk.n],
                     self._compressed_kv_cache(),
-                    seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                    seq_lens=chunk.compressed_seq_lens,
                     gather_lens=None,
-                    block_table=flashmla_metadata.block_table[num_decodes:][
-                        chunk_start:chunk_end
-                    ],
+                    block_table=chunk.compressed_block_table,
                     block_size=flashmla_metadata.block_size // self.compress_ratio,
                     offset=0,
                 )
             dequantize_and_gather_k_cache(
-                kv_ws[:chunk_size],
+                kv_ws[: chunk.size],
                 self.swa_cache_layer.kv_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end],
-                gather_lens=gather_lens[chunk_start:chunk_end],
-                block_table=swa_metadata.block_table[num_decodes:][
-                    chunk_start:chunk_end
-                ],
+                seq_lens=chunk.seq_lens,
+                gather_lens=chunk.gather_lens,
+                block_table=chunk.block_table,
                 block_size=swa_metadata.block_size,
-                offset=chunk_n,
+                offset=chunk.n,
             )
-            first, last = num_decodes + chunk_start, num_decodes + chunk_end
-            qs = int(query_start_loc_cpu[first] - prefill_token_base)
-            qe = int(query_start_loc_cpu[last] - prefill_token_base)
+            qs, qe = chunk.qs, chunk.qe
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[qs:qe],
-                query_start_loc[first : last + 1],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
+                chunk.query_start_loc,
+                chunk.seq_lens,
+                chunk.gather_lens,
                 self.window_size,
                 self.compress_ratio,
                 top_k,
-                chunk_m,
-                chunk_n,
+                chunk.m,
+                chunk.n,
                 out=(idx_ws[: qe - qs], lens_ws[: qe - qs]),
             )
             chunk_out = _token_slice(out, token_base + qs, token_base + qe)
