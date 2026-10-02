@@ -34,6 +34,13 @@ from vllm.v1.worker.gpu.states import RequestState
 
 # GB300 lowc2: skip unchanged sampler-state staging on steps without new requests.
 _STATE_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
+if _STATE_DIRTY_GATE:
+    from vllm.logger import init_logger as _init_logger
+
+    _init_logger(__name__).info(
+        "sampler state dirty skip on (VLLM_SAMPLER_STATE_DIRTY=1): unchanged "
+        "sampler-state / num_blocks staging is skipped"
+    )
 
 
 class Sampler:
