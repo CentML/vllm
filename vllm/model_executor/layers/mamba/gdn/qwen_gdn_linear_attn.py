@@ -3116,7 +3116,7 @@ def qwen_gdn_attention_core_fused_norm_packed(
         # graph, step plan, eager)
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
         b, a = self.split_ba(ba)
-        gdn_inline_ckpt.after_core(self, mixed_qkvz[:, :qkv_size], b, a)
+        gdn_inline_ckpt.after_core(self, mixed_qkvz[:, :qkv_size], b, a, raw=(mixed_qkvz, ba))
 
 
 direct_register_custom_op(
