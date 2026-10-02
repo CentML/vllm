@@ -184,13 +184,19 @@ def _gdn_fi_non_cp_max_tokens() -> int:
 
 
 def _gdn_vsplit_warmup(
-    num_k_heads: int, num_v_heads: int, head_dim: int, dtype: torch.dtype, device
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    device,
 ) -> None:
-    """Compile the V-split kernel for the one variant serving uses (fp32 pool
-    with int32 state_indices, initial and final state) on a dummy pool and
-    enable it; once per process. cute.compile keeps no on-disk cache: without
-    this, the first eligible prefill of each worker would stall for seconds on
-    the compile. A failed compile leaves FlashInfer's kernel in place.
+    """Compile the V-split kernel for the one variant serving uses (pool of
+    ``state_dtype``, fp32 or bf16, with int32 state_indices, initial and final
+    state) on a dummy pool and enable it; once per process. cute.compile keeps
+    no on-disk cache: without this, the first eligible prefill of each worker
+    would stall for seconds on the compile. A failed compile leaves
+    FlashInfer's kernel in place.
 
     The stock FlashInfer non-CP kernel still runs the steps choose_vsplit
     leaves at v_split=1 (some 4-6 sequence batches). Without V-split, the
@@ -208,7 +214,7 @@ def _gdn_vsplit_warmup(
         v = torch.zeros(T, num_v_heads, head_dim, device=device, dtype=dtype)
         gate = torch.ones(T, num_v_heads, device=device, dtype=torch.float32)
         pool = torch.zeros(
-            2, num_v_heads, head_dim, head_dim, device=device, dtype=torch.float32
+            2, num_v_heads, head_dim, head_dim, device=device, dtype=state_dtype
         )
         gdn_vsplit.chunk_gated_delta_rule_vsplit(
             q,
@@ -248,7 +254,10 @@ def _gdn_vsplit_warmup(
         )
         return
     _gdn_vsplit_ready.append(gdn_vsplit)
-    logger.info("GDN prefill: V-split FlashInfer kernel compiled and enabled.")
+    logger.info(
+        "GDN prefill: V-split FlashInfer kernel compiled and enabled (%s state).",
+        str(state_dtype).removeprefix("torch."),
+    )
 
 
 def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
@@ -426,7 +435,7 @@ def fi_chunk_gated_delta_rule(
         and state_indices is not None
         and g_is_exp
         and output_final_state
-        and fi_state.dtype == torch.float32
+        and fi_state.dtype in (torch.float32, torch.bfloat16)
     ):
         gdn_vsplit = _gdn_vsplit_ready[0]
         v_split = gdn_vsplit.choose_vsplit(
@@ -1539,7 +1548,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.head_k_dim == 128
             and self.head_v_dim == 128
         ):
-            _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
+            _gdn_vsplit_warmup(
+                num_k_heads, num_v_heads, self.head_k_dim, dtype, state_dtype, device
+            )
         if (
             GDN_MTP_CUDA_JIT
             and self.gdn_decode_kernel == "cuda"

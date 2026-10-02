@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V-split FlashInfer GDN prefill: bitwise equal to FlashInfer's non-CP kernel
-on the in-place state pool, through the stack wrapper's dispatch.
+on the in-place state pool (fp32 or bf16), through the stack wrapper's
+dispatch.
 """
 
 import pytest
@@ -24,7 +25,7 @@ import vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn as qgdn  # noqa
 H, HV, D = 16, 32, 128
 
 
-def _case(seqlens, seed):
+def _case(seqlens, seed, state_dtype):
     g = torch.Generator(device="cuda").manual_seed(seed)
     T = sum(seqlens)
     q = torch.nn.functional.normalize(
@@ -37,7 +38,9 @@ def _case(seqlens, seed):
     g_exp = torch.exp(-torch.rand(T, HV, device="cuda", generator=g) * 0.5)
     beta = torch.sigmoid(torch.randn(T, HV, device="cuda", generator=g))
     slots = 2 * len(seqlens) + 3
-    pool = 0.05 * torch.randn(slots, HV, D, D, device="cuda", generator=g)
+    pool = (0.05 * torch.randn(slots, HV, D, D, device="cuda", generator=g)).to(
+        state_dtype
+    )
     perm = torch.randperm(slots - 1, generator=torch.Generator().manual_seed(seed))
     state_indices = (perm[: len(seqlens)] + 1).to(torch.int32).cuda()
     cu32 = torch.tensor(
@@ -48,10 +51,13 @@ def _case(seqlens, seed):
 
 @pytest.fixture(scope="module", autouse=True)
 def _vsplit_enabled():
-    qgdn._gdn_vsplit_warmup(H, HV, D, torch.bfloat16, torch.device("cuda"))
+    qgdn._gdn_vsplit_warmup(
+        H, HV, D, torch.bfloat16, torch.float32, torch.device("cuda")
+    )
     assert qgdn._gdn_vsplit_ready, "V-split kernel failed to compile"
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "seqlens,expect_vsplit",
     [
@@ -68,7 +74,7 @@ def _vsplit_enabled():
     ],
 )
 def test_vsplit_dispatch_bitwise_vs_flashinfer_non_cp(
-    seqlens, expect_vsplit, monkeypatch
+    seqlens, expect_vsplit, state_dtype, monkeypatch
 ):
     gdn_vsplit = qgdn._gdn_vsplit_ready[0]
     calls = []
@@ -79,7 +85,9 @@ def test_vsplit_dispatch_bitwise_vs_flashinfer_non_cp(
         return vsplit_fn(*args, **kwargs)
 
     monkeypatch.setattr(gdn_vsplit, "chunk_gated_delta_rule_vsplit", counting_vsplit)
-    q, k, v, g_exp, beta, pool, state_indices, cu32 = _case(seqlens, len(seqlens))
+    q, k, v, g_exp, beta, pool, state_indices, cu32 = _case(
+        seqlens, len(seqlens), state_dtype
+    )
     pool_ref = pool.clone()
     out_ref = torch.empty_like(v)
     chunk_gated_delta_rule(
