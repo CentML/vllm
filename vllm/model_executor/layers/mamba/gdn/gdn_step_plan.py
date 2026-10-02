@@ -412,6 +412,12 @@ def _vs_direct(p, q, v, st):
         tuple(st.stride()[1:]),
         int(p.vsf),
     )
+    if hasattr(ad, "_cg0_split"):
+        # The gdnchunk adapter (CG0 split / C1 reorder) appends its two layout
+        # flags to the cache key (use_init is True here). Without them this
+        # lookup never hits, and every layer falls back to the full adapter
+        # call plus a fresh _vs_direct attempt (host time only; same kernel).
+        key = key + (ad._cg0_split(int(p.vsf), True), bool(ad._C1_REORDER))
     c = ad._cache(*key)
     if "compiled" not in c:
         return None
