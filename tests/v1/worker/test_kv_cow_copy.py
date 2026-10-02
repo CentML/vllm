@@ -20,16 +20,18 @@ NUM_BLOCKS = 24
 NUM_LAYERS = 3
 
 
-def _hybrid_views(raw, layout, attn_dtype, block_size, kernel_block_size):
+def _hybrid_views(
+    raw, layout, attn_dtype, block_size, kernel_block_size, ssm_dtype=torch.float32
+):
     attn = FullAttentionSpec(
         block_size=block_size, num_kv_heads=2, head_size=64, dtype=attn_dtype
     )
-    # GDN-like conv (bf16) + SSM (fp32) state padded to the attention page, as
-    # the hybrid allocator unifies page sizes; overlays the same bytes.
+    # GDN-like conv (bf16) + SSM (fp32 or bf16) state padded to the attention
+    # page, as the hybrid allocator unifies page sizes; overlays the same bytes.
     mamba = MambaSpec(
         block_size=block_size,
         shapes=((3, 160), (2, 32, 48)),
-        dtypes=(torch.bfloat16, torch.float32),
+        dtypes=(torch.bfloat16, ssm_dtype),
         page_size_padded=attn.page_size_bytes,
     )
     views = dense_kv_cache_views(
@@ -72,12 +74,13 @@ def _copies(num_pairs, seed=0):
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
 @pytest.mark.parametrize("attn_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("num_pairs", [1, 7, 12])
-def test_hybrid_attention_and_state_views(layout, attn_dtype, num_pairs):
+@pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
+def test_hybrid_attention_and_state_views(layout, attn_dtype, num_pairs, ssm_dtype):
     if layout == KVCacheLayout.LHBNC:
         pytest.skip("head-split rows are not one contiguous block row")
 
     def make(raw):
-        return _hybrid_views(raw, layout, attn_dtype, 128, None)
+        return _hybrid_views(raw, layout, attn_dtype, 128, None, ssm_dtype)
 
     _run(make, _copies(num_pairs, seed=num_pairs), True, attn_dtype)
 
