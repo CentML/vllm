@@ -33,6 +33,11 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("VLLM_FUSED_KV_BLOCK_COPY_MULTI", "0") == "1"
+# GB300 lowc2: the per-storage table (base address, row elements, row stride)
+# depends only on the persistent cache tensors and num_blocks; with this gate it
+# is built once per (cache addresses, num_blocks) and reused (exact: same table).
+TABLE_CACHE = os.environ.get("VLLM_FUSED_KV_BLOCK_COPY_TABLE_CACHE", "0") == "1"
+_TAB_CACHE: dict[tuple, tuple] = {}
 STATS = {"calls": 0, "fused_calls": 0, "fallback_calls": 0, "fallback_reasons": {}}
 
 
@@ -108,6 +113,26 @@ def copy_kv_cache_blocks_inplace(
         and not np.intersect1d(indices_np[:, 0], indices_np[:, 1]).size
     ):
         return _fallback(fallback, "overlap_or_dup", *args)
+    if TABLE_CACHE:
+        ckey = (
+            num_blocks,
+            tuple((c.device, c.data_ptr(), c.shape, c.stride()) for c in kv_caches),
+        )
+        hit = _TAB_CACHE.get(ckey)
+        if hit is None:
+            hit = _TAB_CACHE[ckey] = _build_table(kv_caches, num_blocks)
+        reason, tab, dev = hit
+        if reason is not None:
+            return _fallback(fallback, reason, *args)
+        return _launch(tab, dev, indices_np, fallback, args)
+    reason, tab, dev = _build_table(kv_caches, num_blocks)
+    if reason is not None:
+        return _fallback(fallback, reason, *args)
+    return _launch(tab, dev, indices_np, fallback, args)
+
+
+def _build_table(kv_caches, num_blocks):
+    """(fallback reason or None, per-storage table, device) for these caches."""
     seen, storages, tab = set(), set(), []
     dev = None
     for cache in kv_caches:
@@ -118,7 +143,7 @@ def copy_kv_cache_blocks_inplace(
         dev = cache.device
         kbpb, rem = divmod(cache.shape[0], num_blocks)
         if rem:
-            return _fallback(fallback, "remainder", *args)
+            return ("remainder", None, None)
         storage = cache.untyped_storage()
         skey = (cache.device, storage.data_ptr())
         sbs = cache.stride(0) * cache.element_size() * kbpb
@@ -131,11 +156,11 @@ def copy_kv_cache_blocks_inplace(
             try:
                 rows = cache.unflatten(0, (num_blocks, kbpb)).view(num_blocks, -1)
             except RuntimeError:
-                return _fallback(fallback, "view_not_viewable", *args)
+                return ("view_not_viewable", None, None)
             nbytes = rows.shape[1] * rows.element_size()
             S = rows.stride(0) * rows.element_size()
             if rows.stride(1) != 1 or nbytes % 4 or S % 4 or rows.data_ptr() % 16:
-                return _fallback(fallback, "view_align", *args)
+                return ("view_align", None, None)
             tab.append((rows.data_ptr(), nbytes // 4, S // 4))
             continue
         if skey in storages:
@@ -145,8 +170,12 @@ def copy_kv_cache_blocks_inplace(
             storage.nbytes() // num_blocks
         )  # blocks = uint8 storage viewed (num_blocks, -1)
         if row_bytes % 4 or storage.data_ptr() % 16:
-            return _fallback(fallback, "align", *args)
+            return ("align", None, None)
         tab.append((storage.data_ptr(), row_bytes // 4, row_bytes // 4))
+    return (None, tab, dev)
+
+
+def _launch(tab, dev, indices_np, fallback, args):
     if not tab:
         return
     if not _commute(tab, indices_np):
