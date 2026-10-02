@@ -262,6 +262,14 @@ def _full_graph_capture() -> bool:
         return True
 
 
+def _cuda_pdl(T: int) -> bool:
+    """gb300-fuse: PDL launch of the CUDA prologue (GLUE_EWS_CUDA_PDL=1 and lcd's Triton PDL switch on)."""
+    if not (GLUE_EWS_CUDA_PDL and _lcd_pdl_on()):
+        return False
+    logger.info_once("[glue] QKV prologue: CUDA kernel launched with PDL (GLUE_EWS_CUDA_PDL; first at T=%d)", T)
+    return True
+
+
 def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tuple[torch.Tensor, torch.Tensor,
                                                                                   torch.Tensor]:
     from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -281,11 +289,17 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
         pos = positions
         T_ = qkv.shape[0]
         use_cuda = T_ >= GLUE_EWS_CUDA_MIN_T
-        if not use_cuda and 0 < GLUE_EWS_CUDA_PW_MIN_T <= T_ and not _full_graph_capture():
-            use_cuda = True
-            STATS["glue_cuda_pw"] = STATS.get("glue_cuda_pw", 0) + 1
-            logger.info_once("[glue] QKV prologue: CUDA kernel outside FULL-graph capture from T >= %d "
-                             "(GLUE_EWS_CUDA_PW_MIN_T; first at T=%d)", GLUE_EWS_CUDA_PW_MIN_T, T_)
+        if not use_cuda and 0 < GLUE_EWS_CUDA_PW_MIN_T <= T_:
+            if _full_graph_capture():
+                # engage proof (gb300-fuse): decode-only FULL graphs keep the PDL Triton kernel below MIN_T
+                STATS["glue_pw_full_kept"] = STATS.get("glue_pw_full_kept", 0) + 1
+                logger.info_once("[glue] QKV prologue: FULL-graph capture keeps the Triton kernel below "
+                                 "GLUE_EWS_CUDA_MIN_T=%d (first at T=%d)", GLUE_EWS_CUDA_MIN_T, T_)
+            else:
+                use_cuda = True
+                STATS["glue_cuda_pw"] = STATS.get("glue_cuda_pw", 0) + 1
+                logger.info_once("[glue] QKV prologue: CUDA kernel outside FULL-graph capture from T >= %d "
+                                 "(GLUE_EWS_CUDA_PW_MIN_T; first at T=%d)", GLUE_EWS_CUDA_PW_MIN_T, T_)
         if use_cuda and GC.supported(
                 qkv, m.head_dim, m.rotary_emb.rotary_dim, 1.0, pos, k_cache, m.rotary_emb.cos_sin_cache):
             STATS["glue_cuda"] = STATS.get("glue_cuda", 0) + 1
@@ -294,7 +308,7 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
                 m.num_heads, m.num_kv_heads,
                 getattr(m.rotary_emb, "mrope_section", None) if pos.ndim == 2 else None,
                 attn_layer._q_scale, attn_layer._k_scale, attn_layer._v_scale, slot_mapping, k_cache, v_cache,
-                gate_copy=not GLUE_EWS_NOGATE, pdl=GLUE_EWS_CUDA_PDL and _lcd_pdl_on())
+                gate_copy=not GLUE_EWS_NOGATE, pdl=_cuda_pdl(T_))
             if gate is None:
                 gate = qkv.new_empty((qkv.shape[0], 0))
             return q8, k_out, gate
