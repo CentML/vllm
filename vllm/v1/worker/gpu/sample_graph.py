@@ -472,7 +472,16 @@ class SamplerGraphs:
         r = self.runner
         row = r.max_num_reqs - 1
         smp = r.sampler
+        rs = r.req_states
+        # A 1-token "prompt" on the scratch row, so per-request state that is
+        # initialised from the prompt (e.g. the penalties bincount) is well-formed.
+        rs.prompt_len.np[row] = 1
+        rs.prefill_len.np[row] = 1
+        rs.prompt_len.copy_to_uva()
+        rs.prefill_len.copy_to_uva()
         smp.add_request(row, 1, sp)
+        if hasattr(smp, "_lowc2_dirty"):
+            smp._lowc2_dirty = True
         smp.apply_staged_writes()
         t0 = __import__("time").perf_counter()
         batches = {b: self._synthetic_decode_batch(b, row) for b in sizes}
@@ -482,7 +491,6 @@ class SamplerGraphs:
         for b in reversed(sizes):
             r.sample(hs[: b * k], batches[b], None)
         torch.cuda.current_stream().synchronize()
-        rs = r.req_states
 
         def rotate_sampler():
             # Same call serving makes (rotates every sampler-state pool together;
