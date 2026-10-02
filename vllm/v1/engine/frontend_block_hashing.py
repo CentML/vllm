@@ -42,8 +42,11 @@ Wire format of ``EngineCoreRequest.prompt_block_hashes``: an 8-byte header
 concatenated 32-byte block hashes of all full prompt blocks.
 """
 
+import array
+import hashlib
 import os
 import threading
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
@@ -60,6 +63,36 @@ FEH_ENABLED = os.environ.get("FEH", "0") == "1"
 FEH_BLOCK = int(os.environ.get("VLLM_FRONTEND_HASH_BLOCK_SIZE", "32"))
 FEH_VERIFY = os.environ.get("VLLM_FRONTEND_HASH_VERIFY", "0") == "1"
 FEH_LOG_EVERY = int(os.environ.get("VLLM_FRONTEND_HASH_LOG_EVERY", "2000"))
+
+# Incremental front-end hashing (GB300 lowc2; port of the Rubin study's F125
+# LT_FEH_MEMO). Agentic turns re-send the whole history and each turn's prompt
+# extends an earlier prompt, so at a 32-token hash block (prefix-match-unit 32)
+# FEH re-hashes ~3K blocks of a ~100K-token turn on the TTFT path. With
+# VLLM_FEH_MEMO=1 prompts are fingerprinted every VLLM_FEH_MEMO_CK tokens
+# (rounded to a multiple of the hash block) with SHA-256 over their exact int32
+# bytes (one streaming pass); a memo maps (cache salt, prefix length, prefix
+# digest) -> that prompt's block-hash chain. A new prompt reuses the chain of its
+# deepest memoized prefix and hashes only the remaining blocks with the unchanged
+# function, so the shipped blob is byte-identical to the stock FEH blob.
+# VLLM_FEH_MEMO_VERIFY=N recomputes the full chain for the first N memo hits and
+# compares (a mismatch logs a warning and ships the stock blob). LRU of
+# VLLM_FEH_MEMO_MAX prompts.
+FEH_MEMO = os.environ.get("VLLM_FEH_MEMO", "0") == "1"
+FEH_MEMO_CK = int(os.environ.get("VLLM_FEH_MEMO_CK", "1024"))
+FEH_MEMO_MAX = int(os.environ.get("VLLM_FEH_MEMO_MAX", "1024"))
+_MEMO_VERIFY_LEFT = [int(os.environ.get("VLLM_FEH_MEMO_VERIFY", "0"))]
+MEMO_STATS = {
+    "reqs": 0,
+    "hits": 0,
+    "blocks_total": 0,
+    "blocks_hashed": 0,
+    "fallback": 0,
+    "verified": 0,
+    "verify_mismatch": 0,
+}
+_memo: dict[tuple, tuple[int, list]] = {}
+_memo_lru: "OrderedDict[int, list]" = OrderedDict()
+_memo_next = [0]
 
 _MAGIC = b"FEH1"
 _HDR = 8  # header: _MAGIC + uint32 block size
@@ -115,24 +148,111 @@ def _compute_prompt_block_hashes(
         return None
     fn, kvu = _frontend_state(cache_config)
     salt = request.cache_salt
-    parent = None
-    out = [_MAGIC, FEH_BLOCK.to_bytes(4, "little")]
-    n = len(toks) // FEH_BLOCK
-    for i in range(n):
+    if FEH_MEMO:
+        return _memo_blob(fn, kvu, toks, salt)
+    return _stock_blob(fn, kvu, toks, salt)
+
+
+def _hash_chain(fn, kvu, toks, salt, start: int, hashes: list) -> list:
+    """Append the hashes of full blocks start.. of ``toks`` to ``hashes``
+    (whose last element is the parent of block ``start``)."""
+    parent = hashes[-1] if start else None
+    for i in range(start, len(toks) // FEH_BLOCK):
         # Same extra keys as generate_block_hash_extra_keys() for a request
         # without multimodal / LoRA / prompt-embeds inputs.
         extra = (salt,) if (i == 0 and salt) else None
         h = kvu.hash_block_tokens(
             fn, parent, toks[i * FEH_BLOCK : (i + 1) * FEH_BLOCK], extra
         )
-        out.append(h)
+        hashes.append(h)
         parent = h
-    return b"".join(out)
+    return hashes
+
+
+def _stock_blob(fn, kvu, toks, salt) -> bytes:
+    hashes = _hash_chain(fn, kvu, toks, salt, 0, [])
+    return b"".join([_MAGIC, FEH_BLOCK.to_bytes(4, "little")] + hashes)
+
+
+def _memo_blob(fn, kvu, toks, salt) -> bytes:
+    B = FEH_BLOCK
+    ck = max(1, round(FEH_MEMO_CK / B)) * B
+    n = len(toks) // B
+    try:
+        arr = array.array("i", toks)
+    except (OverflowError, TypeError):
+        MEMO_STATS["fallback"] += 1
+        return _stock_blob(fn, kvu, toks, salt)
+    # Fingerprint every ck tokens of the full-block region (exact int32 bytes).
+    mv = memoryview(arr).cast("B")
+    sh = hashlib.sha256()
+    digs = []
+    for c in range(ck, n * B + 1, ck):
+        sh.update(mv[(c - ck) * 4 : c * 4])
+        digs.append((c, sh.digest()))
+    start, prefix = 0, None
+    with _lock:
+        for c, d in reversed(digs):
+            e = _memo.get((salt, c, d))
+            if e is not None:
+                start, prefix = c // B, e[1]
+                _memo_lru.move_to_end(e[0])
+                break
+    hashes = list(prefix[:start]) if start else []
+    _hash_chain(fn, kvu, toks, salt, start, hashes)
+    MEMO_STATS["reqs"] += 1
+    MEMO_STATS["blocks_total"] += n
+    MEMO_STATS["blocks_hashed"] += n - start
+    blob = b"".join([_MAGIC, B.to_bytes(4, "little")] + hashes)
+    if start:
+        MEMO_STATS["hits"] += 1
+        if _MEMO_VERIFY_LEFT[0] > 0:
+            _MEMO_VERIFY_LEFT[0] -= 1
+            ref = _stock_blob(fn, kvu, toks, salt)
+            MEMO_STATS["verified"] += 1
+            if ref != blob:
+                MEMO_STATS["verify_mismatch"] += 1
+                logger.warning(
+                    "FEH memo VERIFY MISMATCH (n=%d reused=%d); stats %s",
+                    n,
+                    start,
+                    MEMO_STATS,
+                )
+                return ref
+    if digs:
+        with _lock:
+            eid = _memo_next[0]
+            _memo_next[0] += 1
+            keys = [(salt, c, d) for c, d in digs]
+            for k in keys:
+                _memo[k] = (eid, hashes)
+            _memo_lru[eid] = keys
+            while len(_memo_lru) > FEH_MEMO_MAX:
+                old, oks = _memo_lru.popitem(last=False)
+                for k in oks:
+                    e = _memo.get(k)
+                    if e is not None and e[0] == old:
+                        del _memo[k]
+    if MEMO_STATS["reqs"] % FEH_LOG_EVERY == 1:
+        logger.info(
+            "FEH memo stats %s keys=%d entries=%d ck=%d",
+            MEMO_STATS,
+            len(_memo),
+            len(_memo_lru),
+            ck,
+        )
+    return blob
 
 
 def log_frontend_enabled() -> None:
     logger.info_once(
-        "FEH front-end prompt block hashing enabled (block=%d)", FEH_BLOCK
+        "FEH front-end prompt block hashing enabled (block=%d, memo=%s ck=%d "
+        "max=%d verify=%d)",
+        FEH_BLOCK,
+        FEH_MEMO,
+        FEH_MEMO_CK,
+        FEH_MEMO_MAX,
+        _MEMO_VERIFY_LEFT[0],
     )
 
 
