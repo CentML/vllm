@@ -506,7 +506,7 @@ def _warm_fi_gdn_prefill_state_pool(runner: "GPUModelRunner") -> None:
     Nothing in the live cache is touched.
     """
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        GDN_FI_NON_CP_MAX_TOKENS,
+        _gdn_fi_non_cp_max_tokens,
     )
     from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (  # noqa: E501
         fused_post_conv_prep,
@@ -530,11 +530,13 @@ def _warm_fi_gdn_prefill_state_pool(runner: "GPUModelRunner") -> None:
     h = int(layer.num_k_heads) // int(layer.tp_size)
     hv = int(layer.num_v_heads) // int(layer.tp_size)
     k_dim, v_dim = int(layer.head_k_dim), int(layer.head_v_dim)
-    # One FLA chunk (non-CP), one sequence over the non-CP limit (CP), then
+    # One FLA chunk (non-CP), one sequence over the non-CP limit (CP; the
+    # limit is higher once the layer warmup enabled V-split), then
     # multi-sequence batches (CP while FlashInfer's heuristic picks it).
     batches = [[64]]
-    if GDN_FI_NON_CP_MAX_TOKENS > 0:
-        batches.append([GDN_FI_NON_CP_MAX_TOKENS + 64])
+    non_cp_max_tokens = _gdn_fi_non_cp_max_tokens()
+    if non_cp_max_tokens > 0:
+        batches.append([non_cp_max_tokens + 64])
     batches += [
         [_FI_GDN_POOL_WARMUP_MULTI_SEQ_LEN] * n
         for n in _FI_GDN_POOL_WARMUP_NUM_SEQS
