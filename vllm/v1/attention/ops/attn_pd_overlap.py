@@ -36,6 +36,10 @@ Environment (read at import; default off):
 ``VLLM_ATTN_PD_CHECK``        the first N forks per process are re-run serially
                               and compared bitwise; any mismatch keeps the serial
                               result and disables the fork.
+``VLLM_ATTN_PD_CHECK_START``  check only forks with index >= N (default 0). Engine
+                              start-up warm-up batches fork too (~1,700 forks per
+                              worker on s4), so set N above that to check live
+                              serving forks.
 ``VLLM_ATTN_PD_LOG_EVERY``    log counts every N mixed attention calls (5000; 0 = off):
                               forks, calls below the decode-row minimum, and the
                               mean host cost of plan() when it does not fork.
@@ -60,6 +64,7 @@ ORDER = os.environ.get("VLLM_ATTN_PD_ORDER", "pp").strip().lower()
 MIN_DEC_ROWS = int(os.environ.get("VLLM_ATTN_PD_MIN_DEC_ROWS", "64"))
 SPIN_CYC = int(os.environ.get("VLLM_ATTN_PD_SPIN_CYC", "40000"))
 _CHECK = [int(os.environ.get("VLLM_ATTN_PD_CHECK", "0"))]
+CHECK_START = int(os.environ.get("VLLM_ATTN_PD_CHECK_START", "0"))
 LOG_EVERY = int(os.environ.get("VLLM_ATTN_PD_LOG_EVERY", "5000"))
 if ORDER not in ("pp", "dly"):
     raise ValueError(f"VLLM_ATTN_PD_ORDER must be pp or dly, got {ORDER!r}")
@@ -229,7 +234,7 @@ def plan(
 
 
 def check_due() -> bool:
-    return _CHECK[0] > 0 and not _STATS["disabled"]
+    return _CHECK[0] > 0 and not _STATS["disabled"] and _STATS["forks"] > CHECK_START
 
 
 class serial_scope:
