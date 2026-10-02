@@ -1017,10 +1017,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def capture_model(self, *, profile_only: bool = False) -> int:
         if gdn_layer_graphs.ENABLED:
             # GDN layer graphs: mark vLLM's capture phase
-            return gdn_layer_graphs.capture_model(
+            size = gdn_layer_graphs.capture_model(
                 lambda: self._capture_model_cfix(profile_only=profile_only)
             )
-        return self._capture_model_cfix(profile_only=profile_only)
+        else:
+            size = self._capture_model_cfix(profile_only=profile_only)
+        if (
+            not profile_only
+            and sample_graph.ENABLED
+            and sample_graph.PRECAPTURE
+            and self.speculator is not None
+        ):
+            # Opt-in: capture the decode verify-sampler graphs at start-up.
+            if self._sampler_graphs is None:
+                self._sampler_graphs = sample_graph.SamplerGraphs(self)
+            with torch.inference_mode():
+                self._sampler_graphs.precapture()
+        return size
 
     def _capture_model_cfix(self, *, profile_only: bool = False) -> int:
         if cudagraph_profile_cleanup.ENABLED:

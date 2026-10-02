@@ -72,6 +72,16 @@ if _CHECK_FILE and os.path.isfile(_CHECK_FILE):
     except (OSError, ValueError):
         pass
 LOG_EVERY = int(os.environ.get(_P + "_LOG", "0"))
+# Start-up pre-capture (GB300 lowc2): "1-8" or "1,2,4" = decode batch sizes to
+# capture at engine start, for the sampling parameters in
+# VLLM_SAMPLER_GRAPH_PRECAPTURE_PARAMS ("temperature=1.0,top_k=20,top_p=0.95";
+# SamplingParams keyword arguments). The keys are built exactly like serving
+# keys (same hidden-state / input buffers, parameter signature, state-buffer
+# addresses for every pool-slot parity), so a pre-captured graph is replayed
+# only when a serving step has an identical key; otherwise the lazy path runs
+# as before. Default off.
+PRECAPTURE = os.environ.get(_P + "_PRECAPTURE", "")
+PRECAPTURE_PARAMS = os.environ.get(_P + "_PRECAPTURE_PARAMS", "")
 
 STATS: dict[str, int] = {}
 
@@ -109,6 +119,8 @@ class SamplerGraphs:
         self._getters = None
         self._last_scratch = None
         self._realloc_seen = False
+        self.precaptured: set[tuple] = set()
+        self._in_precapture = False
         logger.info(
             "sampler graphs enabled: max_reqs=%d max_graphs=%d warm=%d check=%d",
             MAX_REQS,
@@ -265,6 +277,21 @@ class SamplerGraphs:
         sig = self._signature(input_batch)
         if sig is None:
             return None
+        if self.precaptured and not self._in_precapture and not STATS.get(
+            "_sig_logged"
+        ):
+            STATS["_sig_logged"] = 1
+            pre_sigs = {k[9] for k in self.precaptured}
+            if sig not in pre_sigs:
+                logger.warning(
+                    "sampler graph pre-capture: first serving signature %s differs "
+                    "from the pre-captured %s (pre-captured graphs will not be "
+                    "replayed; lazy capture continues)",
+                    sig,
+                    sorted(pre_sigs),
+                )
+            else:
+                logger.info("sampler graph pre-capture: serving signature matches")
         if any(row[4] != -1 for row in sig):  # logprobs requested
             return None
         return (
@@ -349,6 +376,151 @@ class SamplerGraphs:
             num_rejected=num_rejected,
         )
         return so, num_sampled, num_rejected
+
+    # ------------------------------------------------------------ pre-capture
+    @staticmethod
+    def _parse_sizes(spec: str) -> list[int]:
+        out: set[int] = set()
+        for part in spec.replace(" ", "").split(","):
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.update(range(int(a), int(b) + 1))
+            else:
+                out.add(int(part))
+        return sorted(b for b in out if 0 < b <= MAX_REQS)
+
+    @staticmethod
+    def _parse_params(spec: str):
+        from vllm.sampling_params import SamplingParams
+
+        kw = {}
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            k, v = part.split("=", 1)
+            v = v.strip()
+            try:
+                kw[k.strip()] = int(v)
+            except ValueError:
+                kw[k.strip()] = float(v)
+        return SamplingParams(**kw)
+
+    def _synthetic_decode_batch(self, B: int, row: int):
+        """A B-request spec-decode verify batch shaped exactly like the one
+        prepare_inputs builds for B decode requests with num_speculative_steps
+        drafts each (same persistent input buffers, dtypes and logits layout);
+        every request maps to request-state row ``row``."""
+        from vllm.v1.worker.gpu.input_batch import InputBatch
+
+        r = self.runner
+        k = r.num_speculative_steps + 1  # logits rows per request
+        n = B * k
+        dev = self._dev
+        ib = InputBatch.make_dummy(B, n, r.input_buffers, max_query_len=k)
+        idx = torch.full((B,), row, dtype=torch.int64, device=dev)
+        num_sched = np.full(B, k, dtype=np.int32)
+        cu_np = np.arange(0, n + 1, k, dtype=np.int32)
+        return replace(
+            ib,
+            idx_mapping=idx,
+            idx_mapping_np=np.full(B, row, dtype=np.intp),
+            expanded_idx_mapping=torch.full((n,), row, dtype=torch.int64, device=dev),
+            expanded_local_pos=torch.arange(k, dtype=torch.int32, device=dev).repeat(B),
+            num_scheduled_tokens=num_sched,
+            num_draft_tokens=B * (k - 1),
+            num_draft_tokens_per_req=np.full(B, k - 1, dtype=np.int32),
+            cu_num_logits=torch.from_numpy(cu_np).to(dev),
+            cu_num_logits_np=cu_np,
+            logits_indices=torch.arange(n, dtype=torch.int64, device=dev),
+            num_computed_tokens_np=np.full(B, 1, dtype=np.int32),
+            prefill_len_np=np.full(B, 1, dtype=np.int32),
+            num_computed_prefill_tokens_np=np.full(B, 1, dtype=np.int32),
+            is_prefilling_np=np.zeros(B, dtype=bool),
+            has_prefill=False,
+        )
+
+    def precapture(self) -> None:
+        """Capture the verify-sampler graphs of B = PRECAPTURE sizes at engine
+        start, for every pool-slot parity of the rotating request / sampler
+        state buffers, using a scratch request-state row (the last row; any
+        real request that later takes it overwrites all of its state)."""
+        r = self.runner
+        sizes = self._parse_sizes(PRECAPTURE)
+        if not sizes or not PRECAPTURE_PARAMS:
+            return
+        cgm = r.cudagraph_manager
+        hs = getattr(cgm, "hidden_states", None)
+        k = r.num_speculative_steps + 1
+        if hs is None or r.sampler is None or r.rejection_sampler is None:
+            logger.warning("sampler graph pre-capture skipped (no FULL graph output)")
+            return
+        sizes = [b for b in sizes if b * k <= hs.shape[0]]
+        sp = self._parse_params(PRECAPTURE_PARAMS)
+        self._in_precapture = True
+        try:
+            self._precapture(sizes, sp, hs, k)
+        finally:
+            self._in_precapture = False
+
+    def _precapture(self, sizes, sp, hs, k) -> None:
+        r = self.runner
+        row = r.max_num_reqs - 1
+        smp = r.sampler
+        smp.add_request(row, 1, sp)
+        smp.apply_staged_writes()
+        t0 = __import__("time").perf_counter()
+        batches = {b: self._synthetic_decode_batch(b, row) for b in sizes}
+        # Eager runs first (largest first): lazy allocations of the sampling
+        # scratch buffers happen outside any capture, and every graph is keyed
+        # on the final scratch addresses.
+        for b in reversed(sizes):
+            r.sample(hs[: b * k], batches[b], None)
+        torch.cuda.current_stream().synchronize()
+        rs = r.req_states
+
+        def rotate_sampler():
+            # Same call serving makes (rotates every sampler-state pool together;
+            # with the lowc2 dirty gate, mark dirty so it really rotates).
+            if hasattr(smp, "_lowc2_dirty"):
+                smp._lowc2_dirty = True
+            smp.apply_staged_writes()
+
+        def rotate_reqs():
+            rs.prompt_len.copy_to_uva()
+            rs.prefill_len.copy_to_uva()
+
+        n_s = smp.sampling_states.temperature.pool.max_concurrency
+        n_r = rs.prompt_len.pool.max_concurrency
+        n_cap = 0
+        for _ in range(n_s):
+            for _ in range(n_r):
+                for b in reversed(sizes):
+                    ib = batches[b]
+                    key = self._eligible_key(hs[: b * k], ib, None)
+                    if key is None or key in self.graphs:
+                        continue
+                    if len(self.graphs) >= MAX_GRAPHS:
+                        break
+                    if self._capture(key, hs[: b * k], ib) is not None:
+                        self.precaptured.add(key)
+                        n_cap += 1
+                rotate_reqs()
+            rotate_sampler()
+        torch.cuda.current_stream().synchronize()
+        _inc("precaptured", n_cap)
+        logger.info(
+            "sampler graph pre-capture: %d graphs for B=%s (params %s, row %d) in "
+            "%.2f s; signature %s",
+            n_cap,
+            sizes,
+            PRECAPTURE_PARAMS,
+            row,
+            __import__("time").perf_counter() - t0,
+            sorted({kk[9] for kk in self.precaptured}),
+        )
 
     # ------------------------------------------------------------------- main
     def sample(self, hidden_states, input_batch, grammar_output):
@@ -442,6 +614,8 @@ class SamplerGraphs:
             return so, ns, nr
         _inc("replay")
         _inc(f"replay_B{key[0]}")
+        if key in self.precaptured:
+            _inc("replay_precaptured")
         if self._realloc_seen:
             _inc("replay_after_realloc")
         if LOG_EVERY and STATS["replay"] % LOG_EVERY == 0:
