@@ -782,12 +782,17 @@ def gdn_forward_core_fused_norm_packed(
 def compile_hash_factors() -> list[str]:
     """AOT compile-cache salts: the key does not include the traced sources,
     so a cache from the unfused graph would silently bypass these rewrites."""
-    return [
+    out = [
         f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
         f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
         f"glue-v3-nqrr{int(GLUE_NQRR)}{GLUE_NQRR_CFG}-gmrr{int(GLUE_GMRR)}{GLUE_GMRR_CFG}-fnq{GLUE_FNQ_XB}"
         f"-lazy{int(GLUE_LAZY)}-gg{GLUE_GG_CFG}-f0{int(GLUE_FNQ_F0)}",
     ]
+    if _OUT_PROJ_ENV == "0":
+        # VLLM_NORM_QUANT_FUSION_OUT_PROJ=0 removes nqf::gate_mul_mxfp8(_qkv)
+        # from the full-attention forward (self_attn._nqf_gate stays unset).
+        out.append("nqf-outproj0")
+    return out
 
 
 if NQF:
