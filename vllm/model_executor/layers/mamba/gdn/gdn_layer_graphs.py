@@ -103,6 +103,11 @@ _SIDE: dict = {}  # device -> side capture stream
 # outputs, MXFP8 stash buffers and the touched state pages bitwise; a mismatch
 # keeps the eager result and disables the layer graphs.
 _CHECK = [int(os.environ.get(_P + "_CHECK", "0"))]
+# gb300-fuse: GLUE_GNQ_CFG=XB,BN -> launch config of the quant-only tiles of the merged layer-graph norm-quant kernel
+# (_gdn_graph_norm_quant_all_kernel: XB rows x the full row in BN-column chunks; default 4,512 = unchanged). The MXFP8
+# block scales (max-abs over 32 columns) and e4m3 values of a row do not depend on the tiling, so any XB (power of 2) /
+# BN (multiple of 32 dividing the row) is bit-identical; GB300 bench at T 312-2048: 1,2048 is 1.6-2.0 us/call faster.
+_GNQ = tuple(int(v) for v in os.environ.get("GLUE_GNQ_CFG", "4,512").split(","))
 MTPW = 4  # 1 + num_speculative_tokens (checked against the metadata)
 
 _GB: dict = {}  # group key (layer names) -> _GroupBufs
@@ -134,6 +139,12 @@ def check_config() -> None:
             int(FIX_PROFILE),
             SPEC_OVERLAP_MODE,
         )
+        if _GNQ != (4, 512):
+            K_ = 32 * 128
+            if _GNQ[1] % 32 or K_ % _GNQ[1] or _GNQ[0] & (_GNQ[0] - 1):
+                raise ValueError(f"GLUE_GNQ_CFG={_GNQ}: XB must be a power of 2, BN a multiple of 32 dividing {K_}")
+            logger.info("[glue] GLUE_GNQ_CFG: merged layer-graph norm-quant quant tiles XB=%d BN=%d (default 4,512)",
+                        *_GNQ)
 
 
 # fmt: off
@@ -1083,8 +1094,8 @@ def _graph_core(layer, gb, mixed_qkvz, ba, core_attn_out, stash=True, only_vsf=N
             HV=HV,
             D=layer.head_v_dim,
             BT=BT,
-            XB=4,
-            BN=512,
+            XB=_GNQ[0],
+            BN=_GNQ[1],
             SIGMOID_GATE=(layer.norm.activation == "sigmoid"),
             PADDED_SF_COLS=psc,
             num_warps=4,
