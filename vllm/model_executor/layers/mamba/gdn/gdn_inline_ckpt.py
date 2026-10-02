@@ -42,6 +42,9 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_MAMBA_TAIL_CKPT", "0") == "1"
 VERIFY = [int(os.environ.get("VLLM_MAMBA_TAIL_CKPT_VERIFY", "0") or 0)]
 LOG_EVERY = max(1, int(os.environ.get("VLLM_MAMBA_TAIL_CKPT_LOG_EVERY", "2000") or 2000))
+# >= 2 checkpoints of one KV-cache group in a step: one gathered conv + chunk launch
+# per layer instead of one pair per checkpoint (same per-sequence math)
+BATCH = os.environ.get("VLLM_MAMBA_TAIL_CKPT_BATCH", "1") == "1"
 
 KIND_BLOCK, KIND_TAIL, KIND_RUN = 0, 1, 2
 
@@ -67,12 +70,15 @@ class _Step:
     group the replay records (a0, L, slot_t, hi_t, cu_t, zero_init, kind, pos,
     slot, start, end); slot_t / cu_t / hi_t are views of one device copy."""
 
-    __slots__ = ("rows", "dev", "per_group", "bufs", "ws", "lmax", "_keep")
+    __slots__ = ("rows", "dev", "per_group", "batch", "bufs", "ws", "lmax", "_keep")
 
     def __init__(self, rows, dev):
         self.rows = rows
         self.dev = dev
         self.per_group: dict[int, list] = {}
+        # gid -> (row index, slots, has_init, cu (+ device_nb count), R, Ltot, maxL,
+        #         zero-init slots) for the gathered launch
+        self.batch: dict[int, tuple] = {}
         self.bufs = None
         self.ws = None
         self.lmax = 0
@@ -214,6 +220,38 @@ def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
         )
         if kind != KIND_RUN:
             st.lmax = max(st.lmax, L)
+    if BATCH:
+        keep = []
+        for gid, recs in st.per_group.items():
+            ck = [r for r in recs if r[6] != KIND_RUN]
+            if len(ck) < 2:
+                continue
+            idx = torch.cat([torch.arange(r[0], r[0] + r[1], dtype=torch.int64) for r in ck])
+            cu = [0]
+            for r in ck:
+                cu.append(cu[-1] + r[1])
+            cu.append(len(ck))  # device_nb count right after cu_seqlens
+            meta_i = torch.tensor([r[8] for r in ck] + cu, dtype=torch.int32)
+            meta_b = torch.tensor([r[9] > 0 and not r[5] for r in ck], dtype=torch.bool)
+            if pin:
+                idx, meta_i, meta_b = idx.pin_memory(), meta_i.pin_memory(), meta_b.pin_memory()
+            idx_d = idx.to(device, non_blocking=True)
+            mi_d = meta_i.to(device, non_blocking=True)
+            mb_d = meta_b.to(device, non_blocking=True)
+            keep += [idx, meta_i, meta_b, idx_d, mi_d, mb_d]
+            R = len(ck)
+            st.batch[gid] = (
+                idx_d,
+                mi_d[:R],
+                mb_d,
+                mi_d[R : 2 * R + 1],
+                R,
+                cu[R],
+                max(r[1] for r in ck),
+                [r[8] for r in ck if r[5]],
+            )
+            st.lmax = max(st.lmax, cu[R])
+        st._keep = st._keep + tuple(keep)
     _STEP[0] = st
     STATS["steps"] += 1
     STATS["rows"] += len(rows)
@@ -258,7 +296,7 @@ def _layer_views(layer):
 
 
 def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
-              ws=None, devnb=None):
+              ws=None, devnb=None, nseq=1, maxlen=None):
     """The split flow's GDN chunk over the rows x/a/b ([L, ...]) in place on the
     pool slot `slot_t`: CUDA conv + post-conv (initial conv window from the slot
     if hi_t, final window written to the slot), then the chunked delta rule with
@@ -277,7 +315,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
     q, k, v, g, beta, out = (t[:L] for t in bufs)
     gcc = _conv()
     if mod._GDN_CONV_CUDA_TPH == "auto":
-        tph = 4 if L < 1024 else 8
+        tph = 4 if L < 1024 * int(nseq) else 8
     else:
         tph = int(mod._GDN_CONV_CUDA_TPH)
     ok = gcc.load().run(
@@ -287,7 +325,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
         slot_t,
         hi_t,
         cu_t,
-        1,
+        int(nseq),
         a,
         b,
         layer.A_log,
@@ -310,7 +348,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
             slot_t,
             hi_t,
             cu_t,
-            1,
+            int(nseq),
             a,
             b,
             layer.A_log,
@@ -324,7 +362,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
     if devnb is None:
         devnb = _use_devnb()
     vs = _vsplit(devnb)
-    vsf = max(int(vs.choose_vsplit(1, L, L, hv=HV)), 1)
+    vsf = max(int(vs.choose_vsplit(int(nseq), L, int(maxlen or L), hv=HV)), 1)
     if devnb:
         if ws is None:
             from vllm.third_party.flashinfer_gdn_vsplit_devnb.gdn_chunked_vs import (
@@ -333,7 +371,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
 
             nsm = torch.cuda.get_device_properties(dev).multi_processor_count
             ws = torch.empty(
-                _K.get_workspace_size(nsm, 1, q.size(1), v.size(1), True),
+                _K.get_workspace_size(nsm, int(nseq), q.size(1), v.size(1), True),
                 dtype=torch.int8,
                 device=dev,
             )
@@ -399,7 +437,37 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
                 dtype=torch.int8,
                 device=mixed_qkv.device,
             )
-    for a0, L, slot_t, hi_t, cu_t, zero_init, kind, pos, slot, start, end in recs:
+    bt = st.batch.get(gid)
+    if bt is not None:
+        idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl, zero_slots = bt
+        if zero_slots:
+            if pages is None:
+                pages = _pages_u8(layer)
+            for slot in zero_slots:
+                pages[slot].zero_()
+        run_chunk(
+            layer,
+            mixed_qkv.index_select(0, idx_d),
+            a.index_select(0, idx_d),
+            b.index_select(0, idx_d),
+            conv_state,
+            ssm,
+            slots_d,
+            hi_d,
+            cu_d,
+            Ltot,
+            bufs=st.bufs,
+            ws=None,
+            nseq=R,
+            maxlen=maxl,
+        )
+        STATS["replays"] += R
+        STATS["replay_tokens"] += Ltot
+        STATS["batched_launches"] = STATS.get("batched_launches", 0) + 1
+        recs_iter = ()
+    else:
+        recs_iter = recs
+    for a0, L, slot_t, hi_t, cu_t, zero_init, kind, pos, slot, start, end in recs_iter:
         if kind == KIND_RUN:
             continue  # the running block (VERIFY only)
         if zero_init:
