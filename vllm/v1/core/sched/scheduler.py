@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched import mamba_inline_ckpt
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -359,6 +360,44 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_fine_grained_prefix_cache
         )
+        # [F122] VLLM_MAMBA_TAIL_CKPT=1: run a prompt chunk through its
+        # block-boundary stop and its partial-tail stop; the states there are
+        # written inside the step (see mamba_inline_ckpt.py). Off by default.
+        self.mamba_inline_ckpt = (
+            mamba_inline_ckpt.ENABLED
+            and self.mamba_partial_cache_hit
+            and self.connector is None
+            and not self.mamba_fine_grained_prefix_cache
+            and self.kv_cache_manager.mamba_inline_ckpt
+        )
+        self._inline_ckpt_used = 0
+        self.inline_ckpt_stats = {
+            "merged": 0,
+            "merged_block": 0,
+            "merged_tail": 0,
+            "chunks_saved": 0,
+            "refused_budget": 0,
+        }
+        if self.mamba_inline_ckpt:
+            logger.info(
+                "[F122] in-step Mamba prefill checkpoints on: block=%d tail=%d "
+                "max_per_step=%d max_running=%d",
+                int(mamba_inline_ckpt.MERGE_BLOCK),
+                int(mamba_inline_ckpt.MERGE_TAIL),
+                mamba_inline_ckpt.MAX_PER_STEP,
+                mamba_inline_ckpt.MAX_RUNNING,
+            )
+        elif mamba_inline_ckpt.ENABLED:
+            logger.warning(
+                "[F122] VLLM_MAMBA_TAIL_CKPT=1 ignored: needs mamba align mode with "
+                "prefix_match_unit < block size, no KV connector, no fine-grained "
+                "junction caching and GDN groups that support it "
+                "(partial_hit=%s connector=%s fine_grained=%s manager=%s)",
+                self.mamba_partial_cache_hit,
+                self.connector is not None,
+                self.mamba_fine_grained_prefix_cache,
+                self.kv_cache_manager.mamba_inline_ckpt,
+            )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -509,9 +548,104 @@ class Scheduler(SchedulerInterface):
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
         )
+        if getattr(self, "mamba_inline_ckpt", False):
+            # [F122] may run through the block-boundary / partial-tail stops.
+            return self._inline_ckpt_split(
+                request, start, end, prefill_end, stops, use_internal_checkpoint
+            )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _inline_ckpt_split(
+        self,
+        request: Request,
+        start: int,
+        end: int,
+        prefill_end: int,
+        stops: tuple[int, int, int, int],
+        use_internal_checkpoint: bool,
+    ) -> int:
+        """[F122] The align-mode split with in-step checkpoints.
+
+        ``stops`` are the split flow's (next block boundary, last cacheable
+        block boundary, partial-tail boundary, junction). The chunk may run
+        through
+          * the next block boundary b (chunk starts mid-block; also when the
+            last cacheable position equals b): the worker re-runs [start, b)
+            in place on block column start // B, which is where the split flow
+            leaves the state at b;
+          * the partial-tail boundary T, if the chunk then reaches the prompt
+            end: the KV cache manager reserves a checkpoint block keyed at T and
+            the worker re-runs [start, T) on it.
+        Every other stop (a last cacheable position beyond b, a junction) is
+        kept. The decision goes to the KV cache manager (shared pending dict),
+        which re-validates it against the allocated chunk.
+        """
+        pending = self.kv_cache_manager.mamba_inline_tail_pending
+        pending.pop(request.request_id, None)
+        orig_end = min((s for s in stops if start < s < end), default=end)
+        if orig_end == end or use_internal_checkpoint:
+            return max(orig_end - start, 0)
+        nbb, lcp, tail, junction = stops
+        block_size = self.cache_config.block_size
+        b = (
+            nbb
+            if mamba_inline_ckpt.MERGE_BLOCK and nbb and start < nbb < end
+            else 0
+        )
+        mandatory = [s for s in (lcp, junction) if start < s < end and s != b]
+        if nbb and start < nbb < end and not b:
+            mandatory.append(nbb)
+        end_m = min(mandatory, default=end)
+        if b and b >= end_m:
+            b = 0  # a mandatory stop at or before b: nothing to run through
+        t = 0
+        if tail and start < tail < end_m:
+            if (
+                mamba_inline_ckpt.MERGE_TAIL
+                and end_m >= prefill_end
+                and prefill_end == request.num_prompt_tokens
+                and tail % block_size != 0
+                and tail - max(start, b) >= self.hash_block_size
+            ):
+                t = tail
+            else:
+                end_m = tail
+        new_end = end_m
+        if b and b >= new_end:
+            b = 0
+        if new_end <= orig_end:
+            return max(orig_end - start, 0)
+        if self._inline_ckpt_used >= mamba_inline_ckpt.MAX_PER_STEP or (
+            mamba_inline_ckpt.MAX_RUNNING > 0
+            and len(self.running) > mamba_inline_ckpt.MAX_RUNNING
+        ):
+            self.inline_ckpt_stats["refused_budget"] += 1
+            return max(orig_end - start, 0)
+        self._inline_ckpt_used += 1
+        st = self.inline_ckpt_stats
+        st["merged"] += 1
+        st["merged_block"] += int(b > 0)
+        st["merged_tail"] += int(t > 0)
+        st["chunks_saved"] += int(b > 0) + int(t > 0)
+        # the manager reserves / derives the checkpoints of this chunk from it
+        pending[request.request_id] = (start, new_end, b, t)
+        n = st["merged"]
+        if n <= 3 or n % mamba_inline_ckpt.LOG_EVERY == 0:
+            logger.info(
+                "[F122] merge #%d req=%s start=%d block=%d tail=%d end=%d "
+                "(split end %d) stats=%s",
+                n,
+                request.request_id,
+                start,
+                b,
+                t,
+                new_end,
+                orig_end,
+                dict(st),
+            )
+        return max(new_end - start, 0)
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -548,6 +682,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        self._inline_ckpt_used = 0
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1368,13 +1503,18 @@ class Scheduler(SchedulerInterface):
         kv_cache_block_copies, cow_retained_blocks = (
             self.kv_cache_manager.take_kv_cache_block_copies()
         )
-        if kv_cache_block_copies:
+        if kv_cache_block_copies or cow_retained_blocks:
             # The copies run with this step's execution; the first non-empty
             # step at or after it gets seq `sched_step_seq + 1` (0-token steps
             # do not advance the seq), and its completion implies the copies
             # have run.
             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        # [F122] this step's in-step Mamba checkpoints (after allocation).
+        mamba_inline_ckpts = None
+        if self.mamba_inline_ckpt:
+            self.kv_cache_manager.mamba_inline_tail_pending.clear()
+            mamba_inline_ckpts = self.kv_cache_manager.take_mamba_inline_ckpts()
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1412,6 +1552,7 @@ class Scheduler(SchedulerInterface):
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
+            mamba_inline_ckpts=mamba_inline_ckpts or None,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )

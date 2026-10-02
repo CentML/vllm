@@ -43,7 +43,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+from vllm.model_executor.layers.mamba.gdn import gdn_inline_ckpt, gdn_layer_graphs
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1769,6 +1769,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            if gdn_inline_ckpt.ENABLED:
+                # [F122] this step's in-step GDN prefill checkpoints -> token rows
+                gdn_inline_ckpt.begin_step(
+                    scheduler_output, input_batch, self.kv_cache_config, self.device
+                )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1780,6 +1785,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
+            if gdn_inline_ckpt.ENABLED:
+                gdn_inline_ckpt.end_step()
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
