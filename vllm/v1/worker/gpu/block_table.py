@@ -14,10 +14,9 @@ from vllm.v1.worker.gpu.buffer_utils import (
     _load_ptr,
 )
 
-
-
 # GB300 lowc2: skip the per-step num_blocks re-copy when no block ids were appended.
 _NUM_BLOCKS_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
+
 
 class BlockTables:
     def __init__(
