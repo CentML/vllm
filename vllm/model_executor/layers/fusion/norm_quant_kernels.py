@@ -312,11 +312,8 @@ def gdn_gated_rmsnorm_quant_(x, z, weight, eps, activation, q, sf, row0, padded_
 
 @triton.jit(do_not_specialize=["LO", "HI", "M"])
 def _nqf_quant_rows_kernel(X, Q, SF_SWZ, LO, HI, M, stride_x, stride_q,
-                           N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
+                           N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
     """Plain MXFP8 quant of rows [LO, HI) (rows >= M are padding: zero scales, no data)."""
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
     row = LO + tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
     in_rng = row < HI
     dmask = in_rng & (row < M)
@@ -355,7 +352,7 @@ def quant_rows(x, q, sf, lo, hi, m, padded_sf_cols, config=None):
     N = x.shape[-1]
     _nqf_quant_rows_kernel[(triton.cdiv(hi - lo, c["XB"]),)](
         x, q, sf, lo, hi, m, x.stride(0), q.stride(0), N=N, BN=c["BN"], XB=c["XB"],
-        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"], launch_pdl=_lcd_pdl_on())
+        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"])
 
 
 @triton.jit(do_not_specialize=["LO", "HI", "LO2", "HI2", "NB1", "M"])
