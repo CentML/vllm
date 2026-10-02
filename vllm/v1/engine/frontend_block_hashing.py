@@ -334,6 +334,13 @@ def shipped_hashes_usable(
 
 
 def unpack_block_hashes(blob: bytes) -> list["BlockHash"]:
+    if FEH_MEMO:
+        # lowc2: slice the bytes directly (one object per hash instead of a
+        # memoryview slice + a copy); same values, ~2x faster for ~3.5K hashes.
+        return cast(
+            "list[BlockHash]",
+            [blob[i : i + _HASH_BYTES] for i in range(_HDR, len(blob), _HASH_BYTES)],
+        )
     mv = memoryview(blob)
     return cast(
         "list[BlockHash]",
