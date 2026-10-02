@@ -420,6 +420,8 @@ class SamplerGraphs:
         n = B * k
         dev = self._dev
         ib = InputBatch.make_dummy(B, n, r.input_buffers, max_query_len=k)
+        # Real decode tokens (make_dummy marks every row as padding).
+        r.input_buffers.is_padding[:n].fill_(False)
         idx = torch.full((B,), row, dtype=torch.int64, device=dev)
         num_sched = np.full(B, k, dtype=np.int32)
         cu_np = np.arange(0, n + 1, k, dtype=np.int32)
@@ -440,6 +442,7 @@ class SamplerGraphs:
             num_computed_prefill_tokens_np=np.full(B, 1, dtype=np.int32),
             is_prefilling_np=np.zeros(B, dtype=bool),
             has_prefill=False,
+            max_query_len=None,
         )
 
     def precapture(self) -> None:
