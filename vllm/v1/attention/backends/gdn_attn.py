@@ -58,25 +58,61 @@ class GDNPrefillCheckpointMetadata:
     Token indices are relative to the prefill token block of the chunk kernel.
     """
 
-    # Split layout: cu_seqlens over the prefill tokens, one state slot and
-    # initial-state flag per (head, tail or unsplit) sequence.
+    # Split layout: cu_seqlens over the prefill tokens (int64 for FlashInfer,
+    # else int32; FlashInfer also gets an int32 copy and the longest sequence
+    # for its V-split rule), one int32 state slot and initial-state flag per
+    # (head, tail or unsplit) sequence.
     split_query_start_loc: torch.Tensor
+    split_query_start_loc_i32: torch.Tensor | None
+    split_max_seqlen: int
     split_state_indices: torch.Tensor
-    split_state_indices_i64: torch.Tensor
     split_has_initial_state: torch.Tensor
     split_no_initial_state: torch.Tensor
     split_chunk_indices: torch.Tensor | None
     split_chunk_offsets: torch.Tensor | None
-    # Tails, gathered: token indices, cu_seqlens and their running slots.
-    tail_token_indices: torch.Tensor
+    # Tails: cu_seqlens (same dtypes as the split layout), int32 running slots
+    # and their tokens. With one checkpoint the tail is the contiguous token
+    # range ``tail_token_range`` and ``tail_token_indices`` is None.
+    tail_token_indices: torch.Tensor | None
+    tail_token_range: tuple[int, int] | None
     tail_query_start_loc: torch.Tensor
+    tail_query_start_loc_i32: torch.Tensor | None
+    tail_max_seqlen: int
     tail_state_indices: torch.Tensor
-    tail_state_indices_i64: torch.Tensor
     tail_chunk_indices: torch.Tensor | None
     tail_chunk_offsets: torch.Tensor | None
-    # Checkpoint slots (same order as the tails) and, per checkpoint, the
-    # index of its first tail token in the non-spec conv input block.
-    checkpoint_state_indices_i64: torch.Tensor
+    # Checkpoint slots (int32, same order as the tails) and, per checkpoint,
+    # the index of its first tail token in the non-spec conv input block.
+    checkpoint_state_indices: torch.Tensor
+    conv_token_indices: torch.Tensor
+
+
+@dataclass
+class GDNPrefillCheckpointPlan:
+    """The block-table-independent part of a step's checkpoint metadata: the
+    host-side layout and its uploads. Computed once per step and shared by the
+    GDN groups (``GDNSharedBuild``); only the slot gather is per group.
+    """
+
+    num_prefills: int
+    num_checkpoints: int
+    num_split: int
+    # int64, packed: checkpoint batch rows | checkpoint block columns |
+    # split slot source (index into cat(prefill slots, checkpoint slots)) |
+    # prefill index of each checkpoint.
+    slot_plan: torch.Tensor
+    split_query_start_loc: torch.Tensor
+    split_query_start_loc_i32: torch.Tensor | None
+    split_max_seqlen: int
+    split_chunk_indices: torch.Tensor | None
+    split_chunk_offsets: torch.Tensor | None
+    tail_token_indices: torch.Tensor | None
+    tail_token_range: tuple[int, int] | None
+    tail_query_start_loc: torch.Tensor
+    tail_query_start_loc_i32: torch.Tensor | None
+    tail_max_seqlen: int
+    tail_chunk_indices: torch.Tensor | None
+    tail_chunk_offsets: torch.Tensor | None
     conv_token_indices: torch.Tensor
 
 
@@ -190,6 +226,10 @@ class GDNSharedBuild:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # Internal prefill checkpoint plan, shared by the GDN groups of the step;
+    # checkpoint_planned tells "no checkpoint" (None) from "not computed".
+    checkpoint_plan: GDNPrefillCheckpointPlan | None = None
+    checkpoint_planned: bool = False
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -293,19 +333,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and self.speculative_config.use_eagle_block_drop()
         )
 
-    def _build_prefill_checkpoint(
+    def _plan_prefill_checkpoint(
         self,
         m: CommonAttentionMetadata,
         prefill_rows: Sequence[int],
         prefill_query_start_loc_cpu: torch.Tensor,
         conv_token_base: int,
-        prefill_state_indices: torch.Tensor,
-        prefill_has_initial_state: torch.Tensor,
-    ) -> GDNPrefillCheckpointMetadata | None:
-        """Checkpoint metadata for this step's prefill sequences, or None if
-        none of them exports a checkpoint. ``prefill_rows[i]`` is the batch
-        row of prefill sequence ``i``; ``conv_token_base`` is the offset of the
-        prefill tokens inside the non-spec conv input block.
+    ) -> GDNPrefillCheckpointPlan | None:
+        """Checkpoint layout of this step's prefill sequences, or None if none
+        of them exports a checkpoint. ``prefill_rows[i]`` is the batch row of
+        prefill sequence ``i``; ``conv_token_base`` is the offset of the
+        prefill tokens inside the non-spec conv input block. Everything is
+        uploaded in two copies (one int64, one int32).
         """
         assert m.seq_lens_cpu_upper_bound is not None
         spec = self.kv_cache_spec
@@ -343,84 +382,148 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             return None
 
         num_prefills = len(qsl) - 1
+        num_ckpt = len(checkpoints)
         split_qsl = [0]
         # Index into cat(prefill_state_indices, checkpoint slots).
         split_slot_src: list[int] = []
-        tail_tokens: list[int] = []
+        tail_ranges: list[tuple[int, int]] = []
         tail_qsl = [0]
         conv_tokens: list[int] = []
         next_ckpt = 0
         for i in range(num_prefills):
             end = qsl[i + 1]
-            if next_ckpt < len(checkpoints) and checkpoints[next_ckpt][0] == i:
+            if next_ckpt < num_ckpt and checkpoints[next_ckpt][0] == i:
                 cut = qsl[i] + checkpoints[next_ckpt][2]
                 split_qsl += [cut, end]
                 split_slot_src += [i, num_prefills + next_ckpt]
-                tail_tokens.extend(range(cut, end))
+                tail_ranges.append((cut, end))
                 tail_qsl.append(tail_qsl[-1] + end - cut)
                 conv_tokens.append(conv_token_base + cut)
                 next_ckpt += 1
             else:
                 split_qsl.append(end)
                 split_slot_src.append(i)
+        num_split = len(split_slot_src)
+        # One checkpoint: its tail is a contiguous token range (sliced in the
+        # forward, no gather).
+        tail_token_range = tail_ranges[0] if num_ckpt == 1 else None
+        tail_tokens: list[int] = []
+        if tail_token_range is None:
+            for cut, end in tail_ranges:
+                tail_tokens.extend(range(cut, end))
 
-        device = prefill_state_indices.device
+        flashinfer = self.gdn_prefill_backend == "flashinfer"
+        # int64 upload: slot plan | conv tokens | tail tokens [| FlashInfer
+        # cu_seqlens: split | tail]; int32 upload: split | tail cu_seqlens.
+        packed64 = [c[1] for c in checkpoints] + [c[3] for c in checkpoints]
+        packed64 += split_slot_src + [c[0] for c in checkpoints]
+        slot_plan_len = len(packed64)
+        packed64 += conv_tokens + tail_tokens
+        if flashinfer:
+            packed64 += split_qsl + tail_qsl
+        device = self.device
+        dev64 = async_tensor_h2d(packed64, device=device, dtype=torch.int64)
+        dev32 = async_tensor_h2d(split_qsl + tail_qsl, device=device, dtype=torch.int32)
+        conv_off = slot_plan_len
+        tail_off = conv_off + num_ckpt
+        qsl_off = tail_off + len(tail_tokens)
+        split_qsl_i32 = dev32[: num_split + 1]
+        tail_qsl_i32 = dev32[num_split + 1 :]
+        if flashinfer:
+            split_query_start_loc = dev64[qsl_off : qsl_off + num_split + 1]
+            tail_query_start_loc = dev64[qsl_off + num_split + 1 :]
+        else:
+            split_query_start_loc = split_qsl_i32
+            tail_query_start_loc = tail_qsl_i32
 
-        def h2d(data: list[int] | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-            return async_tensor_h2d(data, device=device, dtype=dtype)
-
-        num_ckpt = len(checkpoints)
-        rows = h2d([c[1] for c in checkpoints], torch.int64)
-        cols = h2d([c[3] for c in checkpoints], torch.int64)
-        checkpoint_slots = m.block_table_tensor[rows, cols].to(torch.int32)
-        slot_src = h2d(split_slot_src, torch.int64)
-        split_state_indices = torch.cat(
-            [prefill_state_indices.to(torch.int32), checkpoint_slots]
-        ).index_select(0, slot_src)
-        # The tails of the split layout are throwaway: start them from zero.
-        split_has_initial_state = torch.cat(
-            [
-                prefill_has_initial_state,
-                torch.zeros(num_ckpt, dtype=torch.bool, device=device),
-            ]
-        ).index_select(0, slot_src)
-        ckpt_prefill_idx = h2d([c[0] for c in checkpoints], torch.int64)
-        tail_state_indices = prefill_state_indices.to(torch.int32).index_select(
-            0, ckpt_prefill_idx
-        )
-
-        qsl_dtype = (
-            torch.int64 if self.gdn_prefill_backend == "flashinfer" else torch.int32
-        )
-        split_qsl_cpu = torch.tensor(split_qsl, dtype=torch.int32)
-        tail_qsl_cpu = torch.tensor(tail_qsl, dtype=torch.int32)
-        split_query_start_loc = h2d(split_qsl_cpu, qsl_dtype)
-        tail_query_start_loc = h2d(tail_qsl_cpu, qsl_dtype)
         split_chunk_indices = split_chunk_offsets = None
         tail_chunk_indices = tail_chunk_offsets = None
-        if self.gdn_prefill_backend != "flashinfer":
+        if not flashinfer:
             split_chunk_indices, split_chunk_offsets = self._build_chunk_metadata(
-                split_query_start_loc, split_qsl_cpu, device
+                split_query_start_loc,
+                torch.tensor(split_qsl, dtype=torch.int32),
+                device,
             )
             tail_chunk_indices, tail_chunk_offsets = self._build_chunk_metadata(
-                tail_query_start_loc, tail_qsl_cpu, device
+                tail_query_start_loc,
+                torch.tensor(tail_qsl, dtype=torch.int32),
+                device,
             )
-        return GDNPrefillCheckpointMetadata(
+        return GDNPrefillCheckpointPlan(
+            num_prefills=num_prefills,
+            num_checkpoints=num_ckpt,
+            num_split=num_split,
+            slot_plan=dev64[:slot_plan_len],
             split_query_start_loc=split_query_start_loc,
-            split_state_indices=split_state_indices,
-            split_state_indices_i64=split_state_indices.to(torch.int64),
-            split_has_initial_state=split_has_initial_state,
-            split_no_initial_state=~split_has_initial_state,
+            split_query_start_loc_i32=split_qsl_i32 if flashinfer else None,
+            split_max_seqlen=max(b - a for a, b in zip(split_qsl, split_qsl[1:])),
             split_chunk_indices=split_chunk_indices,
             split_chunk_offsets=split_chunk_offsets,
-            tail_token_indices=h2d(tail_tokens, torch.int64),
+            tail_token_indices=(
+                None if tail_token_range is not None else dev64[tail_off:qsl_off]
+            ),
+            tail_token_range=tail_token_range,
             tail_query_start_loc=tail_query_start_loc,
-            tail_state_indices=tail_state_indices,
-            tail_state_indices_i64=tail_state_indices.to(torch.int64),
+            tail_query_start_loc_i32=tail_qsl_i32 if flashinfer else None,
+            tail_max_seqlen=max(b - a for a, b in tail_ranges),
             tail_chunk_indices=tail_chunk_indices,
             tail_chunk_offsets=tail_chunk_offsets,
-            checkpoint_state_indices_i64=checkpoint_slots.to(torch.int64),
-            conv_token_indices=h2d(conv_tokens, torch.int64),
+            conv_token_indices=dev64[conv_off:tail_off],
+        )
+
+    def _build_prefill_checkpoint(
+        self,
+        plan: GDNPrefillCheckpointPlan,
+        block_table: torch.Tensor,
+        prefill_state_indices: torch.Tensor,
+        prefill_has_initial_state: torch.Tensor,
+    ) -> GDNPrefillCheckpointMetadata:
+        """This group's checkpoint metadata: the plan plus the state slots
+        read from its block table, gathered by one kernel.
+        """
+        num_ckpt = plan.num_checkpoints
+        num_split = plan.num_split
+        device = block_table.device
+        # int32: split slots | tail slots | checkpoint slots;
+        # bool: split has-initial-state | its inverse.
+        slots = torch.empty(num_split + 2 * num_ckpt, dtype=torch.int32, device=device)
+        flags = torch.empty(2 * num_split, dtype=torch.bool, device=device)
+        assert prefill_has_initial_state.is_contiguous()
+        _gdn_checkpoint_slots_kernel[(1,)](
+            block_table,
+            block_table.stride(0),
+            prefill_state_indices,
+            prefill_state_indices.stride(0),
+            prefill_has_initial_state,
+            plan.slot_plan,
+            slots,
+            flags,
+            plan.num_prefills,
+            num_ckpt,
+            num_split,
+            # >= 16 keeps the set of compiled variants small (warmed at start).
+            BLOCK_CKPT=max(16, triton.next_power_of_2(num_ckpt)),
+            BLOCK_SPLIT=max(16, triton.next_power_of_2(num_split)),
+        )
+        return GDNPrefillCheckpointMetadata(
+            split_query_start_loc=plan.split_query_start_loc,
+            split_query_start_loc_i32=plan.split_query_start_loc_i32,
+            split_max_seqlen=plan.split_max_seqlen,
+            split_state_indices=slots[:num_split],
+            split_has_initial_state=flags[:num_split],
+            split_no_initial_state=flags[num_split:],
+            split_chunk_indices=plan.split_chunk_indices,
+            split_chunk_offsets=plan.split_chunk_offsets,
+            tail_token_indices=plan.tail_token_indices,
+            tail_token_range=plan.tail_token_range,
+            tail_query_start_loc=plan.tail_query_start_loc,
+            tail_query_start_loc_i32=plan.tail_query_start_loc_i32,
+            tail_max_seqlen=plan.tail_max_seqlen,
+            tail_state_indices=slots[num_split : num_split + num_ckpt],
+            tail_chunk_indices=plan.tail_chunk_indices,
+            tail_chunk_offsets=plan.tail_chunk_offsets,
+            checkpoint_state_indices=slots[num_split + num_ckpt :],
+            conv_token_indices=plan.conv_token_indices,
         )
 
     def _build_chunk_metadata(
@@ -647,28 +750,36 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
         if num_prefills > 0 and self.prefill_checkpoint_enabled:
             assert prefill_state_indices is not None
-            prefill_query_start_loc_cpu = shared.prefill_query_start_loc_cpu
             prefill_has_initial_state = shared.prefill_has_initial_state
-            assert prefill_query_start_loc_cpu is not None
             assert prefill_has_initial_state is not None
-            if spec_sequence_masks_cpu is None:
-                # Decodes (if any) are the front rows; the prefills follow.
-                prefill_rows: Sequence[int] = range(
-                    num_decodes, num_decodes + len(prefill_query_start_loc_cpu) - 1
+            if not shared.checkpoint_planned:
+                prefill_query_start_loc_cpu = shared.prefill_query_start_loc_cpu
+                assert prefill_query_start_loc_cpu is not None
+                if spec_sequence_masks_cpu is None:
+                    # Decodes (if any) are the front rows; the prefills follow.
+                    prefill_rows: Sequence[int] = range(
+                        num_decodes,
+                        num_decodes + len(prefill_query_start_loc_cpu) - 1,
+                    )
+                else:
+                    assert split.non_spec_sequence_masks_cpu is not None
+                    prefill_rows = (
+                        split.non_spec_sequence_masks_cpu.nonzero().flatten().tolist()
+                    )
+                shared.checkpoint_plan = self._plan_prefill_checkpoint(
+                    m,
+                    prefill_rows,
+                    prefill_query_start_loc_cpu,
+                    split.num_decode_tokens if spec_sequence_masks is None else 0,
                 )
-            else:
-                assert split.non_spec_sequence_masks_cpu is not None
-                prefill_rows = (
-                    split.non_spec_sequence_masks_cpu.nonzero().flatten().tolist()
+                shared.checkpoint_planned = True
+            if shared.checkpoint_plan is not None:
+                prefill_checkpoint = self._build_prefill_checkpoint(
+                    shared.checkpoint_plan,
+                    m.block_table_tensor,
+                    prefill_state_indices,
+                    prefill_has_initial_state,
                 )
-            prefill_checkpoint = self._build_prefill_checkpoint(
-                m,
-                prefill_rows,
-                prefill_query_start_loc_cpu,
-                split.num_decode_tokens if spec_sequence_masks is None else 0,
-                prefill_state_indices,
-                prefill_has_initial_state,
-            )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -1335,6 +1446,82 @@ class GDNFusedDecodeStep:
             BLOCK_SIZE=1024,
         )
         return True
+
+
+@triton.jit(
+    do_not_specialize=[
+        "block_table_stride",
+        "prefill_slots_stride",
+        "num_prefills",
+        "num_ckpt",
+        "num_split",
+    ],
+    # Views at arbitrary offsets: one compiled variant for every step.
+    do_not_specialize_on_alignment=[
+        "block_table_ptr",
+        "prefill_slots_ptr",
+        "has_initial_ptr",
+        "plan_ptr",
+        "slots_out_ptr",
+        "flags_out_ptr",
+    ],
+)
+def _gdn_checkpoint_slots_kernel(
+    block_table_ptr,
+    block_table_stride,
+    prefill_slots_ptr,
+    prefill_slots_stride,
+    has_initial_ptr,
+    plan_ptr,
+    slots_out_ptr,
+    flags_out_ptr,
+    num_prefills,
+    num_ckpt,
+    num_split,
+    BLOCK_CKPT: tl.constexpr,
+    BLOCK_SPLIT: tl.constexpr,
+):
+    """GDNPrefillCheckpointPlan.slot_plan -> int32 split | tail | checkpoint
+    slots and the split has / has-no initial state flags (see
+    GDNAttentionMetadataBuilder._build_prefill_checkpoint).
+    """
+    rows_ptr = plan_ptr
+    cols_ptr = plan_ptr + num_ckpt
+    src_ptr = plan_ptr + 2 * num_ckpt
+    prefill_idx_ptr = src_ptr + num_split
+
+    c = tl.arange(0, BLOCK_CKPT)
+    cm = c < num_ckpt
+    row = tl.load(rows_ptr + c, mask=cm, other=0)
+    col = tl.load(cols_ptr + c, mask=cm, other=0)
+    ckpt_slot = tl.load(block_table_ptr + row * block_table_stride + col, mask=cm)
+    prefill_idx = tl.load(prefill_idx_ptr + c, mask=cm, other=0)
+    tail_slot = tl.load(prefill_slots_ptr + prefill_idx * prefill_slots_stride, mask=cm)
+    tl.store(slots_out_ptr + num_split + c, tail_slot.to(tl.int32), mask=cm)
+    tl.store(slots_out_ptr + num_split + num_ckpt + c, ckpt_slot.to(tl.int32), mask=cm)
+
+    s = tl.arange(0, BLOCK_SPLIT)
+    sm = s < num_split
+    src = tl.load(src_ptr + s, mask=sm, other=0)
+    head = src < num_prefills
+    hm = sm & head
+    tm = sm & (src >= num_prefills)
+    head_slot = tl.load(
+        prefill_slots_ptr + src * prefill_slots_stride, mask=hm, other=0
+    )
+    has_initial = tl.load(has_initial_ptr + src, mask=hm, other=0).to(tl.int1)
+    k = tl.where(tm, src - num_prefills, 0)
+    t_row = tl.load(rows_ptr + k, mask=tm, other=0)
+    t_col = tl.load(cols_ptr + k, mask=tm, other=0)
+    tail_split_slot = tl.load(
+        block_table_ptr + t_row * block_table_stride + t_col, mask=tm, other=0
+    )
+    slot = tl.where(head, head_slot.to(tl.int32), tail_split_slot.to(tl.int32))
+    # The tails of the split layout are throwaway: start them from zero.
+    has_initial = has_initial & head
+    tl.store(slots_out_ptr + s, slot, mask=sm)
+    tl.store(flags_out_ptr + s, has_initial, mask=sm)
+    tl.store(flags_out_ptr + num_split + s, ~has_initial, mask=sm)
 
 
 @triton.jit
