@@ -64,6 +64,11 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     gdn_fused_conv_prep,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
+from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
+    copy_state_rows,
+    gather_prefill_rows,
+    store_conv_checkpoint,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1709,11 +1714,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         decode conv kernels read the initial state from columns
         ``[0, width - 1)`` (newest last), so the checkpoint goes there.
         """
-        state_len = width - 1
-        offsets = torch.arange(-state_len, 0, device=conv_input.device)
-        rows = checkpoint.conv_token_indices.unsqueeze(1) + offsets
-        conv_state[checkpoint.checkpoint_state_indices_i64, :, :state_len] = (
-            conv_input[rows].transpose(1, 2).to(conv_state.dtype)
+        store_conv_checkpoint(
+            conv_input,
+            conv_state,
+            width - 1,
+            checkpoint.conv_token_indices,
+            checkpoint.checkpoint_state_indices,
         )
 
     def _run_prefill_chunk(
@@ -1725,8 +1731,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         ssm_state: torch.Tensor,
         query_start_loc: torch.Tensor,
+        query_start_loc_i32: torch.Tensor | None,
+        max_seqlen: int,
         state_indices: torch.Tensor,
-        state_indices_i64: torch.Tensor,
         has_initial_state: torch.Tensor | None,
         no_initial_state: torch.Tensor | None,
         chunk_indices: torch.Tensor | None,
@@ -1734,8 +1741,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """One chunk-kernel call that reads and writes the ssm pool rows at
-        ``state_indices``. ``has_initial_state``/``no_initial_state`` None:
-        every sequence starts from its pool row.
+        ``state_indices`` (int32). ``has_initial_state``/``no_initial_state``
+        None: every sequence starts from its pool row.
         """
         if self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
             if has_initial_state is not None:
@@ -1752,8 +1759,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
                 core_attn_out=out,
                 state_indices=state_indices,
+                max_seqlen=max_seqlen,
+                cu_seqlens_i32=query_start_loc_i32,
             )
             return o
+        state_indices_i64 = state_indices.to(torch.int64)
         initial_state = ssm_state[state_indices_i64]
         if no_initial_state is not None:
             initial_state[no_initial_state, ...] = 0
@@ -1800,8 +1810,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             beta,
             ssm_state,
             checkpoint.split_query_start_loc,
+            checkpoint.split_query_start_loc_i32,
+            checkpoint.split_max_seqlen,
             checkpoint.split_state_indices,
-            checkpoint.split_state_indices_i64,
             checkpoint.split_has_initial_state,
             checkpoint.split_no_initial_state,
             checkpoint.split_chunk_indices,
@@ -1809,28 +1820,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             out,
         )
         # 2. The running slots now hold the checkpoint states: snapshot them.
-        ssm_state[checkpoint.checkpoint_state_indices_i64] = ssm_state[
-            checkpoint.tail_state_indices_i64
-        ]
-        # 3. Rerun the tails from the checkpoint states.
+        copy_state_rows(
+            ssm_state,
+            checkpoint.checkpoint_state_indices,
+            checkpoint.tail_state_indices,
+        )
+        # 3. Rerun the tails from the checkpoint states. One tail is a token
+        # range: run it on slices and write its outputs in place.
         idx = checkpoint.tail_token_indices
+        if checkpoint.tail_token_range is not None:
+            start, end = checkpoint.tail_token_range
+            q_t, k_t, v_t, g_t, beta_t = (t[:, start:end] for t in (q, k, v, g, beta))
+            out_t: torch.Tensor | None = o[0, start:end]
+        else:
+            assert idx is not None
+            q_t, k_t, v_t, g_t, beta_t = gather_prefill_rows(idx, q, k, v, g, beta)
+            out_t = None
         o_tail = self._run_prefill_chunk(
-            q.index_select(1, idx),
-            k.index_select(1, idx),
-            v.index_select(1, idx),
-            g.index_select(1, idx),
-            beta.index_select(1, idx),
+            q_t,
+            k_t,
+            v_t,
+            g_t,
+            beta_t,
             ssm_state,
             checkpoint.tail_query_start_loc,
+            checkpoint.tail_query_start_loc_i32,
+            checkpoint.tail_max_seqlen,
             checkpoint.tail_state_indices,
-            checkpoint.tail_state_indices_i64,
             None,
             None,
             checkpoint.tail_chunk_indices,
             checkpoint.tail_chunk_offsets,
-            None,
+            out_t,
         )
-        o.index_copy_(1, idx, o_tail.to(o.dtype))
+        if out_t is None:
+            assert idx is not None
+            o.index_copy_(1, idx, o_tail.to(o.dtype))
         return o
 
     def _forward_core(
@@ -1979,7 +2004,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and non_spec_query_start_loc is not None
             and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
         )
-        if attn_metadata.num_prefills > 0 and attn_metadata.prefill_checkpoint is not None:
+        if (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.prefill_checkpoint is not None
+        ):
             # Both prefill conv paths read the pre-conv inputs; the checkpoint's
             # conv window is taken from them before either conv runs.
             assert mixed_qkv_non_spec is not None
