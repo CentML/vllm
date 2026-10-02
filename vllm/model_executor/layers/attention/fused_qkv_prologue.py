@@ -68,6 +68,14 @@ GLUE_EWS_CUDA = os.environ.get("GLUE_EWS_CUDA", "0") == "1"
 # ... only for T >= GLUE_EWS_CUDA_MIN_T tokens (GB300 bench: CUDA 1.6-2x faster from T ~192 up, Triton tpp1 faster at
 # T <= 24 decode sizes)
 GLUE_EWS_CUDA_MIN_T = int(os.environ.get("GLUE_EWS_CUDA_MIN_T", "128"))
+# gb300-fuse: GLUE_EWS_CUDA_PW_MIN_T=<n> (> 0): also take the CUDA kernel for T >= n whenever the call is NOT being
+# captured into a FULL CUDA graph (i.e. PIECEWISE graphs = mixed steps, and eager forwards). FULL decode graphs keep
+# the PDL Triton kernel below GLUE_EWS_CUDA_MIN_T. Decided inside the opaque custom op at capture time, so capture and
+# replay take the same branch. Same per-token math either kernel (bit-identical).
+GLUE_EWS_CUDA_PW_MIN_T = int(os.environ.get("GLUE_EWS_CUDA_PW_MIN_T", "0"))
+# gb300-fuse: GLUE_EWS_CUDA_PDL=1: launch the CUDA kernel with PDL (programmatic stream serialization) when lcd's PDL
+# switch is on; griddepcontrol.wait before any global access, launch_dependents after the last qkv read. Exact.
+GLUE_EWS_CUDA_PDL = os.environ.get("GLUE_EWS_CUDA_PDL", "0") == "1"
 STATS = {"calls": 0, "layers": 0}
 
 
@@ -239,6 +247,21 @@ def launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, 
 _CFG: dict = {}  # layer_name -> {"mod": Qwen3NextAttention}
 
 
+def _full_graph_capture() -> bool:
+    """gb300-fuse: True while a FULL CUDA graph is being captured (decode-only batches in FULL_AND_PIECEWISE; the
+    runner captures FULL graphs with the forward context in mode NONE, PIECEWISE graphs in mode PIECEWISE; eager
+    forwards are not capturing). Same rule as gdn_out_alloc._full_graph_forward."""
+    try:
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        return (torch.cuda.is_current_stream_capturing()
+                and is_forward_context_available()
+                and get_forward_context().cudagraph_runtime_mode not in (CUDAGraphMode.PIECEWISE,))
+    except Exception:  # no forward context: treat as FULL (keeps the GLUE_EWS_CUDA_MIN_T rule)
+        return True
+
+
 def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tuple[torch.Tensor, torch.Tensor,
                                                                                   torch.Tensor]:
     from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -256,7 +279,14 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
         from vllm.model_executor.layers.attention import glue_ews_cuda as GC
 
         pos = positions
-        if qkv.shape[0] >= GLUE_EWS_CUDA_MIN_T and GC.supported(
+        T_ = qkv.shape[0]
+        use_cuda = T_ >= GLUE_EWS_CUDA_MIN_T
+        if not use_cuda and 0 < GLUE_EWS_CUDA_PW_MIN_T <= T_ and not _full_graph_capture():
+            use_cuda = True
+            STATS["glue_cuda_pw"] = STATS.get("glue_cuda_pw", 0) + 1
+            logger.info_once("[glue] QKV prologue: CUDA kernel outside FULL-graph capture from T >= %d "
+                             "(GLUE_EWS_CUDA_PW_MIN_T; first at T=%d)", GLUE_EWS_CUDA_PW_MIN_T, T_)
+        if use_cuda and GC.supported(
                 qkv, m.head_dim, m.rotary_emb.rotary_dim, 1.0, pos, k_cache, m.rotary_emb.cos_sin_cache):
             STATS["glue_cuda"] = STATS.get("glue_cuda", 0) + 1
             q8, k_out, gate = GC.launch(
@@ -264,7 +294,7 @@ def _op_impl(qkv: torch.Tensor, positions: torch.Tensor, layer_name: str) -> tup
                 m.num_heads, m.num_kv_heads,
                 getattr(m.rotary_emb, "mrope_section", None) if pos.ndim == 2 else None,
                 attn_layer._q_scale, attn_layer._k_scale, attn_layer._v_scale, slot_mapping, k_cache, v_cache,
-                gate_copy=not GLUE_EWS_NOGATE)
+                gate_copy=not GLUE_EWS_NOGATE, pdl=GLUE_EWS_CUDA_PDL and _lcd_pdl_on())
             if gate is None:
                 gate = qkv.new_empty((qkv.shape[0], 0))
             return q8, k_out, gate
@@ -386,3 +416,6 @@ if ENABLED:
         logger.info("[glue] QKV prologue: cuda=%s from T=%d; tokens/program 1 up to T=%d (else %d); heads/program %d, "
                     "gate copy %s", GLUE_EWS_CUDA, GLUE_EWS_CUDA_MIN_T, GLUE_EWS_TPP_SPLIT, TPP, GLUE_EWS_HG,
                     not GLUE_EWS_NOGATE)
+    if GLUE_EWS_CUDA and (GLUE_EWS_CUDA_PW_MIN_T or GLUE_EWS_CUDA_PDL):
+        logger.info("[glue] QKV prologue (gb300-fuse): cuda outside FULL-graph capture from T=%d (0 = off); "
+                    "cuda PDL launch %s", GLUE_EWS_CUDA_PW_MIN_T, GLUE_EWS_CUDA_PDL)

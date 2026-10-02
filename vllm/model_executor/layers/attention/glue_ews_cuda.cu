@@ -86,9 +86,20 @@ struct Args {
   const float* v_scale;
   int T, nq, nkv;
   float eps;
+  int pdl;  // gb300-fuse: 1 = launched with programmatic stream serialization (PDL)
 };
 
+// gb300-fuse (GLUE_EWS_CUDA_PDL): PDL edges. wait = before ANY global read or write (the producer qkv_proj may still be
+// reading the memory our outputs reuse); trigger = after this warp's last qkv read (lets the next PDL kernel launch).
+__device__ __forceinline__ void pdl_wait(const Args& a) {
+  if (a.pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+}
+__device__ __forceinline__ void pdl_trigger(const Args& a) {
+  if (a.pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
 __global__ __launch_bounds__(kWarpsPerCta * 32) void ews_kernel(Args a) {
+  pdl_wait(a);
   const int lane = threadIdx.x & 31;
   const int64_t item = static_cast<int64_t>(blockIdx.x) * kWarpsPerCta + (threadIdx.x >> 5);
   const int nh = a.nq + a.nkv;
@@ -155,6 +166,7 @@ __global__ __launch_bounds__(kWarpsPerCta * 32) void ews_kernel(Args a) {
       uint4* gd = reinterpret_cast<uint4*>(a.gate_out + static_cast<int64_t>(token) * a.gate_stride + lh * kD);
       gd[lane] = gs[lane];  // 32 lanes x 16 B = 256 bf16
     }
+    pdl_trigger(a);
     return;
   }
   __nv_bfloat16* ko = a.k_out + static_cast<int64_t>(token) * a.k_out_stride + lh * kD;
@@ -167,9 +179,9 @@ __global__ __launch_bounds__(kWarpsPerCta * 32) void ews_kernel(Args a) {
   }
   ko[lane] = __float2bfloat16_rn(o1);
   ko[kHalf + lane] = __float2bfloat16_rn(o2);
-  if (a.slot == nullptr || token >= a.n_slots) return;
+  if (a.slot == nullptr || token >= a.n_slots) { pdl_trigger(a); return; }
   const int64_t sl = a.slot[token];
-  if (sl < 0) return;
+  if (sl < 0) { pdl_trigger(a); return; }
   const int64_t blk = sl / a.block_size;
   const int64_t off = sl - blk * a.block_size;
   const float ks = *a.k_scale, vs = *a.v_scale;
@@ -191,13 +203,14 @@ __global__ __launch_bounds__(kWarpsPerCta * 32) void ews_kernel(Args a) {
     const uint8_t hi = e4m3(__fdiv_rn(__bfloat162float(vv.y), vs));
     reinterpret_cast<uint16_t*>(vd)[32 * g + lane] = static_cast<uint16_t>(lo | (hi << 8));
   }
+  pdl_trigger(a);
 }
 
 void launch(torch::Tensor qkv, torch::Tensor positions, torch::Tensor qw, torch::Tensor kw, torch::Tensor cs, double eps,
             int64_t nq, int64_t nkv, int64_t mh, int64_t mw, torch::Tensor q_scale, torch::Tensor k_scale,
             torch::Tensor v_scale, c10::optional<torch::Tensor> slot, c10::optional<torch::Tensor> k_cache,
             c10::optional<torch::Tensor> v_cache, torch::Tensor q8, torch::Tensor k_out,
-            c10::optional<torch::Tensor> gate) {
+            c10::optional<torch::Tensor> gate, bool pdl) {
   const int64_t T = qkv.size(0);
   if (T == 0) return;
   TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && qkv.stride(1) == 1 && qkv.stride(0) % 8 == 0);
@@ -250,10 +263,26 @@ void launch(torch::Tensor qkv, torch::Tensor positions, torch::Tensor qw, torch:
   a.nq = static_cast<int>(nq);
   a.nkv = static_cast<int>(nkv);
   a.eps = static_cast<float>(eps);
+  a.pdl = pdl ? 1 : 0;
   const int64_t items = T * (nq + nkv);
   const dim3 grid(static_cast<unsigned>((items + kWarpsPerCta - 1) / kWarpsPerCta));
-  ews_kernel<<<grid, kWarpsPerCta * 32, 0, c10::cuda::getCurrentCUDAStream()>>>(a);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (!pdl) {
+    ews_kernel<<<grid, kWarpsPerCta * 32, 0, c10::cuda::getCurrentCUDAStream()>>>(a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  // gb300-fuse: programmatic dependent launch (becomes a programmatic edge under stream capture)
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = dim3(kWarpsPerCta * 32);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = c10::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, ews_kernel, a));
 }
 
 }  // namespace glue_ews

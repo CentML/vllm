@@ -28,14 +28,14 @@ def load():
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}"
     build = os.path.join(
-        os.environ.get("GLUE_EWS_CUDA_BUILD_DIR", os.path.expanduser("~/.cache/glue_ews_cuda")), f"sm{arch}_v1"
+        os.environ.get("GLUE_EWS_CUDA_BUILD_DIR", os.path.expanduser("~/.cache/glue_ews_cuda")), f"sm{arch}_v2"
     )
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
     cpp._get_cuda_arch_flags = lambda cflags=None: [f"-gencode=arch=compute_{arch},code=sm_{arch}"]
     try:
         _ext = cpp.load(
-            name="_glue_ews_cuda_v1",
+            name="_glue_ews_cuda_v2",
             sources=[os.path.join(_HERE, "glue_ews_cuda.cu")],
             # no fast-math, no FMA contraction: every op is written explicitly to match the Triton PTX
             extra_cuda_cflags=["-O3", "-std=c++20", "-fmad=false", "-lineinfo"],
@@ -65,9 +65,11 @@ def supported(qkv, head_dim, rotary_dim, norm_beta, positions, k_cache, cos_sin_
 
 
 def launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, num_kv_heads, mrope_section,
-           q_scale, k_scale, v_scale, slot_mapping, k_cache, v_cache, gate_copy=True):
+           q_scale, k_scale, v_scale, slot_mapping, k_cache, v_cache, gate_copy=True, pdl=False):
     """Same results as fused_qkv_prologue.launch: (q_fp8 [T, H*D], k_out bf16 [T, KVH*D], gate bf16 [T, H*D] or
-    None when gate_copy is False); writes K/V to the cache when slot_mapping is not None."""
+    None when gate_copy is False); writes K/V to the cache when slot_mapping is not None.
+    pdl (gb300-fuse, GLUE_EWS_CUDA_PDL): launch with programmatic stream serialization; the kernel waits
+    (griddepcontrol.wait) before any global access and triggers its dependents after its last qkv read."""
     T = qkv.shape[0]
     dev = qkv.device
     D = 256
@@ -84,5 +86,5 @@ def launch(qkv, positions, q_weight, k_weight, cos_sin_cache, eps, num_q_heads, 
         kc = k_cache.view(torch.uint8)
         vc = v_cache.view(torch.uint8)
     load().launch(qkv, positions, q_weight, k_weight, cos_sin_cache, float(eps), num_q_heads, num_kv_heads, mh, mw,
-                  q_scale, k_scale, v_scale, slot_mapping, kc, vc, q8.view(torch.uint8), k_out, gate)
+                  q_scale, k_scale, v_scale, slot_mapping, kc, vc, q8.view(torch.uint8), k_out, gate, bool(pdl))
     return q8, k_out, gate
