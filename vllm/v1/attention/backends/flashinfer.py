@@ -615,7 +615,8 @@ class TRTLLMPrefill:
 
     ctx_tiles: int = 0
     """Sum over prefill requests of ceil(q_len / 128): the trtllm-gen context
-    FMHA launches ctx_tiles * num_q_heads CTAs (attn-pdo wave gate)."""
+    FMHA launches ctx_tiles * num_q_heads CTAs (attn-pdo wave gate); -1 when
+    the launch takes the FMHA_GEN generation-kernel route instead."""
 
     pd_ctas: int = 0
     """attn-pdo wave gate with VLLM_ATTN_PD_WAVE_MODEL=gen: the fmha-sol gen
@@ -1590,7 +1591,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
                     ctx_tiles=(
-                        int(((query_lens_prefill_cpu + 127) // 128).sum().item())
+                        (
+                            -1
+                            if attn_pd_overlap.would_route_gen(
+                                int(qo_indptr_prefill_cpu[-1].item()),
+                                num_prefills,
+                                max_q_len_prefill,
+                            )
+                            else int(
+                                ((query_lens_prefill_cpu + 127) // 128).sum().item()
+                            )
+                        )
                         if attn_pd_overlap.WAVE_GATE
                         and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
                         else 0

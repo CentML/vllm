@@ -57,6 +57,10 @@ Environment (read at import; default off):
                               vs serial.
 ``VLLM_ATTN_PD_MIN_WAVES``    2 (waves = ceil(ctx_ctas / SMs)).
 ``VLLM_ATTN_PD_MAX_LAST_FILL`` 0.5 (fraction of the SMs busy in the last wave).
+``VLLM_ATTN_PD_GEN_ROUTE_FORK`` with the wave gate on: also fork when the prefill
+                              takes the FMHA_GEN generation-kernel route (a
+                              memory-bound split-KV kernel, no context-kernel wave
+                              tail). Default 0 = serial.
 ``VLLM_ATTN_PD_LOG_EVERY``    log counts every N mixed attention calls (5000; 0 = off):
                               forks, calls below the decode-row minimum, and the
                               mean host cost of plan() when it does not fork.
@@ -90,6 +94,7 @@ WAVE_MODEL = os.environ.get("VLLM_ATTN_PD_WAVE_MODEL", "ctx").strip().lower()
 PERSISTENT = -3  # ctx_ctas sentinel (WAVE_MODEL=gen): Persistent gen-route launch
 if WAVE_MODEL not in ("ctx", "gen"):
     raise ValueError(f"VLLM_ATTN_PD_WAVE_MODEL must be ctx or gen, got {WAVE_MODEL!r}")
+GEN_ROUTE_FORK = os.environ.get("VLLM_ATTN_PD_GEN_ROUTE_FORK", "0") == "1"
 _SMS: dict = {}
 if ORDER not in ("pp", "dly"):
     raise ValueError(f"VLLM_ATTN_PD_ORDER must be pp or dly, got {ORDER!r}")
@@ -225,8 +230,10 @@ def _log_counts() -> None:
 
 
 def _wave_ok(ctx_ctas: int, device: torch.device) -> bool:
-    if ctx_ctas == PERSISTENT:
+    if ctx_ctas == PERSISTENT:  # Persistent gen launch: long tail, always fork
         return True
+    if ctx_ctas < 0:  # FMHA_GEN route: no context-kernel wave tail
+        return GEN_ROUTE_FORK
     idx = device.index if device.index is not None else torch.cuda.current_device()
     sms = _SMS.get(idx)
     if sms is None:
@@ -251,7 +258,7 @@ def plan(
     c["calls"] += 1
     if LOG_EVERY and c["calls"] % LOG_EVERY == 0:
         _log_counts()
-    wave_skip = bool(WAVE_GATE and ctx_ctas and not _wave_ok(ctx_ctas, device))
+    wave_skip = bool(WAVE_GATE and ctx_ctas is not None and ctx_ctas != 0 and not _wave_ok(ctx_ctas, device))
     if (
         c["disabled"]
         or getattr(_TLS, "serial", False)
@@ -365,3 +372,21 @@ def predict_launch(
     base = nq * hkv * B
     S = min(-(-max_kv // 256), max(1, vsm // base))
     return (base, True) if S <= 1 else (base * S, False)
+
+
+def would_route_gen(T: int, B: int, max_q: int) -> bool:
+    """Host-only estimate of whether a launch with T tokens, B requests and
+    max_q takes the ``gen`` route (ignores the dtype/shape support checks).
+    Used by the attn-pdo wave gate. ``gen_rule_accepts`` is the optional
+    ``FMHA_GEN_RULE`` gate of the gen-routing module (absent = the ``rubin``
+    default rule: every eligible launch routes ``gen``)."""
+    gr = _gen_routing()
+    if gr is None:
+        return False
+    rule = getattr(gr, "gen_rule_accepts", None)
+    return (
+        gr.ENABLED
+        and gr._GEN
+        and (T <= gr._GEN_MAX_T or B > gr._MAX_B)
+        and (rule(T, B, max_q) if rule is not None else True)
+    )
