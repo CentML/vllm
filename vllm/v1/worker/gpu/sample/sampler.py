@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -30,6 +32,10 @@ from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
 
 
+# GB300 lowc2: skip unchanged sampler-state staging on steps without new requests.
+_STATE_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
+
+
 class Sampler:
     def __init__(
         self,
@@ -49,6 +55,7 @@ class Sampler:
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
+        self._lowc2_dirty = True  # see apply_staged_writes (VLLM_SAMPLER_STATE_DIRTY)
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
@@ -68,6 +75,10 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        # GB300 lowc2 (VLLM_SAMPLER_STATE_DIRTY=1): the per-request state rows
+        # change only here; apply_staged_writes then skips the per-step re-copy
+        # of unchanged UVA-backed state when nothing was added.
+        self._lowc2_dirty = True
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -94,6 +105,15 @@ class Sampler:
         )
 
     def apply_staged_writes(self) -> None:
+        if _STATE_DIRTY_GATE:
+            # Every UVA-backed / staged sampler state is written only from
+            # add_request (above), so a step without a new request has nothing
+            # to stage: skip re-copying ~15 unchanged host arrays into the next
+            # pool slot (exact: the current slot already holds this content,
+            # and pool rotation still happens on every write).
+            if not self._lowc2_dirty:
+                return
+            self._lowc2_dirty = False
         self.sampling_states.apply_staged_writes()
         self.penalties_state.apply_staged_writes()
         self.logit_bias_state.apply_staged_writes()
