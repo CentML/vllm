@@ -272,11 +272,22 @@ def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
                     cu.append(cu[-1] + L)
                 R = len(segs)
                 m = dev_i32([slot for slot, _ in segs] + cu + [R])
+                # fast path: the last 3 rows of every segment (conv window at its cut)
+                idx3 = torch.tensor(
+                    [r0 + L - 3 + j for _, (r0, L, _) in segs for j in range(3)], dtype=torch.int64
+                )
+                if pin:
+                    idx3 = idx3.pin_memory()
+                idx3_d = idx3.to(device, non_blocking=True)
+                st._keep += [idx3, idx3_d]
+                c3 = dev_i32([3 * i for i in range(R + 1)] + [R])
+                f3 = dev_bool([False] * R)
                 waves.append(
                     (
                         "batch",
                         (idx_d, m[:R], dev_bool([hi for _, (_, _, hi) in segs]),
-                         m[R : 2 * R + 1], R, cu[R], max(L for _, (_, L, _) in segs), ones),
+                         m[R : 2 * R + 1], R, cu[R], max(L for _, (_, L, _) in segs), ones,
+                         idx3_d, c3, f3),
                     )
                 )
                 st.lmax = max(st.lmax, cu[R])
@@ -461,7 +472,7 @@ def _page_copies(layer, st, gid):
         STATS["page_copies"] = STATS.get("page_copies", 0) + len(cps)
 
 
-def _direct_kernel(q, v, ssm, slot_t, vsf):
+def _direct_kernel(q, v, ssm, slot_t, vsf, nseq=1):
     """The device_nb V-split adapter's compiled kernel for this key (compiled by the
     GDN layer graphs at capture), or None. Same key formula as the adapter."""
     from vllm.third_party.flashinfer_gdn_vsplit_devnb import adapter as ad
@@ -471,15 +482,15 @@ def _direct_kernel(q, v, ssm, slot_t, vsf):
     key = (dev, ad._num_sm(dev), str(q.dtype), str(ssm.dtype), HQ, HV, HQ >= HV, True, True, True,
            str(slot_t.dtype), tuple(ssm.stride()[1:]), tuple(ssm.stride()[1:]), int(vsf), True,
            ad._cg0_split(vsf, True), bool(ad._C1_REORDER))
-    hit = _DIRECT.get(key)
+    hit = _DIRECT.get((key, int(nseq)))
     if hit is None:
         c = ad._cache(*key)
         if "compiled" not in c:
             return None
         ws = torch.empty(
-            ad.GatedDeltaNetChunkedKernel.get_workspace_size(ad._num_sm(dev), 1, HQ, HV, True),
+            ad.GatedDeltaNetChunkedKernel.get_workspace_size(ad._num_sm(dev), int(nseq), HQ, HV, True),
             dtype=torch.int8, device=q.device)
-        hit = _DIRECT[key] = (c["compiled"], ws)
+        hit = _DIRECT[(key, int(nseq))] = (c["compiled"], ws)
     return hit
 
 
@@ -488,22 +499,44 @@ def _chunk_shared(layer, shared, r0, L, ssm, slot_t, cu_t, st):
     conv outputs, in place on the pool slot (initial state = the slot's state)."""
     q, k, v, g, beta = (t[r0 : r0 + L] for t in shared)
     HV = layer.num_v_heads // layer.tp_size
-    out = st.bufs[5][:L]
-    scale = 1.0 / (layer.head_k_dim**0.5)
+    _run_direct(q, k, v, g, beta, st.bufs[5][:L], cu_t, ssm, slot_t, 1, L, st, HV,
+                1.0 / (layer.head_k_dim**0.5))
+
+
+def _run_direct(q, k, v, g, beta, out, cu, ssm, slots, nseq, maxlen, st, HV, scale):
     vs = _vsplit(True)
-    vsf = max(int(vs.choose_vsplit(1, L, L, hv=HV)), 1)
-    d = _direct_kernel(q, v, ssm, slot_t, vsf)
+    vsf = max(int(vs.choose_vsplit(int(nseq), q.size(0), int(maxlen), hv=HV)), 1)
+    d = _direct_kernel(q, v, ssm, slots, vsf, nseq)
     if d is not None:
         if st.stream is None:
             import cuda.bindings.driver as cuda
 
             st.stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
-        d[0](q, k, v, g, beta, out, cu_t, ssm, ssm, slot_t, None, None, 0, scale, d[1], st.stream)
+        d[0](q, k, v, g, beta, out, cu, ssm, ssm, slots, None, None, 0, scale, d[1], st.stream)
         STATS["direct_calls"] = STATS.get("direct_calls", 0) + 1
     else:
-        vs.chunk_gated_delta_rule_vsplit(q, k, v, g, beta, out, cu_t, ssm, ssm, scale,
-                                         state_indices=slot_t, v_split=vsf, device_nb=True)
+        vs.chunk_gated_delta_rule_vsplit(q, k, v, g, beta, out, cu, ssm, ssm, scale,
+                                         state_indices=slots, v_split=vsf, device_nb=True)
         STATS["adapter_calls"] = STATS.get("adapter_calls", 0) + 1
+
+
+def _chunk_gathered(layer, shared, idx_d, Ltot, R, maxl, ssm, slots_d, cu_d, st):
+    q, k, v, g, beta = (t.index_select(0, idx_d) for t in shared)
+    HV = layer.num_v_heads // layer.tp_size
+    _run_direct(q, k, v, g, beta, st.bufs[5][:Ltot], cu_d, ssm, slots_d, R, maxl, st, HV,
+                1.0 / (layer.head_k_dim**0.5))
+
+
+def _conv_windows_gathered(layer, mixed_qkv, a, b, conv_state, idx3_d, R, slots_d, c3, f3, st):
+    H = layer.num_k_heads // layer.tp_size
+    q, k, v, g, beta = (t[: 3 * R] for t in st.bufs[:5])
+    conv_w = layer.conv1d.weight.view(layer.conv1d.weight.size(0), layer.conv1d.weight.size(2))
+    gcc = _conv()
+    ok = gcc.load().run(mixed_qkv.index_select(0, idx3_d), conv_w, conv_state, slots_d, f3,
+                        c3[: R + 1], int(R), a.index_select(0, idx3_d), b.index_select(0, idx3_d),
+                        layer.A_log, layer.dt_bias, q, k, v, g, beta, int(H), 4, int(gcc.RV))
+    if not ok:
+        raise RuntimeError("[F122] CUDA conv refused the gathered conv-window launch")
 
 
 def _conv_window(layer, mixed_qkv, a, b, conv_state, end, slot_t, st):
@@ -568,8 +601,16 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
             if kind == "copy":
                 _page_copies(layer, st, gid)
                 continue
-            ones = w if kind == "one" else w[7]
-            for r0, L, slot_t, hi_t, cu_t in ones:
+            if kind == "batch":
+                # >= 2 segments: rows gathered once, one chunk launch, one conv-window launch
+                idx_d, slots_d, _, cu_d, R, Ltot, maxl, _, idx3_d, c3, f3 = w
+                _chunk_gathered(layer, shared, idx_d, Ltot, R, maxl, ssm, slots_d, cu_d, st)
+                _conv_windows_gathered(layer, mixed_qkv, a, b, conv_state, idx3_d, R, slots_d, c3, f3, st)
+                STATS["replays"] += R
+                STATS["replay_tokens"] += Ltot
+                STATS["batched_launches"] = STATS.get("batched_launches", 0) + 1
+                continue
+            for r0, L, slot_t, hi_t, cu_t in w:
                 _chunk_shared(layer, shared, r0, L, ssm, slot_t, cu_t, st)
                 _conv_window(layer, mixed_qkv, a, b, conv_state, r0 + L, slot_t, st)
                 STATS["replays"] += 1
@@ -586,7 +627,7 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
                 STATS["replays"] += 1
                 STATS["replay_tokens"] += L
         elif kind == "batch":
-            idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl, _ = w
+            idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl = w[:7]
             run_chunk(layer, mixed_qkv.index_select(0, idx_d), a.index_select(0, idx_d),
                       b.index_select(0, idx_d), conv_state, ssm, slots_d, hi_d, cu_d, Ltot,
                       bufs=st.bufs, nseq=R, maxlen=maxl)
