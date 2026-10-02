@@ -682,6 +682,155 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+# Copy-on-write block copies for partial prefix hits: every distinct storage's
+# scheduler-block rows src -> dst in ONE launch, 16-byte accesses, no gather
+# temp. Table rows are (row start, row length, row stride) in 16-byte units
+# relative to an anchor storage; scaling by 4 int32 elements lets Triton prove
+# 16-byte alignment, so loads/stores vectorize to 128 bits.
+_COW_COPY_BLOCK = 1024
+_COW_COPY_ITERS = 4
+
+
+@triton.jit(do_not_specialize=["num_pairs"])
+def _copy_kv_cache_block_rows_kernel(
+    anchor_ptr,  # int32 view of one storage; all addresses are relative to it
+    table_ptr,  # int64 [num_entries, 3]: start16, len16, stride16
+    idx_ptr,  # int64 [2, num_pairs]: src blocks, then dst blocks
+    num_pairs,
+    BLOCK: tl.constexpr,
+    ITERS: tl.constexpr,
+):
+    pair = tl.program_id(0)
+    chunk = tl.program_id(1)
+    entry = tl.program_id(2)
+    start16 = tl.load(table_ptr + entry * 3)
+    row_elems = tl.load(table_ptr + entry * 3 + 1) * 4
+    stride16 = tl.load(table_ptr + entry * 3 + 2)
+    start = chunk.to(tl.int64) * (BLOCK * ITERS)
+    if start < row_elems:
+        src = tl.load(idx_ptr + pair)
+        dst = tl.load(idx_ptr + num_pairs + pair)
+        src_row = anchor_ptr + (start16 + src * stride16) * 4
+        dst_row = anchor_ptr + (start16 + dst * stride16) * 4
+        for i in tl.static_range(ITERS):
+            offs = start + i * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < row_elems
+            vals = tl.load(src_row + offs, mask=mask)
+            tl.store(dst_row + offs, vals, mask=mask)
+
+
+def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
+    """Compile the copy-on-write kernel before serving (first use would
+    otherwise JIT inside a step).
+    """
+    if device.type != "cuda":
+        return
+    buf = torch.zeros(8, dtype=torch.int32, device=device)
+    table = torch.tensor([[0, 1, 1]], dtype=torch.int64, device=device)
+    indices = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    _copy_kv_cache_block_rows_kernel[(1, 1, 1)](
+        buf,
+        table,
+        indices,
+        1,
+        BLOCK=_COW_COPY_BLOCK,
+        ITERS=_COW_COPY_ITERS,
+        num_warps=4,
+    )
+
+
+# Row layout -> (anchor int32 tensor, device table, num entries, max row len16),
+# or None when the layout cannot be copied in one launch.
+_cow_copy_plans: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, int] | None] = {}
+
+
+def _cow_copy_rows(kv_caches: Iterable[torch.Tensor], num_blocks: int) -> tuple | None:
+    """Scheduler-block rows exactly as the per-storage path copies them: one
+    (storage, row address of block 0, row bytes, block stride bytes) per
+    distinct whole storage or per-layer view. None if unsupported.
+    """
+    device = None
+    rows_out: set[tuple[int, int, int, int]] = set()
+    seen: set[int] = set()
+    anchor = None
+    for cache in kv_caches:
+        if cache.data_ptr() in seen:
+            continue
+        seen.add(cache.data_ptr())
+        if device is None:
+            if not cache.is_cuda:
+                return None
+            device = cache.device
+        elif cache.device != device:
+            return None
+        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+        if remainder:
+            return None
+        storage = cache.untyped_storage()
+        if anchor is None:
+            anchor = storage
+        block_stride = cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+        if storage.nbytes() == num_blocks * block_stride:
+            rows_out.add(
+                (storage.data_ptr(), storage.data_ptr(), block_stride, block_stride)
+            )
+            continue
+        # Copying a block element by element equals copying its byte span when
+        # the block's elements densely tile that span (any dim order, e.g. a
+        # head-minor LBNHC page).
+        block = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))[0]
+        dims = sorted(
+            (stride, size)
+            for size, stride in zip(block.shape, block.stride())
+            if size != 1
+        )
+        dense_stride = 1
+        for stride, size in dims:
+            if stride != dense_stride:
+                return None
+            dense_stride *= size
+        rows_out.add(
+            (
+                storage.data_ptr(),
+                cache.data_ptr(),
+                block.numel() * cache.element_size(),
+                block_stride,
+            )
+        )
+    if anchor is None:
+        return None
+    return device, anchor, tuple(sorted(rows_out))
+
+
+def _cow_copy_rows_commute(
+    rows: tuple[tuple[int, int, int, int], ...], num_blocks: int
+) -> bool:
+    """True if, for every src/dst pair set with unique destinations disjoint
+    from the sources, all row copies may run in parallel with the result of
+    the sequential per-storage path. Rows of one block stride S that keep each
+    block's bytes inside one S-sized slot whose index is (region start in
+    num_blocks * S units) + block id cannot read bytes another copy writes
+    unless both address the same block (then they write identical bytes).
+    Rows of different strides must not overlap at all.
+    """
+    footprints: dict[tuple[int, int], tuple[int, int]] = {}
+    for storage, addr, length, stride in rows:
+        if (addr | length | stride) % 16 or length > stride:
+            return False
+        slot, offset = divmod(addr - storage, stride)
+        if offset + length > stride or slot % num_blocks:
+            return False
+        lo = addr
+        hi = addr + (num_blocks - 1) * stride + length
+        key = (storage, stride)
+        if key in footprints:
+            old_lo, old_hi = footprints[key]
+            lo, hi = min(lo, old_lo), max(hi, old_hi)
+        footprints[key] = (lo, hi)
+    spans = sorted(footprints.values())
+    return all(prev[1] <= cur[0] for prev, cur in zip(spans, spans[1:]))
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
@@ -689,8 +838,84 @@ def copy_kv_cache_blocks_inplace(
 ) -> None:
     if not kv_cache_block_copies:
         return
-
+    kv_caches = list(kv_caches)
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    src_np, dst_np = indices_np[:, 0], indices_np[:, 1]
+    plan = None
+    # Direct row copies equal gather-then-scatter only when destinations are
+    # unique and no block is both a source and a destination.
+    if (
+        len(np.unique(dst_np)) == len(dst_np)
+        and not np.intersect1d(src_np, dst_np).size
+    ):
+        layout = _cow_copy_rows(kv_caches, num_blocks)
+        if layout is not None:
+            device, anchor_storage, rows = layout
+            key = (device, anchor_storage.data_ptr(), num_blocks, rows)
+            if key not in _cow_copy_plans:
+                _cow_copy_plans[key] = _make_cow_copy_plan(
+                    device, anchor_storage, rows, num_blocks
+                )
+            plan = _cow_copy_plans[key]
+    if plan is None:
+        _copy_kv_cache_blocks_inplace_per_storage(kv_caches, num_blocks, indices_np)
+        return
+    anchor, table, num_entries, max_len16 = plan
+    indices = async_tensor_h2d(np.concatenate([src_np, dst_np]), device=anchor.device)
+    num_pairs = len(indices_np)
+    grid = (
+        num_pairs,
+        triton.cdiv(max_len16 * 4, _COW_COPY_BLOCK * _COW_COPY_ITERS),
+        num_entries,
+    )
+    _copy_kv_cache_block_rows_kernel[grid](
+        anchor,
+        table,
+        indices,
+        num_pairs,
+        BLOCK=_COW_COPY_BLOCK,
+        ITERS=_COW_COPY_ITERS,
+        num_warps=4,
+    )
+
+
+def _make_cow_copy_plan(
+    device: torch.device,
+    anchor_storage: torch.UntypedStorage,
+    rows: tuple[tuple[int, int, int, int], ...],
+    num_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, int, int] | None:
+    if not _cow_copy_rows_commute(rows, num_blocks) or anchor_storage.data_ptr() % 16:
+        logger.info_once(
+            "KV copy-on-write: %d cache rows are not provably disjoint or "
+            "16-byte aligned; using the per-storage copy.",
+            len(rows),
+        )
+        return None
+    base = anchor_storage.data_ptr()
+    table = np.array(
+        [
+            ((addr - base) // 16, length // 16, stride // 16)
+            for _, addr, length, stride in rows
+        ],
+        dtype=np.int64,
+    )
+    anchor = torch.empty(0, dtype=torch.int32, device=device)
+    anchor.set_(anchor_storage, 0, (anchor_storage.nbytes() // 4,))
+    max_len16 = max(length for _, _, length, _ in rows) // 16
+    logger.info_once(
+        "KV copy-on-write: %d cache rows of up to %d bytes in one launch.",
+        len(rows),
+        max_len16 * 16,
+    )
+    return anchor, torch.from_numpy(table).to(device), len(rows), max_len16
+
+
+def _copy_kv_cache_blocks_inplace_per_storage(
+    kv_caches: Iterable[torch.Tensor],
+    num_blocks: int,
+    indices_np: np.ndarray,
+) -> None:
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()

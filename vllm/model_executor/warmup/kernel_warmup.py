@@ -190,6 +190,9 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
     mamba_triton_warmup(worker.model_runner)
+    from vllm.v1.worker.utils import warmup_copy_kv_cache_block_rows
+
+    warmup_copy_kv_cache_block_rows(worker.model_runner.device)
     if worker.use_v2_model_runner:
         fused_spec_sampler_warmup(worker.model_runner)
 
