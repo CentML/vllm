@@ -32,7 +32,7 @@ HIDDEN = HV * V
 EPS = 1e-6
 
 
-def _case(num_requests, num_padded, seed, device, S=4):
+def _case(num_requests, num_padded, seed, device, S=4, state_dtype=torch.float32):
     """Requests of 1..S tokens (one without a valid source state, one with a
     skipped destination slot), plus ``num_padded`` FULL-graph padding
     requests (no tokens) whose rows are padding.
@@ -59,7 +59,7 @@ def _case(num_requests, num_padded, seed, device, S=4):
     # SD layout: [slots, state_len, dim] storage, [slots, dim, state_len] view.
     conv_state = torch.randn(slots, W - 1 + S - 1, CONV_DIM, generator=g)
     conv_state = conv_state.to(torch.bfloat16)
-    state = 0.05 * torch.randn(slots, HV, V, K, generator=g)
+    state = (0.05 * torch.randn(slots, HV, V, K, generator=g)).to(state_dtype)
     A_log = torch.log(torch.empty(HV).uniform_(1, 16, generator=g))
     dt_bias = torch.randn(HV, generator=g)
     norm_w = (1 + 0.1 * torch.randn(V, generator=g)).to(torch.bfloat16)
@@ -163,18 +163,24 @@ def _padding_scales(out_scale, rows, n_valid):
     return out_scale[off]
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "num_requests,num_padded", [(1, 0), (2, 0), (3, 1), (4, 0), (6, 2)]
 )
 @pytest.mark.parametrize("block_v,num_warps", [(None, None), (8, 2), (32, 4)])
 @pytest.mark.parametrize("spec_tokens", [1, 4, 5, 6])
 def test_fused_decode_matches_three_kernels(
-    num_requests, num_padded, block_v, num_warps, spec_tokens
+    num_requests, num_padded, block_v, num_warps, spec_tokens, state_dtype
 ):
     """``spec_tokens`` = MTP draft tokens + 1 per request (k = 3 -> 4)."""
     device = torch.device("cuda")
     ref_t, n, rows = _case(
-        num_requests, num_padded, 7 * num_requests, device, S=spec_tokens
+        num_requests,
+        num_padded,
+        7 * num_requests,
+        device,
+        S=spec_tokens,
+        state_dtype=state_dtype,
     )
     fused_t = {k: v.clone() for k, v in ref_t.items()}
     n_valid = int(ref_t["cu"][-1])
@@ -187,16 +193,29 @@ def test_fused_decode_matches_three_kernels(
     # Conv window roll (stored raw values, every slot): bitwise.
     assert torch.equal(fused_t["conv_state"], ref_t["conv_state"])
     # SSM states: written slots agree to fp32 rounding (the q/k L2-norm sums
-    # reduce in a different order); untouched slots keep their bytes.
-    torch.testing.assert_close(fused_t["state"], ref_t["state"], rtol=1e-5, atol=1e-6)
+    # reduce in a different order); untouched slots keep their bytes. A bf16
+    # pool stores both rounded to nearest even, so the rare values whose fp32
+    # results straddle a rounding boundary differ by one bf16 step.
+    if state_dtype == torch.bfloat16:
+        torch.testing.assert_close(
+            fused_t["state"], ref_t["state"], rtol=2**-7, atol=1e-6
+        )
+        diff = fused_t["state"] != ref_t["state"]
+        assert diff.float().mean() < 1e-3
+    else:
+        torch.testing.assert_close(
+            fused_t["state"], ref_t["state"], rtol=1e-5, atol=1e-6
+        )
     # Padding rows: zero values, and zero scales up to the 128-row padding.
     assert not out_q[n_valid:].view(torch.uint8).any()
     assert not _padding_scales(out_scale, rows, n_valid).any()
     # Valid rows: the same MXFP8 activation up to rare one-step rounding
-    # flips of a value or a block scale.
+    # flips of a value or a block scale (one e4m3 step is up to 1/8 relative;
+    # the bf16-pool cases hit a 1/13 step).
     deq = _dequant(out_q, out_scale)[:n_valid]
     ref = _dequant(ref_q, ref_scale)[:n_valid]
-    torch.testing.assert_close(deq, ref, rtol=0.07, atol=1e-3)
+    rtol = 0.07 if state_dtype == torch.float32 else 0.125
+    torch.testing.assert_close(deq, ref, rtol=rtol, atol=1e-3)
     flips = out_q[:n_valid].view(torch.uint8) != ref_q[:n_valid].view(torch.uint8)
     assert flips.float().mean() < 1e-3
 
