@@ -528,8 +528,10 @@ class InputProcessor:
                         )
 
         if prompt_ids and tokenizer is not None:
-            max_input_id = max(prompt_ids, default=0)
-            min_input_id = min(prompt_ids, default=0)
+            # VLLM_FEH_MEMO=1: one exact int32 pass shared with FEH (same values).
+            min_input_id, max_input_id = frontend_block_hashing.prompt_id_min_max(
+                prompt_ids
+            )
 
             # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
             # self.model_config.get_vocab_size() is the model’s vocab size.

@@ -91,6 +91,37 @@ MEMO_STATS = {
     "verify_mismatch": 0,
 }
 _memo: dict[tuple, tuple[int, list]] = {}
+# The front end converts each prompt to an exact int32 array once (validation and
+# the memo share it); keyed on the list object identity and length.
+_last_arr = threading.local()
+
+
+def _int32_array(toks):
+    """array('i') of ``toks`` (shared by prompt_id_min_max and the memo), or
+    None if a value does not fit int32."""
+    c = getattr(_last_arr, "v", None)
+    if c is not None and c[0] is toks and c[1] == len(toks):
+        return c[2]
+    try:
+        arr = array.array("i", toks)
+    except (OverflowError, TypeError):
+        arr = None
+    _last_arr.v = (toks, len(toks), arr)
+    return arr
+
+
+def prompt_id_min_max(toks) -> tuple[int, int]:
+    """(min, max) of the prompt token ids. With VLLM_FEH_MEMO=1 one exact int32
+    conversion (reused by the memo) + numpy min/max replaces two Python-level
+    passes over the prompt; same values."""
+    if FEH_MEMO and len(toks) >= 4096:
+        arr = _int32_array(toks)
+        if arr is not None:
+            import numpy as np
+
+            a = np.frombuffer(arr, dtype=np.int32)
+            return int(a.min()), int(a.max())
+    return min(toks, default=0), max(toks, default=0)
 _memo_lru: "OrderedDict[int, list]" = OrderedDict()
 _memo_next = [0]
 
@@ -178,9 +209,8 @@ def _memo_blob(fn, kvu, toks, salt) -> bytes:
     B = FEH_BLOCK
     ck = max(1, round(FEH_MEMO_CK / B)) * B
     n = len(toks) // B
-    try:
-        arr = array.array("i", toks)
-    except (OverflowError, TypeError):
+    arr = _int32_array(toks)
+    if arr is None:
         MEMO_STATS["fallback"] += 1
         return _stock_blob(fn, kvu, toks, salt)
     # Fingerprint every ck tokens of the full-block region (exact int32 bytes).
@@ -204,6 +234,7 @@ def _memo_blob(fn, kvu, toks, salt) -> bytes:
     MEMO_STATS["blocks_total"] += n
     MEMO_STATS["blocks_hashed"] += n - start
     blob = b"".join([_MAGIC, B.to_bytes(4, "little")] + hashes)
+    _last_arr.v = None
     if start:
         MEMO_STATS["hits"] += 1
         if _MEMO_VERIFY_LEFT[0] > 0:
