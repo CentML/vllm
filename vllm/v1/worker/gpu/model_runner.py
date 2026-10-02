@@ -87,6 +87,7 @@ from vllm.v1.worker import fused_kv_block_copy
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import cudagraph_profile_cleanup
+from vllm.v1.worker.gpu import sample_graph
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -227,6 +228,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = torch.cuda.Stream(self.device)
+        self._sampler_graphs = None  # opt-in VLLM_SAMPLER_GRAPH
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -2078,9 +2080,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for states in aux_hidden_states
             ]
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        if sample_graph.ENABLED:
+            # Opt-in: CUDA-graph replay of the decode-step verify sampler.
+            if self._sampler_graphs is None:
+                self._sampler_graphs = sample_graph.SamplerGraphs(self)
+            sampler_output, num_sampled, num_rejected = self._sampler_graphs.sample(
+                hidden_states, input_batch, grammar_output
+            )
+        else:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
