@@ -51,6 +51,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -144,6 +145,11 @@ GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS",
 GDN_FUSED_DECODE_MAX_REQUESTS = int(
     os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_REQS", "0")
 )
+# Larger spec-decode batches run the register-resident CUDA kernel of
+# ops/gdn_mtp_cuda.py (JIT-built by the GDN warmup; same contract as the csrc
+# MTP kernel, VR 77 requests: 77.0 vs 81.6 us, 48: 48.3 vs 55.3 us) instead of
+# the csrc kernel; VLLM_GDN_MTP_JIT=0 keeps the csrc kernel.
+GDN_MTP_CUDA_JIT = os.environ.get("VLLM_GDN_MTP_JIT", "1") == "1"
 # FlashInfer GDN prefill: a single sequence of at most this many tokens runs
 # the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
@@ -1530,6 +1536,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.head_v_dim == 128
         ):
             _gdn_vsplit_warmup(num_k_heads, num_v_heads, self.head_k_dim, dtype, device)
+        if (
+            GDN_MTP_CUDA_JIT
+            and self.gdn_decode_kernel == "cuda"
+            and current_platform.is_device_capability_family(100)
+        ):
+            gdn_mtp_cuda.enable()
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -2565,23 +2577,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 scale=self.head_k_dim**-0.5,
             )
             return False
-        ops.fused_gdn_decode_post_conv_mtp(
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            state_indices=state_indices[:num_requests],
-            cu_seqlens=cu_seqlens[: num_requests + 1],
-            num_accepted_tokens=num_accepted_tokens[:num_requests],
-            state=self.kv_cache[1],
-            output_gate=output_gate,
-            norm_weight=self.norm.weight,
-            out=core_attn_out,
-            scale=self.head_k_dim**-0.5,
-            norm_eps=self.layer_norm_epsilon,
-            output_gate_activation=self.norm.activation,
+        args = (
+            mixed_qkv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state_indices[:num_requests],
+            cu_seqlens[: num_requests + 1],
+            num_accepted_tokens[:num_requests],
+            self.kv_cache[1],
+            output_gate,
+            self.norm.weight,
+            core_attn_out,
+            self.head_k_dim**-0.5,
+            self.layer_norm_epsilon,
+            self.norm.activation,
         )
+        if gdn_mtp_cuda.ready() and gdn_mtp_cuda.gdn_mtp_cuda(*args):
+            return True
+        ops.fused_gdn_decode_post_conv_mtp(*args)
         return True
 
     def _forward_core_decode_spec_one_launch(
