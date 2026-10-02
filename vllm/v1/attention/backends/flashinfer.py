@@ -1816,6 +1816,12 @@ def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | Non
             return None
         buf = torch.zeros(_FI_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
         _FI_KV_COUNTER_BUFS[(device, kind)] = buf
+        logger.info(
+            "FI persistent KV counter on: kind=%s device=%s bytes=%d",
+            kind,
+            device,
+            _FI_KV_COUNTER_BYTES,
+        )
     return buf
 
 
