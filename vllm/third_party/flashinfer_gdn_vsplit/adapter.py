@@ -72,7 +72,7 @@ def chunk_gated_delta_rule_vsplit(
 ) -> None:
     """Same contract as flashinfer chunk_gated_delta_rule_sm100 (no checkpoints).
     q/k: [T, HQ, 128] bf16, v/output: [T, HV, 128], gate (=exp(g)) / beta: [T, HV] fp32,
-    cu_seqlens int32 [B+1], states [N, HV, 128(V), 128(K)] fp32 (pool if state_indices)."""
+    cu_seqlens int32 [B+1], states [N, HV, 128(V), 128(K)] fp32 or bf16 (pool if state_indices)."""
     HQ, HV, DK = q.size(1), v.size(1), q.size(2)
     assert DK == 128 and v.size(2) == 128
     assert cu_seqlens.dtype == torch.int32
