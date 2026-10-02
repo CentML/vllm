@@ -98,6 +98,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         ),
         load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
     )
+    # Honor speculative_config.moe_backend for the draft (the target's
+    # --moe-backend may not support the draft's quantization, e.g. MXFP4 draft
+    # with an NVFP4-only backend such as flashinfer_cutedsl).
+    if speculative_config.moe_backend is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            kernel_config=replace(
+                draft_vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
