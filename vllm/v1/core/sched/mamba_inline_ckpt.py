@@ -64,6 +64,8 @@ KIND_BLOCK = 0  # state at a block boundary -> the block-table column that held 
 #                 chunk's initial state (written in place)
 KIND_TAIL = 1  # state at the partial-tail boundary -> a reserved side block
 KIND_RUN = 2  # the running block (state at the chunk end; worker VERIFY only)
+KIND_SPLIT = 3  # a block boundary whose state is not cached: no write, but the
+#                 worker splits a later checkpoint's replay there (split-flow grid)
 
 
 def tail_boundary(num_prompt_tokens: int, hash_block_size: int, eagle_drop: bool) -> int:

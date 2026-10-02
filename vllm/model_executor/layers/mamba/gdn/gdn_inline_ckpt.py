@@ -46,7 +46,7 @@ LOG_EVERY = max(1, int(os.environ.get("VLLM_MAMBA_TAIL_CKPT_LOG_EVERY", "2000") 
 # per layer instead of one pair per checkpoint (same per-sequence math)
 BATCH = os.environ.get("VLLM_MAMBA_TAIL_CKPT_BATCH", "1") == "1"
 
-KIND_BLOCK, KIND_TAIL, KIND_RUN = 0, 1, 2
+KIND_BLOCK, KIND_TAIL, KIND_RUN, KIND_SPLIT = 0, 1, 2, 3  # = mamba_inline_ckpt.KIND_*
 
 STATS = {
     "steps": 0,
@@ -66,23 +66,24 @@ _MODS: dict = {}
 
 class _Step:
     """One forward's checkpoints. rows: per request (a0, start, end, ckpts), a0 =
-    the request's first row in the step's token batch. per_group: per KV-cache
-    group the replay records (a0, L, slot_t, hi_t, cu_t, zero_init, kind, pos,
-    slot, start, end); slot_t / cu_t / hi_t are views of one device copy."""
+    the request's first row in the step's token batch. per_group: gid -> the
+    records (a0, slot, kind, pos, start, end, zero_init) (VERIFY); waves: gid ->
+    list of launches; copies: gid -> page copies (src, dst) after the first wave;
+    zeros: gid -> pages to zero-fill before the first wave."""
 
-    __slots__ = ("rows", "dev", "per_group", "batch", "bufs", "ws", "lmax", "_keep")
+    __slots__ = ("rows", "dev", "per_group", "waves", "copies", "zeros", "bufs",
+                 "lmax", "_keep")
 
     def __init__(self, rows, dev):
         self.rows = rows
         self.dev = dev
         self.per_group: dict[int, list] = {}
-        # gid -> (row index, slots, has_init, cu (+ device_nb count), R, Ltot, maxL,
-        #         zero-init slots) for the gathered launch
-        self.batch: dict[int, tuple] = {}
+        self.waves: dict[int, list] = {}
+        self.copies: dict[int, list] = {}
+        self.zeros: dict[int, list] = {}
         self.bufs = None
-        self.ws = None
         self.lmax = 0
-        self._keep = None
+        self._keep = []
 
 
 _STEP: list = [None]
@@ -157,9 +158,44 @@ def end_step() -> None:
     _STEP[0] = None
 
 
+def _plan_jobs(rows, gid):
+    """Per request of the step: the split flow's chunk chain that produces this
+    group's checkpoints. A tail checkpoint D (pre-filled with the state at start)
+    replays [start, b) [b, T) when a block boundary b lies before T (the split
+    flow restarts its chunk grid at b), else [start, T); a cached block state X
+    is a page copy of D after [start, b), or its own replay [start, b) in place
+    when there is no tail checkpoint. Returns jobs (target slot, zero_init,
+    [(row offset, length, has_init), ...], copy-after-first-segment slot)."""
+    jobs = []
+    for a0, start, end, cks in rows:
+        b = 0
+        x = d = None
+        zero = False
+        for pos, kind, zero_init, blocks in cks:
+            if kind in (KIND_BLOCK, KIND_SPLIT):
+                b = pos
+                if kind == KIND_BLOCK:
+                    x = blocks[gid]
+            elif kind == KIND_TAIL:
+                t, d, zero = pos, blocks[gid], bool(zero_init)
+        if d is not None:
+            cuts = [start] + ([b] if start < b < t else []) + [t]
+            segs = [
+                (a0 + lo - start, hi - lo, (lo > start) or (start > 0 and not zero))
+                for lo, hi in zip(cuts, cuts[1:])
+            ]
+            copy_to = x if (x is not None and len(cuts) == 3) else None
+            jobs.append((d, zero, segs, copy_to))
+            if x is not None and copy_to is None:
+                raise RuntimeError(f"[F122] block checkpoint {b} not before tail {t}")
+        elif x is not None:
+            jobs.append((x, False, [(a0, b - start, start > 0)], None))
+    return jobs
+
+
 def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
     """Model runner, after prepare_inputs / the align pre-copy and before the
-    forward: map this step's checkpoints onto token rows."""
+    forward: map this step's checkpoints onto token rows and launch plans."""
     _STEP[0] = None
     ck = getattr(scheduler_output, "mamba_inline_ckpts", None) if scheduler_output else None
     if not ck:
@@ -181,90 +217,82 @@ def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
             )
         rows.append((a0, start, end, ckpts))
     st = _Step(rows, device)
-    # one host int32 row per record: [slot, cu0=0, cu1=L, nb=1] (cu_seqlens plus
-    # the device_nb count), one bool per record: has_initial_state; one copy
-    meta = []
-    for a0, start, end, cks in rows:
-        for pos, kind, zero_init, blocks in cks:
-            for gid, blk in blocks.items():
-                meta.append((gid, a0, start, end, pos, kind, bool(zero_init), blk))
+    gids = sorted({g for _, _, _, cks in rows for c in cks for g in c[3]})
     pin = torch.cuda.is_available()
-    ints = torch.empty((len(meta), 4), dtype=torch.int32, pin_memory=pin)
-    hib = torch.empty((len(meta),), dtype=torch.bool, pin_memory=pin)
-    for r, (gid, a0, start, end, pos, kind, zero_init, blk) in enumerate(meta):
-        ints[r, 0] = blk
-        ints[r, 1] = 0
-        ints[r, 2] = pos - start
-        ints[r, 3] = 1
-        hib[r] = start > 0 and not zero_init
-    ints_d = ints.to(device, non_blocking=True)
-    hib_d = hib.to(device, non_blocking=True)
-    st._keep = (ints, hib, ints_d, hib_d)
-    for r, (gid, a0, start, end, pos, kind, zero_init, blk) in enumerate(meta):
-        L = pos - start
-        assert L > 0
-        st.per_group.setdefault(gid, []).append(
-            (
-                a0,
-                L,
-                ints_d[r, 0:1],
-                hib_d[r : r + 1],
-                ints_d[r, 1:3],
-                zero_init,
-                kind,
-                pos,
-                blk,
-                start,
-                end,
-            )
-        )
-        if kind != KIND_RUN:
-            st.lmax = max(st.lmax, L)
-    if BATCH:
-        keep = []
-        for gid, recs in st.per_group.items():
-            ck = [r for r in recs if r[6] != KIND_RUN]
-            if len(ck) < 2:
-                continue
-            idx = torch.cat([torch.arange(r[0], r[0] + r[1], dtype=torch.int64) for r in ck])
-            cu = [0]
-            for r in ck:
-                cu.append(cu[-1] + r[1])
-            cu.append(len(ck))  # device_nb count right after cu_seqlens
-            meta_i = torch.tensor([r[8] for r in ck] + cu, dtype=torch.int32)
-            meta_b = torch.tensor([r[9] > 0 and not r[5] for r in ck], dtype=torch.bool)
-            if pin:
-                idx, meta_i, meta_b = idx.pin_memory(), meta_i.pin_memory(), meta_b.pin_memory()
-            idx_d = idx.to(device, non_blocking=True)
-            mi_d = meta_i.to(device, non_blocking=True)
-            mb_d = meta_b.to(device, non_blocking=True)
-            keep += [idx, meta_i, meta_b, idx_d, mi_d, mb_d]
-            R = len(ck)
-            st.batch[gid] = (
-                idx_d,
-                mi_d[:R],
-                mb_d,
-                mi_d[R : 2 * R + 1],
-                R,
-                cu[R],
-                max(r[1] for r in ck),
-                [r[8] for r in ck if r[5]],
-            )
-            st.lmax = max(st.lmax, cu[R])
-        st._keep = st._keep + tuple(keep)
+
+    def dev_i32(vals):
+        t = torch.tensor(vals, dtype=torch.int32)
+        if pin:
+            t = t.pin_memory()
+        d = t.to(device, non_blocking=True)
+        st._keep += [t, d]
+        return d
+
+    def dev_bool(vals):
+        t = torch.tensor(vals, dtype=torch.bool)
+        if pin:
+            t = t.pin_memory()
+        d = t.to(device, non_blocking=True)
+        st._keep += [t, d]
+        return d
+
+    for gid in gids:
+        st.per_group[gid] = [
+            (a0, blocks[gid], kind, pos, start, end, bool(zero_init))
+            for a0, start, end, cks in rows
+            for pos, kind, zero_init, blocks in cks
+        ]
+        jobs = _plan_jobs(rows, gid)
+        if not jobs:
+            continue
+        st.zeros[gid] = [j[0] for j in jobs if j[1]]
+        st.copies[gid] = [(j[0], j[3]) for j in jobs if j[3] is not None]
+        waves = []
+        for w in range(max(len(j[2]) for j in jobs)):
+            segs = [(j[0], j[2][w]) for j in jobs if len(j[2]) > w]
+            if len(segs) == 1 or not BATCH:
+                for slot, (r0, L, hi) in segs:
+                    m = dev_i32([slot, 0, L, 1])  # slot | cu_seqlens | device_nb count
+                    waves.append(("one", (r0, L, m[0:1], dev_bool([hi]), m[1:3])))
+                    st.lmax = max(st.lmax, L)
+            else:
+                idx = torch.cat(
+                    [torch.arange(r0, r0 + L, dtype=torch.int64) for _, (r0, L, _) in segs]
+                )
+                if pin:
+                    idx = idx.pin_memory()
+                idx_d = idx.to(device, non_blocking=True)
+                st._keep += [idx, idx_d]
+                cu = [0]
+                for _, (_, L, _) in segs:
+                    cu.append(cu[-1] + L)
+                R = len(segs)
+                m = dev_i32([slot for slot, _ in segs] + cu + [R])
+                waves.append(
+                    (
+                        "batch",
+                        (idx_d, m[:R], dev_bool([hi for _, (_, _, hi) in segs]),
+                         m[R : 2 * R + 1], R, cu[R], max(L for _, (_, L, _) in segs)),
+                    )
+                )
+                st.lmax = max(st.lmax, cu[R])
+            if w == 0:
+                waves.append(("copy", None))
+        st.waves[gid] = waves
     _STEP[0] = st
     STATS["steps"] += 1
     STATS["rows"] += len(rows)
     for _, _, _, cks in rows:
         for c in cks:
             STATS["block_ckpts"] += int(c[1] == KIND_BLOCK)
+            STATS["block_splits"] = STATS.get("block_splits", 0) + int(c[1] == KIND_SPLIT)
             STATS["tail_ckpts"] += int(c[1] == KIND_TAIL)
             STATS["zero_init"] += int(c[1] == KIND_TAIL and c[2])
     if STATS["steps"] <= 3 or STATS["steps"] % LOG_EVERY == 0:
         logger.info(
             "[F122] worker step #%d rows=%s devnb=%d stats=%s",
             STATS["steps"],
-            [(a0, s, e, [(c[0], c[1], c[2]) for c in cks]) for a0, s, e, cks in rows],
+            [(a0, s_, e, [(c[0], c[1], c[2]) for c in cks]) for a0, s_, e, cks in rows],
             int(_use_devnb()),
             dict(STATS),
         )
@@ -407,89 +435,55 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
     gid = _LAYER_GROUP.get(layer.prefix)
     if gid is None:
         raise RuntimeError(f"[F122] GDN layer {layer.prefix} has no KV-cache group")
-    recs = st.per_group.get(gid)
-    if not recs:
+    waves = st.waves.get(gid)
+    if not waves:
         return
     conv_state, ssm, _ = _layer_views(layer)
     pages = None
     verify = VERIFY[0] > 0 and not torch.cuda.is_current_stream_capturing()
+    recs = st.per_group.get(gid, [])
     snaps = None
     if verify:
         pages = _pages_u8(layer)
-        snaps = {r[8]: pages[r[8]].clone() for r in recs}
+        snaps = {r[1]: pages[r[1]].clone() for r in recs if r[2] != KIND_SPLIT}
     if st.bufs is None:
         H = layer.num_k_heads // layer.tp_size
         HV = layer.num_v_heads // layer.tp_size
         # one set of conv-output / scratch-output buffers per step, reused by
-        # every layer (stream-ordered)
+        # every layer and launch (stream-ordered)
         st.bufs = _alloc_bufs(
             st.lmax, H, HV, layer.head_k_dim, layer.head_v_dim, mixed_qkv.dtype,
             mixed_qkv.device,
         )
-        if _use_devnb():
-            from vllm.third_party.flashinfer_gdn_vsplit_devnb.gdn_chunked_vs import (
-                GatedDeltaNetChunkedKernel as _K,
-            )
-
-            nsm = torch.cuda.get_device_properties(mixed_qkv.device).multi_processor_count
-            st.ws = torch.empty(
-                _K.get_workspace_size(nsm, 1, H, HV, True),
-                dtype=torch.int8,
-                device=mixed_qkv.device,
-            )
-    bt = st.batch.get(gid)
-    if bt is not None:
-        idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl, zero_slots = bt
-        if zero_slots:
-            if pages is None:
-                pages = _pages_u8(layer)
-            for slot in zero_slots:
-                pages[slot].zero_()
-        run_chunk(
-            layer,
-            mixed_qkv.index_select(0, idx_d),
-            a.index_select(0, idx_d),
-            b.index_select(0, idx_d),
-            conv_state,
-            ssm,
-            slots_d,
-            hi_d,
-            cu_d,
-            Ltot,
-            bufs=st.bufs,
-            ws=None,
-            nseq=R,
-            maxlen=maxl,
-        )
-        STATS["replays"] += R
-        STATS["replay_tokens"] += Ltot
-        STATS["batched_launches"] = STATS.get("batched_launches", 0) + 1
-        recs_iter = ()
-    else:
-        recs_iter = recs
-    for a0, L, slot_t, hi_t, cu_t, zero_init, kind, pos, slot, start, end in recs_iter:
-        if kind == KIND_RUN:
-            continue  # the running block (VERIFY only)
-        if zero_init:
-            if pages is None:
-                pages = _pages_u8(layer)
+    zeros = st.zeros.get(gid)
+    if zeros:
+        if pages is None:
+            pages = _pages_u8(layer)
+        for slot in zeros:
             pages[slot].zero_()
-        run_chunk(
-            layer,
-            mixed_qkv[a0 : a0 + L],
-            a[a0 : a0 + L],
-            b[a0 : a0 + L],
-            conv_state,
-            ssm,
-            slot_t,
-            hi_t,
-            cu_t,
-            L,
-            bufs=st.bufs,
-            ws=st.ws,
-        )
-        STATS["replays"] += 1
-        STATS["replay_tokens"] += L
+    for kind, w in waves:
+        if kind == "one":
+            r0, L, slot_t, hi_t, cu_t = w
+            run_chunk(layer, mixed_qkv[r0 : r0 + L], a[r0 : r0 + L], b[r0 : r0 + L],
+                      conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=st.bufs)
+            STATS["replays"] += 1
+            STATS["replay_tokens"] += L
+        elif kind == "batch":
+            idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl = w
+            run_chunk(layer, mixed_qkv.index_select(0, idx_d), a.index_select(0, idx_d),
+                      b.index_select(0, idx_d), conv_state, ssm, slots_d, hi_d, cu_d, Ltot,
+                      bufs=st.bufs, nseq=R, maxlen=maxl)
+            STATS["replays"] += R
+            STATS["replay_tokens"] += Ltot
+            STATS["batched_launches"] = STATS.get("batched_launches", 0) + 1
+        else:  # page copies after the first wave: D (state at b) -> X
+            cps = st.copies.get(gid)
+            if cps:
+                if pages is None:
+                    pages = _pages_u8(layer)
+                for src, dst in cps:
+                    pages[dst].copy_(pages[src])
+                STATS["page_copies"] = STATS.get("page_copies", 0) + len(cps)
     if verify:
         _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out)
 
@@ -520,7 +514,8 @@ def _scratch_views(layer, page_src):
 
 
 def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
-    """Split-flow chain on a scratch pool vs the in-step checkpoints (bitwise)."""
+    """Split-flow chain on a scratch page vs the in-step checkpoints (bitwise).
+    recs: (a0, slot, kind, pos, start, end, zero_init)."""
     conv, ssm = layer.kv_cache[0], layer.kv_cache[1]
     pages = _pages_u8(layer)
     base = min(conv.data_ptr(), ssm.data_ptr())
@@ -531,57 +526,48 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
     dev = ssm.device
     by_req: dict = {}
     for r in recs:
-        by_req.setdefault((r[0], r[9], r[10]), []).append(r)
+        by_req.setdefault((r[0], r[4], r[5]), []).append(r)
     for (a0, start, end), rs in by_req.items():
         if VERIFY[0] <= 0:
             return
         VERIFY[0] -= 1
-        rs = sorted(rs, key=lambda r: (r[7], r[6]))
-        ck = [r for r in rs if r[6] != KIND_RUN]
-        run = [r for r in rs if r[6] == KIND_RUN]
+        rs = sorted(rs, key=lambda r: (r[3], r[2]))
+        cuts = [r for r in rs if r[2] in (KIND_BLOCK, KIND_SPLIT, KIND_TAIL)]
+        run = [r for r in rs if r[2] == KIND_RUN]
         bad = []
         # the state at `start`: D's pre-copied page, else X before its replay
-        d_init = next((snaps[r[8]] for r in ck if r[6] == KIND_TAIL), None)
-        x_init = next((snaps[r[8]] for r in ck if r[6] == KIND_BLOCK), None)
-        zero = any(r[5] for r in ck)
+        d_init = next((snaps[r[1]] for r in cuts if r[2] == KIND_TAIL), None)
+        x_init = next((snaps[r[1]] for r in cuts if r[2] == KIND_BLOCK), None)
+        zero = any(r[6] for r in cuts if r[2] == KIND_TAIL)
         if d_init is not None and x_init is not None and not zero:
             if not torch.equal(d_init[s0:s1], x_init[s0:s1]):
                 bad.append("precopy_ssm")
             if not torch.equal(d_init[c0:c1], x_init[c0:c1]):
                 bad.append("precopy_conv")
         init = d_init if d_init is not None else x_init
+        if init is None:
+            continue
         raw, s_conv, s_ssm = _scratch_views(layer, init)
         if zero:
             raw.zero_()
         slot0 = torch.zeros(1, dtype=torch.int32, device=dev)
         cur = start
-        for r in ck + [None]:
-            pos = end if r is None else r[7]
+        for r in cuts + [None]:
+            pos = end if r is None else r[3]
             L = pos - cur
             if L <= 0:
                 continue
-            hi = torch.tensor([cur > 0 and not (zero and cur == start)], device=dev)
+            hi = torch.tensor([cur > start or (start > 0 and not zero)], device=dev)
             cu = torch.tensor([0, L, 1], dtype=torch.int32, device=dev)
             lo, hi_row = a0 + cur - start, a0 + pos - start
             # the other V-split kernel copy than the replay: also checks that the
             # graph (device_nb) and eager kernels store the same bits
-            run_chunk(
-                layer,
-                mixed_qkv[lo:hi_row],
-                a[lo:hi_row],
-                b[lo:hi_row],
-                s_conv,
-                s_ssm,
-                slot0,
-                hi,
-                cu[:2],
-                L,
-                devnb=not _use_devnb(),
-            )
+            run_chunk(layer, mixed_qkv[lo:hi_row], a[lo:hi_row], b[lo:hi_row], s_conv,
+                      s_ssm, slot0, hi, cu[:2], L, devnb=not _use_devnb())
             cur = pos
-            if r is None:
-                break
-            got = pages[r[8]]
+            if r is None or r[2] == KIND_SPLIT:
+                continue
+            got = pages[r[1]]
             if not torch.equal(got[s0:s1], raw[s0:s1]):
                 d = (got[s0:s1].view(torch.float32) - raw[s0:s1].view(torch.float32)).abs()
                 bad.append(f"ssm@{pos}:max{float(d.max()):.3g}")
@@ -591,7 +577,7 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
         # informational, float-order)
         fin = "n/a"
         if run:
-            got = pages[run[0][8]]
+            got = pages[run[0][1]]
             if torch.equal(got[s0:s1], raw[s0:s1]):
                 fin = "bitwise"
             else:
@@ -601,25 +587,16 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
                 fin == "bitwise"
             )
         STATS["verify_layers"] += 1
+        desc = [(r[3], r[2]) for r in cuts]
         if bad:
             STATS["verify_mismatch"] += 1
             logger.warning(
                 "[F122] VERIFY MISMATCH layer=%s group=%d start=%d end=%d ckpts=%s bad=%s",
-                layer.prefix,
-                gid,
-                start,
-                end,
-                [(r[7], r[6]) for r in ck],
-                bad,
+                layer.prefix, gid, start, end, desc, bad,
             )
-        elif STATS["verify_layers"] <= 5 or STATS["verify_layers"] % 100 == 0:
+        elif (STATS["verify_layers"] <= 5 or STATS["verify_layers"] % 100 == 0
+              or any(r[2] in (KIND_BLOCK, KIND_SPLIT) for r in cuts) and STATS["verify_layers"] % 10 == 0):
             logger.info(
                 "[F122] verify ok #%d layer=%s group=%d start=%d end=%d ckpts=%s final=%s",
-                STATS["verify_layers"],
-                layer.prefix,
-                gid,
-                start,
-                end,
-                [(r[7], r[6]) for r in ck],
-                fin,
+                STATS["verify_layers"], layer.prefix, gid, start, end, desc, fin,
             )

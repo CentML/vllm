@@ -163,9 +163,11 @@ class Emu:
                     if kind == mamba_inline_ckpt.KIND_RUN:
                         assert blk == run.block_id
                         continue
-                    if kind == mamba_inline_ckpt.KIND_BLOCK:
+                    if kind in (mamba_inline_ckpt.KIND_BLOCK, mamba_inline_ckpt.KIND_SPLIT):
                         assert pos == (start // B + 1) * B
                         assert blk == blocks[start // B].block_id
+                    if kind == mamba_inline_ckpt.KIND_SPLIT:
+                        continue  # position only (uncached block state)
                     if zero_init:
                         assert start == 0
                     else:

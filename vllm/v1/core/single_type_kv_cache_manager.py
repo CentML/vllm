@@ -2218,6 +2218,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 self.num_inline_block_ckpts += 1
             else:
+                # not cached: X needs no state, but the worker still splits the
+                # tail checkpoint's replay at b like the split flow's chunks
+                ckpts.append(
+                    (b, mamba_inline_ckpt.KIND_SPLIT, False, x_block.block_id)
+                )
                 self.num_inline_block_skipped += 1
         tail_hash = None
         if d_block is not None:
@@ -2236,7 +2241,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.num_inline_tail_ckpts += 1
             else:
                 d_block = None
-        if ckpts:
+        if any(c[1] != mamba_inline_ckpt.KIND_SPLIT for c in ckpts):
             # the running block (state at end): only read by the worker's VERIFY
             run_block = self.req_to_blocks[request.request_id][
                 (end - 1) // self.block_size
@@ -2274,7 +2279,11 @@ class MambaManager(SingleTypeKVCacheManager):
         if plan is not None:
             blocks += [blk for blk in (plan[3], plan[5]) if blk is not None]
         if step is not None:
-            ids = {c[3] for c in step[2] if c[1] != mamba_inline_ckpt.KIND_RUN}
+            ids = {
+                c[3]
+                for c in step[2]
+                if c[1] in (mamba_inline_ckpt.KIND_BLOCK, mamba_inline_ckpt.KIND_TAIL)
+            }
             blocks += [
                 blk
                 for blk in self.req_to_blocks.get(request_id, ())
