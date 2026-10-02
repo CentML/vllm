@@ -613,6 +613,10 @@ class TRTLLMPrefill:
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
 
+    ctx_tiles: int = 0
+    """Sum over prefill requests of ceil(q_len / 128): the trtllm-gen context
+    FMHA launches ctx_tiles * num_q_heads CTAs (attn-pdo wave gate)."""
+
 
 @dataclass
 class FlashInferTrtllmAPIDecode:
@@ -1580,6 +1584,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     cum_seq_lens_kv=paged_kv_indptr_prefill_gpu,
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
+                    ctx_tiles=(
+                        int(((query_lens_prefill_cpu + 127) // 128).sum().item())
+                        if attn_pd_overlap.WAVE_GATE
+                        else 0
+                    ),
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -2229,7 +2238,14 @@ class FlashInferImpl(AttentionImpl):
         # Opt-in (VLLM_ATTN_PD_OVERLAP): run the prefill and the decode kernels
         # of this mixed step on two streams (attn_pd_overlap.py); None = serial.
         _pdo = (
-            attn_pd_overlap.plan(num_prefill_tokens, num_decode_tokens, query.device)
+            attn_pd_overlap.plan(
+                num_prefill_tokens,
+                num_decode_tokens,
+                query.device,
+                ctx_ctas=attn_metadata.prefill.ctx_tiles * self.num_heads
+                if attn_pd_overlap.WAVE_GATE and num_prefill_tokens > 0
+                else None,
+            )
             if attn_pd_overlap.ENABLED
             and prefill_use_trtllm
             and decode_with_trtllm_gen

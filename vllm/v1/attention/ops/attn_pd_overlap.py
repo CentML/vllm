@@ -40,6 +40,15 @@ Environment (read at import; default off):
                               start-up warm-up batches fork too (~1,700 forks per
                               worker on s4), so set N above that to check live
                               serving forks.
+``VLLM_ATTN_PD_WAVE_GATE``    1 = fork only when the prefill (context) launch, of
+                              ctx_ctas = sum(ceil(q/128)) * q_heads CTAs at one CTA
+                              per SM, has at least MIN_WAVES waves or its last wave
+                              is at most MAX_LAST_FILL full. A single near-full wave
+                              leaves no tail to backfill, and the decode beside it
+                              only stretches it (exact: the gate only decides
+                              fork vs serial). Default 0.
+``VLLM_ATTN_PD_MIN_WAVES``    2 (waves = ceil(ctx_ctas / SMs)).
+``VLLM_ATTN_PD_MAX_LAST_FILL`` 0.5 (fraction of the SMs busy in the last wave).
 ``VLLM_ATTN_PD_LOG_EVERY``    log counts every N mixed attention calls (5000; 0 = off):
                               forks, calls below the decode-row minimum, and the
                               mean host cost of plan() when it does not fork.
@@ -66,21 +75,29 @@ SPIN_CYC = int(os.environ.get("VLLM_ATTN_PD_SPIN_CYC", "40000"))
 _CHECK = [int(os.environ.get("VLLM_ATTN_PD_CHECK", "0"))]
 CHECK_START = int(os.environ.get("VLLM_ATTN_PD_CHECK_START", "0"))
 LOG_EVERY = int(os.environ.get("VLLM_ATTN_PD_LOG_EVERY", "5000"))
+WAVE_GATE = ENABLED and os.environ.get("VLLM_ATTN_PD_WAVE_GATE", "0") == "1"
+MIN_WAVES = int(os.environ.get("VLLM_ATTN_PD_MIN_WAVES", "2"))
+MAX_LAST_FILL = float(os.environ.get("VLLM_ATTN_PD_MAX_LAST_FILL", "0.5"))
+_SMS: dict = {}
 if ORDER not in ("pp", "dly"):
     raise ValueError(f"VLLM_ATTN_PD_ORDER must be pp or dly, got {ORDER!r}")
 
 _TLS = threading.local()
 _DEV: dict = {}  # device index -> per-device state
-_STATS = {"calls": 0, "forks": 0, "below_min": 0, "capture": 0, "off_ns": 0, "fork_ns": 0,
+_STATS = {"calls": 0, "forks": 0, "below_min": 0, "capture": 0, "wave_skip": 0, "off_ns": 0, "fork_ns": 0,
           "checks": 0, "mismatch": 0, "disabled": False}
 if ENABLED:
     logger.info(
         "attention decode||prefill overlap (attn-pdo) enabled: order=%s "
-        "min_decode_rows=%d spin_cycles=%d check=%d",
+        "min_decode_rows=%d spin_cycles=%d check=%d wave_gate=%s "
+        "(min_waves=%d max_last_fill=%.2f)",
         ORDER,
         MIN_DEC_ROWS,
         SPIN_CYC,
         _CHECK[0],
+        WAVE_GATE,
+        MIN_WAVES,
+        MAX_LAST_FILL,
     )
 
 
@@ -178,14 +195,15 @@ def _log_counts() -> None:
     off_n = max(1, c["calls"] - c["forks"])
     logger.info(
         "attn-pdo: mixed attention calls %d: forks %d (%.1f%%), below %d decode rows "
-        "%d, under capture %d; plan() host cost: not forked %.0f ns/call, forked "
-        "%.0f ns/call; checks ok %d, mismatches %d",
+        "%d, under capture %d, wave-gated %d; plan() host cost: not forked %.0f "
+        "ns/call, forked %.0f ns/call; checks ok %d, mismatches %d",
         c["calls"],
         c["forks"],
         100.0 * c["forks"] / max(1, c["calls"]),
         MIN_DEC_ROWS,
         c["below_min"],
         c["capture"],
+        c["wave_skip"],
         c["off_ns"] / off_n,
         c["fork_ns"] / max(1, c["forks"]),
         c["checks"],
@@ -193,8 +211,21 @@ def _log_counts() -> None:
     )
 
 
+def _wave_ok(ctx_ctas: int, device: torch.device) -> bool:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _SMS.get(idx)
+    if sms is None:
+        sms = _SMS[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    waves = -(-ctx_ctas // sms)
+    last_fill = (ctx_ctas - (waves - 1) * sms) / sms
+    return waves >= MIN_WAVES or last_fill <= MAX_LAST_FILL
+
+
 def plan(
-    num_prefill_tokens: int, num_decode_tokens: int, device: torch.device
+    num_prefill_tokens: int,
+    num_decode_tokens: int,
+    device: torch.device,
+    ctx_ctas: "int | None" = None,
 ) -> "Fork | None":
     """Return a Fork (and record the fork point on the current stream) when this
     attention call should overlap its prefill and decode kernels."""
@@ -205,14 +236,18 @@ def plan(
     c["calls"] += 1
     if LOG_EVERY and c["calls"] % LOG_EVERY == 0:
         _log_counts()
+    wave_skip = bool(WAVE_GATE and ctx_ctas and not _wave_ok(ctx_ctas, device))
     if (
         c["disabled"]
         or getattr(_TLS, "serial", False)
         or num_decode_tokens < MIN_DEC_ROWS
+        or wave_skip
         or torch.cuda.is_current_stream_capturing()
     ):
         if num_decode_tokens < MIN_DEC_ROWS:
             c["below_min"] += 1
+        elif wave_skip and not getattr(_TLS, "serial", False):
+            c["wave_skip"] += 1
         elif not c["disabled"] and not getattr(_TLS, "serial", False):
             c["capture"] += 1
         if getattr(_TLS, "serial", False):
