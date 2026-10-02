@@ -39,6 +39,11 @@ def _cache(*key):
     return {}
 
 
+# Key of the latest call; the GDN step plan's direct launch (GGM_VSDIRECT) checks
+# its own rebuilt key against it (gdn_step_plan._vs_direct).
+_LAST_KEY: list = [None]
+
+
 _CG0_SPLIT = os.environ.get("VLLM_GDN_VSPLIT_CG0SPLIT", "0") == "1"
 # VLLM_GDN_VSPLIT_C1REORDER=1 (default off): issue the state-update GEMM (KV) before the output GEMM (QKV) and let
 # compute group 1 drain chunk c's output after it has published state c+1 (exact: same ops, different order).
@@ -102,6 +107,7 @@ def chunk_gated_delta_rule_vsplit(
            tuple(initial_state.stride()[1:]) if (use_idx and use_init) else None,
            tuple(output_state.stride()[1:]) if (use_idx and store_final) else None,
            int(v_split), _cg0_split(v_split, use_init), _C1_REORDER and use_init)
+    _LAST_KEY[0] = key
     c = _cache(*key)
     dv = 128 // v_split
     if "compiled" not in c:

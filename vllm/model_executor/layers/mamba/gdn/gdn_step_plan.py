@@ -418,8 +418,23 @@ def _vs_direct(p, q, v, st):
         # lookup never hits, and every layer falls back to the full adapter
         # call plus a fresh _vs_direct attempt (host time only; same kernel).
         key = key + (ad._cg0_split(int(p.vsf), True), bool(ad._C1_REORDER))
+    # Guard: _vs_direct runs right after an adapter call with the same inputs, so
+    # the adapter's last key must equal this rebuilt key (length, field order and
+    # values). A future adapter-key change would otherwise silently disable the
+    # direct launch (every layer falling back to the full adapter call).
+    lk = getattr(ad, "_LAST_KEY", None)
+    if lk is not None and lk[0] is not None and lk[0] != key:
+        STATS["vs_direct_key_mismatch"] = STATS.get("vs_direct_key_mismatch", 0) + 1
+        logger.warning_once(
+            "GDN step plan: VSDIRECT key mismatch vs the V-split adapter "
+            "(adapter key %d fields, plan key %d fields): direct launch disabled",
+            len(lk[0]),
+            len(key),
+        )
+        return None
     c = ad._cache(*key)
     if "compiled" not in c:
+        STATS["vs_direct_miss"] = STATS.get("vs_direct_miss", 0) + 1
         return None
     B = p.cu_p_i32.size(0) - 1
     ws = torch.empty(
@@ -429,6 +444,9 @@ def _vs_direct(p, q, v, st):
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     STATS["vs_direct"] = STATS.get("vs_direct", 0) + 1
+    logger.info_once(
+        "GDN step plan: VSDIRECT direct launch engaged (adapter key %d fields)", len(key)
+    )
     return (c["compiled"], ws, stream, tuple(st.stride()))
 
 
