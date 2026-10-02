@@ -2574,6 +2574,10 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
+        if self.inline_ckpt:
+            # [F122] sizing / plan state never outlives one scheduling step
+            self._inline_alloc.clear()
+            self._inline_plan.clear()
 
     def _cache_partial_tail_block(
         self,
