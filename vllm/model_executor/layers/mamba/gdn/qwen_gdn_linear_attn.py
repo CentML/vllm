@@ -2509,7 +2509,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self, mixed_qkvz, ba, core_attn_out
         ):
             # VLLM_GDN_LAYER_GRAPHS=1: served by this layer's CUDA graph
+            self._f122_graph = True  # [F122] its conv outputs are in the shared buffers
             return
+        self._f122_graph = False
         if norm_quant.NQF and norm_quant.gdn_packed_enabled(self, core_attn_out):
             # NQF=1: run the core with the gated RMSNorm writing out_proj's
             # MXFP8 input into static buffers, quantize the remaining rows and

@@ -72,7 +72,7 @@ class _Step:
     zeros: gid -> pages to zero-fill before the first wave."""
 
     __slots__ = ("rows", "dev", "per_group", "waves", "copies", "zeros", "bufs",
-                 "lmax", "_keep")
+                 "lmax", "_keep", "const", "stream")
 
     def __init__(self, rows, dev):
         self.rows = rows
@@ -84,6 +84,8 @@ class _Step:
         self.bufs = None
         self.lmax = 0
         self._keep = []
+        self.const = None  # (cu3 + count, has_init False) for the 3-row conv-window launch
+        self.stream = None  # cuda-python stream handle for the direct kernel calls
 
 
 _STEP: list = [None]
@@ -250,11 +252,13 @@ def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
         waves = []
         for w in range(max(len(j[2]) for j in jobs)):
             segs = [(j[0], j[2][w]) for j in jobs if len(j[2]) > w]
+            ones = []
+            for slot, (r0, L, hi) in segs:
+                m = dev_i32([slot, 0, L, 1])  # slot | cu_seqlens | device_nb count
+                ones.append((r0, L, m[0:1], dev_bool([hi]), m[1:3]))
+                st.lmax = max(st.lmax, L)
             if len(segs) == 1 or not BATCH:
-                for slot, (r0, L, hi) in segs:
-                    m = dev_i32([slot, 0, L, 1])  # slot | cu_seqlens | device_nb count
-                    waves.append(("one", (r0, L, m[0:1], dev_bool([hi]), m[1:3])))
-                    st.lmax = max(st.lmax, L)
+                waves.append(("one", ones))
             else:
                 idx = torch.cat(
                     [torch.arange(r0, r0 + L, dtype=torch.int64) for _, (r0, L, _) in segs]
@@ -272,13 +276,15 @@ def begin_step(scheduler_output, input_batch, kv_cache_config, device) -> None:
                     (
                         "batch",
                         (idx_d, m[:R], dev_bool([hi for _, (_, _, hi) in segs]),
-                         m[R : 2 * R + 1], R, cu[R], max(L for _, (_, L, _) in segs)),
+                         m[R : 2 * R + 1], R, cu[R], max(L for _, (_, L, _) in segs), ones),
                     )
                 )
                 st.lmax = max(st.lmax, cu[R])
             if w == 0:
                 waves.append(("copy", None))
         st.waves[gid] = waves
+    c = dev_i32([0, 3, 1])
+    st.const = (c, dev_bool([False]))
     _STEP[0] = st
     STATS["steps"] += 1
     STATS["rows"] += len(rows)
@@ -426,6 +432,95 @@ def _alloc_bufs(L, H, HV, K, V, dtype, dev):
     )
 
 
+# graph fast path (VLLM_MAMBA_TAIL_CKPT_FAST=1, default): layers served by a GDN layer graph
+FAST = os.environ.get("VLLM_MAMBA_TAIL_CKPT_FAST", "1") == "1"
+_DIRECT: dict = {}
+
+
+def _graph_conv_outputs(layer, mixed_qkv):
+    """(q, k, v, g, beta) with this step's conv outputs of `layer` at absolute rows,
+    if its core was served by a GDN layer graph in this call, else None."""
+    if not getattr(layer, "_f122_graph", False):
+        return None
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
+    H = layer.num_k_heads // layer.tp_size
+    HV = layer.num_v_heads // layer.tp_size
+    sh = gdn_layer_graphs._SHARED.get((mixed_qkv.device, H, HV))
+    if sh is None or sh[0].size(0) < mixed_qkv.size(0):
+        return None
+    return sh
+
+
+def _page_copies(layer, st, gid):
+    cps = st.copies.get(gid)
+    if cps:
+        pages = _pages_u8(layer)
+        for src, dst in cps:
+            pages[dst].copy_(pages[src])
+        STATS["page_copies"] = STATS.get("page_copies", 0) + len(cps)
+
+
+def _direct_kernel(q, v, ssm, slot_t, vsf):
+    """The device_nb V-split adapter's compiled kernel for this key (compiled by the
+    GDN layer graphs at capture), or None. Same key formula as the adapter."""
+    from vllm.third_party.flashinfer_gdn_vsplit_devnb import adapter as ad
+
+    HQ, HV = q.size(1), v.size(1)
+    dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    key = (dev, ad._num_sm(dev), str(q.dtype), str(ssm.dtype), HQ, HV, HQ >= HV, True, True, True,
+           str(slot_t.dtype), tuple(ssm.stride()[1:]), tuple(ssm.stride()[1:]), int(vsf), True,
+           ad._cg0_split(vsf, True), bool(ad._C1_REORDER))
+    hit = _DIRECT.get(key)
+    if hit is None:
+        c = ad._cache(*key)
+        if "compiled" not in c:
+            return None
+        ws = torch.empty(
+            ad.GatedDeltaNetChunkedKernel.get_workspace_size(ad._num_sm(dev), 1, HQ, HV, True),
+            dtype=torch.int8, device=q.device)
+        hit = _DIRECT[key] = (c["compiled"], ws)
+    return hit
+
+
+def _chunk_shared(layer, shared, r0, L, ssm, slot_t, cu_t, st):
+    """Chunked delta rule over the absolute rows [r0, r0 + L) of the layer graph's
+    conv outputs, in place on the pool slot (initial state = the slot's state)."""
+    q, k, v, g, beta = (t[r0 : r0 + L] for t in shared)
+    HV = layer.num_v_heads // layer.tp_size
+    out = st.bufs[5][:L]
+    scale = 1.0 / (layer.head_k_dim**0.5)
+    vs = _vsplit(True)
+    vsf = max(int(vs.choose_vsplit(1, L, L, hv=HV)), 1)
+    d = _direct_kernel(q, v, ssm, slot_t, vsf)
+    if d is not None:
+        if st.stream is None:
+            import cuda.bindings.driver as cuda
+
+            st.stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
+        d[0](q, k, v, g, beta, out, cu_t, ssm, ssm, slot_t, None, None, 0, scale, d[1], st.stream)
+        STATS["direct_calls"] = STATS.get("direct_calls", 0) + 1
+    else:
+        vs.chunk_gated_delta_rule_vsplit(q, k, v, g, beta, out, cu_t, ssm, ssm, scale,
+                                         state_indices=slot_t, v_split=vsf, device_nb=True)
+        STATS["adapter_calls"] = STATS.get("adapter_calls", 0) + 1
+
+
+def _conv_window(layer, mixed_qkv, a, b, conv_state, end, slot_t, st):
+    """The conv window at `end` (last 3 inputs x[end-3:end], as the conv kernel stores
+    it at a sequence end) into the slot: the conv kernel over those 3 rows alone."""
+    cu3, hi0 = st.const
+    H = layer.num_k_heads // layer.tp_size
+    q, k, v, g, beta = (t[:3] for t in st.bufs[:5])
+    conv_w = layer.conv1d.weight.view(layer.conv1d.weight.size(0), layer.conv1d.weight.size(2))
+    gcc = _conv()
+    ok = gcc.load().run(mixed_qkv[end - 3 : end], conv_w, conv_state, slot_t, hi0, cu3[:2], 1,
+                        a[end - 3 : end], b[end - 3 : end], layer.A_log, layer.dt_bias,
+                        q, k, v, g, beta, int(H), 4, int(gcc.RV))
+    if not ok:
+        raise RuntimeError("[F122] CUDA conv refused the 3-row conv-window launch")
+
+
 def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
     """End of the GDN core custom op of `layer` (any path): write this step's
     in-step checkpoints of the layer's KV-cache group."""
@@ -461,15 +556,37 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
             pages = _pages_u8(layer)
         for slot in zeros:
             pages[slot].zero_()
+    shared = _graph_conv_outputs(layer, mixed_qkv) if FAST else None
+    if shared is not None:
+        # this layer's core ran as a GDN layer graph: its conv + post-conv outputs
+        # (q, k, v, g, beta at absolute rows) are still in the shared buffers, and
+        # the replay rows' values equal the split flow's chunk inputs (per-token
+        # conv, same initial window). Only the chunk recurrence runs again (direct
+        # kernel call); the conv window at each cut is written by the conv kernel
+        # over the cut's last 3 rows (no initial window needed).
+        for kind, w in waves:
+            if kind == "copy":
+                _page_copies(layer, st, gid)
+                continue
+            ones = w if kind == "one" else w[7]
+            for r0, L, slot_t, hi_t, cu_t in ones:
+                _chunk_shared(layer, shared, r0, L, ssm, slot_t, cu_t, st)
+                _conv_window(layer, mixed_qkv, a, b, conv_state, r0 + L, slot_t, st)
+                STATS["replays"] += 1
+                STATS["replay_tokens"] += L
+        STATS["fast_layers"] = STATS.get("fast_layers", 0) + 1
+        if verify:
+            _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out)
+        return
     for kind, w in waves:
         if kind == "one":
-            r0, L, slot_t, hi_t, cu_t = w
-            run_chunk(layer, mixed_qkv[r0 : r0 + L], a[r0 : r0 + L], b[r0 : r0 + L],
-                      conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=st.bufs)
-            STATS["replays"] += 1
-            STATS["replay_tokens"] += L
+            for r0, L, slot_t, hi_t, cu_t in w:
+                run_chunk(layer, mixed_qkv[r0 : r0 + L], a[r0 : r0 + L], b[r0 : r0 + L],
+                          conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=st.bufs)
+                STATS["replays"] += 1
+                STATS["replay_tokens"] += L
         elif kind == "batch":
-            idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl = w
+            idx_d, slots_d, hi_d, cu_d, R, Ltot, maxl, _ = w
             run_chunk(layer, mixed_qkv.index_select(0, idx_d), a.index_select(0, idx_d),
                       b.index_select(0, idx_d), conv_state, ssm, slots_d, hi_d, cu_d, Ltot,
                       bufs=st.bufs, nseq=R, maxlen=maxl)
@@ -477,13 +594,7 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None) -> None:
             STATS["replay_tokens"] += Ltot
             STATS["batched_launches"] = STATS.get("batched_launches", 0) + 1
         else:  # page copies after the first wave: D (state at b) -> X
-            cps = st.copies.get(gid)
-            if cps:
-                if pages is None:
-                    pages = _pages_u8(layer)
-                for src, dst in cps:
-                    pages[dst].copy_(pages[src])
-                STATS["page_copies"] = STATS.get("page_copies", 0) + len(cps)
+            _page_copies(layer, st, gid)
     if verify:
         _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out)
 
