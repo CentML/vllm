@@ -389,7 +389,8 @@ def fi_chunk_gated_delta_rule(
     ``output_g_exp=True``). ``output``: contiguous buffer with ``v.numel()``
     elements that FlashInfer writes into instead of allocating.
     ``state_indices``: contiguous int32 slot ids; ``initial_state`` is then the
-    fp32 SSM state pool, read from and updated in place at those rows (SM10x).
+    SSM state pool (fp32 or bf16), read from and updated in place at those
+    rows (SM10x).
     ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
     copy of ``cu_seqlens``) feed the V-split path; both are optional.
     """
@@ -506,12 +507,15 @@ class ChunkGatedDeltaRule(CustomOp):
 
     def updates_state_in_place(self, state_dtype: torch.dtype) -> bool:
         """Whether prefill reads and writes the SSM state pool in place
-        (FlashInfer ``state_indices``, SM10x, fp32 pool).
+        (FlashInfer ``state_indices``, SM10x, fp32 or bf16 pool). FlashInfer's
+        SM100 kernels (non-CP and CP) load a bf16 pool row into fp32, compute
+        in fp32 and store the final state rounded to nearest even, as the
+        gather path's ``last_state.to(ssm_state.dtype)`` does.
         """
         return (
             self.gdn_prefill_backend == "flashinfer"
             and current_platform.is_device_capability_family(100)
-            and state_dtype == torch.float32
+            and state_dtype in (torch.float32, torch.bfloat16)
         )
 
     def forward_cuda(
