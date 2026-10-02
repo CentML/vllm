@@ -2298,6 +2298,20 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if self.mamba_cache_mode == "align":
+            checkpoint = self._checkpoints.get(request.request_id)
+            if checkpoint is not None:
+                # A checkpointed chunk runs through every block boundary below
+                # its checkpoint column without stopping, so it materializes
+                # none of those states. Those columns can still hold a physical
+                # block: a previous chunk's never-written speculative scratch
+                # block, or the private copy of a sub-block prefix hit (state
+                # at the chunk start). Never register them as full blocks.
+                _, checkpoint_idx = checkpoint
+                self.num_cached_block[request.request_id] = max(
+                    self.num_cached_block.get(request.request_id, 0),
+                    checkpoint_idx,
+                )
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
