@@ -578,25 +578,29 @@ def _conv_window(layer, mixed_qkv, a, b, conv_state, end, slot_t, st):
 
 # ----------------------------------------------------------------------------------------------
 # Replay graphs (VLLM_MAMBA_TAIL_CKPT_GRAPH=1, default). On a layer-graph step, the replay of one
-# layer is one CUDA graph replay plus two row gathers: the per-wave device_nb chunk launches over
-# absolute rows of the shared conv-output buffers (full T_MAX views: the graph does not depend on the
-# step's token count), one conv-window launch per wave over the gathered last 3 input rows of every
-# segment, the page zero-fills / copies. All per-step values (rows, slots, pages) are device metadata,
-# written for every group with one host-to-device copy in begin_step; a graph is keyed by the layer
-# and the step's launch counts (spec), captured on first use. Same kernels and arguments as the eager
-# fast path except the fixed v_split 2 (the V-split kernel is bitwise identical across v_split).
+# layer is one row gather (the last 3 input rows before every cut) plus one CUDA graph replay: page
+# zero-fills, the first wave's device_nb chunk launches over absolute rows of the shared conv-output
+# buffers (full T_MAX views: the graph does not depend on the step's token count), the page copies
+# D -> X, the second wave's chunk launches, then one conv-window launch writing every cut's window
+# (X's window at b after the copy, D's at T). All per-step values (rows, slots, pages) are device
+# metadata, written for every group with one host-to-device copy in begin_step; a graph is keyed by
+# the layer and the step's launch counts, captured on first use. Same kernels as the eager fast path;
+# fixed v_split 2 (the V-split kernel is bitwise identical across v_split); the conv-window launch
+# gets zero a / b rows (they only feed its thrown-away g / beta outputs, not the window).
 # ----------------------------------------------------------------------------------------------
 GRAPH = os.environ.get("VLLM_MAMBA_TAIL_CKPT_GRAPH", "1") == "1"
 R_MAX, W_MAX, Z_MAX, C_MAX = 4, 2, 4, 4
+NW_MAX = R_MAX + C_MAX  # conv windows: one per job + one per page copy
 _O_CU = 0  # (w, r) -> [row0, row0 + L, 1 (device_nb count)]
-_O_SLOT = _O_CU + W_MAX * R_MAX * 3  # (w, r) -> slot
-_O_CU3 = _O_SLOT + W_MAX * R_MAX  # [0, 3, ..., 3 R_MAX]: conv-window cu_seqlens
-_O_IDX = _O_CU3 + R_MAX + 1  # (w, 3 r + j) -> row of the segment's last 3 inputs
-_O_CP = _O_IDX + W_MAX * 3 * R_MAX  # [src, dst] x C_MAX page copies after wave 0
-_O_Z = _O_CP + 2 * C_MAX  # Z_MAX pages zero-filled before wave 0
+_O_SLOT = _O_CU + W_MAX * R_MAX * 3  # (w, r) -> slot of the chunk launch
+_O_CSLOT = _O_SLOT + W_MAX * R_MAX  # window i -> slot
+_O_CU3 = _O_CSLOT + NW_MAX  # [0, 3, ..., 3 NW_MAX]: conv-window cu_seqlens
+_O_IDX = _O_CU3 + NW_MAX + 1  # window i -> its 3 input rows
+_O_CP = _O_IDX + 3 * NW_MAX  # [src, dst] x C_MAX page copies after wave 0
+_O_Z = _O_CP + 2 * C_MAX  # Z_MAX pages zero-filled first
 _META = (_O_Z + Z_MAX + 3) // 4 * 4
 _GR: dict = {}  # (layer, spec, addresses) -> CUDAGraph
-_GBUF: dict = {}  # device -> _GraphBufs
+_GBUF: dict = {}  # device index -> _GraphBufs
 
 
 class _GraphBufs:
@@ -613,15 +617,14 @@ class _GraphBufs:
         dev = self.dev
         H = layer.num_k_heads // layer.tp_size
         HV = layer.num_v_heads // layer.tp_size
-        n = W_MAX * 3 * R_MAX
-        self.sz = torch.zeros(n, wz, dtype=torch.bfloat16, device=dev)
-        self.sba = torch.zeros(n, wba, dtype=torch.bfloat16, device=dev)
+        n = 3 * NW_MAX
+        self.sz = torch.zeros(n, wz, dtype=torch.bfloat16, device=dev)  # gathered input rows
+        self.ab = torch.zeros(n, wba, dtype=torch.bfloat16, device=dev)  # zero ba rows (split_ba)
         # chunk outputs (thrown away) at absolute rows; conv-window outputs (thrown away)
         self.out = torch.empty(shared[0].size(0), HV, layer.head_v_dim, dtype=torch.bfloat16,
                                device=dev)
-        self.c3 = _alloc_bufs(3 * R_MAX, H, HV, layer.head_k_dim, layer.head_v_dim,
-                              torch.bfloat16, dev)[:5]
-        self.f3 = torch.zeros(R_MAX, dtype=torch.bool, device=dev)
+        self.c3 = _alloc_bufs(n, H, HV, layer.head_k_dim, layer.head_v_dim, torch.bfloat16, dev)[:5]
+        self.f3 = torch.zeros(NW_MAX, dtype=torch.bool, device=dev)
         self.stream = torch.cuda.Stream(device=dev)
         self.pool = torch.cuda.graph_pool_handle()
         self.ready = True
@@ -633,7 +636,7 @@ def _dev_key(device):
 
 
 def _graph_spec(jobs):
-    """(launches per wave, zero-fills, page copies) if the step fits the graphs."""
+    """(launches per wave, zero-fills, page copies, conv windows) if the step fits the graphs."""
     W = max(len(j[2]) for j in jobs)
     counts = tuple(sum(1 for j in jobs if len(j[2]) > w) for w in range(W))
     nz = sum(1 for j in jobs if j[1])
@@ -641,7 +644,7 @@ def _graph_spec(jobs):
     if W > W_MAX or counts[0] > R_MAX or nz > Z_MAX or nc > C_MAX:
         STATS["graph_misfit"] = STATS.get("graph_misfit", 0) + 1
         return None
-    return counts, nz, nc
+    return counts, nz, nc, len(jobs) + nc
 
 
 def _fill_graph_meta(st, device, n_groups):
@@ -653,9 +656,8 @@ def _fill_graph_meta(st, device, n_groups):
     for gid in st.graph:
         jobs = st.jobs[gid]
         row = m[gid]
-        # unused entries: row 0 / slot 0 (the gathers read W_MAX * 3 * R_MAX rows)
-        row[:] = 0
-        row[_O_CU3 : _O_CU3 + R_MAX + 1] = np.arange(R_MAX + 1, dtype=np.int32) * 3
+        row[:] = 0  # unused entries: row 0 / slot 0 (the null block)
+        row[_O_CU3 : _O_CU3 + NW_MAX + 1] = np.arange(NW_MAX + 1, dtype=np.int32) * 3
         for w in range(max(len(j[2]) for j in jobs)):
             n = 0
             for j in jobs:
@@ -663,18 +665,20 @@ def _fill_graph_meta(st, device, n_groups):
                     continue
                 r0, L, _ = j[2][w]
                 o = _O_CU + (w * R_MAX + n) * 3
-                row[o] = r0
-                row[o + 1] = r0 + L
-                row[o + 2] = 1
+                row[o : o + 3] = (r0, r0 + L, 1)
                 row[_O_SLOT + w * R_MAX + n] = j[0]
-                o = _O_IDX + w * 3 * R_MAX + 3 * n
-                row[o : o + 3] = (r0 + L - 3, r0 + L - 2, r0 + L - 1)
                 n += 1
-        i = 0
-        for src, dst in st.copies[gid]:
-            row[_O_CP + 2 * i] = src
-            row[_O_CP + 2 * i + 1] = dst
-            i += 1
+        wins = []  # (slot, end row): X's window at b (D chains with a copy), each job's last cut
+        for j in jobs:
+            if j[3] is not None:
+                wins.append((j[3], j[2][0][0] + j[2][0][1]))
+            r0, L, _ = j[2][-1]
+            wins.append((j[0], r0 + L))
+        for i, (slot, e) in enumerate(wins):
+            row[_O_CSLOT + i] = slot
+            row[_O_IDX + 3 * i : _O_IDX + 3 * i + 3] = (e - 3, e - 2, e - 1)
+        for i, (src, dst) in enumerate(st.copies[gid]):
+            row[_O_CP + 2 * i : _O_CP + 2 * i + 2] = (src, dst)
         for i, slot in enumerate(st.zeros[gid]):
             row[_O_Z + i] = slot
     h = torch.empty(m.shape, dtype=torch.int32, pin_memory=st.pin)
@@ -708,9 +712,8 @@ def _page_zero_kernel(words, lst, page_words, stride_words, BLOCK: tl.constexpr)
 _PAGE_BLOCK = 4096
 
 
-def _graph_bufs(layer, ssm, shared, mq_full, ba):
-    gb = _GBUF.get(_dev_key(ssm.device))
-    if gb is None or mq_full.dtype != torch.bfloat16 or ba.dtype != torch.bfloat16:
+def _graph_bufs(layer, gb, shared, mq_full, ba):
+    if mq_full.dtype != torch.bfloat16 or ba.dtype != torch.bfloat16:
         return None
     if not gb.ready:
         gb.setup(layer, shared, mq_full.size(1), ba.size(1))
@@ -722,21 +725,19 @@ def _graph_bufs(layer, ssm, shared, mq_full, ba):
                                   BLOCK=_PAGE_BLOCK, num_warps=4)
         _page_zero_kernel[(1, 1)](words, lst[_O_Z:], words.size(1), words.stride(0),
                                   BLOCK=_PAGE_BLOCK, num_warps=4)
-    if mq_full.size(1) != gb.sz.size(1) or ba.size(1) != gb.sba.size(1):
+    if mq_full.size(1) != gb.sz.size(1) or ba.size(1) != gb.ab.size(1):
         return None
     return gb
 
 
 def _graph_body(layer, gid, spec, gb, conv_state, ssm, shared, kern, cstream):
-    counts, nz, nc = spec
+    counts, nz, nc, nw = spec
     row = gb.meta[gid]
     H = layer.num_k_heads // layer.tp_size
     qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
     scale = 1.0 / (layer.head_k_dim**0.5)
     conv_w = layer.conv1d.weight.view(layer.conv1d.weight.size(0), layer.conv1d.weight.size(2))
-    gcc = _conv().load()
-    pages = _pages_u8(layer)
-    words = pages.view(torch.int32)
+    words = _pages_u8(layer).view(torch.int32)
     pw = words.size(1)
     grid_t = triton.cdiv(pw, _PAGE_BLOCK)
     q, k, v, g, beta = shared
@@ -749,22 +750,21 @@ def _graph_body(layer, gid, spec, gb, conv_state, ssm, shared, kern, cstream):
             sl = _O_SLOT + w * R_MAX + r
             kern[0](q, k, v, g, beta, gb.out, row[o : o + 2], ssm, ssm, row[sl : sl + 1], None, None,
                     0, scale, kern[1], cstream)
-        r0 = w * 3 * R_MAX
-        b3, a3 = layer.split_ba(gb.sba[r0 : r0 + 3 * n])
-        q3, k3, v3, g3, be3 = (t[: 3 * n] for t in gb.c3)
-        ok = gcc.run(gb.sz[r0 : r0 + 3 * n, :qkv_size], conv_w, conv_state,
-                     row[_O_SLOT + w * R_MAX : _O_SLOT + w * R_MAX + n], gb.f3[:n],
-                     row[_O_CU3 : _O_CU3 + n + 1], n, a3, b3, layer.A_log, layer.dt_bias,
-                     q3, k3, v3, g3, be3, int(H), 4, int(_conv().RV))
-        assert ok, "[F122] CUDA conv refused the conv-window launch (replay graph)"
         if w == 0 and nc:
             _page_copy_kernel[(nc, grid_t)](words, row[_O_CP:], pw, words.stride(0),
                                             BLOCK=_PAGE_BLOCK, num_warps=4)
+    b3, a3 = layer.split_ba(gb.ab[: 3 * nw])
+    q3, k3, v3, g3, be3 = (t[: 3 * nw] for t in gb.c3)
+    ok = _conv().load().run(gb.sz[: 3 * nw, :qkv_size], conv_w, conv_state,
+                            row[_O_CSLOT : _O_CSLOT + nw], gb.f3[:nw], row[_O_CU3 : _O_CU3 + nw + 1],
+                            nw, a3, b3, layer.A_log, layer.dt_bias, q3, k3, v3, g3, be3, int(H), 4,
+                            int(_conv().RV))
+    assert ok, "[F122] CUDA conv refused the conv-window launch (replay graph)"
 
 
 def _graph_replay(layer, gid, spec, conv_state, ssm, shared, mq_full, ba) -> bool:
-    """This layer's replay of the step as one graph replay (+ two row gathers); False if the
-    graph path is unavailable for it."""
+    """This layer's replay of the step: one row gather + one graph replay; False if the graph
+    path is unavailable for it."""
     gb = _GBUF.get(_dev_key(ssm.device))
     if gb is None or gid >= gb.meta.size(0):
         return False
@@ -772,10 +772,9 @@ def _graph_replay(layer, gid, spec, conv_state, ssm, shared, mq_full, ba) -> boo
            gb.meta.data_ptr(), mq_full.size(1), ba.size(1))
     gr = _GR.get(key)
     if gr is None:
-        if _pages_u8(layer).size(1) % 4 or _graph_bufs(layer, ssm, shared, mq_full, ba) is None:
+        if _pages_u8(layer).size(1) % 4 or _graph_bufs(layer, gb, shared, mq_full, ba) is None:
             return False
-        q, v = shared[0], shared[2]
-        kern = _direct_kernel(q, v, ssm, gb.meta[gid, _O_SLOT : _O_SLOT + 1], 2, 1)
+        kern = _direct_kernel(shared[0], shared[2], ssm, gb.meta[gid, _O_SLOT : _O_SLOT + 1], 2, 1)
         if kern is None:
             STATS["graph_nokernel"] = STATS.get("graph_nokernel", 0) + 1
             return False
@@ -794,10 +793,8 @@ def _graph_replay(layer, gid, spec, conv_state, ssm, shared, mq_full, ba) -> boo
         torch.cuda.current_stream().wait_stream(s)
         _GR[key] = gr
         STATS["graphs_captured"] = STATS.get("graphs_captured", 0) + 1
-    n = len(spec[0]) * 3 * R_MAX
-    idx = gb.meta[gid, _O_IDX : _O_IDX + n]
-    torch.index_select(mq_full, 0, idx, out=gb.sz[:n])
-    torch.index_select(ba, 0, idx, out=gb.sba[:n])
+    n = 3 * spec[3]
+    torch.index_select(mq_full, 0, gb.meta[gid, _O_IDX : _O_IDX + n], out=gb.sz[:n])
     gr.replay()
     return True
 
