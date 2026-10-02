@@ -120,6 +120,7 @@ def _build_layer(
         norm=_TestGatedNorm(norm_weight, output_gate_activation),
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
+        _fused_decode_counters=None,
     )
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -133,6 +134,8 @@ def _build_layer(
         "_rms_norm_gated_strided_gate_cuda",
         "_forward_core_fused_norm",
         "_forward_core_fused_norm_packed",
+        "_forward_core_decode_spec_one_launch",
+        "_gated_norm_mxfp8",
         "split_ba",
     ):
         setattr(
@@ -425,3 +428,134 @@ def test_fused_model_path_matches_reference(
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+@pytest.mark.parametrize("num_requests", [1, 3])
+@torch.inference_mode()
+def test_one_launch_model_path_matches_three_kernels(num_requests: int) -> None:
+    """Decode-only spec batches of at most VLLM_GDN_FUSED_DECODE_MAX_REQS
+    requests take the one-launch core (gdn_mtp_fused_decode) and produce
+    out_proj's MXFP8 activation, conv window and SSM states of the
+    conv -> Triton recurrence -> gated-norm MXFP8 path; larger batches keep
+    the three-kernel path.
+    """
+    torch.manual_seed(2)
+    device = torch.device("cuda")
+    vllm_config = _make_vllm_config()
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=MambaSpec(
+            block_size=BLOCK_SIZE,
+            shapes=((16, 64),),
+            dtypes=(torch.float16,),
+            num_speculative_blocks=NUM_SPEC,
+        ),
+        layer_names=[PREFIX],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    batch = BatchSpec(
+        seq_lens=[128, 96, 64][:num_requests], query_lens=[SPEC_TOKENS] * num_requests
+    )
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    common.block_table_tensor.add_(1)
+    with set_current_vllm_config(vllm_config):
+        metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+            num_accepted_tokens=torch.tensor(
+                [1, 3, 2][:num_requests], dtype=torch.int32, device=device
+            ),
+            num_decode_draft_tokens_cpu=torch.full(
+                (num_requests,), NUM_SPEC, dtype=torch.int32
+            ),
+        )
+    assert metadata.num_prefills == 0 and metadata.num_spec_decodes == num_requests
+
+    assert metadata.spec_state_indices_tensor is not None
+    pool_size = int(metadata.spec_state_indices_tensor.max().item()) + 1
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+        )
+    )
+    conv_state_seed = 0.5 * torch.randn(
+        pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
+    )
+    ssm_state_seed = 0.05 * torch.randn(
+        pool_size, *temporal_state_shape, dtype=torch.float32, device=device
+    )
+    a_log = torch.log(torch.empty(HV, device=device).uniform_(1, 16))
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    conv_weight = 0.5 * torch.randn(
+        CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device
+    )
+    norm_weight = (1 + 0.1 * torch.randn(V, device=device)).to(torch.bfloat16)
+    num_tokens = batch.compute_num_tokens()
+    mixed_qkvz = torch.randn(
+        num_tokens, CONV_DIM + HV * V, dtype=torch.bfloat16, device=device
+    )
+    ba = torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
+    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
+
+    def run(one_launch: bool):
+        layer = _build_layer(
+            vllm_config,
+            conv_state_seed.clone(),
+            ssm_state_seed.clone(),
+            a_log,
+            dt_bias,
+            conv_weight,
+            norm_weight,
+            "silu",
+        )
+        layer._fused_decode_counters = torch.zeros(
+            4 * H, dtype=torch.int32, device=device
+        )
+        context.no_compile_layers = {PREFIX: layer}
+        out_q = torch.empty(
+            num_tokens, HV * V, dtype=torch.float8_e4m3fn, device=device
+        )
+        out_scale = torch.empty(
+            qwen_gdn_linear_attn.gdn_mxfp8_scale_numel(num_tokens, HV * V),
+            dtype=torch.uint8,
+            device=device,
+        )
+        with (
+            patch.object(
+                qwen_gdn_linear_attn, "get_forward_context", return_value=context
+            ),
+            patch.object(qwen_gdn_linear_attn, "GDN_MTP_TRITON_MAX_REQUESTS", 4),
+            patch.object(
+                qwen_gdn_linear_attn,
+                "GDN_FUSED_DECODE_MAX_REQUESTS",
+                4 if one_launch else 0,
+            ),
+            patch.object(
+                qwen_gdn_linear_attn,
+                "gdn_mtp_fused_decode",
+                wraps=qwen_gdn_linear_attn.gdn_mtp_fused_decode,
+            ) as fused_mock,
+        ):
+            torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                mixed_qkvz.clone(),
+                ba,
+                torch.empty(num_tokens, HV, V, dtype=torch.bfloat16, device=device),
+                layer_name=_encode_layer_name(PREFIX),
+                out_q=out_q,
+                out_scale=out_scale,
+            )
+        assert fused_mock.call_count == int(one_launch)
+        assert int(layer._fused_decode_counters.abs().sum()) == 0
+        return layer, out_q, out_scale
+
+    ref_layer, ref_q, ref_scale = run(one_launch=False)
+    layer, out_q, out_scale = run(one_launch=True)
+    assert torch.equal(layer.kv_cache[0], ref_layer.kv_cache[0])
+    torch.testing.assert_close(
+        layer.kv_cache[1], ref_layer.kv_cache[1], rtol=1e-5, atol=1e-6
+    )
+    assert torch.equal(out_scale, ref_scale)
+    flips = out_q.view(torch.uint8) != ref_q.view(torch.uint8)
+    assert flips.float().mean() < 1e-3

@@ -64,6 +64,10 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     gdn_fused_conv_prep,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
+from vllm.model_executor.layers.mamba.ops.gdn_mtp_fused_decode import (
+    MAX_FUSED_DECODE_TOKENS,
+    gdn_mtp_fused_decode,
+)
 from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
     copy_state_rows,
     gather_prefill_rows,
@@ -103,6 +107,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNPrefillCheckpointMetadata,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.
@@ -131,6 +136,14 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 # the gated norm in the MXFP8/norm kernel after it. Larger batches use the CUDA
 # MTP kernel (bandwidth-bound regime). VR crossover, norm included: ~4-6.
 GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS", "4"))
+# Decode-only spec batches of at most this many requests run the whole GDN core
+# (conv window roll + recurrence + gated norm + out_proj's MXFP8 quant) as one
+# launch (gdn_mtp_fused_decode) instead of three. Off at 0 (default). VR, 4
+# tokens per request, per GDN layer: -2.9 us at 1-2 requests, -3.4 at 3, -2.2 at
+# 4, none at 6.
+GDN_FUSED_DECODE_MAX_REQUESTS = int(
+    os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_REQS", "0")
+)
 # FlashInfer GDN prefill: a single sequence of at most this many tokens runs
 # the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
@@ -820,6 +833,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.gdn_out_mxfp8 = self.enable_fused_gdn_decode and _consumes_swizzled_mxfp8(
             self.out_proj
         )
+        # One-launch spec-decode core for small decode batches: its per
+        # (request, key head) arrival counters (zero between launches); None
+        # when off or ineligible.
+        fused_decode = (
+            GDN_FUSED_DECODE_MAX_REQUESTS > 0
+            and self.gdn_out_mxfp8
+            and self.conv_kernel_size == 4
+            and self.conv1d.bias is None
+            and self.activation in ("silu", "swish")
+            and self.norm.bias is None
+            and self.norm.norm_before_gate
+        )
+        self.register_buffer(
+            "_fused_decode_counters",
+            torch.zeros(
+                GDN_FUSED_DECODE_MAX_REQUESTS * (self.num_k_heads // self.tp_size),
+                dtype=torch.int32,
+                device=current_platform.current_device(),
+            )
+            if fused_decode
+            else None,
+            persistent=False,
+        )
+        if fused_decode:
+            logger.info_once(
+                "GDN spec-decode core in one launch for decode batches of <= %d "
+                "requests",
+                GDN_FUSED_DECODE_MAX_REQUESTS,
+            )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -2542,6 +2584,62 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         return True
 
+    def _forward_core_decode_spec_one_launch(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        out_q: torch.Tensor,
+        out_scale: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> None:
+        """``_forward_core_decode_spec_fused_norm`` + ``_gated_norm_mxfp8`` of
+        a decode-only spec batch in one launch (``gdn_mtp_fused_decode``):
+        conv window roll, recurrence, gated norm and out_proj's MXFP8
+        activation. Rows past the valid token count get zeros.
+        """
+        state_indices = attn_metadata.spec_state_indices_tensor
+        cu_seqlens = attn_metadata.spec_query_start_loc
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        assert state_indices is not None
+        assert cu_seqlens is not None
+        assert num_accepted_tokens is not None
+        assert state_indices.size(1) <= MAX_FUSED_DECODE_TOKENS
+        assert self._fused_decode_counters is not None
+        num_requests = attn_metadata.num_spec_decodes
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        gdn_mtp_fused_decode(
+            mixed_qkv,
+            a,
+            b,
+            conv_state,
+            self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            ),
+            self.A_log,
+            self.dt_bias,
+            state_indices[:num_requests],
+            cu_seqlens[: num_requests + 1],
+            num_accepted_tokens[:num_requests],
+            self.kv_cache[1],
+            core_attn_out,
+            output_gate,
+            self.norm.weight,
+            self.norm.eps,
+            self.norm.activation,
+            out_q,
+            out_scale,
+            self._fused_decode_counters,
+            scale=self.head_k_dim**-0.5,
+            null_block_id=NULL_BLOCK_ID,
+        )
+
     def _forward_core_fused_norm_packed(
         self,
         mixed_qkvz: torch.Tensor,
@@ -2738,6 +2836,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
         ):
+            if (
+                quantize
+                and self._fused_decode_counters is not None
+                and attn_metadata.num_spec_decodes <= GDN_FUSED_DECODE_MAX_REQUESTS
+                and attn_metadata.spec_state_indices_tensor is not None
+                and attn_metadata.spec_state_indices_tensor.size(1)
+                <= MAX_FUSED_DECODE_TOKENS
+            ):
+                self._forward_core_decode_spec_one_launch(
+                    mixed_qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    output_gate=output_gate,
+                    core_attn_out=core_attn_out,
+                    out_q=out_q,  # type: ignore[arg-type]
+                    out_scale=out_scale,  # type: ignore[arg-type]
+                    attn_metadata=attn_metadata,
+                )
+                return
             if not quantize:
                 # The MTP kernels skip FULL-graph padding requests.
                 core_attn_out.zero_()
