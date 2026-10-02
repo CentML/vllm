@@ -269,6 +269,7 @@ def test_fused_forward_uses_packed_entrypoint() -> None:
 )
 @pytest.mark.parametrize("output_gate_activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("decode_backend", ["cuda", "cuda_jit", "triton"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_fused_model_path_matches_reference(
     seq_lens: list[int],
@@ -277,6 +278,7 @@ def test_fused_model_path_matches_reference(
     expected_fused_calls: int,
     output_gate_activation: str,
     decode_backend: str,
+    state_dtype: torch.dtype,
 ) -> None:
     """Fused MTP (decode-only batches and the contiguous spec block of mixed
     batches) and its interleaved/prefill/decode fallbacks match the reference,
@@ -336,9 +338,9 @@ def test_fused_model_path_matches_reference(
     conv_state_seed = 0.05 * torch.randn(
         pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
     )
-    ssm_state_seed = 0.01 * torch.randn(
-        pool_size, *temporal_state_shape, dtype=torch.float32, device=device
-    )
+    ssm_state_seed = (
+        0.01 * torch.randn(pool_size, *temporal_state_shape, device=device)
+    ).to(state_dtype)
     a_log = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
     dt_bias = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
     conv_weight = 0.1 * torch.randn(
@@ -437,9 +439,12 @@ def test_fused_model_path_matches_reference(
     )
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_requests", [1, 3])
 @torch.inference_mode()
-def test_one_launch_model_path_matches_three_kernels(num_requests: int) -> None:
+def test_one_launch_model_path_matches_three_kernels(
+    num_requests: int, state_dtype: torch.dtype
+) -> None:
     """Decode-only spec batches of at most VLLM_GDN_FUSED_DECODE_MAX_REQS
     requests take the one-launch core (gdn_mtp_fused_decode) and produce
     out_proj's MXFP8 activation, conv window and SSM states of the
@@ -490,9 +495,9 @@ def test_one_launch_model_path_matches_three_kernels(num_requests: int) -> None:
     conv_state_seed = 0.5 * torch.randn(
         pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
     )
-    ssm_state_seed = 0.05 * torch.randn(
-        pool_size, *temporal_state_shape, dtype=torch.float32, device=device
-    )
+    ssm_state_seed = (
+        0.05 * torch.randn(pool_size, *temporal_state_shape, device=device)
+    ).to(state_dtype)
     a_log = torch.log(torch.empty(HV, device=device).uniform_(1, 16))
     dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
     conv_weight = 0.5 * torch.randn(
@@ -560,9 +565,17 @@ def test_one_launch_model_path_matches_three_kernels(num_requests: int) -> None:
     ref_layer, ref_q, ref_scale = run(one_launch=False)
     layer, out_q, out_scale = run(one_launch=True)
     assert torch.equal(layer.kv_cache[0], ref_layer.kv_cache[0])
-    torch.testing.assert_close(
-        layer.kv_cache[1], ref_layer.kv_cache[1], rtol=1e-5, atol=1e-6
-    )
+    if state_dtype == torch.bfloat16:
+        # Both store the fp32 result rounded to nearest even: one bf16 step
+        # apart where the fp32 results straddle a rounding boundary.
+        torch.testing.assert_close(
+            layer.kv_cache[1], ref_layer.kv_cache[1], rtol=2**-7, atol=1e-6
+        )
+        assert (layer.kv_cache[1] != ref_layer.kv_cache[1]).float().mean() < 1e-3
+    else:
+        torch.testing.assert_close(
+            layer.kv_cache[1], ref_layer.kv_cache[1], rtol=1e-5, atol=1e-6
+        )
     assert torch.equal(out_scale, ref_scale)
     flips = out_q.view(torch.uint8) != ref_q.view(torch.uint8)
     assert flips.float().mean() < 1e-3
