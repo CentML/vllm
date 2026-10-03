@@ -70,6 +70,13 @@ QO_MAXT = int(os.environ.get("GLUE_GSC_QO_MAXT", "256"))
 # gsc2: also let gscd's GB300 fp32 decode kernels (GDN_STATE_COMMIT_GB=1: gb_decode_kernel / gb_kh_kernel) write the
 # fused quant (same epilogue rule as deferred_decode_kernel; bitwise vs FlashInfer's mxfp8 quant). Default off.
 QO_GB = os.environ.get("GDN_STATE_COMMIT_GB_QO", "0") == "1"
+# gy-convmerge (default off): fold the decode-only step's MTP conv update (Triton _causal_conv1d_update_kernel) into
+# gb_decode_kernel's prologue for calls with 1..FOLD_MAXB requests (14 = one GB wave: 14 x 32 CTAs <= 3 x 152).
+# Exact: same per-element arithmetic, same side effects on mixed_qkv and the conv state (gdn_state_commit.cu,
+# GSC_FOLD). Needs GDN_STATE_COMMIT_GB=1. Read only inside the GDN core custom-op bodies (eager, never traced by
+# torch.compile; FULL graphs are captured per process), so it is not an AOT compile-hash factor (as F122's knobs).
+FOLD = os.environ.get("GDN_STATE_COMMIT_CONV_FOLD", "0") == "1"
+FOLD_MAXB = int(os.environ.get("GDN_STATE_COMMIT_CONV_FOLD_MAXB", "14"))
 
 
 def _dbg(what):
@@ -184,6 +191,7 @@ def eager_load(site: str) -> None:
         logger.info("gdn_state_commit: decode extension loaded eagerly (%s)", site)
     except Exception as e:  # noqa: BLE001 - never block start-up on the eager path
         logger.warning("gdn_state_commit: eager load at %s failed (%r); loading at first use", site, e)
+    install_conv_fold()  # gy-convmerge (no-op unless GDN_STATE_COMMIT_CONV_FOLD=1); before any CUDA-graph capture
 
 
 def load(minb=None, gb=None):
@@ -233,6 +241,9 @@ def load(minb=None, gb=None):
     if gb:
         tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k{SPEC}s{KH}h{KH_MIN}".format(**gbo)
         gb_flags += ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
+        if FOLD and gb_env is None:  # gy-convmerge: decode conv fold (the CK0 check reference stays unfolded)
+            tag += "_fold1"
+            gb_flags += ["-DGSC_FOLD=1"]
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -381,6 +392,109 @@ def decode(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accep
         load().decode(*args)  # (checked when GDN_STATE_COMMIT_GB_CHECK is set: see _CheckedExt)
     _dbg(f"decode N={state_indices.size(0)} w={state_indices.size(1)}")
     return out
+
+
+# ----------------------------------------------------------------------------------------------
+# gy-convmerge: decode conv fold (GDN_STATE_COMMIT_CONV_FOLD=1)
+# ----------------------------------------------------------------------------------------------
+_FOLD_SEEN: set = set()
+_FOLD_ORIG = [None]
+
+
+def decode_fold(mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens, state,
+                output_gate, norm_weight, out, scale, norm_eps, output_gate_activation, conv_state, conv_weights):
+    """causal_conv1d_update(mixed_qkv, conv_state, conv_weights, None, silu, conv_state_indices=state_indices[:, 0],
+    num_accepted_tokens, query_start_loc=cu_seqlens, max_query_len <= MAX_T) followed by decode(...) on its output,
+    as ONE gb_decode_kernel launch. mixed_qkv holds the raw conv inputs on entry and the conv output on return.
+    Returns False when nothing was launched (contract not met): the caller then runs the two original calls."""
+    n = state_indices.size(0)
+    if (not FOLD or _GB_CHECK or n <= 0 or n > FOLD_MAXB or state.dtype != torch.float32
+            or os.environ.get("GDN_STATE_COMMIT_GB", "0") != "1" or not state_indices.is_contiguous()):
+        return False
+    ext = load()
+    if not hasattr(ext, "decode_fold"):
+        return False
+    args = (mixed_qkv, a, b, A_log, dt_bias, state_indices, cu_seqlens, num_accepted_tokens,
+            state, output_gate, norm_weight, out, float(scale), float(norm_eps),
+            output_gate_activation == "sigmoid")
+    t = _qo_target(out, state)
+    if t is not None:
+        ok = ext.decode_qo_fold(*args, t["q"], t["sf"], int(t["psc"]), conv_state, conv_weights)
+        if ok:
+            t["qo"] = True
+            STATS["decode_qo_calls"] = STATS.get("decode_qo_calls", 0) + 1
+    else:
+        ok = ext.decode_fold(*args, conv_state, conv_weights)
+    key = (bool(ok), int(n), t is not None)
+    if key not in _FOLD_SEEN:
+        _FOLD_SEEN.add(key)
+        logger.info("[convfold] decode n=%d qo=%d -> %s", n, int(t is not None),
+                    "conv update folded into gb_decode_kernel" if ok else "refused (Triton conv + decode)")
+    if not ok:
+        STATS["conv_fold_refused"] = STATS.get("conv_fold_refused", 0) + 1
+        return False
+    STATS["decode_calls"] += 1
+    STATS["conv_fold_calls"] = STATS.get("conv_fold_calls", 0) + 1
+    _dbg(f"decode_fold N={n} w={state_indices.size(1)}")
+    return True
+
+
+def _fold_try(layer, mixed_qkv, b, a, output_gate, core_attn_out, md) -> bool:
+    """The decode-only step of QwenGatedDeltaNetAttention._forward_core_decode_spec_fused_norm (same slices, same
+    tensors as its causal_conv1d_update + ops.fused_gdn_decode_post_conv_mtp -> decode calls), folded."""
+    n = int(md.num_spec_decodes)
+    if n <= 0 or n > FOLD_MAXB:
+        return False
+    from vllm import _custom_ops as ops
+
+    if not getattr(ops, "_GDN_STATE_COMMIT_DECODE", False):
+        return False  # the decode op is not this module's kernel
+    si, cu, nacc = md.spec_state_indices_tensor, md.spec_query_start_loc, md.num_accepted_tokens
+    if si is None or cu is None or nacc is None or si.size(1) > MAX_T:
+        return False
+    if layer.conv1d.bias is not None or layer.activation not in ("silu", "swish", True):
+        return False
+    if layer.conv1d.weight.dim() != 3 or layer.conv1d.weight.size(2) != 4:
+        return False
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    T = md.num_actual_tokens
+    conv_state = layer.kv_cache[0] if is_conv_state_dim_first() else layer.kv_cache[0].transpose(-1, -2)
+    conv_weights = layer.conv1d.weight.view(layer.conv1d.weight.size(0), layer.conv1d.weight.size(2))
+    return decode_fold(mixed_qkv[:T], a[:T], b[:T], layer.A_log, layer.dt_bias, si[:n], cu[: n + 1], nacc[:n],
+                       layer.kv_cache[1], output_gate[:T], layer.norm.weight, core_attn_out[:T],
+                       layer.head_k_dim**-0.5, layer.layer_norm_epsilon, layer.norm.activation, conv_state,
+                       conv_weights)
+
+
+def install_conv_fold() -> bool:
+    """GDN_STATE_COMMIT_CONV_FOLD=1: wrap QwenGatedDeltaNetAttention._forward_core_decode_spec_fused_norm (the
+    decode-only MTP step: Triton conv update, then the GB decode kernel) so that calls with <= FOLD_MAXB requests
+    run the folded kernel; everything else (and any contract miss) runs the original method. The model file is not
+    edited. Installed at engine start (eager_load), before vLLM captures its CUDA graphs."""
+    if not FOLD or _FOLD_ORIG[0] is not None:
+        return _FOLD_ORIG[0] is not None
+    import sys
+
+    mod = sys.modules.get("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
+    cls = getattr(mod, "QwenGatedDeltaNetAttention", None) if mod is not None else None
+    orig = getattr(cls, "_forward_core_decode_spec_fused_norm", None) if cls is not None else None
+    if orig is None:
+        logger.warning("[convfold] NOT installed: QwenGatedDeltaNetAttention._forward_core_decode_spec_fused_norm "
+                       "not found")
+        return False
+
+    def _forward_core_decode_spec_fused_norm(self, mixed_qkv, b, a, output_gate, core_attn_out, attn_metadata):
+        if _fold_try(self, mixed_qkv, b, a, output_gate, core_attn_out, attn_metadata):
+            return None
+        return orig(self, mixed_qkv=mixed_qkv, b=b, a=a, output_gate=output_gate, core_attn_out=core_attn_out,
+                    attn_metadata=attn_metadata)
+
+    _FOLD_ORIG[0] = orig
+    cls._forward_core_decode_spec_fused_norm = _forward_core_decode_spec_fused_norm
+    logger.info("[convfold] installed: decode-only MTP conv update folded into gb_decode_kernel for 1..%d requests "
+                "(GDN_STATE_COMMIT_CONV_FOLD=1)", FOLD_MAXB)
+    return True
 
 
 def _dt_type(t):

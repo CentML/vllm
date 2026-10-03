@@ -214,6 +214,116 @@ __device__ __forceinline__ void qo_zero_pad_rows(const QoArgs& qo, int n_tok, in
 #define GSC_QO_PARAM
 #define GSC_QO_ARG
 #endif
+#ifndef GSC_FOLD
+#define GSC_FOLD 0
+#endif
+#if GSC_FOLD
+#if !GSC_GB
+#error "GSC_FOLD (decode conv fold) needs the GB300 fp32 kernel build (GSC_GB=1)"
+#endif
+// gy-convmerge (GSC_FOLD=1; env GDN_STATE_COMMIT_CONV_FOLD=1, default off): the MTP spec-decode conv update
+// (vLLM causal_conv1d.py `_causal_conv1d_update_kernel` with IS_VARLEN, IS_SPEC_DECODING, HAS_NULL_BLOCK, no bias,
+// width 4, SiLU, APC off) runs in gb_decode_kernel's prologue instead of a separate Triton launch before it.
+// Per element the arithmetic is the Triton kernel's, as in gdn_conv_cuda's bit-exact spec_conv_body (smallops,
+// validated bitwise vs Triton on sm_103 with GK2_MIXED_ADD=0):
+//   p_j = bf16-RN(win_j * w_j) (mul.rn.bf16x2), acc = (((+0 + p0) + p1) + p2) + p3 (exact bf16 -> f32, add.f32, no
+//   contraction: every op is inline PTX), y = div.full.f32(acc, ex2.approx.f32(acc * -log2e) + 1) -> cvt.rn.bf16.
+// Side effects, exactly as the Triton update: the x rows are overwritten in place with the conv output, and the conv
+// state of the slot is rolled to [state[off+1], state[off+2] (both 0 if slot >= num_cache_lines), x_0 .. x_{q-1}]
+// (rows 0 .. q+1; off = num_accepted - 1, raw). Pad requests (slot <= 0 = the null block) and empty rows are skipped,
+// as both the Triton update and this kernel already do.
+// q/k channels are shared by the VPK value-head CTAs of a key head: each CTA reads them (conv inputs) before its
+// K-log atomic (__syncthreads + __threadfence first); only the last CTA writes the q/k conv state, the q/k output rows
+// and the K log, after the atomic and a __threadfence (the K log's own protocol). v channels belong to one CTA, which
+// writes them after its own reads (CTA barrier).
+struct ConvFold {
+  uint16_t* x;            // mixed_qkv rows (bf16, channel stride 1), in place; nullptr = fold off (stock path)
+  int64_t sx;             // row stride of x (elements)
+  const uint16_t* w;      // conv weight [conv_dim, 4] bf16
+  int64_t sw_dim, sw_w;   // weight strides (elements)
+  uint16_t* cs;           // conv state view (slots, conv_dim, state_len) bf16
+  int64_t cs_seq, cs_dim, cs_tok;
+  int64_t ncl;            // conv_state.size(0) (the Triton kernel's num_cache_lines)
+  int wvec;               // 1: weight [conv_dim, 4] contiguous and 16-B aligned (one 16-B tap load per channel pair)
+  int vec;                // 1: cs_dim == 1 and state / x rows 16-B aligned (16-B write-back stores)
+};
+namespace cfold {
+__device__ __forceinline__ uint32_t bmul2(uint32_t a, uint32_t b) {
+  uint32_t r;
+  asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+__device__ __forceinline__ float bf_lo(uint32_t p) { return __uint_as_float(p << 16); }
+__device__ __forceinline__ float bf_hi(uint32_t p) { return __uint_as_float(p & 0xffff0000u); }
+__device__ __forceinline__ float fadd(float a, float b) { float r; asm("add.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fmul(float a, float b) { float r; asm("mul.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fdivf(float a, float b) { float r; asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float fex2(float a) { float r; asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
+// acc(lo, hi) += bf16x2 product (exact upconvert, fp32 round-to-nearest add)
+__device__ __forceinline__ void acc_add(float& lo, float& hi, uint32_t p) {
+  lo = fadd(lo, bf_lo(p));
+  hi = fadd(hi, bf_hi(p));
+}
+// Triton: acc / (1 + tl.exp(-acc)) -> bf16, for a channel pair (lo = even channel)
+__device__ __forceinline__ uint32_t silu2(float a0, float a1) {
+  const float y0 = fdivf(a0, fadd(fex2(fmul(a0, __uint_as_float(0xBFB8AA3Bu))), 1.0f));
+  const float y1 = fdivf(a1, fadd(fex2(fmul(a1, __uint_as_float(0xBFB8AA3Bu))), 1.0f));
+  uint32_t r;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(y1), "f"(y0));
+  return r;
+}
+// conv state of (slot, token row tok), channels ch, ch+1 (ch even)
+__device__ __forceinline__ uint32_t ld_cs2(const ConvFold& cf, int64_t slot, int64_t tok, int ch) {
+  const uint16_t* q = cf.cs + slot * cf.cs_seq + tok * cf.cs_tok;
+  if (cf.cs_dim == 1) return *reinterpret_cast<const uint32_t*>(q + ch);
+  return static_cast<uint32_t>(q[static_cast<int64_t>(ch) * cf.cs_dim]) |
+         (static_cast<uint32_t>(q[static_cast<int64_t>(ch + 1) * cf.cs_dim]) << 16);
+}
+__device__ __forceinline__ void st_cs2(const ConvFold& cf, int64_t slot, int64_t tok, int ch, uint32_t v) {
+  uint16_t* q = cf.cs + slot * cf.cs_seq + tok * cf.cs_tok;
+  if (cf.cs_dim == 1) { *reinterpret_cast<uint32_t*>(q + ch) = v; return; }
+  q[static_cast<int64_t>(ch) * cf.cs_dim] = static_cast<uint16_t>(v & 0xffffu);
+  q[static_cast<int64_t>(ch + 1) * cf.cs_dim] = static_cast<uint16_t>(v >> 16);
+}
+// Write-back of `npairs` channel pairs starting at pair p0 of the CTA's staging rows (pair p = channels 2p, 2p+1 of
+// [q 0..127 | k 128..255 | v 256..383]) to global channel g0 (multiple of 8): conv-state rows 0..q+1 from fr, output
+// rows bos .. bos+q-1 from fx. Threads [t0, t0 + nthr) of the CTA take the work; 16-B stores when cf.vec.
+template <int kPairs>
+__device__ __forceinline__ void write_back(const ConvFold& cf, const uint32_t (*fr)[kPairs], const uint32_t (*fx)[kPairs],
+                                           int p0, int npairs, int g0, int64_t slot, int bos, int q, int t, int nthr) {
+  if (cf.vec) {
+    const int per_row = npairs / 4;  // 16-B units (4 pairs = 8 channels)
+    for (int idx = t; idx < (q + 2 + q) * per_row; idx += nthr) {
+      const int r = idx / per_row, u = idx - r * per_row;
+      const int p = p0 + 4 * u, g = g0 + 8 * u;
+      if (r < q + 2) {
+        *reinterpret_cast<uint4*>(cf.cs + slot * cf.cs_seq + static_cast<int64_t>(r) * cf.cs_tok + g) =
+            *reinterpret_cast<const uint4*>(&fr[r][p]);
+      } else {
+        const int tt = r - (q + 2);
+        *reinterpret_cast<uint4*>(cf.x + static_cast<int64_t>(bos + tt) * cf.sx + g) =
+            *reinterpret_cast<const uint4*>(&fx[tt][p]);
+      }
+    }
+  } else {
+    for (int idx = t; idx < (q + 2 + q) * npairs; idx += nthr) {
+      const int r = idx / npairs, u = idx - r * npairs;
+      if (r < q + 2) {
+        st_cs2(cf, slot, r, g0 + 2 * u, fr[r][p0 + u]);
+      } else {
+        const int tt = r - (q + 2);
+        *reinterpret_cast<uint32_t*>(cf.x + static_cast<int64_t>(bos + tt) * cf.sx + g0 + 2 * u) = fx[tt][p0 + u];
+      }
+    }
+  }
+}
+}  // namespace cfold
+#define GSC_FOLD_PARAM , ConvFold cf
+#define GSC_FOLD_ARG , tl_fold
+#else
+#define GSC_FOLD_PARAM
+#define GSC_FOLD_ARG
+#endif
 struct Sum2 { float x; float y; };
 __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
 #pragma unroll
@@ -1654,7 +1764,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
     const int* __restrict__ num_accepted_tokens, float* __restrict__ state,
     const __nv_bfloat16* __restrict__ output_gate, const void* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ out, int H, int HV, int dt_bias_type, bool norm_weight_is_bf16, float scale,
-    float norm_eps, Strides strides GSC_QO_PARAM) {
+    float norm_eps, Strides strides GSC_QO_PARAM GSC_FOLD_PARAM) {
   const int request = blockIdx.x;
   const int value_head = blockIdx.y;
   const int key_head = value_head / VPK;
@@ -1716,6 +1826,65 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
   accepted = accepted < 0 ? 0 : (accepted > kMaxT ? kMaxT : accepted);
   const int R = flag != 0 ? accepted : 0;
   const int Rprep = GB_SPEC ? accepted : R;  // replay tokens prepped (>= R; extra ones are never used)
+#if GSC_FOLD
+  // (1b) gy-convmerge conv fold: the conv update of this CTA's channels (q, k of the key head, v of the value head)
+  // for the new tokens, one channel pair per thread, into smem: s_fx = conv output (bf16x2), s_fr = the rolled
+  // conv-state rows (old[off+1], old[off+2], raw x_0 .. x_{q-1}). All conv-state / x reads of this CTA complete here.
+  constexpr int kFoldPairs = (2 * kDimK + kDimV) / 2;  // 192 = q 64 | k 64 | v 64
+  __shared__ __align__(16) uint32_t s_fx[kMaxT][kFoldPairs];
+  __shared__ __align__(16) uint32_t s_fr[kMaxT + 2][kFoldPairs];
+  const bool fold = cf.x != nullptr;
+  if (fold) {
+    if (tid < kFoldPairs) {
+      const int pr = tid;
+      const int ch = pr < 64 ? key_head * kDimK + 2 * pr
+                             : (pr < 128 ? H * kDimK + key_head * kDimK + 2 * (pr - 64)
+                                         : 2 * H * kDimK + value_head * kDimV + 2 * (pr - 128));
+      uint32_t wt[4];
+      if (cf.wvec) {  // (ch: taps 0,1 | 2,3), (ch+1: taps 0,1 | 2,3) -> per-tap channel pairs
+        const uint4 u = *reinterpret_cast<const uint4*>(cf.w + static_cast<int64_t>(ch) * 4);
+        wt[0] = __byte_perm(u.x, u.z, 0x5410);
+        wt[1] = __byte_perm(u.x, u.z, 0x7632);
+        wt[2] = __byte_perm(u.y, u.w, 0x5410);
+        wt[3] = __byte_perm(u.y, u.w, 0x7632);
+      } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          wt[j] = static_cast<uint32_t>(cf.w[static_cast<int64_t>(ch) * cf.sw_dim + j * cf.sw_w]) |
+                  (static_cast<uint32_t>(cf.w[static_cast<int64_t>(ch + 1) * cf.sw_dim + j * cf.sw_w]) << 16);
+      }
+      const int64_t off = static_cast<int64_t>(num_accepted_tokens[request]) - 1;  // raw, as the Triton kernel
+      const int64_t slot = base_slot;
+      const uint32_t c0 = cfold::ld_cs2(cf, slot, off + 0, ch);
+      const uint32_t c1 = cfold::ld_cs2(cf, slot, off + 1, ch);
+      const uint32_t c2 = cfold::ld_cs2(cf, slot, off + 2, ch);
+      uint32_t xr[kMaxT];
+#pragma unroll
+      for (int t = 0; t < kMaxT; ++t)
+        xr[t] = t < num_tokens ? *reinterpret_cast<const uint32_t*>(cf.x + static_cast<int64_t>(bos + t) * cf.sx + ch) : 0u;
+      const bool in_cache = slot < cf.ncl;
+      s_fr[0][pr] = in_cache ? c1 : 0u;
+      s_fr[1][pr] = in_cache ? c2 : 0u;
+      uint32_t w0 = c0, w1 = c1, w2 = c2;
+#pragma unroll
+      for (int t = 0; t < kMaxT; ++t) {
+        if (t < num_tokens) {
+          float lo = 0.0f, hi = 0.0f;  // +0 (Triton: acc = zeros, then acc += x * w per tap)
+          cfold::acc_add(lo, hi, cfold::bmul2(w0, wt[0]));
+          cfold::acc_add(lo, hi, cfold::bmul2(w1, wt[1]));
+          cfold::acc_add(lo, hi, cfold::bmul2(w2, wt[2]));
+          cfold::acc_add(lo, hi, cfold::bmul2(xr[t], wt[3]));
+          s_fx[t][pr] = cfold::silu2(lo, hi);
+          s_fr[2 + t][pr] = xr[t];
+          w0 = w1;
+          w1 = w2;
+          w2 = xr[t];
+        }
+      }
+    }
+    __syncthreads();
+  }
+#endif
   // (2) token prep (stock arithmetic; k / q stored in the paired order)
   float g_pre[4] = {0.f, 0.f, 0.f, 0.f};
   float w_pre[4] = {0.f, 0.f, 0.f, 0.f};
@@ -1728,9 +1897,19 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int dim = lane + i * 32;
-      qv[i] = __bfloat162float(mixed_qkv[mixed_base + key_head * kDimK + dim]);
-      kv[i] = __bfloat162float(mixed_qkv[mixed_base + H * kDimK + key_head * kDimK + dim]);
-      s_v[kMaxT + t][dim] = mixed_qkv[mixed_base + 2 * H * kDimK + value_head * kDimV + dim];
+#if GSC_FOLD
+      if (fold) {  // the folded conv's output (= what the Triton update would have left in mixed_qkv)
+        const __nv_bfloat16* fx = reinterpret_cast<const __nv_bfloat16*>(s_fx[t]);
+        qv[i] = __bfloat162float(fx[dim]);
+        kv[i] = __bfloat162float(fx[kDimK + dim]);
+        s_v[kMaxT + t][dim] = fx[2 * kDimK + dim];
+      } else
+#endif
+      {
+        qv[i] = __bfloat162float(mixed_qkv[mixed_base + key_head * kDimK + dim]);
+        kv[i] = __bfloat162float(mixed_qkv[mixed_base + H * kDimK + key_head * kDimK + dim]);
+        s_v[kMaxT + t][dim] = mixed_qkv[mixed_base + 2 * H * kDimK + value_head * kDimV + dim];
+      }
       if (task == warp) {  // this warp also runs token t's epilogue
         g_pre[i] = __bfloat162float(output_gate[static_cast<int64_t>(token) * strides.gate_row + value_head * kDimV + dim]);
         w_pre[i] = norm_weight_is_bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(norm_weight)[dim])
@@ -1796,6 +1975,20 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
     }
     if (last) {
       __threadfence();
+#if GSC_FOLD
+      if (fold) {
+        // K log = the post-conv k (as the Triton update leaves it in mixed_qkv), from smem
+        for (int linear = lane; linear < num_tokens * kDimK; linear += 32) {
+          const int t = linear / kDimK, d = linear % kDimK;
+          log_k[(static_cast<int64_t>(t) * H + key_head) * kDimK + d] =
+              reinterpret_cast<const __nv_bfloat16*>(s_fx[t])[kDimK + d];
+        }
+        // shared q / k channels: conv-state roll + in-place output rows, written by the last reader only
+        cfold::write_back<kFoldPairs>(cf, s_fr, s_fx, 0, 64, key_head * kDimK, base_slot, bos, num_tokens, lane, 32);
+        cfold::write_back<kFoldPairs>(cf, s_fr, s_fx, 64, 64, H * kDimK + key_head * kDimK, base_slot, bos,
+                                      num_tokens, lane, 32);
+      } else
+#endif
       for (int linear = lane; linear < num_tokens * kDimK; linear += 32) {
         const int t = linear / kDimK, d = linear % kDimK;
         log_k[(static_cast<int64_t>(t) * H + key_head) * kDimK + d] =
@@ -1807,6 +2000,12 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
     const int t = linear / kDimV, d = linear % kDimV;
     log_v[(static_cast<int64_t>(t) * HV + value_head) * kDimV + d] = s_v[kMaxT + t][d];
   }
+#if GSC_FOLD
+  // v channels of this value head: only this CTA reads them (conv phase, before the barrier above)
+  if (fold)
+    cfold::write_back<kFoldPairs>(cf, s_fr, s_fx, 128, 64, 2 * H * kDimK + value_head * kDimV, base_slot, bos,
+                                  num_tokens, tid, kGbThreads);
+#endif
   if (tid < num_tokens) {
     log_ab[(tid * HV + value_head) * 2] = a[static_cast<int64_t>(bos + tid) * strides.a_row + value_head];
     log_ab[(tid * HV + value_head) * 2 + 1] = b[static_cast<int64_t>(bos + tid) * strides.b_row + value_head];
@@ -3221,6 +3420,12 @@ __global__ __launch_bounds__(kThreads, 2) void materialize_kernel(MatArgs args) 
   if (tid == 0) *dst_ctr = 0;
 }
 
+#if GSC_FOLD
+// gy-convmerge: the fold's conv arguments, set only around decode_core by decode_fold / decode_qo_fold (the
+// gb_decode_kernel launch passes them; nullptr x = fold off, the stock path of the same kernel)
+static thread_local ConvFold tl_fold = {};
+#endif
+
 #if GSC_QO
 static void decode_core(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
             torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
@@ -3307,6 +3512,9 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
 #if GSC_GB
 #if GB_KH
   if (!sbf && vpk == 2 && (GB_KH == 1 || n >= GB_KH_MIN)) {  // GB300 fp32 kernel, one CTA per (request, key head)
+#if GSC_FOLD
+    TORCH_CHECK(tl_fold.x == nullptr, "gdn_state_commit: the conv fold runs only in gb_decode_kernel (n < GB_KH_MIN)");
+#endif
     static bool gbk_attr[2] = {};
     const dim3 kgrid(n, H);
 #define GSC_GBK_LAUNCH(SIG_)                                                                                      \
@@ -3330,7 +3538,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
       C10_CUDA_CHECK(cudaFuncSetAttribute(gb_decode_kernel<VPK_, SIG_>, cudaFuncAttributePreferredSharedMemoryCarveout, 100)); \
       gb_attr[VPK_ - 1][SIG_] = true;                                                                             \
     }                                                                                                             \
-    gb_decode_kernel<VPK_, SIG_><<<grid, kGbThreads, kGbDyn, stream>>>(GSC_ARGS(float) GSC_QO_ARG);
+    gb_decode_kernel<VPK_, SIG_><<<grid, kGbThreads, kGbDyn, stream>>>(GSC_ARGS(float) GSC_QO_ARG GSC_FOLD_ARG);
     if (vpk == 2) {
       if (sigmoid_gate) { GSC_GB_LAUNCH(2, true); } else { GSC_GB_LAUNCH(2, false); }
     } else {
@@ -3415,6 +3623,92 @@ void decode_qo(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch:
   decode_core(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, output_gate,
               norm_weight, out, scale, norm_eps, sigmoid_gate, qo);
 }
+#endif
+
+#if GSC_FOLD
+// gy-convmerge: contract of the decode conv fold. False (nothing launched) -> the caller runs the Triton conv update
+// and the plain decode. The fold needs the gb_decode_kernel path (fp32 state, n < GB_KH_MIN), the GDN conv shapes
+// (width 4, conv_dim = (2H + HV) * 128) and 4-B aligned channel pairs; the conv-state slot of a request is its ssm slot
+// (state_indices[:, 0]: the caller passes conv_state_indices = state_indices[:, 0], as the Triton call does).
+static bool fold_setup(ConvFold& cf, torch::Tensor mixed_qkv, torch::Tensor state, torch::Tensor state_indices,
+                       torch::Tensor conv_state, torch::Tensor conv_w) {
+  if (state.scalar_type() != at::kFloat || state.dim() != 4) return false;
+  if (mixed_qkv.scalar_type() != at::kBFloat16 || mixed_qkv.dim() != 2 || mixed_qkv.stride(1) != 1) return false;
+  const int64_t HV = state.size(1);
+  const int64_t conv_dim = mixed_qkv.size(1);
+  if ((conv_dim - HV * kDimV) % (2 * kDimK) != 0) return false;
+  const int64_t H = (conv_dim - HV * kDimV) / (2 * kDimK);
+  if (H <= 0 || HV % H != 0 || (HV / H != 1 && HV / H != 2)) return false;
+  const int64_t n = state_indices.size(0);
+  if (n <= 0) return false;
+#if GB_KH
+  if (HV / H == 2 && (GB_KH == 1 || n >= GB_KH_MIN)) return false;  // gb_kh_kernel: no fold
+#endif
+  if (conv_w.scalar_type() != at::kBFloat16 || conv_w.dim() != 2 || conv_w.size(0) != conv_dim || conv_w.size(1) != 4)
+    return false;
+  if (conv_state.scalar_type() != at::kBFloat16 || conv_state.dim() != 3 || conv_state.size(1) != conv_dim ||
+      conv_state.size(2) < kMaxT + 2)
+    return false;
+  if (reinterpret_cast<uintptr_t>(mixed_qkv.data_ptr()) % 4 != 0 || mixed_qkv.stride(0) % 2 != 0) return false;
+  if (conv_state.stride(1) == 1 && (reinterpret_cast<uintptr_t>(conv_state.data_ptr()) % 4 != 0 ||
+                                    conv_state.stride(0) % 2 != 0 || conv_state.stride(2) % 2 != 0))
+    return false;
+  cf.x = reinterpret_cast<uint16_t*>(mixed_qkv.data_ptr());
+  cf.sx = mixed_qkv.stride(0);
+  cf.w = reinterpret_cast<const uint16_t*>(conv_w.data_ptr());
+  cf.sw_dim = conv_w.stride(0);
+  cf.sw_w = conv_w.stride(1);
+  cf.cs = reinterpret_cast<uint16_t*>(conv_state.data_ptr());
+  cf.cs_seq = conv_state.stride(0);
+  cf.cs_dim = conv_state.stride(1);
+  cf.cs_tok = conv_state.stride(2);
+  cf.ncl = conv_state.size(0);
+  cf.wvec = cf.sw_dim == 4 && cf.sw_w == 1 && reinterpret_cast<uintptr_t>(conv_w.data_ptr()) % 16 == 0;
+  cf.vec = cf.cs_dim == 1 && cf.cs_seq % 8 == 0 && cf.cs_tok % 8 == 0 &&
+           reinterpret_cast<uintptr_t>(conv_state.data_ptr()) % 16 == 0 && cf.sx % 8 == 0 &&
+           reinterpret_cast<uintptr_t>(mixed_qkv.data_ptr()) % 16 == 0;
+  return true;
+}
+
+// conv update + decode in one launch: mixed_qkv holds the RAW conv inputs (the qkv part of in_proj's output) on entry
+// and the conv output on return; conv_state (slots, conv_dim, state_len) is rolled; everything else as decode().
+bool decode_fold(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
+                 torch::Tensor state_indices, torch::Tensor cu_seqlens, torch::Tensor num_accepted, torch::Tensor state,
+                 torch::Tensor output_gate, torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps,
+                 bool sigmoid_gate, torch::Tensor conv_state, torch::Tensor conv_w) {
+  ConvFold cf{};
+  if (!fold_setup(cf, mixed_qkv, state, state_indices, conv_state, conv_w)) return false;
+  tl_fold = cf;
+  try {
+    decode(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, output_gate, norm_weight,
+           out, scale, norm_eps, sigmoid_gate);
+  } catch (...) {
+    tl_fold = ConvFold{};
+    throw;
+  }
+  tl_fold = ConvFold{};
+  return true;
+}
+#if GSC_QO
+bool decode_qo_fold(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+                    torch::Tensor dt_bias, torch::Tensor state_indices, torch::Tensor cu_seqlens,
+                    torch::Tensor num_accepted, torch::Tensor state, torch::Tensor output_gate,
+                    torch::Tensor norm_weight, torch::Tensor out, double scale, double norm_eps, bool sigmoid_gate,
+                    torch::Tensor q, torch::Tensor sf, int64_t psc, torch::Tensor conv_state, torch::Tensor conv_w) {
+  ConvFold cf{};
+  if (!fold_setup(cf, mixed_qkv, state, state_indices, conv_state, conv_w)) return false;
+  tl_fold = cf;
+  try {
+    decode_qo(mixed_qkv, a, b, a_log, dt_bias, state_indices, cu_seqlens, num_accepted, state, output_gate,
+              norm_weight, out, scale, norm_eps, sigmoid_gate, q, sf, psc);
+  } catch (...) {
+    tl_fold = ConvFold{};
+    throw;
+  }
+  tl_fold = ConvFold{};
+  return true;
+}
+#endif
 #endif
 
 void materialize(int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0, c10::optional<torch::Tensor> a1,
@@ -3531,6 +3825,22 @@ int64_t occupancy_gb() {
 #endif
 }
 
+#if GSC_FOLD
+// gy-convmerge diagnostics: gb_decode_kernel<2, false> (the kernel the fold edits; occupancy_gb() reports gb_kh_kernel
+// when GB_KH is set), same encoding as occupancy_gb()
+int64_t occupancy_gbd() {
+  auto fn = gb_decode_kernel<2, false>;
+  constexpr int dyn = kGbDyn;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
+  C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  int n = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, kGbThreads, dyn));
+  cudaFuncAttributes fa;
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, fn));
+  return static_cast<int64_t>(fa.localSizeBytes) * 1000000000LL + n * 1000000 + fa.numRegs * 1000 + fa.sharedSizeBytes / 1024;
+}
+#endif
+
 int64_t log_bytes(int64_t H, int64_t HV) { return log_layout(static_cast<int>(H), static_cast<int>(HV)).bytes; }
 
 }  // namespace gsc
@@ -3539,6 +3849,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &gsc::decode);
 #if GSC_QO
   m.def("decode_qo", &gsc::decode_qo);
+#endif
+#if GSC_FOLD
+  m.def("occupancy_gbd", &gsc::occupancy_gbd);
+  m.def("decode_fold", &gsc::decode_fold);
+#if GSC_QO
+  m.def("decode_qo_fold", &gsc::decode_qo_fold);
+#endif
 #endif
   m.def("materialize", &gsc::materialize);
   m.def("log_bytes", &gsc::log_bytes);
