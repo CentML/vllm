@@ -60,39 +60,52 @@ else()
     )
   endif()
 
-  # DeepJIT otherwise targets physical SM107 (`sm_107f`). DeepGEMM dispatches
-  # SM107 through SM100 kernels and its vendored CUTLASS predates SM107, so
-  # compile those JIT kernels for the compatible SM100 family without changing
-  # DeepJIT's physical device-reporting API.
-  set(_deepgemm_sm107_patch
-      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm-sm107-sm100-family.patch")
-  execute_process(
-    COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
-            apply --check "${_deepgemm_sm107_patch}"
-    RESULT_VARIABLE _deepgemm_patch_check
-    OUTPUT_QUIET
-    ERROR_QUIET)
-  if(_deepgemm_patch_check EQUAL 0)
+  # Patches, applied in order:
+  # - deepgemm-sm107-sm100-family.patch: DeepJIT otherwise targets physical
+  #   SM107 (`sm_107f`). DeepGEMM dispatches SM107 through SM100 kernels and
+  #   its vendored CUTLASS predates SM107, so compile those JIT kernels for the
+  #   compatible SM100 family without changing DeepJIT's physical
+  #   device-reporting API.
+  # - deepgemm-megamoe-sm107-perdie.patch: opt-in Rubin (SM107) fp8 x fp4
+  #   MegaMoE kernel (K=64 block-scaled UMMA, packed FP4 weights in shared
+  #   memory; DG_MEGA_MOE_SM107=1) and per-die execution with die-local weights
+  #   (Rubin locality domains; DG_MEGA_MOE_SM107_PERDIE=1,
+  #   deep_gemm.mega.sm107_locality). Additive: with the env flags unset the
+  #   SM100 kernels and their outputs are unchanged. vLLM enables it with
+  #   VLLM_DSV41_MEGAMOE_SM107 / VLLM_DSV41_MEGAMOE_PERDIE.
+  set(_deepgemm_patches
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm-sm107-sm100-family.patch"
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm-megamoe-sm107-perdie.patch")
+  foreach(_deepgemm_patch IN LISTS _deepgemm_patches)
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
-              apply "${_deepgemm_sm107_patch}"
-      COMMAND_ERROR_IS_FATAL ANY)
-  else()
-    # A cached FetchContent tree may already contain the patch. Accept only an
-    # exact reverse-applicable patch; any other state is an actionable error.
-    execute_process(
-      COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
-              apply --reverse --check "${_deepgemm_sm107_patch}"
-      RESULT_VARIABLE _deepgemm_reverse_patch_check
+              apply --check "${_deepgemm_patch}"
+      RESULT_VARIABLE _deepgemm_patch_check
       OUTPUT_QUIET
       ERROR_QUIET)
-    if(NOT _deepgemm_reverse_patch_check EQUAL 0)
-      message(FATAL_ERROR
-        "DeepGEMM SM107 family-target patch does not apply cleanly to "
-        "${deepgemm_SOURCE_DIR}")
+    if(_deepgemm_patch_check EQUAL 0)
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
+                apply "${_deepgemm_patch}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    else()
+      # A cached FetchContent tree may already contain the patch. Accept only
+      # an exact reverse-applicable patch; any other state is an actionable
+      # error.
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" -C "${deepgemm_SOURCE_DIR}"
+                apply --reverse --check "${_deepgemm_patch}"
+        RESULT_VARIABLE _deepgemm_reverse_patch_check
+        OUTPUT_QUIET
+        ERROR_QUIET)
+      if(NOT _deepgemm_reverse_patch_check EQUAL 0)
+        message(FATAL_ERROR
+          "DeepGEMM patch ${_deepgemm_patch} does not apply cleanly to "
+          "${deepgemm_SOURCE_DIR}")
+      endif()
     endif()
-  endif()
-  message(STATUS "DeepGEMM SM107 JIT target: SM100 family")
+  endforeach()
+  message(STATUS "DeepGEMM SM107 JIT target: SM100 family; Rubin MegaMoE kernel: opt-in")
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
 endif()
 
@@ -252,6 +265,18 @@ if(DEEPGEMM_ARCHS)
   install(DIRECTORY "${deepgemm_SOURCE_DIR}/third-party/cutlass/include/"
     DESTINATION vllm/third_party/deep_gemm/include
     COMPONENT _deep_gemm_C)
+
+  # CUTLASS with SM107 support for the opt-in sm_107a JIT target of the Rubin
+  # MegaMoE kernel (DG_MEGA_MOE_SM107_ARCH=107a reads include/sm107_cutlass).
+  # Every other DeepGEMM kernel keeps the vendored CUTLASS above.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4 AND EXISTS
+     "${deepgemm_SOURCE_DIR}/deep_gemm/include/deep_gemm/impls/sm107_fp8_fp4_mega_moe.cuh")
+    include(${CMAKE_CURRENT_LIST_DIR}/cutlass_sm107.cmake)
+    install(DIRECTORY "${CUTLASS_SM107_SOURCE_DIR}/include/cute"
+                      "${CUTLASS_SM107_SOURCE_DIR}/include/cutlass"
+      DESTINATION vllm/third_party/deep_gemm/include/sm107_cutlass
+      COMPONENT _deep_gemm_C)
+  endif()
 
 else()
   message(STATUS "DeepGEMM will not compile: "
