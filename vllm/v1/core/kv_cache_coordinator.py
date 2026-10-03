@@ -13,9 +13,12 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -29,6 +32,156 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _resolved_impl(manager: SingleTypeKVCacheManager, name: str):
+    """The class function ``manager.<name>`` dispatches to, or None when the
+    instance overrides it (hot-path specializations then stay off)."""
+    if name in vars(manager):
+        return None
+    return getattr(type(manager), name)
+
+
+def _remove_skipped_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, int | None] | None:
+    """How ``KVCacheCoordinator.remove_skipped_blocks`` handles ``manager``.
+
+    Returns None when the manager's ``remove_skipped_blocks`` provably never
+    does anything (the base removal with no skipped tokens, e.g. full
+    attention, or the circular-buffer ring); ``(manager, offset)`` when it is
+    the base removal driven by ``SlidingWindowManager.get_num_skipped_tokens``
+    (``offset = sliding_window - 1 + extra_retained_tokens``), which the
+    coordinator inlines; ``(manager, None)`` to call the method as is.
+    """
+    base = SingleTypeKVCacheManager
+    remove = _resolved_impl(manager, "remove_skipped_blocks")
+    if remove is CircularBufferManager.remove_skipped_blocks:
+        return None
+    if remove is base.remove_skipped_blocks:
+        num_skipped = _resolved_impl(manager, "get_num_skipped_tokens")
+        if num_skipped is base.get_num_skipped_tokens:
+            return None
+        if (
+            num_skipped is SlidingWindowManager.get_num_skipped_tokens
+            and _resolved_impl(manager, "_remove_blocks_in_range")
+            is base._remove_blocks_in_range
+        ):
+            assert isinstance(manager, SlidingWindowManager)
+            return (
+                manager,
+                manager.sliding_window - 1 + manager.extra_retained_tokens,
+            )
+    return (manager, None)
+
+
+# How the coordinator's per-group allocation loops handle a manager.
+_ALLOC_GENERIC = 0  # call the manager method
+_ALLOC_BASE = 1  # base SingleTypeKVCacheManager logic, inlined fast path
+_ALLOC_RING = 2  # CircularBufferManager: one block per request, inlined
+_ALLOC_CROSS = 3  # cross-attention: sized by the encoder tokens
+
+
+def _num_blocks_to_allocate_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, int, int | None]:
+    """``(manager, kind, swa_skip_offset)`` for
+    ``KVCacheCoordinator.get_num_blocks_to_allocate``. ``_ALLOC_BASE`` needs
+    the base ``get_num_blocks_to_allocate`` with the base partial-hit and
+    evictable-block helpers, and a ``get_num_skipped_tokens`` that is either
+    the base one (offset None: nothing skipped) or the sliding-window one."""
+    if isinstance(manager, CrossAttentionManager):
+        return (manager, _ALLOC_CROSS, None)
+    base = SingleTypeKVCacheManager
+    impl = _resolved_impl(manager, "get_num_blocks_to_allocate")
+    if impl is CircularBufferManager.get_num_blocks_to_allocate:
+        return (manager, _ALLOC_RING, None)
+    if (
+        impl is base.get_num_blocks_to_allocate
+        and _resolved_impl(manager, "_has_partial_local_hit")
+        is base._has_partial_local_hit
+        and "_get_num_evictable_blocks" not in vars(manager)
+        and type(manager)._get_num_evictable_blocks.__func__
+        is base._get_num_evictable_blocks.__func__
+    ):
+        num_skipped = _resolved_impl(manager, "get_num_skipped_tokens")
+        if num_skipped is base.get_num_skipped_tokens:
+            return (manager, _ALLOC_BASE, None)
+        if num_skipped is SlidingWindowManager.get_num_skipped_tokens:
+            assert isinstance(manager, SlidingWindowManager)
+            return (
+                manager,
+                _ALLOC_BASE,
+                manager.sliding_window - 1 + manager.extra_retained_tokens,
+            )
+    return (manager, _ALLOC_GENERIC, None)
+
+
+def _allocate_new_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, int]:
+    """``(manager, kind)`` for ``KVCacheCoordinator.allocate_new_blocks``."""
+    if isinstance(manager, CrossAttentionManager):
+        return (manager, _ALLOC_CROSS)
+    impl = _resolved_impl(manager, "allocate_new_blocks")
+    if impl is SingleTypeKVCacheManager.allocate_new_blocks:
+        return (manager, _ALLOC_BASE)
+    if (
+        impl is CircularBufferManager.allocate_new_blocks
+        and _resolved_impl(manager, "_claim_ring_block")
+        is CircularBufferManager._claim_ring_block
+    ):
+        return (manager, _ALLOC_RING)
+    return (manager, _ALLOC_GENERIC)
+
+
+def _cache_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, bool] | None:
+    """How the coordinator's ``cache_blocks`` handles ``manager``.
+
+    None: the call never does anything (caching disabled, the ring, or the
+    base implementation on a non-prefix-cacheable spec such as SWA under
+    bounded replay). ``(manager, True)``: the base implementation (also full
+    attention when its blocks are hash-sized, so no partial-tail entry), which
+    returns at once unless a block became full since the last call; the
+    coordinator checks that itself. ``(manager, False)``: always call.
+    """
+    if not manager.enable_caching:
+        return None
+    impl = _resolved_impl(manager, "cache_blocks")
+    if impl is CircularBufferManager.cache_blocks:
+        return None
+    if impl is SingleTypeKVCacheManager.cache_blocks or (
+        impl is FullAttentionManager.cache_blocks
+        and manager.block_size == manager.block_pool.hash_block_size
+    ):
+        if not manager.kv_cache_spec.prefix_cacheable:
+            return None
+        return (manager, True)
+    return (manager, False)
+
+
+def _fused_allocate_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, int | None, bool] | None:
+    """``(manager, swa_skip_offset, is_ring)`` for
+    ``KVCacheCoordinator.allocate_without_new_hits``, or None when the
+    manager does not use the inlined base / ring logic in all three phases
+    (removal, block count, allocation)."""
+    remove = _remove_skipped_blocks_plan_entry(manager)
+    _, num_kind, num_offset = _num_blocks_to_allocate_plan_entry(manager)
+    _, alloc_kind = _allocate_new_blocks_plan_entry(manager)
+    if num_kind == _ALLOC_RING and alloc_kind == _ALLOC_RING and remove is None:
+        return (manager, None, True)
+    if num_kind == _ALLOC_BASE and alloc_kind == _ALLOC_BASE:
+        if remove is None and num_offset is None:
+            # Base removal with nothing skipped (e.g. full attention).
+            return (manager, None, False)
+        if remove is not None and remove[1] is not None and remove[1] == num_offset:
+            # Sliding window: the same skip rule drives removal and count.
+            return (manager, num_offset, False)
+    return None
 
 
 def _validate_prefix_cache_retention_interval(
@@ -155,6 +308,34 @@ class KVCacheCoordinator(ABC):
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers
         )
+        # Per-request hot path (every scheduled request, every step): drop the
+        # managers whose removal is a no-op and inline the sliding-window rule.
+        self._remove_skipped_blocks_plan = tuple(
+            entry
+            for manager in self.single_type_managers
+            if (entry := _remove_skipped_blocks_plan_entry(manager)) is not None
+        )
+        self._num_blocks_to_allocate_plan = tuple(
+            _num_blocks_to_allocate_plan_entry(manager)
+            for manager in self.single_type_managers
+        )
+        self._allocate_new_blocks_plan = tuple(
+            _allocate_new_blocks_plan_entry(manager)
+            for manager in self.single_type_managers
+        )
+        self._cache_blocks_plan = tuple(
+            entry
+            for manager in self.single_type_managers
+            if (entry := _cache_blocks_plan_entry(manager)) is not None
+        )
+        # One pass over the groups for allocate_without_new_hits, available
+        # when every group uses the inlined base / ring logic.
+        fused_plan = tuple(
+            _fused_allocate_plan_entry(manager) for manager in self.single_type_managers
+        )
+        self._fused_allocate_plan = (
+            None if any(entry is None for entry in fused_plan) else fused_plan
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -209,8 +390,40 @@ class KVCacheCoordinator(ABC):
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
-        for i, manager in enumerate(self.single_type_managers):
-            if isinstance(manager, CrossAttentionManager):
+        for i, (manager, kind, swa_skip_offset) in enumerate(
+            self._num_blocks_to_allocate_plan
+        ):
+            if kind == _ALLOC_BASE and len(new_computed_blocks[i]) == 0:
+                # Inlined SingleTypeKVCacheManager.get_num_blocks_to_allocate
+                # without new prefix-cache hits (every running request).
+                block_size = manager.block_size
+                num_required_blocks = -(num_tokens // -block_size)
+                if (
+                    apply_admission_cap
+                    and manager.max_admission_blocks_per_request is not None
+                ):
+                    num_required_blocks = min(
+                        num_required_blocks, manager.max_admission_blocks_per_request
+                    )
+                req_blocks = manager.req_to_blocks.get(request_id)
+                num_req_blocks = 0 if req_blocks is None else len(req_blocks)
+                if (
+                    swa_skip_offset is not None
+                    and request_id not in manager.num_cached_block
+                ):
+                    # Blocks skipped by the attention window count as held.
+                    num_skipped_blocks = (
+                        max(0, total_computed_tokens - swa_skip_offset) // block_size
+                    )
+                    if num_skipped_blocks > num_req_blocks:
+                        num_req_blocks = num_skipped_blocks
+                if num_required_blocks > num_req_blocks:
+                    num_blocks_to_allocate += num_required_blocks - num_req_blocks
+            elif kind == _ALLOC_RING:
+                # Inlined CircularBufferManager.get_num_blocks_to_allocate.
+                if not manager.req_to_blocks.get(request_id):
+                    num_blocks_to_allocate += 1
+            elif kind == _ALLOC_CROSS:
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
@@ -281,6 +494,118 @@ class KVCacheCoordinator(ABC):
                     num_external_computed_tokens,
                 )
 
+    @property
+    def supports_allocate_without_new_hits(self) -> bool:
+        return self._fused_allocate_plan is not None
+
+    def allocate_without_new_hits(
+        self,
+        request_id: str,
+        processed_computed_tokens: int,
+        num_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        num_blocks_to_keep_free: int,
+    ) -> tuple[list[KVCacheBlock], ...] | None:
+        """``remove_skipped_blocks``, ``get_num_blocks_to_allocate`` and, if
+        the new blocks fit, ``allocate_new_blocks`` for a request without new
+        prefix-cache hits, external or encoder tokens (every running request),
+        in one pass over the groups.
+
+        Requires ``supports_allocate_without_new_hits``: every group uses the
+        base (full attention, sliding window) or ring logic, which these
+        phases read and write per group only (a removal frees blocks to the
+        pool, which no block count reads). So running each group's removal
+        and count before the next group's removal is equivalent to the three
+        separate loops; allocation then runs in group order, only for the
+        groups whose ``allocate_new_blocks`` has anything to do.
+
+        Args:
+            request_id: The request ID.
+            processed_computed_tokens: As in ``remove_skipped_blocks``.
+            num_tokens: Token slots needed, as in ``allocate_new_blocks``.
+            total_computed_tokens: As in ``get_num_blocks_to_allocate``.
+            num_tokens_main_model: As in ``allocate_new_blocks``.
+            num_blocks_to_keep_free: Free blocks that must remain after the
+                allocation (reserved blocks plus watermark).
+
+        Returns:
+            The new blocks per group; an empty tuple when no group gets a new
+            block (most decode steps); None (nothing allocated) when the new
+            blocks do not fit.
+
+        """
+        plan = self._fused_allocate_plan
+        assert plan is not None
+        num_blocks_to_allocate = 0
+        groups_to_allocate: list[int] = []
+        for i, (manager, swa_skip_offset, is_ring) in enumerate(plan):
+            req_to_blocks = manager.req_to_blocks
+            if is_ring:
+                # CircularBufferManager: one block per request, claimed once.
+                if not req_to_blocks.get(request_id):
+                    num_blocks_to_allocate += 1
+                    groups_to_allocate.append(i)
+                continue
+            block_size = manager.block_size
+            if swa_skip_offset is not None:
+                # remove_skipped_blocks (see there).
+                num_skipped_tokens = processed_computed_tokens - swa_skip_offset
+                if num_skipped_tokens > 0:
+                    blocks = req_to_blocks[request_id]
+                    j = min(num_skipped_tokens // block_size, len(blocks)) - 1
+                    null_block = manager._null_block
+                    if j >= 0 and blocks[j] is not null_block:
+                        # Inlined _remove_blocks_in_range(request_id, 0, j + 1):
+                        # null out and free back to the first removed block.
+                        freed: list[KVCacheBlock] = []
+                        while j >= 0:
+                            block = blocks[j]
+                            if block is null_block or block == null_block:
+                                break
+                            freed.append(block)
+                            blocks[j] = null_block
+                            j -= 1
+                        if freed:
+                            manager.block_pool.free_blocks(freed)
+            # get_num_blocks_to_allocate (see there).
+            blocks = req_to_blocks.get(request_id)
+            num_req_blocks = 0 if blocks is None else len(blocks)
+            num_required_blocks = -(num_tokens // -block_size)
+            num_held_blocks = num_req_blocks
+            if (
+                swa_skip_offset is not None
+                and request_id not in manager.num_cached_block
+            ):
+                num_skipped_blocks = (
+                    max(0, total_computed_tokens - swa_skip_offset) // block_size
+                )
+                if num_skipped_blocks > num_held_blocks:
+                    num_held_blocks = num_skipped_blocks
+            if num_required_blocks > num_held_blocks:
+                num_blocks_to_allocate += num_required_blocks - num_held_blocks
+            # allocate_new_blocks allocates, redirects a partial hit or creates
+            # the request's block table; otherwise it returns [].
+            if (
+                blocks is None
+                or num_required_blocks > num_req_blocks
+                or request_id in manager._partial_hit_reqs
+            ):
+                groups_to_allocate.append(i)
+        if (
+            num_blocks_to_allocate
+            > self.block_pool.get_num_free_blocks() - num_blocks_to_keep_free
+        ):
+            return None
+        if not groups_to_allocate:
+            return ()
+        new_blocks: list[list[KVCacheBlock]] = [[] for _ in plan]
+        for i in groups_to_allocate:
+            new_blocks[i] = plan[i][0].allocate_new_blocks(
+                request_id, num_tokens, num_tokens_main_model
+            )
+        return tuple(new_blocks)
+
     def allocate_new_blocks(
         self,
         request_id: str,
@@ -305,16 +630,34 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
-        return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+        new_blocks: list[list[KVCacheBlock]] = []
+        for manager, kind in self._allocate_new_blocks_plan:
+            if kind == _ALLOC_BASE:
+                # Most steps cross no block boundary in most groups: return
+                # the base method's empty result without calling it.
+                if request_id not in manager._partial_hit_reqs:
+                    req_blocks = manager.req_to_blocks[request_id]
+                    if -(num_tokens // -manager.block_size) <= len(req_blocks):
+                        new_blocks.append([])
+                        continue
+            elif kind == _ALLOC_RING:
+                # The ring's single block is claimed once per request.
+                if manager.req_to_blocks[request_id]:
+                    new_blocks.append([])
+                    continue
+            elif kind == _ALLOC_CROSS:
+                new_blocks.append(
+                    manager.allocate_new_blocks(
+                        request_id, num_encoder_tokens, num_tokens_main_model
+                    )
+                )
+                continue
+            new_blocks.append(
+                manager.allocate_new_blocks(
+                    request_id, num_tokens, num_tokens_main_model
+                )
             )
-            for manager in self.single_type_managers
-        )
+        return tuple(new_blocks)
 
     def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
         """Positions a later request replaying this prompt can resume at.
@@ -347,15 +690,19 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
-        boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            if not manager.enable_caching:
-                continue
+        boundaries = None
+        for manager, skip_if_no_new_full_block in self._cache_blocks_plan:
             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
             # tokens can be re-prefilled during multi-module MTP.
             num_tokens_to_cache = max(
                 0, num_computed_tokens - self.num_reprefillable_tokens
             )
+            if skip_if_no_new_full_block and manager.num_cached_block.get(
+                request.request_id, 0
+            ) >= (num_tokens_to_cache // manager.block_size):
+                continue
+            if boundaries is None:
+                boundaries = self.get_replay_boundaries(request)
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,
@@ -448,10 +795,30 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
-        for manager in self.single_type_managers:
-            manager.remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
+        for manager, swa_skip_offset in self._remove_skipped_blocks_plan:
+            if swa_skip_offset is None:
+                manager.remove_skipped_blocks(
+                    request_id, processed_computed_tokens, num_prompt_tokens
+                )
+                continue
+            # Inlined SlidingWindowManager.get_num_skipped_tokens and the base
+            # remove_skipped_blocks. The removal walks back from the last
+            # skipped block and stops at the first null block, so when that
+            # block is already null (the window has not crossed a new block
+            # since the last call) it frees nothing: skip the call.
+            num_skipped_tokens = processed_computed_tokens - swa_skip_offset
+            if num_skipped_tokens <= 0:
+                continue
+            blocks = manager.req_to_blocks[request_id]
+            num_skipped_blocks = min(
+                num_skipped_tokens // manager.block_size, len(blocks)
             )
+            if (
+                num_skipped_blocks == 0
+                or blocks[num_skipped_blocks - 1] is manager._null_block
+            ):
+                continue
+            manager._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """Get the blocks for the request."""
@@ -806,11 +1173,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return round_down(num_tokens, self.scheduler_block_size)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
-        boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            if not manager.enable_caching:
-                continue
+        # _align_cacheable, inlined (called twice per request per step).
+        cached_num_computed_tokens = (
+            num_computed_tokens
+            if self.enable_partial_hash_hits
+            else num_computed_tokens
+            // self.scheduler_block_size
+            * self.scheduler_block_size
+        )
+        boundaries = None
+        for manager, skip_if_no_new_full_block in self._cache_blocks_plan:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
             # it, so make that lookahead block eligible to be cached.
@@ -828,6 +1200,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_finalized_computed_tokens,
                     cached_num_finalized_computed_tokens + manager.block_size,
                 )
+            # Most calls (every decode step) complete no new block.
+            if skip_if_no_new_full_block and manager.num_cached_block.get(
+                request.request_id, 0
+            ) >= (num_tokens_to_cache // manager.block_size):
+                continue
+            if boundaries is None:
+                boundaries = self.get_replay_boundaries(request)
             # The manager already knows the fine hit granularity
             # (``scheduler_block_size``); retention is passed separately so it
             # can keep both the coarse segment tails and the fine replay

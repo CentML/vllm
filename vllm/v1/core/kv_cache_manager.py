@@ -4,6 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from operator import attrgetter
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -29,6 +30,9 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# KVCacheBlock.block_hash_num_tokens without the property call.
+_get_block_hash_num_tokens = attrgetter("_block_hash_num_tokens")
 
 
 @dataclass
@@ -102,9 +106,9 @@ class KVCacheBlocks:
             if group_ids is None
             else tuple(self.blocks[group_id] for group_id in group_ids)
         )
-        if allow_none and all(len(group) == 0 for group in groups):
+        if allow_none and not any(groups):
             return None
-        return tuple([blk.block_id for blk in group] for group in groups)
+        return tuple([[blk.block_id for blk in group] for group in groups])
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
@@ -478,6 +482,24 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        if (
+            new_computed_blocks is None
+            and num_new_computed_tokens == 0
+            and num_external_computed_tokens == 0
+            and num_encoder_tokens == 0
+            and not full_sequence_must_fit
+            and not delay_cache_blocks
+            and self.coordinator.supports_allocate_without_new_hits
+        ):
+            # Every running request: no new hits to adopt (see below).
+            return self._allocate_slots_without_new_hits(
+                request,
+                num_new_tokens,
+                num_lookahead_tokens,
+                reserved_blocks,
+                has_scheduled_reqs,
+            )
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -611,6 +633,48 @@ class KVCacheManager:
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
+        return self.create_kv_cache_blocks(new_blocks)
+
+    def _allocate_slots_without_new_hits(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_lookahead_tokens: int,
+        reserved_blocks: int,
+        has_scheduled_reqs: bool,
+    ) -> KVCacheBlocks | None:
+        """allocate_slots without new computed (prefix-hit or external)
+        tokens, encoder tokens, full-sequence admission gate or delayed
+        caching: the same steps, with the coordinator's removal, block count
+        and allocation fused into one pass over the groups."""
+        num_computed_tokens = request.num_computed_tokens
+        total_computed_tokens = min(num_computed_tokens, self.max_model_len)
+        watermark_blocks = 0
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            watermark_blocks = self.watermark_blocks
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+        )
+        new_blocks = self.coordinator.allocate_without_new_hits(
+            request.request_id,
+            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            num_tokens_need_slot,
+            num_computed_tokens,
+            num_tokens_main_model,
+            reserved_blocks + watermark_blocks,
+        )
+        if new_blocks is None:
+            return None
+        num_tokens_to_cache = min(
+            total_computed_tokens + num_new_tokens, request.num_tokens
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        if not new_blocks:
+            return self.empty_kv_cache_blocks
         return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
@@ -790,12 +854,14 @@ class KVCacheManager:
                 # Cross-attention and encoder-only groups are not prefix cached.
                 continue
 
-            group_cached_tokens = 0
-            for block in blocks:
-                group_cached_tokens = max(
-                    group_cached_tokens,
-                    block.block_hash_num_tokens or 0,
-                )
+            # max(0, block.block_hash_num_tokens or 0 for each block), in C.
+            group_cached_tokens = max(
+                0,
+                max(
+                    filter(None, map(_get_block_hash_num_tokens, blocks)),
+                    default=0,
+                ),
+            )
 
             cached_tokens = (
                 group_cached_tokens

@@ -586,7 +586,7 @@ class SingleTypeKVCacheManager(ABC):
 
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        self.block_pool.free_blocks_reversed(self.pop_blocks_for_free(request_id))
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
@@ -676,11 +676,15 @@ class SingleTypeKVCacheManager(ABC):
         last_block = min(last_block, len(blocks))
 
         freed: list[KVCacheBlock] = []
+        null_block = self._null_block
         for i in range(last_block - 1, first_block - 1, -1):
-            if blocks[i] == self._null_block:
+            block = blocks[i]
+            # The identity test is the common stop (an already removed block)
+            # and spares the field-by-field dataclass comparison.
+            if block is null_block or block == null_block:
                 break
-            freed.append(blocks[i])
-            blocks[i] = self._null_block
+            freed.append(block)
+            blocks[i] = null_block
         if freed:
             self.block_pool.free_blocks(freed)
 
@@ -796,12 +800,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         )
         # Phase 1: longest run of cached full blocks from the start. A missing
         # block implies every later block misses too (chained hashes).
-        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
-            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
-            if not cached_block:
-                break
-            for computed, cached in zip(computed_blocks, cached_block):
-                computed.append(cached)
+        if len(kv_cache_group_ids) == 1 and isinstance(block_pool, BlockPool):
+            computed_blocks[0].extend(
+                block_pool.get_cached_block_prefix(
+                    itertools.islice(full_block_hashes, max_length // block_size),
+                    kv_cache_group_ids[0],
+                )
+            )
+        else:
+            for block_hash in itertools.islice(
+                full_block_hashes, max_length // block_size
+            ):
+                cached_block = block_pool.get_cached_block(
+                    block_hash, kv_cache_group_ids
+                )
+                if not cached_block:
+                    break
+                for computed, cached in zip(computed_blocks, cached_block):
+                    computed.append(cached)
         hit_length = len(computed_blocks[0]) * block_size
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
