@@ -307,6 +307,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_DSV41_MEGAMOE_SM107: bool = False
+    VLLM_DSV41_MEGAMOE_PERDIE: str = "0"
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2117,6 +2118,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_MEGAMOE_SM107": lambda: bool(
         int(os.getenv("VLLM_DSV41_MEGAMOE_SM107", "0"))
     ),
+    # Opt-in per-die (Rubin locality domain) execution of the SM107 MegaMoE kernel (needs VLLM_DSV41_MEGAMOE_SM107=1
+    # and the per-die DeepGEMM overlay): "0" off, "1" per-die task queues + die-local routed and shared expert
+    # weights, "routed" per-die queues + die-local routed weights only (no extra memory for the shared experts).
+    # Incompatible with EPLB (the localized weights are not (E, ...) tensors).
+    "VLLM_DSV41_MEGAMOE_PERDIE": lambda: os.getenv("VLLM_DSV41_MEGAMOE_PERDIE", "0"),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)
