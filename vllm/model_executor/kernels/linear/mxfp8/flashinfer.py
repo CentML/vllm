@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -22,6 +24,11 @@ from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+# Optional per-M backend switch for FlashInferCutedslMxfp8LinearKernel, e.g.
+# VLLM_MXFP8_FI_LARGE_M_BACKEND=cutlass VLLM_MXFP8_FI_LARGE_M_THRESHOLD=2048.
+_LARGE_M_BACKEND = os.environ.get("VLLM_MXFP8_FI_LARGE_M_BACKEND", "")
+_LARGE_M_THRESHOLD = int(os.environ.get("VLLM_MXFP8_FI_LARGE_M_THRESHOLD", "2048"))
 
 
 def _check_mm_mxfp8_shape(weight_shape: tuple[int, int]) -> tuple[bool, str | None]:
@@ -186,13 +193,22 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                 x.view(-1, K), is_sf_swizzled_layout=True
             )
 
+        # Large-M GEMMs can run faster on FlashInfer's CUTLASS backend (same operand
+        # and scale layouts). M is static per CUDA-graph capture size, so this is
+        # graph-safe. Opt-in via VLLM_MXFP8_FI_LARGE_M_BACKEND.
+        backend = "cute-dsl"
+        if (
+            _LARGE_M_BACKEND
+            and input_mxfp8.shape[0] >= _LARGE_M_THRESHOLD
+        ):
+            backend = _LARGE_M_BACKEND
         output = vllm_flashinfer.mm_mxfp8(
             input_mxfp8,
             weight,
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cute-dsl",
+            backend=backend,
         )
 
         if bias is not None:
