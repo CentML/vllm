@@ -586,7 +586,7 @@ class SingleTypeKVCacheManager(ABC):
 
         """
         # Free blocks in reverse order so that the tail blocks are freed first.
-        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
+        self.block_pool.free_blocks_reversed(self.pop_blocks_for_free(request_id))
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

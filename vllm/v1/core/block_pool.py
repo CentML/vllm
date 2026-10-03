@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
+from itertools import compress, repeat
+from operator import is_not
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -806,6 +808,27 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
+
+    def free_blocks_reversed(self, blocks: list[KVCacheBlock]) -> None:
+        """Same as ``free_blocks(reversed(blocks))`` (free a request's blocks
+        tail first), but drops null blocks before the per-block loop.
+
+        Sliding-window and Mamba block tables are mostly null blocks (one per
+        block outside the window), so a finished long request's table can be
+        thousands of entries of which only a few hold real blocks. Freeing a
+        null block only decrements its (unmaintained) ref_cnt, so apply that
+        decrement in bulk and filter the nulls out in C.
+        """
+        if len(blocks) <= 16:
+            self.free_blocks(reversed(blocks))
+            return
+        null_block = self.null_block
+        tail_first = blocks[::-1]
+        non_null = list(
+            compress(tail_first, map(is_not, tail_first, repeat(null_block)))
+        )
+        null_block.ref_cnt -= len(tail_first) - len(non_null)
+        self.free_blocks(non_null)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
