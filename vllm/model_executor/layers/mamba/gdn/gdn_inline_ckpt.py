@@ -1064,8 +1064,6 @@ def warmup(runner) -> None:
 
 
 def _warmup(runner) -> None:
-    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
-
     mod = _gdn()
     layers = [m for m in runner.model.modules() if isinstance(m, mod.QwenGatedDeltaNetAttention)]
     if not layers:
@@ -1073,7 +1071,13 @@ def _warmup(runner) -> None:
         return
     if not _LAYER_GROUP:
         set_layer_groups(runner.kv_cache_config)
-    layer = layers[0]
+    warmup_layer(layers[0], len(runner.kv_cache_config.kv_cache_groups), len(layers))
+
+
+def warmup_layer(layer, n_groups: int, n_layers: int = 0) -> None:
+    """warmup() for one GDN layer (every GDN layer has the same shapes / page layout)."""
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
     ssm = layer.kv_cache[1]
     dev = ssm.device
     H = layer.num_k_heads // layer.tp_size
@@ -1126,7 +1130,6 @@ def _warmup(runner) -> None:
     done.append("page copy / zero")
     # static buffers: shared conv outputs (step plan + layer graphs) and the replay-graph buffers
     shared = gdn_layer_graphs._shared(dev, H, HV)
-    n_groups = len(runner.kv_cache_config.kv_cache_groups)
     dk = _dev_key(dev)
     gb = _GBUF.get(dk)
     if gb is None:
@@ -1141,5 +1144,5 @@ def _warmup(runner) -> None:
     logger.info(
         "[F122] warmup done: compiled %s; shared conv-output buffers %d rows; replay buffers "
         "ready (%.0f MiB static); %d GDN layers, %d KV-cache groups, page %d B",
-        ", ".join(done), shared[0].size(0), mb, len(layers), n_groups, words.size(1) * 4,
+        ", ".join(done), shared[0].size(0), mb, n_layers, n_groups, words.size(1) * 4,
     )
