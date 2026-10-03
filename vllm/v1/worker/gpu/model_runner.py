@@ -102,6 +102,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
+from vllm.v1.worker.gpu import prefix_front
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
@@ -683,6 +684,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
         )
+        # rx-cascade: exact "front" grouping of shared-prefix decode requests (PREFIX_SPREAD=1; default off).
+        self._prefix_front_gid = None
+        if prefix_front.ENABLED:
+            for gi, group in enumerate(kv_cache_config.kv_cache_groups):
+                spec = group.kv_cache_spec
+                layer_spec = (
+                    spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+                )
+                if not isinstance(layer_spec, MambaSpec):
+                    self._prefix_front_gid = gi
+                    break
+            if self._prefix_front_gid is not None:
+                self.block_tables.enable_first_block_tracking()
+            prefix_front.log_engage(
+                self._prefix_front_gid,
+                [type(g.kv_cache_spec).__name__ for g in kv_cache_config.kv_cache_groups],
+            )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
             self.device,
@@ -1301,6 +1319,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = sort_batch_req_ids(
             num_tokens_per_req, draft_tokens, self.decode_query_len
         )
+        if getattr(self, "_prefix_front_gid", None) is not None:
+            req_ids = prefix_front.reorder(
+                req_ids,
+                num_tokens_per_req,
+                draft_tokens,
+                self.decode_query_len,
+                self.req_states.req_id_to_index,
+                self.block_tables.first_block_np[self._prefix_front_gid],
+            )
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
