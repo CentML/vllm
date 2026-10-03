@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
 from itertools import compress, repeat
-from operator import is_not
+from operator import is_, is_not
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -870,10 +870,32 @@ class BlockPool:
         null block only decrements its (unmaintained) ref_cnt, so apply that
         decrement in bulk and filter the nulls out in C.
         """
-        if len(blocks) <= 16:
+        num_blocks = len(blocks)
+        if num_blocks <= 16:
             self.free_blocks(reversed(blocks))
             return
         null_block = self.null_block
+        if blocks[0] is null_block:
+            # Sliding-window tables are a run of null blocks (everything that
+            # left the window) followed by a few real blocks. Find the run's
+            # end by bisection, then verify it: every entry before it is the
+            # null block, none after it is.
+            lo, hi = 0, num_blocks
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if blocks[mid] is null_block:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            tail = blocks[lo:]
+            if (
+                len(tail) <= 64
+                and not any(map(is_, tail, repeat(null_block)))
+                and blocks[:lo].count(null_block) == lo
+            ):
+                null_block.ref_cnt -= lo
+                self.free_blocks(tail[::-1])
+                return
         tail_first = blocks[::-1]
         non_null = list(
             compress(tail_first, map(is_not, tail_first, repeat(null_block)))
