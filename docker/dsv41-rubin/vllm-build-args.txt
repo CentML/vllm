@@ -1,0 +1,20 @@
+# docker/Dockerfile build arguments for the DeepSeek-V4.1-Flash Rubin (VR200,
+# aarch64) image; read by build.sh. Same as the mlperf-endpoints recipe
+# (NVIDIA/src/deepseek-v4.1-flash/configs/vllm-build-args.txt), except:
+# - torch_cuda_arch_list is 10.0 only (the arch of the CentML Rubin image).
+#   "10.7" fails ptxas on attn_res_kernel (tcgen05 on sm_107); sm_100f code
+#   runs on sm_107. Rubin-native cubins are added per kernel instead:
+#   FlashMLA _flashmla_C gets 10.7a (flashmla.cmake), DeepGEMM JITs at runtime.
+# - max_jobs/nvcc_threads sized for one arch on a 176-core Vera node.
+CUDA_VERSION=13.4.1
+torch_cuda_arch_list=10.0
+INSTALL_KV_CONNECTORS=true
+INSTALL_RUBIN_PRERELEASE=true
+TRITON_INSTALL_FROM_SOURCE_REPO=https://github.com/triton-lang/triton.git
+TRITON_INSTALL_FROM_SOURCE_REVISION=3f6e41132b5edf639bfb872ad73d4688765e08b8
+RUN_WHEEL_CHECK=false
+GIT_REPO_CHECK=1
+BUILD_BASE_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
+FINAL_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
+max_jobs=32
+nvcc_threads=2

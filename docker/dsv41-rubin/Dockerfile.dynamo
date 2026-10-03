@@ -1,0 +1,14 @@
+# ai-dynamo on top of the vllm-openai image built from this branch (build.sh).
+# Plain ai-dynamo, not ai-dynamo[vllm], which would replace this vLLM build;
+# the constraints stop the resolver from changing vLLM, torch or transformers.
+ARG VLLM_IMAGE
+FROM ${VLLM_IMAGE} AS dsv41-dynamo
+ARG DYNAMO_VERSION=1.6.0.dev20260924
+RUN uv pip freeze --system | grep -iE '^(vllm|torch|transformers)==' > /tmp/protected.txt \
+    && cat /tmp/protected.txt \
+    && uv pip install --system -c /tmp/protected.txt "ai-dynamo==${DYNAMO_VERSION}" \
+    && uv pip freeze --system | grep -iE '^(vllm|torch|transformers)==' | diff /tmp/protected.txt - \
+    && rm /tmp/protected.txt \
+    && python3 -c "import importlib.util as u; assert u.find_spec('dynamo.vllm')" \
+    && python3 -m dynamo.frontend --help > /dev/null
+LABEL ai.dynamo.version="${DYNAMO_VERSION}"
