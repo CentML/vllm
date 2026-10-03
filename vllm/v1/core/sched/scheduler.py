@@ -627,6 +627,12 @@ class Scheduler(SchedulerInterface):
             )
 
         # First, schedule the RUNNING requests.
+        # One profiling scope object, entered once per request: the scope
+        # types (nullcontext, record_function, nvtx.annotate) are reusable,
+        # and building one per request is measurable at ~500 requests/step.
+        allocate_slots_scope = record_function_or_nullcontext(
+            "schedule: allocate_slots"
+        )
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -743,7 +749,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
+            with allocate_slots_scope:
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
@@ -1673,6 +1679,9 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        # Shared result for steps that allocated no new block (most decode
+        # steps): get_block_ids(allow_none=True) returns None for it.
+        empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1699,8 +1708,11 @@ class Scheduler(SchedulerInterface):
             if not self.use_v2_model_runner:  # noqa: SIM102
                 if req_id not in self.prev_step_scheduled_req_ids:
                     all_token_ids[req_id] = req.all_token_ids.copy()
+            new_blocks = req_to_new_blocks[req_id]
             new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                None
+                if new_blocks is empty_blocks
+                else new_blocks.get_block_ids(allow_none=True)
             )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
@@ -2448,15 +2460,45 @@ class Scheduler(SchedulerInterface):
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
-        for num_new, output_token_id in enumerate(new_token_ids, 1):
-            request.append_output_token_ids(output_token_id)
+        # Append token by token (a stop trims the rest), but hash the newly
+        # completed blocks once afterwards instead of after every token: the
+        # hashes depend only on the token ids, and check_stop does not read
+        # them. This is Request.append_output_token_ids, unrolled.
+        output_token_ids = request._output_token_ids
+        all_token_ids = request._all_token_ids
+        max_model_len = self.max_model_len
+        sampling_params = request.sampling_params
+        num_new_tokens = len(new_token_ids)
+        if (
+            sampling_params is not None
+            and not request.pooling_params
+            and sampling_params.repetition_detection is None
+            and len(all_token_ids) + num_new_tokens < max_model_len
+            and len(output_token_ids) + num_new_tokens < request.max_tokens
+            and sampling_params.eos_token_id not in new_token_ids
+            and not (
+                (stop_token_ids := sampling_params.stop_token_ids)
+                and any(map(stop_token_ids.__contains__, new_token_ids))
+            )
+        ):
+            # Common case: no token is a stop token and no length limit is
+            # reached even after the last one, so check_stop would return
+            # False, without side effects, after every token.
+            output_token_ids.extend(new_token_ids)
+            all_token_ids.extend(new_token_ids)
+        else:
+            for num_new, output_token_id in enumerate(new_token_ids, 1):
+                output_token_ids.append(output_token_id)
+                all_token_ids.append(output_token_id)
 
-            # Check for stop and update request state.
-            # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
-            if stopped:
-                del new_token_ids[num_new:]  # Trim new tokens if needed.
-                break
+                # Check for stop and update request state.
+                # This must be called before we make the EngineCoreOutput.
+                stopped = check_stop(request, max_model_len)
+                if stopped:
+                    del new_token_ids[num_new:]  # Trim new tokens if needed.
+                    break
+        if new_token_ids:
+            request.update_block_hashes()
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:

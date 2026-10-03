@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
+from itertools import compress, repeat
+from operator import is_, is_not
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -222,6 +224,47 @@ class BlockPool:
                 return None
             cached_blocks.append(block)
         return cached_blocks
+
+    def get_cached_block_prefix(
+        self, block_hashes: Iterable[BlockHash], kv_cache_group_id: int
+    ) -> list[KVCacheBlock]:
+        """Cached blocks of one KV cache group for the longest fully cached
+        prefix of ``block_hashes``.
+
+        Same as calling ``get_cached_block(block_hash, [kv_cache_group_id])``
+        for each hash and stopping at the first miss, without building a key
+        and a one-element list per hash (a prefix-cache lookup walks the
+        whole cached prefix of a request).
+        """
+        if (
+            type(self).get_cached_block is not BlockPool.get_cached_block
+            or "get_cached_block" in vars(self)
+            or type(self.cached_block_hash_to_block) is not BlockHashToBlockMap
+        ):
+            blocks: list[KVCacheBlock] = []
+            for block_hash in block_hashes:
+                cached = self.get_cached_block(block_hash, [kv_cache_group_id])
+                if not cached:
+                    break
+                blocks.append(cached[0])
+            return blocks
+        # The key layout of make_block_hash_with_group_id.
+        group_id_suffix = kv_cache_group_id.to_bytes(4, "big", signed=False)
+        cache = self.cached_block_hash_to_block
+        lookup = cache._cache.get
+        blocks = []
+        for block_hash in block_hashes:
+            key = block_hash + group_id_suffix
+            block = lookup(key)
+            if block is None:
+                break
+            if type(block) is not KVCacheBlock:
+                # Several blocks share the hash: let the map pick one.
+                block = cache.get_one_block(key)
+                if not block:
+                    break
+            blocks.append(block)
+        return blocks
 
     def cache_full_blocks(
         self,
@@ -688,12 +731,22 @@ class BlockPool:
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
+            metrics_collector = self.metrics_collector
+            hashes_by_block = self.cached_block_hashes_by_block
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                # Eviction has nothing to do for a block that carries no
+                # prefix-cache hash (most reused blocks, e.g. every block a
+                # sliding window released) unless metrics track evictions.
+                if (
+                    metrics_collector
+                    or block._block_hash is not None
+                    or block.block_id in hashes_by_block
+                ):
+                    self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
-                if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                if metrics_collector:
+                    metrics_collector.on_block_allocated(block)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
@@ -806,6 +859,49 @@ class BlockPool:
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
+
+    def free_blocks_reversed(self, blocks: list[KVCacheBlock]) -> None:
+        """Same as ``free_blocks(reversed(blocks))`` (free a request's blocks
+        tail first), but drops null blocks before the per-block loop.
+
+        Sliding-window and Mamba block tables are mostly null blocks (one per
+        block outside the window), so a finished long request's table can be
+        thousands of entries of which only a few hold real blocks. Freeing a
+        null block only decrements its (unmaintained) ref_cnt, so apply that
+        decrement in bulk and filter the nulls out in C.
+        """
+        num_blocks = len(blocks)
+        if num_blocks <= 16:
+            self.free_blocks(reversed(blocks))
+            return
+        null_block = self.null_block
+        if blocks[0] is null_block:
+            # Sliding-window tables are a run of null blocks (everything that
+            # left the window) followed by a few real blocks. Find the run's
+            # end by bisection, then verify it: every entry before it is the
+            # null block, none after it is.
+            lo, hi = 0, num_blocks
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if blocks[mid] is null_block:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            tail = blocks[lo:]
+            if (
+                len(tail) <= 64
+                and not any(map(is_, tail, repeat(null_block)))
+                and blocks[:lo].count(null_block) == lo
+            ):
+                null_block.ref_cnt -= lo
+                self.free_blocks(tail[::-1])
+                return
+        tail_first = blocks[::-1]
+        non_null = list(
+            compress(tail_first, map(is_not, tail_first, repeat(null_block)))
+        )
+        null_block.ref_cnt -= len(tail_first) - len(non_null)
+        self.free_blocks(non_null)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
