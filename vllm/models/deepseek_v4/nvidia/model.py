@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
+import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -206,6 +208,59 @@ def make_deepseek_v4_expert_params_mapping(
             ("w3", "w3"),
         ]
     ]
+
+
+def _maybe_enable_megamoe_sm107(deep_gemm) -> None:
+    """Route DeepGEMM MegaMoE to its Rubin (sm_107) kernel when VLLM_DSV41_MEGAMOE_SM107=1.
+
+    DeepGEMM selects the kernel per call from DG_MEGA_MOE_SM107, so this must run before the first MegaMoE call
+    (and before CUDA graph capture). The block_m heuristic (and thus the shared-expert SF layout written by
+    prepare_megamoe_inputs) is identical for both kernels.
+    """
+    if not envs.VLLM_DSV41_MEGAMOE_SM107:
+        return
+    impl = os.path.join(
+        os.path.dirname(deep_gemm.__file__),
+        "include/deep_gemm/impls/sm107_fp8_fp4_mega_moe.cuh",
+    )
+    if torch.cuda.get_device_capability() != (10, 7) or not os.path.exists(impl):
+        logger.warning_once(
+            "VLLM_DSV41_MEGAMOE_SM107=1 ignored: it needs a compute capability 10.7 GPU "
+            "and the Rubin-patched DeepGEMM (%s not found).",
+            impl,
+        )
+        return
+    os.environ.setdefault("DG_MEGA_MOE_SM107", "1")
+    logger.info_once(
+        "DeepGEMM MegaMoE: Rubin SM107 kernel enabled (DG_MEGA_MOE_SM107=%s).",
+        os.environ["DG_MEGA_MOE_SM107"],
+    )
+
+
+def _get_megamoe_locality_module(deep_gemm):
+    """DeepGEMM's Rubin locality helpers (`deep_gemm.mega.sm107_locality`), or None when per-die MegaMoE is off,
+    unsupported, or the installed DeepGEMM predates it."""
+    mode = envs.VLLM_DSV41_MEGAMOE_PERDIE
+    if mode not in ("1", "routed"):
+        return None
+    try:
+        locality = importlib.import_module(deep_gemm.__name__ + ".mega.sm107_locality")
+        available = locality.is_localization_available()
+    except (ImportError, AttributeError, RuntimeError) as e:
+        locality, available = None, False
+        logger.warning_once("VLLM_DSV41_MEGAMOE_PERDIE ignored: per-die DeepGEMM unavailable (%s).", e)
+    if not available or os.environ.get("DG_MEGA_MOE_SM107") != "1":
+        logger.warning_once(
+            "VLLM_DSV41_MEGAMOE_PERDIE ignored: it needs the SM107 MegaMoE kernel "
+            "(VLLM_DSV41_MEGAMOE_SM107=1) on a 2-locality-domain Rubin GPU."
+        )
+        return None
+    os.environ.setdefault("DG_MEGA_MOE_SM107_PERDIE", "1")
+    logger.info_once(
+        "DeepGEMM MegaMoE: per-die execution with die-local %s weights.",
+        "routed and shared expert" if mode == "1" else "routed expert",
+    )
+    return locality
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -540,9 +595,54 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         ).squeeze(0)
 
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
+        self._finalize_weights(shared_experts)
+        self._maybe_localize_weights()
+
+    def _maybe_localize_weights(self) -> None:
+        """VLLM_DSV41_MEGAMOE_PERDIE: move the transformed weights into the Rubin locality domains, split along N
+        (`(2, [E,] N / 2, K)`, half `d` homed on die `d`). The kernel then runs one task queue per die, each owning
+        the N half homed on it. Runs once per layer; the replaced copies are released."""
+        if self._transformed_l1_weights is None:
+            return
+        localize_shared = (
+            envs.VLLM_DSV41_MEGAMOE_PERDIE == "1" and self._transformed_shared_l1_weights is not None
+        )
+        if getattr(self, "_weights_localized", False) and (
+            not localize_shared or getattr(self, "_shared_weights_localized", False)
+        ):
+            return
+        from vllm.utils.deep_gemm import _import_deep_gemm
+
+        locality = _get_megamoe_locality_module(_import_deep_gemm())
+        if locality is None:
+            return
+        localize = locality.localize
+        if not getattr(self, "_weights_localized", False):
+            l1, l1_sf = self._transformed_l1_weights
+            l2, l2_sf = self._transformed_l2_weights
+            self._transformed_l1_weights = (localize(l1), l1_sf)
+            self._transformed_l2_weights = (localize(l2), l2_sf)
+            del l1, l2
+            self._weights_localized = True
+        # The shared-expert originals stay referenced by the (unused) shared MLP
+        # parameters, so localizing them costs ~35 MiB per layer extra.
+        if localize_shared and not getattr(self, "_shared_weights_localized", False):
+            sl1, sl1_sf = self._transformed_shared_l1_weights
+            sl2, sl2_sf = self._transformed_shared_l2_weights
+            self._transformed_shared_l1_weights = (localize(sl1), sl1_sf)
+            self._transformed_shared_l2_weights = (localize(sl2), sl2_sf)
+            self._shared_weights_localized = True
+        # Probe the SM -> die map now: it allocates and synchronizes, so it must not first run inside graph capture
+        locality.get_balanced_sm_locality_domains()
+        # Return the replaced routed copies to the driver: the localized tensors are driver (cuMem) allocations
+        # outside PyTorch's caching allocator, and vLLM's memory profiling must not count both
+        torch.cuda.empty_cache()
+
+    def _finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        _maybe_enable_megamoe_sm107(deep_gemm)
 
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
@@ -645,6 +745,10 @@ class DeepseekV4MegaMoEExperts(nn.Module):
 
     def get_expert_weights(self) -> list[torch.Tensor]:
         self.finalize_weights()
+        if getattr(self, "_weights_localized", False):
+            raise NotImplementedError(
+                "EPLB is not supported with VLLM_DSV41_MEGAMOE_PERDIE (die-localized MegaMoE weights)"
+            )
         assert self._transformed_l1_weights is not None
         assert self._transformed_l2_weights is not None
 
