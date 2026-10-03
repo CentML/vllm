@@ -1604,6 +1604,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         )
                         if attn_pd_overlap.WAVE_GATE
                         and attn_pd_overlap.WAVE_MODEL == "gen"
+                        and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
                         else 0
                     ),
                 )
@@ -2278,6 +2279,9 @@ class FlashInferImpl(AttentionImpl):
                 else None,
             )
             if attn_pd_overlap.ENABLED
+            # cheap pre-check: below the decode-row minimum the hook is skipped
+            # entirely (no plan() call), so gated-off points pay ~no host time
+            and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
             and prefill_use_trtllm
             and decode_with_trtllm_gen
             and not use_dcp
