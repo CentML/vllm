@@ -1141,8 +1141,12 @@ def warmup_layer(layer, n_groups: int, n_layers: int = 0) -> None:
     torch.cuda.synchronize(dev)
     mb = sum(t.numel() * t.element_size() for t in shared) / 2**20
     mb += (gb.out.numel() * gb.out.element_size() + gb.sz.numel() * gb.sz.element_size()) / 2**20
+    # these buffers are allocated after vLLM's KV sizing: report the device memory left
+    free_b, total_b = torch.cuda.mem_get_info(dev)
     logger.info(
         "[F122] warmup done: compiled %s; shared conv-output buffers %d rows; replay buffers "
-        "ready (%.0f MiB static); %d GDN layers, %d KV-cache groups, page %d B",
+        "ready (%.0f MiB static); %d GDN layers, %d KV-cache groups, page %d B; device free "
+        "%.2f GiB of %.1f GiB after warmup (torch reserved %.2f GiB)",
         ", ".join(done), shared[0].size(0), mb, n_layers, n_groups, words.size(1) * 4,
+        free_b / 2**30, total_b / 2**30, torch.cuda.memory_reserved(dev) / 2**30,
     )
