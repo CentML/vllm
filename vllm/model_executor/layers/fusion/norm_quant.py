@@ -245,8 +245,16 @@ def _pre_norm(
                 xb = max(1, GLUE_FNQ_XB)
                 out, res, q, swz = G.fin_norm_quant_f0(g2, wts, idx, a, r, w, eps, xb, 4 * xb)
                 STATS["fin_f0"] = STATS.get("fin_f0", 0) + 1
+                logger.info_once(
+                    "[glue] fused finalize + pre-norm without the SEG-fold zero input (GLUE_FNQ_F0, rows/program %d)", xb
+                )
             elif GLUE_FNQ_XB > 0:
                 from vllm.model_executor.layers.fusion import glue_kernels as G
+
+                if GLUE_FNQ_F0:
+                    # rubin-glue: F0 requested but the shared-expert input is not the SEG zeros buffer; this path has
+                    # no PDL launch (fin_norm_quant_rr), so make the fallback visible
+                    logger.warning_once("[glue] GLUE_FNQ_F0 not taken (shared-expert input is not the SEG zeros)")
 
                 out, res, q, swz = G.fin_norm_quant_rr(
                     g2, wts, idx, f, a, r, w, eps, GLUE_FNQ_XB, 4 * GLUE_FNQ_XB
