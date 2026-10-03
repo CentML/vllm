@@ -190,7 +190,7 @@ def load(minb=None):
     c3o = int(os.environ.get("GDN_STATE_COMMIT_CK3_ORDER", "0"))  # CK=3: token loads before state
     c3ps = int(os.environ.get("GDN_STATE_COMMIT_CK3_PFS", "1"))  # CK=3: prefetch includes the state
     tag = f"b{minb}_nc{nc}_f{f2}_p{ps}_r{pr}_x{fx}_e{ea}_ck{ck}_pdl{pdl}" + (f"_u{upd}" if upd != 1 else "") + (
-        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}_v3" if ck == 3 else "_v4")
+        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}_v3" if ck == 3 else "_v4") + ("_mc2")
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -263,15 +263,24 @@ class LayerTable:
 
 
 def materialize(mode, num_items, table: LayerTable, H, a0, a1=None, a2=None, a3=None, a4=None,
-                has_init=None, bt_ptrs=None, bt_stride=0, block_size=0, idx_map=None):
+                has_init=None, bt_ptrs=None, bt_stride=0, block_size=0, idx_map=None, compact=0):
+    """compact > 0 ([rubin-ck], modes 1-3): grid (compact, H, layers) over only the items that pass the per-item
+    decision instead of (num_items, H, layers) mostly-empty CTAs. Same bytes written (bitwise)."""
     if num_items <= 0:
         return
     STATS["materialize_calls"] += 1
     i32 = lambda t: None if t is None else t.to(torch.int32).contiguous()  # noqa: E731
-    load().materialize(int(mode), int(num_items), int(table.n), i32(a0), i32(a1), i32(a2), i32(a3),
-                       i32(a4), None if has_init is None else has_init.to(torch.bool).contiguous(),
-                       i32(idx_map), bt_ptrs, int(bt_stride), int(block_size), table.state, table.alog, table.dtb,
-                       table.group, int(table.slot_stride), int(H), int(table.HV), int(table.dt_type), int(table.state_bf16))
+    args = (int(mode), int(num_items), int(table.n), i32(a0), i32(a1), i32(a2), i32(a3),
+            i32(a4), None if has_init is None else has_init.to(torch.bool).contiguous(),
+            i32(idx_map), bt_ptrs, int(bt_stride), int(block_size), table.state, table.alog, table.dtb,
+            table.group, int(table.slot_stride), int(H), int(table.HV), int(table.dt_type), int(table.state_bf16))
+    ext = load()
+    if compact and int(mode) != 0 and hasattr(ext, "materialize_compact"):
+        logger.info_once("gdn_state_commit: compact align materialize active (VLLM_MAMBA_ALIGN_COMPACT=%d)",
+                         int(compact))
+        ext.materialize_compact(int(compact), *args)
+    else:
+        ext.materialize(*args)
     _dbg(f"materialize mode={mode} items={num_items} layers={table.n}")
 
 
@@ -426,6 +435,14 @@ def forward_core_prologue(layer, md) -> None:
 # ----------------------------------------------------------------------------------------------
 # worker align-mode copies (v1/worker/mamba_utils.py MambaSpecDecodeGPUContext)
 # ----------------------------------------------------------------------------------------------
+def align_compact() -> int:
+    """[rubin-ck] VLLM_MAMBA_ALIGN_COMPACT=G (default 0 = off): the align-mode precopy / postprocess state copies
+    (stock conv copies in v1/worker/mamba_utils.py and the GDN ssm materialize here) run a grid of G CTAs per
+    (state, tile) / (key head, layer) over only the requests whose copy decision is taken, instead of one CTA per
+    request. Exact: the same bytes are written."""
+    return int(os.environ.get("VLLM_MAMBA_ALIGN_COMPACT", "0"))
+
+
 class _WorkerTables:
     table = None
     H = None
@@ -457,7 +474,7 @@ def worker_precopy(ctx, num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu, id
     STATS["precopy_calls"] += 1
     materialize(1, num_reqs, t, _WorkerTables.H, src_col_gpu, state_idx_gpu, token_bias_gpu,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size, idx_map=idx_mapping)
+                block_size=ctx.block_size, idx_map=idx_mapping, compact=align_compact())
 
 
 def worker_postprocess(ctx, num_reqs, num_accepted_tokens_gpu, mamba_state_idx_gpu,
@@ -471,7 +488,7 @@ def worker_postprocess(ctx, num_reqs, num_accepted_tokens_gpu, mamba_state_idx_g
     materialize(2, num_reqs, t, _WorkerTables.H, num_accepted_tokens_gpu, mamba_state_idx_gpu,
                 num_scheduled_tokens_gpu, num_computed_tokens_gpu, num_draft_tokens_gpu,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size)
+                block_size=ctx.block_size, compact=align_compact())
 
 
 def worker_postprocess_align(ctx, num_reqs, num_accepted_tokens_gpu, state_idx_gpu,
@@ -486,4 +503,4 @@ def worker_postprocess_align(ctx, num_reqs, num_accepted_tokens_gpu, state_idx_g
     materialize(3, num_reqs, t, _WorkerTables.H, ctx.num_accepted_tokens_out, state_idx_gpu,
                 None, new_num_computed_tokens_gpu, None,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size, idx_map=idx_mapping)
+                block_size=ctx.block_size, idx_map=idx_mapping, compact=align_compact())
