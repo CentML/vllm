@@ -1375,6 +1375,15 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
 #ifndef GSC_CK3_F2
 #define GSC_CK3_F2 1  // 1: packed f32x2 commit; 0: scalar (same bits)
 #endif
+#ifndef GSC_CK3_REMAP
+#define GSC_CK3_REMAP 0  // [rubin-ck] 1 (row loop unrolled x2) / 2 (not unrolled): commit lane map chunk c = lane >> 1, row half hh = lane & 1, 8 rows per lane.
+                         // k_j of the lane's chunk is loaded once into registers (2 LDS.128 per j instead of 16) and
+                         // each row's c_j comes from a per-warp smem table written by the row-solve lanes. Same
+                         // per-element op sequence (fmul(s, G_R) then fma(c_j, k_j, .) for j < R ascending, RN bf16).
+#endif
+#if GSC_CK3_REMAP && !GSC_CK3_F2
+#error "GSC_CK3_REMAP needs GSC_CK3_F2=1"
+#endif
 __device__ __forceinline__ float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
 __device__ __forceinline__ uint32_t pack_rn(float a, float b) {
@@ -1532,6 +1541,11 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
   __shared__ CkRep s_rep;
   __shared__ CkNew s_new;
   __shared__ int s_last;
+#if GSC_CK3_REMAP
+  // [rubin-ck] per-warp c_j table, entry hh * 9 + r for warp row hh * 8 + r (padding puts rows r and 8 + r on
+  // different banks)
+  __shared__ __align__(16) float s_cc[kWarps][17][kMaxT];
+#endif
   __nv_bfloat16* vrep = svec;
   __nv_bfloat16* vnew = svec + 3 * kSplitRep;
 
@@ -1751,6 +1765,33 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
       }
     }
     const float GR = crep.GR;
+#if GSC_CK3_REMAP
+    // [rubin-ck] commit, lane = (chunk c = lane >> 1, row half hh = lane & 1), rows hh * 8 + r (r < 8) of this warp.
+    // Per element (row, col) the op sequence is unchanged: u = fmul(s, G_R) (f32x2 .ftz), then for j < R in
+    // ascending order u = fma(c_j[row], k_j[col], u) (f32x2 .ftz), then RN to bf16 -> bitwise equal to the CK3 map.
+    if (half == 0)
+      *reinterpret_cast<float4*>(&s_cc[warp][(rr >> 3) * 9 + (rr & 7)][0]) = make_float4(cc[0], cc[1], cc[2], cc[3]);
+    __syncwarp();
+    {
+      const int c = lane >> 1, hh = lane & 1;
+      unsigned long long kp[kMaxT][4];
+#pragma unroll
+      for (int j = 0; j < kMaxT; ++j) {
+        if (j < R) {
+          const float4 k0 = *reinterpret_cast<const float4*>(&sk[j][c * 8]);
+          const float4 k1 = *reinterpret_cast<const float4*>(&sk[j][c * 8 + 4]);
+          kp[j][0] = f2_pk(k0.x, k0.y);
+          kp[j][1] = f2_pk(k0.z, k0.w);
+          kp[j][2] = f2_pk(k1.x, k1.y);
+          kp[j][3] = f2_pk(k1.z, k1.w);
+        }
+      }
+      const unsigned long long gr2 = f2_pk(GR, GR);
+      const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(st)) + (warp * 16 + hh * 8) * (kDimK * 2);
+      __nv_bfloat16* gdst0 = head_state + (warp * 16 + hh * 8) * kDimK + c * 8;
+#if GSC_CK3_REMAP == 2
+#pragma unroll 1
+#else
 #pragma unroll 2
 #endif
       for (int r = 0; r < 8; ++r) {
@@ -1847,6 +1888,7 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
     (void)gdst;
     mm_store_rows(head_state, st, warp, lane);
 #endif
+#endif  // GSC_CK3_REMAP
   }
   // ---- new tokens: outputs only
   mm_dots3(acc, st, vnew, kSplitNew, warp, lane);

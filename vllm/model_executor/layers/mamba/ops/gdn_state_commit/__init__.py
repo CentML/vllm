@@ -189,8 +189,10 @@ def load(minb=None):
     c3p = int(os.environ.get("GDN_STATE_COMMIT_CK3_PF", "0"))  # CK=3: L2 prefetch distance (blocks)
     c3o = int(os.environ.get("GDN_STATE_COMMIT_CK3_ORDER", "0"))  # CK=3: token loads before state
     c3ps = int(os.environ.get("GDN_STATE_COMMIT_CK3_PFS", "1"))  # CK=3: prefetch includes the state
+    # [rubin-ck] CK=3: commit lane remap (k of the lane's chunk in registers; bitwise equal to CK=3)
+    c3r = int(os.environ.get("GDN_STATE_COMMIT_CK3_REMAP", "0"))
     tag = f"b{minb}_nc{nc}_f{f2}_p{ps}_r{pr}_x{fx}_e{ea}_ck{ck}_pdl{pdl}" + (f"_u{upd}" if upd != 1 else "") + (
-        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}_v3" if ck == 3 else "_v4") + ("_mc2")
+        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}" + (f"r{c3r}" if c3r else "") + "_v3" if ck == 3 else "_v4") + ("_mc2")
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -201,7 +203,7 @@ def load(minb=None):
             name=f"_gdn_state_commit_{tag}",
             sources=[os.path.join(_HERE, "gdn_state_commit.cu")],
             # --use_fast_math: same as vLLM's build of fused_gdn_decode_kernel.cu (bit-exactness)
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}", f"-DGSC_CK3_REMAP={c3r}"],
             extra_cflags=["-O3", "-std=c++20"],
             build_directory=build,
             verbose=False,
