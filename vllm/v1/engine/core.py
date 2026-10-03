@@ -73,6 +73,7 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine import frontend_block_hashing
+from vllm.v1.engine import gc_admit
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -264,6 +265,8 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
+        # rx-host2: optional freeze-on-admit GC policy (VLLM_GC_FREEZE_ADMIT, default off).
+        gc_admit.init()
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
@@ -1554,6 +1557,7 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            gc_admit.on_idle()
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1878,6 +1882,7 @@ class EngineCoreProc(EngineCore):
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
+                            gc_admit.on_admit()
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
