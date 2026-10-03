@@ -621,7 +621,25 @@ class Scheduler(SchedulerInterface):
             mamba_inline_ckpt.MAX_RUNNING > 0
             and len(self.running) > mamba_inline_ckpt.MAX_RUNNING
         ):
-            self.inline_ckpt_stats["refused_budget"] += 1
+            st_r = self.inline_ckpt_stats
+            st_r["refused_budget"] += 1
+            # [F122] log-only: which budget refused (load gate vs per-step cap)
+            over_running = (
+                mamba_inline_ckpt.MAX_RUNNING > 0
+                and len(self.running) > mamba_inline_ckpt.MAX_RUNNING
+            )
+            st_r["refused_running"] = st_r.get("refused_running", 0) + int(over_running)
+            nr = st_r["refused_budget"]
+            if nr <= 3 or nr % mamba_inline_ckpt.LOG_EVERY == 0:
+                logger.info(
+                    "[F122] refused #%d (running=%d max_running=%d "
+                    "max_per_step=%d) stats=%s",
+                    nr,
+                    len(self.running),
+                    mamba_inline_ckpt.MAX_RUNNING,
+                    mamba_inline_ckpt.MAX_PER_STEP,
+                    st_r,
+                )
             return max(orig_end - start, 0)
         self._inline_ckpt_used += 1
         st = self.inline_ckpt_stats
