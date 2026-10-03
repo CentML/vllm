@@ -64,6 +64,12 @@ STATS = {
 
 _LAYER_GROUP: dict[str, int] = {}
 _MODS: dict = {}
+# start-up warmup state (warmup()): devnb = the device_nb V-split kernel is compiled,
+# page = the Triton page copy / zero kernels are compiled
+_WARM = {"done": False, "devnb": False, "page": False}
+# the V-split factor of every device_nb replay launch (graph and eager fast path): the
+# kernel is bitwise identical across v_split, and warmup() compiles only this key
+_DEVNB_VSPLIT = 2
 
 
 class _Step:
@@ -119,21 +125,31 @@ def _vsplit(devnb: bool):
 
 
 def _use_devnb() -> bool:
-    """The kernel copy the split flow's chunks run on at low concurrency: the
-    GDN layer graphs' device_nb V-split copy (compiled at graph capture), else
-    the regular V-split copy (both bitwise identical by construction)."""
+    """The kernel copy the eager replays run on: the device_nb V-split copy when it is
+    compiled (by the GDN layer graphs at capture, or by warmup() at start-up), else the
+    regular V-split copy (both bitwise identical by construction; VERIFY runs the other
+    one)."""
     v = _MODS.get("devnb_on")
     if v is None:
         try:
             from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
 
-            v = _MODS["devnb_on"] = bool(gdn_layer_graphs.ENABLED and gdn_layer_graphs.DEVNB)
+            v = bool(gdn_layer_graphs.ENABLED and gdn_layer_graphs.DEVNB) or _WARM["devnb"]
         except ImportError:
             # [F122] adapt: the layer-graph module (row 14 / #88 family) may not
-            # be present; without it there is no device_nb V-split copy to
-            # prefer (the two copies are bitwise identical by construction).
-            v = _MODS["devnb_on"] = False
+            # be present; without it only warmup can provide the device_nb copy
+            # (the two copies are bitwise identical by construction).
+            v = _WARM["devnb"]
+        if _WARM["done"]:
+            _MODS["devnb_on"] = v
     return v
+
+
+def step_has_jobs() -> bool:
+    """This forward has in-step checkpoint replays (begin_step ran with a plan): the GDN
+    step plan then writes its conv outputs into the shared buffers (gdn_step_plan)."""
+    st = _STEP[0]
+    return st is not None and bool(st.jobs)
 
 
 def _conv():
@@ -431,6 +447,7 @@ def run_chunk(layer, x, a, b, conv_state, ssm, slot_t, hi_t, cu_t, L, bufs=None,
     vs = _vsplit(devnb)
     vsf = max(int(vs.choose_vsplit(int(nseq), L, int(maxlen or L), hv=HV)), 1)
     if devnb:
+        vsf = _DEVNB_VSPLIT  # [rx-f122] the one device_nb key warmup() compiles (bitwise across v_split)
         if ws is None:
             from vllm.third_party.flashinfer_gdn_vsplit_devnb.gdn_chunked_vs import (
                 GatedDeltaNetChunkedKernel as _K,
@@ -502,8 +519,11 @@ def _direct_kernel(q, v, ssm, slot_t, vsf, nseq=1):
     HQ, HV = q.size(1), v.size(1)
     dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
     key = (dev, ad._num_sm(dev), str(q.dtype), str(ssm.dtype), HQ, HV, HQ >= HV, True, True, True,
-           str(slot_t.dtype), tuple(ssm.stride()[1:]), tuple(ssm.stride()[1:]), int(vsf), True,
-           ad._cg0_split(vsf, True), bool(ad._C1_REORDER))
+           str(slot_t.dtype), tuple(ssm.stride()[1:]), tuple(ssm.stride()[1:]), int(vsf), True)
+    if hasattr(ad, "_cg0_split"):
+        # GB300's device_nb adapter carries the gdnchunk CG0 / C1 flags in its key;
+        # Rubin's device_nb copy does not (15 fields, as its adapter builds them)
+        key = key + (ad._cg0_split(vsf, True), bool(ad._C1_REORDER))
     hit = _DIRECT.get((key, int(nseq)))
     if hit is None:
         c = ad._cache(*key)
@@ -527,7 +547,7 @@ def _chunk_shared(layer, shared, r0, L, ssm, slot_t, cu_t, st):
 
 def _run_direct(q, k, v, g, beta, out, cu, ssm, slots, nseq, maxlen, st, HV, scale):
     vs = _vsplit(True)
-    vsf = max(int(vs.choose_vsplit(int(nseq), q.size(0), int(maxlen), hv=HV)), 1)
+    vsf = _DEVNB_VSPLIT  # [rx-f122] fixed (bitwise across v_split; the warmed key)
     d = _direct_kernel(q, v, ssm, slots, vsf, nseq)
     if d is not None:
         if st.stream is None:
@@ -717,14 +737,17 @@ def _graph_bufs(layer, gb, shared, mq_full, ba):
         return None
     if not gb.ready:
         gb.setup(layer, shared, mq_full.size(1), ba.size(1))
+    if not _WARM["page"]:
         # compile the page kernels outside any capture, with the real page view and list
-        # alignment: copy the null block (slot 0) onto itself, zero-fill it
+        # alignment: copy the null block (slot 0) onto itself, zero-fill it (warmup() does
+        # this at start-up on a scratch page with the same layout)
         words = _pages_u8(layer).view(torch.int32)
         lst = torch.zeros(_META, dtype=torch.int32, device=gb.dev)
         _page_copy_kernel[(1, 1)](words, lst[_O_CP:], words.size(1), words.stride(0),
                                   BLOCK=_PAGE_BLOCK, num_warps=4)
         _page_zero_kernel[(1, 1)](words, lst[_O_Z:], words.size(1), words.stride(0),
                                   BLOCK=_PAGE_BLOCK, num_warps=4)
+        _WARM["page"] = True
     if mq_full.size(1) != gb.sz.size(1) or ba.size(1) != gb.ab.size(1):
         return None
     return gb
@@ -823,6 +846,11 @@ def after_core(layer, mixed_qkv, b, a, core_attn_out=None, raw=None) -> None:
         shared = _graph_conv_outputs(layer, mixed_qkv)
         if shared is not None and _graph_replay(layer, gid, spec, conv_state, ssm, shared, *raw):
             STATS["graph_layers"] = STATS.get("graph_layers", 0) + 1
+            if layer._f122_graph == "plan":
+                # [rx-f122] conv outputs from the GDN step plan (shared buffers)
+                STATS["plan_graph_layers"] = STATS.get("plan_graph_layers", 0) + 1
+                if STATS["plan_graph_layers"] == 1:
+                    logger.info("[F122] replay graphs engaged on step-plan layers (shared conv outputs)")
             STATS["replays"] += sum(spec[0])
             if verify:
                 _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out)
@@ -978,7 +1006,7 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
                 continue
             got = pages[r[1]]
             if not torch.equal(got[s0:s1], raw[s0:s1]):
-                d = (got[s0:s1].view(torch.float32) - raw[s0:s1].view(torch.float32)).abs()
+                d = (got[s0:s1].view(ssm.dtype).float() - raw[s0:s1].view(ssm.dtype).float()).abs()
                 bad.append(f"ssm@{pos}:max{float(d.max()):.3g}")
             if not torch.equal(got[c0:c1], raw[c0:c1]):
                 bad.append(f"conv@{pos}")
@@ -990,7 +1018,7 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
             if torch.equal(got[s0:s1], raw[s0:s1]):
                 fin = "bitwise"
             else:
-                d = (got[s0:s1].view(torch.float32) - raw[s0:s1].view(torch.float32)).abs()
+                d = (got[s0:s1].view(ssm.dtype).float() - raw[s0:s1].view(ssm.dtype).float()).abs()
                 fin = f"max|d|={float(d.max()):.3g}"
             STATS["verify_final_bitwise"] = STATS.get("verify_final_bitwise", 0) + int(
                 fin == "bitwise"
@@ -1009,3 +1037,109 @@ def _verify(layer, st, gid, recs, snaps, mixed_qkv, b, a, core_attn_out):
                 "[F122] verify ok #%d layer=%s group=%d start=%d end=%d ckpts=%s final=%s",
                 STATS["verify_layers"], layer.prefix, gid, start, end, desc, fin,
             )
+
+
+# ----------------------------------------------------------------------------------------------
+# [rx-f122] Start-up warmup (Rubin port). Serving must not JIT-compile (start-up rule): every
+# kernel the in-step checkpoints can launch is compiled here, after vLLM's graph capture and
+# before the first request, on a scratch page with the pool's per-slot layout (no pool writes):
+#   * the device_nb V-split chunk kernel, v_split _DEVNB_VSPLIT (replay graphs, eager fast path,
+#     eager replays): compiled by the GDN layer graphs only when they are on (r32), so the
+#     step-plan arms (r256+) would otherwise compile it at the first merged step;
+#   * the regular V-split chunk kernel, v_split 1 and 2 (VERIFY's reference chain; the same keys
+#     as the serving prefill path, so normally already compiled);
+#   * the Triton page copy / zero kernels (replay graphs).
+# It also allocates the static buffers: the GDN layer graphs' T_MAX conv-output buffers (the step
+# plan writes into them on checkpoint steps) and the replay-graph buffers.
+# ----------------------------------------------------------------------------------------------
+def warmup(runner) -> None:
+    if _WARM["done"] or not ENABLED:
+        return
+    _WARM["done"] = True
+    try:
+        _warmup(runner)
+    except Exception as e:  # noqa: BLE001 - never break start-up; the lazy paths remain
+        logger.warning("[F122] warmup FAILED (lazy compiles at the first merged step): %r", e)
+    _MODS.pop("devnb_on", None)
+
+
+def _warmup(runner) -> None:
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
+    mod = _gdn()
+    layers = [m for m in runner.model.modules() if isinstance(m, mod.QwenGatedDeltaNetAttention)]
+    if not layers:
+        logger.info("[F122] warmup: no Qwen GDN layer")
+        return
+    if not _LAYER_GROUP:
+        set_layer_groups(runner.kv_cache_config)
+    layer = layers[0]
+    ssm = layer.kv_cache[1]
+    dev = ssm.device
+    H = layer.num_k_heads // layer.tp_size
+    HV = layer.num_v_heads // layer.tp_size
+    K, V = layer.head_k_dim, layer.head_v_dim
+    raw, _, s_ssm = _scratch_views(layer, _pages_u8(layer)[0])
+    raw.zero_()
+    L = 64
+    gen = torch.Generator(device=dev).manual_seed(0)
+
+    def rnd(*shape, scale=0.1, dtype=torch.bfloat16):
+        return (torch.randn(*shape, device=dev, generator=gen) * scale).to(dtype)
+
+    q, k, v = rnd(L, H, K), rnd(L, H, K), rnd(L, HV, V)
+    gate = (torch.rand(L, HV, device=dev, generator=gen) * 0.5 + 0.5).float()
+    beta = (torch.rand(L, HV, device=dev, generator=gen) * 0.5).float()
+    out = torch.empty(L, HV, V, dtype=torch.bfloat16, device=dev)
+    slot0 = torch.zeros(1, dtype=torch.int32, device=dev)
+    cu = torch.tensor([0, L, 1], dtype=torch.int32, device=dev)  # [0, L] + device_nb count 1
+    scale = 1.0 / (K**0.5)
+    done = []
+    # device_nb copy (one key: v_split _DEVNB_VSPLIT, pool strides, initial state, in place)
+    from vllm.third_party.flashinfer_gdn_vsplit_devnb.gdn_chunked_vs import (
+        GatedDeltaNetChunkedKernel as _K,
+    )
+
+    nsm = torch.cuda.get_device_properties(dev).multi_processor_count
+    ws = torch.empty(_K.get_workspace_size(nsm, 1, H, HV, True), dtype=torch.int8, device=dev)
+    _vsplit(True).chunk_gated_delta_rule_vsplit(
+        q, k, v, gate, beta, out, cu[:2], s_ssm, s_ssm, scale,
+        state_indices=slot0, v_split=_DEVNB_VSPLIT, device_nb=True, workspace=ws)
+    if _direct_kernel(q, v, ssm, slot0, _DEVNB_VSPLIT, 1) is None:
+        raise RuntimeError("device_nb V-split kernel not in the adapter cache after its compile")
+    _WARM["devnb"] = True
+    done.append(f"device_nb v_split {_DEVNB_VSPLIT}")
+    # regular copy, both V-split factors the serving rule picks (VERIFY's reference chain)
+    for vsf in (1, 2):
+        _vsplit(False).chunk_gated_delta_rule_vsplit(
+            q, k, v, gate, beta, out, cu[:2], s_ssm, s_ssm, scale,
+            state_indices=slot0, v_split=vsf)
+        done.append(f"regular v_split {vsf}")
+    # Triton page kernels: same specialization as the pool (page words, stride, list offsets)
+    words = raw.view(1, -1).view(torch.int32)
+    lst = torch.zeros(_META, dtype=torch.int32, device=dev)
+    _page_copy_kernel[(1, 1)](words, lst[_O_CP:], words.size(1), words.stride(0),
+                              BLOCK=_PAGE_BLOCK, num_warps=4)
+    _page_zero_kernel[(1, 1)](words, lst[_O_Z:], words.size(1), words.stride(0),
+                              BLOCK=_PAGE_BLOCK, num_warps=4)
+    _WARM["page"] = True
+    done.append("page copy / zero")
+    # static buffers: shared conv outputs (step plan + layer graphs) and the replay-graph buffers
+    shared = gdn_layer_graphs._shared(dev, H, HV)
+    n_groups = len(runner.kv_cache_config.kv_cache_groups)
+    dk = _dev_key(dev)
+    gb = _GBUF.get(dk)
+    if gb is None:
+        gb = _GBUF[dk] = _GraphBufs(torch.device("cuda", dk), n_groups)
+    wz = (layer.key_dim * 2 + layer.value_dim * 2) // layer.tp_size  # mixed_qkvz columns
+    wba = 2 * HV  # ba columns (b | a)
+    if not gb.ready:
+        gb.setup(layer, shared, wz, wba)
+    torch.cuda.synchronize(dev)
+    mb = sum(t.numel() * t.element_size() for t in shared) / 2**20
+    mb += (gb.out.numel() * gb.out.element_size() + gb.sz.numel() * gb.sz.element_size()) / 2**20
+    logger.info(
+        "[F122] warmup done: compiled %s; shared conv-output buffers %d rows; replay buffers "
+        "ready (%.0f MiB static); %d GDN layers, %d KV-cache groups, page %d B",
+        ", ".join(done), shared[0].size(0), mb, len(layers), n_groups, words.size(1) * 4,
+    )

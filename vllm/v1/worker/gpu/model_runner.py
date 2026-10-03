@@ -1107,6 +1107,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        if not profile_only and gdn_inline_ckpt.ENABLED:
+            # [F122] compile the in-step checkpoint kernels before serving (0 runtime JIT)
+            with torch.inference_mode():
+                gdn_inline_ckpt.warmup(self)
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
