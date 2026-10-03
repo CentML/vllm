@@ -122,18 +122,19 @@ HOIST_CONV = ENABLED and os.environ.get("VLLM_GDN_PLAN_HOIST_CONV", "0") == "1"
 #       recorded after it, and the join is enqueued on the caller's stream
 #       before run_plan returns (before any reader of either branch).
 #       Same kernels, same arguments, same per-buffer order.
-#   VLLM_GDN_SPEC_OVERLAP_MODE=hp (default): chunk + norm on a high-priority
-#       stream (its CTAs need an empty SM, so they must be dispatched before the
-#       decode CTAs backfill), spec branch on the caller's stream;
-#       =side: spec branch on a side stream, chunk + norm on the caller's stream
-#       (GB300 gdnp mode 2).
+#   VLLM_GDN_SPEC_OVERLAP_MODE=side (default): spec branch on a side stream,
+#       chunk + norm on the caller's stream, enqueued first (GB300 gdnp mode 2;
+#       the side stream's event wake gives the chunk's full-SM CTAs a head start);
+#       =hp: chunk + norm on a high-priority stream, spec branch on the caller's
+#       stream (measured ~1.5-2.5 us/layer slower on VR200: the chunk then waits
+#       for the cross-stream wake itself).
 #   VLLM_GDN_SPEC_OVERLAP_MIN_S (192): only steps with >= this many spec tokens
 #       (host cost ~4 stream ops per layer; low C is host-bound).
 #   VLLM_GDN_SPEC_OVERLAP_MAX_NS (0 = no limit): only steps with <= this many
 #       prefill sequences (the chunk grid fills the GPU from 4 sequences on).
 #   Never during a CUDA graph capture (the GDN layer graphs keep their own path).
 OVL = ENABLED and os.environ.get("VLLM_GDN_SPEC_OVERLAP", "0") == "1"
-OVL_MODE = os.environ.get("VLLM_GDN_SPEC_OVERLAP_MODE", "hp").strip().lower()
+OVL_MODE = os.environ.get("VLLM_GDN_SPEC_OVERLAP_MODE", "side").strip().lower()
 OVL_MIN_S = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MIN_S", "192"))
 OVL_MAX_NS = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MAX_NS", "0"))
 _OVL_RES: dict = {}
