@@ -45,7 +45,7 @@ def _scores(case: str, rows: int, n: int, g: torch.Generator) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("case", ["random", "ties", "tail", "signed_zero", "nan"])
-@pytest.mark.parametrize("rows,n,out_k", [(48, 9000, 2048), (16, 1000, 2048), (8, 300, 64)])
+@pytest.mark.parametrize("rows,n,out_k", [(48, 9000, 2048), (16, 1000, 2048), (8, 3000, 256)])
 def test_fast_select_topk_matches_torch(case, rows, n, out_k):
     g = torch.Generator(device="cuda").manual_seed(0)
     scores = _scores(case, rows, n, g)
@@ -54,18 +54,19 @@ def test_fast_select_topk_matches_torch(case, rows, n, out_k):
     torch.testing.assert_close(out, _reference(scores, out_k), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("bound_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("has_starts,row_repeat,max_row_len", [(False, 2, 6000), (True, 1, None)])
 def test_select_candidate_blocks_fast_path_bitwise(
-    monkeypatch, has_starts, row_repeat, max_row_len
+    monkeypatch, has_starts, row_repeat, max_row_len, bound_dtype
 ):
     g = torch.Generator(device="cuda").manual_seed(1)
     rows, width, out_k = 64, 9000, 512
     logits = torch.randn(rows, width, device="cuda", generator=g).bfloat16().float()
     nb = rows // row_repeat
-    ke = torch.randint(0, width + 1, (nb,), device="cuda", generator=g, dtype=torch.int32)
+    ke = torch.randint(0, width + 1, (nb,), device="cuda", generator=g, dtype=bound_dtype)
     if max_row_len is not None:
         ke = ke.clamp(max=max_row_len)
-    ks = (ke.float() * 0.3).int() if has_starts else None
+    ks = (ke.float() * 0.3).to(bound_dtype) if has_starts else None
     outs = []
     for fast in (False, True):
         monkeypatch.setattr(cb, "FAST_CANDIDATE_TOPK", fast)

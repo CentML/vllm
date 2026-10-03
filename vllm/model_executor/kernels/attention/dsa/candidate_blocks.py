@@ -215,7 +215,8 @@ def _candidate_topk_kernel(
         live = tl.where(lim > start, (lim - start + BLOCK_SIZE - 1) // BLOCK_SIZE, 0)
         # _block_scores_kernel pins block (end - start - 1) // BLOCK_SIZE to +inf.
         pin = tl.where(end > start, (end - start - 1) // BLOCK_SIZE + 1, 0)
-        n_scan = tl.minimum(tl.maximum(live, pin), nblocks)
+        # int32 like nblocks: the bounds may be int64 tensors.
+        n_scan = tl.minimum(tl.maximum(live, pin), nblocks).to(tl.int32)
     else:
         n_scan = nblocks
     n_tail = nblocks - n_scan
@@ -582,9 +583,14 @@ def select_candidate_blocks(
     score_width = width if max_row_len is None else max(1, min(width, max_row_len))
     nblocks = triton.cdiv(score_width, block_size)
     scores = logits.new_empty((rows, nblocks))
+    # torch.topk(sorted=True) sorts k <= 128 results with a comparison sort
+    # (bitonic below 32, unstable; warp merge sort up to 128, NaN largest) and
+    # 128 < k <= 4096 with a stable CUB radix sort; the fast kernel reproduces
+    # the radix-sort regime only (DSV4.1: k = 2048).
     fast = (
         FAST_CANDIDATE_TOPK
         and topk_blocks == out.shape[1]
+        and 128 < min(topk_blocks, nblocks)
         and triton.next_power_of_2(topk_blocks) <= 2048
         and nblocks < (1 << 21) - 1
     )
