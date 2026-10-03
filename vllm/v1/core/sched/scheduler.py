@@ -627,6 +627,12 @@ class Scheduler(SchedulerInterface):
             )
 
         # First, schedule the RUNNING requests.
+        # One profiling scope object, entered once per request: the scope
+        # types (nullcontext, record_function, nvtx.annotate) are reusable,
+        # and building one per request is measurable at ~500 requests/step.
+        allocate_slots_scope = record_function_or_nullcontext(
+            "schedule: allocate_slots"
+        )
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -743,7 +749,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
+            with allocate_slots_scope:
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
