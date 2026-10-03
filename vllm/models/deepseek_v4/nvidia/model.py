@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -206,6 +207,33 @@ def make_deepseek_v4_expert_params_mapping(
             ("w3", "w3"),
         ]
     ]
+
+
+def _maybe_enable_megamoe_sm107(deep_gemm) -> None:
+    """Route DeepGEMM MegaMoE to its Rubin (sm_107) kernel when VLLM_DSV41_MEGAMOE_SM107=1.
+
+    DeepGEMM selects the kernel per call from DG_MEGA_MOE_SM107, so this must run before the first MegaMoE call
+    (and before CUDA graph capture). The block_m heuristic (and thus the shared-expert SF layout written by
+    prepare_megamoe_inputs) is identical for both kernels.
+    """
+    if not envs.VLLM_DSV41_MEGAMOE_SM107:
+        return
+    impl = os.path.join(
+        os.path.dirname(deep_gemm.__file__),
+        "include/deep_gemm/impls/sm107_fp8_fp4_mega_moe.cuh",
+    )
+    if torch.cuda.get_device_capability() != (10, 7) or not os.path.exists(impl):
+        logger.warning_once(
+            "VLLM_DSV41_MEGAMOE_SM107=1 ignored: it needs a compute capability 10.7 GPU "
+            "and the Rubin-patched DeepGEMM (%s not found).",
+            impl,
+        )
+        return
+    os.environ.setdefault("DG_MEGA_MOE_SM107", "1")
+    logger.info_once(
+        "DeepGEMM MegaMoE: Rubin SM107 kernel enabled (DG_MEGA_MOE_SM107=%s).",
+        os.environ["DG_MEGA_MOE_SM107"],
+    )
 
 
 class DeepseekV4MegaMoEExperts(nn.Module):
@@ -543,6 +571,7 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
         deep_gemm = _import_deep_gemm()
+        _maybe_enable_megamoe_sm107(deep_gemm)
 
         if self._transformed_l1_weights is None:
             self._check_runtime_supported()
