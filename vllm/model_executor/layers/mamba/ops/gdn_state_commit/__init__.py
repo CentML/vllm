@@ -233,6 +233,14 @@ def load(minb=None, gb=None):
     if gb:
         tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k{SPEC}s{KH}h{KH_MIN}".format(**gbo)
         gb_flags += ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
+        # gy-lowc: V-split GB kernel for calls with <= GB_VS_MAXN requests (2 / 4 CTAs per value head in a
+        # thread-block cluster; bit-exact with gb_decode_kernel). Default off: tag and flags unchanged.
+        if int(os.environ.get("GDN_STATE_COMMIT_GB_VS", "0")):
+            vs_parts = int(os.environ.get("GDN_STATE_COMMIT_GB_VS_PARTS", "2"))
+            vs_maxn = int(os.environ.get("GDN_STATE_COMMIT_GB_VS_MAXN", "2"))
+            assert vs_parts in (2, 4) and vs_maxn >= 1, (vs_parts, vs_maxn)
+            tag += f"_vs{vs_parts}p{vs_maxn}"
+            gb_flags += ["-DGB_VS=1", f"-DGB_VS_PARTS={vs_parts}", f"-DGB_VS_MAXN={vs_maxn}"]
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
