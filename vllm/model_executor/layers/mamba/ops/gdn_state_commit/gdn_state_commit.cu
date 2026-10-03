@@ -2227,12 +2227,23 @@ __global__ __launch_bounds__(kThreads, 2) void materialize_kernel(MatArgs args) 
   mat_item<S, VPK>(args, blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
+// [gx-alignc] CTAs/SM bound of the compact kernel: fp32 state 4 (the default fp32 build is 64 regs / 4 CTAs/SM, and
+// 152 SMs x 4 = 608 >= the 480 (key head, layer) CTAs of one active item -> one wave), bf16 3 (rubin-ck's 80-reg build).
+// rubin-ck as shipped used the fixed 3 CTAs/SM for both state types (rebuild with -DGSC_MATC_MINB_F32=3 to match).
+#ifndef GSC_MATC_MINB_F32
+#define GSC_MATC_MINB_F32 4
+#endif
+#ifndef GSC_MATC_MINB_BF16
+#define GSC_MATC_MINB_BF16 3
+#endif
+
 // [rubin-ck] compact mode (separate kernel so the default kernel's code and occupancy are unchanged): every CTA
 // builds the same ascending list of active items (one load round per item, spread over the CTA), then CTA x handles
 // list entries x, x + gridDim.x, ... for its (key head, layer). Per-item work is the unchanged mat_item -> the same
-// bytes are written as in the full (items, H, layers) grid. 3 CTAs/SM like the default kernel's 80-register build.
+// bytes are written as in the full (items, H, layers) grid.
 template <typename S, int VPK>
-__global__ __launch_bounds__(kThreads, 3) void materialize_compact_kernel(MatArgs args) {
+__global__ __launch_bounds__(kThreads, sizeof(S) == 4 ? GSC_MATC_MINB_F32 : GSC_MATC_MINB_BF16)
+void materialize_compact_kernel(MatArgs args) {
   __shared__ int s_list[kMatMaxItems];
   __shared__ int s_wsum[kWarps];
   __shared__ int s_cnt;

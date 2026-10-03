@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -651,6 +652,14 @@ def mamba_align_compact() -> int:
     return gdn_state_commit.align_compact()
 
 
+# [gx-alignc] VLLM_MAMBA_ALIGN_CONV_Z1=1 (default 0 = off): when every copied state is a conv state (conv_width > 0;
+# e.g. the deferred GDN state commit, whose copy specs are conv-only), launch the fused align copies with grid z = 1
+# instead of _TEMPORAL_TILES. _copy_mamba_state_block returns at once for conv states on tile_idx > 0, and the
+# num_accepted_tokens_out store is guarded by tile_idx == 0, so the bytes written are identical with 16x fewer CTAs.
+# With any temporal state the context keeps the full tile grid. Applies to the original and the compact kernels.
+_MAMBA_ALIGN_CONV_Z1 = os.environ.get("VLLM_MAMBA_ALIGN_CONV_Z1", "0") == "1"
+
+
 @triton.jit(do_not_specialize=["num_reqs"])
 def postprocess_mamba_fused_compact_kernel(
     num_accepted_tokens_ptr,
@@ -1015,6 +1024,9 @@ class MambaSpecDecodeGPUContext:
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
+    # [gx-alignc] grid z of the fused align copies: _TEMPORAL_TILES, or 1 when VLLM_MAMBA_ALIGN_CONV_Z1=1 and every
+    # state is a conv state (set by initialize_from_forward_context).
+    align_copy_tiles: int = _TEMPORAL_TILES
 
     # persistent output for the once-per-step, all-group aligned-index launch.
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
@@ -1189,6 +1201,7 @@ class MambaSpecDecodeGPUContext:
         block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
+        num_temporal = 0  # [gx-alignc] VLLM_MAMBA_ALIGN_CONV_Z1 needs conv-only states
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
             layer_names = kv_cache_group.layer_names
@@ -1252,6 +1265,7 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
+                        num_temporal += 1
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
@@ -1282,6 +1296,15 @@ class MambaSpecDecodeGPUContext:
                     idx += 1
 
         assert idx == self.num_states
+        if _MAMBA_ALIGN_CONV_Z1 and num_temporal == 0 and idx > 0:
+            self.align_copy_tiles = 1
+            logger.info(
+                "mamba align copies: conv-only states (%d), grid z = 1 "
+                "(VLLM_MAMBA_ALIGN_CONV_Z1=1)",
+                idx,
+            )
+        else:
+            self.align_copy_tiles = _TEMPORAL_TILES
 
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
@@ -1370,7 +1393,11 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_states
         compact = mamba_align_compact()
-        grid = (min(compact, num_reqs) if compact else num_reqs, total_states, _TEMPORAL_TILES)
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
         kernel = postprocess_mamba_fused_kernel
         extra = {}
         if compact:  # [rubin-ck] same copies over the active requests only
@@ -1439,7 +1466,11 @@ class MambaSpecDecodeGPUContext:
             return
         total_states = self.num_states
         compact = mamba_align_compact()
-        grid = (min(compact, num_reqs) if compact else num_reqs, total_states, _TEMPORAL_TILES)
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
         kernel = precopy_mamba_align_fused_kernel
         extra = {}
         if compact:  # [rubin-ck] same copies over the requests that cross a block boundary only
@@ -1502,7 +1533,11 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_states
         compact = mamba_align_compact()
-        grid = (min(compact, num_reqs) if compact else num_reqs, total_states, _TEMPORAL_TILES)
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
         kernel = postprocess_mamba_fused_kernel
         extra = {}
         if compact:  # [rubin-ck] same copies over the active requests only
