@@ -99,6 +99,18 @@ LAZY_IDX_CHECK = [int(os.environ.get("VLLM_GDN_STEP_PLAN_LAZY_IDX_CHECK", "0"))]
 MDREUSE_PTR_KEY = os.environ.get("VLLM_GDN_STEP_PLAN_MDREUSE_PTR_KEY", "0") == "1"
 LOG = os.environ.get("VLLM_GDN_STEP_PLAN_LOG", "1") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_GDN_STEP_PLAN_LOG_EVERY", "2000"))
+# Host-side hoists of run_plan (exact: same kernels, same arguments; default off,
+# one gate each so they can be attributed separately; never used during a CUDA
+# graph capture, which keeps the stock path):
+#   VLLM_GDN_PLAN_HOIST_STATIC=1  per-layer constants (conv-state / conv-weight
+#       views, layout flag, scalar casts) built once per layer and reused while
+#       the layer's KV-cache tensors and conv weight are the same objects;
+#   VLLM_GDN_PLAN_HOIST_CONV=1    the spec-row causal_conv1d_update launch with
+#       its scalar / constexpr arguments computed once per step plan and checked
+#       per layer (dtype, strides, shapes, bias, activation), falling back to
+#       the stock wrapper on any difference.
+HOIST_STATIC = ENABLED and os.environ.get("VLLM_GDN_PLAN_HOIST_STATIC", "0") == "1"
+HOIST_CONV = ENABLED and os.environ.get("VLLM_GDN_PLAN_HOIST_CONV", "0") == "1"
 
 HOST_TRIMS = os.environ.get("GGM_OG2", "0") == "1"
 GROUP_MATERIALIZE = (
@@ -172,6 +184,12 @@ def check_config(state_commit: bool, norm_quant_fusion: bool) -> None:
             int(LAZY),
             int(VSDIRECT),
             int(MDREUSE),
+        )
+    if HOIST_STATIC or HOIST_CONV:
+        logger.info(
+            "GDN step plan host hoists enabled: static=%d conv=%d",
+            int(HOIST_STATIC),
+            int(HOIST_CONV),
         )
     if GROUP_MATERIALIZE and state_commit:
         logger.info("GDN state materialize: one launch per KV group enabled")
@@ -382,6 +400,7 @@ class _Plan:
         "scale",
         "names",
         "vs_direct",
+        "conv_pre",
     )
 
 
@@ -583,6 +602,7 @@ def build_plan(layer, md, raw):
     p.vsf = 1
     p.vsmod = None
     p.vs_direct = None
+    p.conv_pre = None
     if mod._GDN_FI_VSPLIT and not p.want_cp:
         st = mod._GDN_VSPLIT_STATE
         if mod._GDN_FI_VSPLIT_CHECK:
@@ -676,6 +696,174 @@ def build_plan(layer, md, raw):
     return p
 
 
+_CC: list = []
+
+
+def _cc():
+    """The causal_conv1d ops module (imported lazily, like _gdn / _gsc)."""
+    if not _CC:
+        from vllm.model_executor.layers.mamba.ops import causal_conv1d as m
+
+        _CC.append(m)
+    return _CC[0]
+
+
+_CONV_DIM_FIRST: list = []
+
+
+def _layer_static(layer, mod, kv0, kv1, w):
+    """VLLM_GDN_PLAN_HOIST_STATIC: the per-layer values run_plan rebuilds on
+    every call, computed exactly as run_plan does. Valid while kv0 / kv1 / w are
+    the same tensor objects (their metadata cannot change in place)."""
+    if not _CONV_DIM_FIRST:
+        _CONV_DIM_FIRST.append(bool(mod.is_conv_state_dim_first()))
+    conv_state = kv0 if _CONV_DIM_FIRST[0] else kv0.transpose(-1, -2)
+    conv_weights = w.view(w.size(0), w.size(2))
+    STATS["hoist_static_build"] = STATS.get("hoist_static_build", 0) + 1
+    return (
+        kv0,
+        kv1,
+        w,
+        conv_state,
+        conv_weights,
+        float(layer.head_k_dim**-0.5),
+        float(layer.layer_norm_epsilon),
+        layer.norm.activation == "sigmoid",
+        int(layer.num_k_heads // layer.tp_size),
+    )
+
+
+class _ConvPre:
+    """VLLM_GDN_PLAN_HOIST_CONV: the arguments causal_conv1d_update passes to
+    _causal_conv1d_update_kernel for this step's spec rows (varlen + spec
+    decoding, out = x, default null_block_id), computed once per plan from the
+    first layer and valid for every layer with the same checked properties."""
+
+    __slots__ = ("chk", "grid", "scal", "kw")
+
+
+def _conv_pre(p, x, conv_state, weight, bias, activation):
+    cc = _cc()
+    if isinstance(activation, bool):
+        act = "silu" if activation is True else None
+    else:
+        act = activation
+    if act is not None and act not in ("silu", "swish"):
+        return None
+    if p.nacc is None or p.cu_s is None or p.conv_si is None:
+        return None  # not the varlen spec-decoding form this path mirrors
+    batch = p.conv_si.size(0)
+    dim = x.size(1)
+    seqlen = p.mql
+    _, width = weight.shape
+    num_cache_lines, _, _ = conv_state.size()
+    stride_w_dim, stride_w_width = weight.stride()
+    stride_x_token, stride_x_dim = x.stride()
+    s_seq, s_dim, s_tok = conv_state.stride()
+    state_len = width - 1 + (seqlen - 1)  # num_accepted_tokens is not None
+    c = _ConvPre()
+    c.chk = (
+        x.dtype,
+        x.stride(),
+        dim,
+        conv_state.dtype,
+        tuple(conv_state.shape),
+        conv_state.stride(),
+        tuple(weight.shape),
+        weight.stride(),
+        bias is None,
+        activation,
+    )
+    c.grid = (batch, triton.cdiv(dim, 256))
+    c.scal = (
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        0,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        s_seq,
+        s_dim,
+        s_tok,
+        p.conv_si.stride(0),
+        0,
+        stride_x_dim,
+        stride_x_token,
+        cc.NULL_BLOCK_ID,
+    )
+    c.kw = dict(
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=act in ["silu", "swish"],
+        IS_VARLEN=True,
+        IS_APC_ENABLED=False,
+        IS_SPEC_DECODING=True,
+        NP2_STATELEN=triton.next_power_of_2(state_len),
+        HAS_NULL_BLOCK=cc.NULL_BLOCK_ID is not None,
+        BLOCK_N=256,
+        launch_pdl=cc.current_platform.is_arch_support_pdl(),
+    )
+    return c
+
+
+def conv_update_spec(p, x, conv_state, weight, bias, activation):
+    """causal_conv1d_update(x, conv_state, weight, bias, activation,
+    conv_state_indices=p.conv_si, num_accepted_tokens=p.nacc,
+    query_start_loc=p.cu_s, max_query_len=p.mql, validate_data=False) with the
+    per-step arguments hoisted (VLLM_GDN_PLAN_HOIST_CONV). Same kernel object,
+    same arguments; launched on the current stream. Returns x (the wrapper's
+    result when x.dtype == conv_state.dtype)."""
+    c = p.conv_pre
+    if c is None:  # first spec-row layer of this plan; False = not applicable
+        c = _conv_pre(p, x, conv_state, weight, bias, activation)
+        p.conv_pre = c if c is not None else False
+    if c and c.chk == (
+        x.dtype,
+        x.stride(),
+        x.size(1),
+        conv_state.dtype,
+        tuple(conv_state.shape),
+        conv_state.stride(),
+        tuple(weight.shape),
+        weight.stride(),
+        bias is None,
+        activation,
+    ) and x.dtype == conv_state.dtype and x.dim() == 2:
+        _cc()._causal_conv1d_update_kernel[c.grid](
+            x,
+            weight,
+            bias,
+            conv_state,
+            p.conv_si,
+            p.nacc,
+            p.cu_s,
+            None,
+            None,
+            x,
+            *c.scal,
+            **c.kw,
+        )
+        STATS["hoist_conv"] = STATS.get("hoist_conv", 0) + 1
+        return x
+    STATS["hoist_conv_fallback"] = STATS.get("hoist_conv_fallback", 0) + 1
+    return _gdn().causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=p.conv_si,
+        num_accepted_tokens=p.nacc,
+        query_start_loc=p.cu_s,
+        max_query_len=p.mql,
+        validate_data=False,
+    )
+
+
 def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
     """One layer of a planned mixed step: the kernels of the zero-copy mixed
     path, in its order, with its arguments.
@@ -683,31 +871,50 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
     mod = _gdn()
     gsc = _gsc()
     S, N = p.S, p.N
-    ssm_state = layer.kv_cache[1]
-    conv_state = (
-        layer.kv_cache[0]
-        if mod.is_conv_state_dim_first()
-        else layer.kv_cache[0].transpose(-1, -2)
-    )
-    conv_weights = layer.conv1d.weight.view(
-        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
-    )
+    hoist = (HOIST_STATIC or HOIST_CONV) and not torch.cuda.is_current_stream_capturing()
+    if hoist and HOIST_STATIC:
+        kvc = layer.kv_cache
+        kv0, kv1, w = kvc[0], kvc[1], layer.conv1d.weight
+        ls = layer.__dict__.get("_gdn_plan_static")
+        if ls is None or ls[0] is not kv0 or ls[1] is not kv1 or ls[2] is not w:
+            ls = layer.__dict__["_gdn_plan_static"] = _layer_static(layer, mod, kv0, kv1, w)
+        ssm_state, conv_state, conv_weights = kv1, ls[3], ls[4]
+        k_scale, n_eps, n_sig, n_kh = ls[5], ls[6], ls[7], ls[8]
+    else:
+        ssm_state = layer.kv_cache[1]
+        conv_state = (
+            layer.kv_cache[0]
+            if mod.is_conv_state_dim_first()
+            else layer.kv_cache[0].transpose(-1, -2)
+        )
+        conv_weights = layer.conv1d.weight.view(
+            layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
+        )
+        k_scale = float(layer.head_k_dim**-0.5)
+        n_eps = float(layer.layer_norm_epsilon)
+        n_sig = layer.norm.activation == "sigmoid"
+        n_kh = int(layer.num_k_heads // layer.tp_size)
     if not MAT:
         gsc._layer_check(layer)
         gsc.materialize_non_spec(layer, md)
     if S > 0:
-        mixed_qkv_spec = mod.causal_conv1d_update(
-            mixed_qkv[:S],
-            conv_state,
-            conv_weights,
-            layer.conv1d.bias,
-            layer.activation,
-            conv_state_indices=p.conv_si,
-            num_accepted_tokens=p.nacc,
-            query_start_loc=p.cu_s,
-            max_query_len=p.mql,
-            validate_data=False,
-        )
+        if hoist and HOIST_CONV:
+            mixed_qkv_spec = conv_update_spec(
+                p, mixed_qkv[:S], conv_state, conv_weights, layer.conv1d.bias, layer.activation
+            )
+        else:
+            mixed_qkv_spec = mod.causal_conv1d_update(
+                mixed_qkv[:S],
+                conv_state,
+                conv_weights,
+                layer.conv1d.bias,
+                layer.activation,
+                conv_state_indices=p.conv_si,
+                num_accepted_tokens=p.nacc,
+                query_start_loc=p.cu_s,
+                max_query_len=p.mql,
+                validate_data=False,
+            )
         if p.dec_direct:
             gsc.STATS["decode_calls"] += 1
             gsc.load().decode(
@@ -723,9 +930,9 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
                 output_gate[:S],
                 layer.norm.weight,
                 core_attn_out[:S],
-                float(layer.head_k_dim**-0.5),
-                float(layer.layer_norm_epsilon),
-                layer.norm.activation == "sigmoid",
+                k_scale,
+                n_eps,
+                n_sig,
             )
         else:
             mod.ops.fused_gdn_decode_post_conv_mtp(
@@ -774,7 +981,7 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
         v,
         g,
         beta,
-        int(layer.num_k_heads // layer.tp_size),
+        n_kh,
         int(p.tph),
         int(p.rv),
     )
