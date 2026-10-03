@@ -1592,6 +1592,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     ctx_tiles=(
                         int(((query_lens_prefill_cpu + 127) // 128).sum().item())
                         if attn_pd_overlap.WAVE_GATE
+                        and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
                         else 0
                     ),
                     pd_ctas=(
