@@ -225,6 +225,47 @@ class BlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
+    def get_cached_block_prefix(
+        self, block_hashes: Iterable[BlockHash], kv_cache_group_id: int
+    ) -> list[KVCacheBlock]:
+        """Cached blocks of one KV cache group for the longest fully cached
+        prefix of ``block_hashes``.
+
+        Same as calling ``get_cached_block(block_hash, [kv_cache_group_id])``
+        for each hash and stopping at the first miss, without building a key
+        and a one-element list per hash (a prefix-cache lookup walks the
+        whole cached prefix of a request).
+        """
+        if (
+            type(self).get_cached_block is not BlockPool.get_cached_block
+            or "get_cached_block" in vars(self)
+            or type(self.cached_block_hash_to_block) is not BlockHashToBlockMap
+        ):
+            blocks: list[KVCacheBlock] = []
+            for block_hash in block_hashes:
+                cached = self.get_cached_block(block_hash, [kv_cache_group_id])
+                if not cached:
+                    break
+                blocks.append(cached[0])
+            return blocks
+        # The key layout of make_block_hash_with_group_id.
+        group_id_suffix = kv_cache_group_id.to_bytes(4, "big", signed=False)
+        cache = self.cached_block_hash_to_block
+        lookup = cache._cache.get
+        blocks = []
+        for block_hash in block_hashes:
+            key = block_hash + group_id_suffix
+            block = lookup(key)
+            if block is None:
+                break
+            if type(block) is not KVCacheBlock:
+                # Several blocks share the hash: let the map pick one.
+                block = cache.get_one_block(key)
+                if not block:
+                    break
+            blocks.append(block)
+        return blocks
+
     def cache_full_blocks(
         self,
         request: Request,
