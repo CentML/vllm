@@ -35,6 +35,7 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import MoEOutput
+from vllm.models.common.ops.row_copy import index_copy_rows_
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 
@@ -108,8 +109,7 @@ class DecoderReplayLayers:
             return False
         return (
             is_forward_context_available()
-            and get_forward_context().cudagraph_runtime_mode
-            == CUDAGraphMode.PIECEWISE
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
             and self.graph_forward_context is not None
         )
 
@@ -151,7 +151,7 @@ class DecoderReplayLayers:
             else:
                 # The trimmed rows' outputs stay zero; nothing reads them.
                 out[:num_tokens].zero_()
-                out[:num_tokens].index_copy_(0, rows, src[:n])
+                index_copy_rows_(out[:num_tokens], rows, src[:n])
         return tuple(out[:num_tokens] for out in self._out_bufs)
 
     @staticmethod
@@ -253,6 +253,6 @@ class DecoderReplayLayers:
         # The trimmed rows' outputs stay zero; nothing reads them.
         num_tokens = hidden_states.shape[0]
         return tuple(
-            out.new_zeros((num_tokens, *out.shape[1:])).index_copy_(0, rows, out)
+            index_copy_rows_(out.new_zeros((num_tokens, *out.shape[1:])), rows, out)
             for out in row_outputs
         )
