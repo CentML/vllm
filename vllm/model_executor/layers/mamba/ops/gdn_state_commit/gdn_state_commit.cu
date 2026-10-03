@@ -39,6 +39,9 @@
 #if GSC_QO
 #include <cuda_fp8.h>
 #endif
+#ifndef GSC_TRIG
+#define GSC_TRIG 0  // gx-pdlgemm: early PDL trigger (launch_dependents) at decode-kernel start on the QO path
+#endif
 
 namespace gsc {
 
@@ -149,6 +152,16 @@ struct QoArgs {
   int T;            // rows of out (graph size)
   int pm;           // T rounded up to 128
 };
+// gx-pdlgemm (GSC_TRIG=1): with the fused out_proj quant (QO) the next kernel in the stream is the PDL-launched
+// FlashInfer CuTe out_proj GEMM, which touches only its weights / weight scales before griddepcontrol.wait and reads
+// q / sf only after it (i.e. after this grid has completed and flushed). Triggering at the start lets that GEMM's
+// CTAs launch onto drained SMs during this kernel's last wave and prefetch their weights; numerics are unchanged.
+// Only the QO path triggers (qo.q != nullptr), so every other successor sees the stock implicit trigger at exit.
+__device__ __forceinline__ void qo_early_trigger(const QoArgs& qo) {
+#if GSC_TRIG
+  if (qo.q != nullptr) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 __device__ __forceinline__ float qo_mul_rn(float a, float b) {  // IEEE mul, no FTZ / no contraction
   float r;
   asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
@@ -1215,6 +1228,7 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
+  qo_early_trigger(qo);
   if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid, out, HV);
 #endif
   if (num_tokens <= 0) return;
@@ -1776,6 +1790,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_decode_kernel(
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
+  qo_early_trigger(qo);
   static_assert(kGbThreads == kThreads, "GSC_QO pad-row zeroing assumes 256-thread CTAs");
   if (qo.q != nullptr) qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, value_head, tid, out, HV);
 #endif
@@ -2218,6 +2233,7 @@ __global__ __launch_bounds__(kGbThreads, GB_MINB) void gb_kh_kernel(
   const int bos = cu_seqlens[request];
   const int num_tokens = cu_seqlens[request + 1] - bos;
 #if GSC_QO
+  qo_early_trigger(qo);
   if (qo.q != nullptr) {  // the pad rows of both value heads (same row partition as the value-head kernels)
     qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0, tid, out, HV);
     qo_zero_pad_rows(qo, cu_seqlens[gridDim.x], request, gridDim.x, vh0 + 1, tid, out, HV);

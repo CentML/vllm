@@ -238,6 +238,11 @@ def load(minb=None, gb=None):
     gb_flags = ["-DGSC_QO=1"] if QO_ENV else []
     if QO_ENV:
         tag += "_qo1"
+    # gx-pdlgemm: early PDL trigger on the QO path (exact; launch order only). Env GDN_STATE_COMMIT_TRIG=1.
+    trig = int(os.environ.get("GDN_STATE_COMMIT_TRIG", "0")) if QO_ENV else 0
+    if trig:
+        gb_flags += ["-DGSC_TRIG=1"]
+        tag += "_trig1"
     if gb:
         tag += "_gb{W}w{D}d{NS}n{F2}f{MINB}m{KREG}k{SPEC}s{KH}h{KH_MIN}".format(**gbo)
         gb_flags += ["-DGSC_GB=1"] + [f"-DGB_{k}={v}" for k, v in gbo.items()]
