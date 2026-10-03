@@ -1,0 +1,65 @@
+Subject: [PATCH] trtllm fused MoE launcher: routing kernels never PDL-launched
+
+Unified diff against FlashInfer 0.6.18.post1 (tag 8bc3b578)
+csrc/trtllm_fused_moe_kernel_launcher.cu
+(sha256 7b7adacc9117eb64869bb68b96818af9588a85651afd83cb4a27abaae54152bf;
+installed as flashinfer/data/csrc/...).
+
+FlashInfer passes one enable_pdl to Routing::Runner::run and to
+MoE::Runner::run (FC1 / FC2 / activation / finalize). On sm_107 its
+Python layer clamps enable_pdl off for the whole chain (core.py
+_device_support_moe_pdl, upstream #4806: intermittent unspecified launch
+failures / hangs reported at the routing kernel launch with PDL on).
+
+This patch passes enable_pdl = false to all four routing_runner.run(...)
+call sites, so the routing / permutation kernels (routingCustom block,
+dyn-block, cluster, coop, init-expert-counts, and vLLM's 0001 gs2 kernel)
+are launched without the programmatic-stream-serialization attribute and,
+since every routing wait / trigger is guarded by mUsePdl, never wait on or
+trigger a programmatic edge. The MoE runner keeps the caller's enable_pdl,
+so FC1 / FC2 can be PDL-launched (FC1 then launches only when the routing
+grid has exited; FC2 overlaps FC1's tail). Numerics are unchanged (launch
+attributes only).
+
+Applied and built by vllm/model_executor/layers/fused_moe/
+flashinfer_exact_routing.py when VLLM_MOE_PDL_FC=1; that module also
+bypasses FlashInfer's sm_107 clamp only while this patched module is in use.
+
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu	2026-10-02 21:59:16
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu	2026-10-02 21:59:16
+@@ -1516,7 +1516,7 @@
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -2612,7 +2612,7 @@
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -3305,7 +3305,7 @@
+                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
+                        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
+                        static_cast<RoutingMethodType>(routing_method_type), routing_stream,
+-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
++                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -4403,7 +4403,7 @@
+       static_cast<int*>(buffers.num_non_exiting_ctas.data_ptr()), dtype_elt, routing_bias_dtype,
+       use_routing_scales_on_input, use_deep_seek_fp8,
+       static_cast<RoutingMethodType>(routing_method_type), stream, routing_logits_dtype,
+-      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), enable_pdl);
++      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ }
+ 
+ /// Allocate graph-stable routing metadata storage for each requested tile without launching work.
