@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     SlidingWindowManager,
@@ -132,6 +133,33 @@ def _allocate_new_blocks_plan_entry(
     ):
         return (manager, _ALLOC_RING)
     return (manager, _ALLOC_GENERIC)
+
+
+def _cache_blocks_plan_entry(
+    manager: SingleTypeKVCacheManager,
+) -> tuple[SingleTypeKVCacheManager, bool] | None:
+    """How the coordinator's ``cache_blocks`` handles ``manager``.
+
+    None: the call never does anything (caching disabled, the ring, or the
+    base implementation on a non-prefix-cacheable spec such as SWA under
+    bounded replay). ``(manager, True)``: the base implementation (also full
+    attention when its blocks are hash-sized, so no partial-tail entry), which
+    returns at once unless a block became full since the last call; the
+    coordinator checks that itself. ``(manager, False)``: always call.
+    """
+    if not manager.enable_caching:
+        return None
+    impl = _resolved_impl(manager, "cache_blocks")
+    if impl is CircularBufferManager.cache_blocks:
+        return None
+    if impl is SingleTypeKVCacheManager.cache_blocks or (
+        impl is FullAttentionManager.cache_blocks
+        and manager.block_size == manager.block_pool.hash_block_size
+    ):
+        if not manager.kv_cache_spec.prefix_cacheable:
+            return None
+        return (manager, True)
+    return (manager, False)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -272,6 +300,11 @@ class KVCacheCoordinator(ABC):
         self._allocate_new_blocks_plan = tuple(
             _allocate_new_blocks_plan_entry(manager)
             for manager in self.single_type_managers
+        )
+        self._cache_blocks_plan = tuple(
+            entry
+            for manager in self.single_type_managers
+            if (entry := _cache_blocks_plan_entry(manager)) is not None
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
@@ -515,15 +548,19 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
-        boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            if not manager.enable_caching:
-                continue
+        boundaries = None
+        for manager, skip_if_no_new_full_block in self._cache_blocks_plan:
             # Only cache tokens with finalized KV. The last num_reprefillable_tokens
             # tokens can be re-prefilled during multi-module MTP.
             num_tokens_to_cache = max(
                 0, num_computed_tokens - self.num_reprefillable_tokens
             )
+            if skip_if_no_new_full_block and manager.num_cached_block.get(
+                request.request_id, 0
+            ) >= (num_tokens_to_cache // manager.block_size):
+                continue
+            if boundaries is None:
+                boundaries = self.get_replay_boundaries(request)
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,
@@ -994,11 +1031,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return round_down(num_tokens, self.scheduler_block_size)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
-        boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            if not manager.enable_caching:
-                continue
+        # _align_cacheable, inlined (called twice per request per step).
+        cached_num_computed_tokens = (
+            num_computed_tokens
+            if self.enable_partial_hash_hits
+            else num_computed_tokens
+            // self.scheduler_block_size
+            * self.scheduler_block_size
+        )
+        boundaries = None
+        for manager, skip_if_no_new_full_block in self._cache_blocks_plan:
             num_tokens_to_cache = cached_num_computed_tokens
             # EAGLE groups match one block past each aligned boundary and drop
             # it, so make that lookahead block eligible to be cached.
@@ -1016,6 +1058,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     num_finalized_computed_tokens,
                     cached_num_finalized_computed_tokens + manager.block_size,
                 )
+            # Most calls (every decode step) complete no new block.
+            if skip_if_no_new_full_block and manager.num_cached_block.get(
+                request.request_id, 0
+            ) >= (num_tokens_to_cache // manager.block_size):
+                continue
+            if boundaries is None:
+                boundaries = self.get_replay_boundaries(request)
             # The manager already knows the fine hit granularity
             # (``scheduler_block_size``); retention is passed separately so it
             # can keep both the coarse segment tails and the fine replay
