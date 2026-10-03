@@ -143,6 +143,9 @@ OVL_MAX_NS = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MAX_NS", "0"))
 #       wait) instead of the Python wrappers, the caller's Stream object cached by
 #       its (id, device, type) key, and the capture check shared with the hoists.
 #       Same stream operations in the same order -> same GPU dependency graph.
+#   VLLM_GDN_SPEC_OVERLAP_MODE=sideearly: as side, but the fork is recorded BEFORE
+#       the prefill conv, so the spec branch's conv update also runs beside
+#       conv_post (works with and without FAST).
 OVL_FAST = os.environ.get("VLLM_GDN_SPEC_OVERLAP_FAST", "0") == "1"
 _OVL_RES: dict = {}
 _OVL_FAST_RES: dict = {}
@@ -1125,6 +1128,50 @@ def _ovl_ok(p, mixed_qkv, conv_state, not_capturing=False) -> bool:
     return True
 
 
+def _ovl_begin(fast):
+    """Record the overlap fork on the caller's stream (mode sideearly).
+    Returns (caller Stream, side Stream, fork event, join event, caller key, side key)."""
+    if fast:
+        C = torch._C
+        dev_idx = C._cuda_getDevice()
+        r = _OVL_FAST_RES.get(dev_idx) or _ovl_fast_res(dev_idx)
+        key = C._cuda_getCurrentStream(dev_idx)
+        if r[4] != key:
+            r[4] = key
+            r[5] = torch.cuda.Stream(stream_id=key[0], device_index=key[1], device_type=key[2])
+        C._CudaEventBase.record(r[2], r[5])
+        return (r[5], r[0], r[2], r[3], key, r[1])
+    main = torch.cuda.current_stream()
+    st, _, ev_fork, ev_join = _ovl_res(main.device)
+    ev_fork.record(main)
+    return (main, st, ev_fork, ev_join, None, None)
+
+
+def _ovl_spec_join(ctx, fast, spec_args) -> None:
+    """Spec branch on the side stream after the fork, then the join on the caller's stream."""
+    main, st, ev_fork, ev_join, key, stkey = ctx
+    if fast:
+        C = torch._C
+        EB = C._CudaEventBase
+        EB.wait(ev_fork, st)
+        C._cuda_setStream(*stkey)
+        try:
+            _run_spec(*spec_args)
+        finally:
+            C._cuda_setStream(*key)
+        EB.record(ev_join, st)
+        EB.wait(ev_join, main)
+    else:
+        st.wait_event(ev_fork)
+        torch.cuda.set_stream(st)
+        try:
+            _run_spec(*spec_args)
+        finally:
+            torch.cuda.set_stream(main)
+        ev_join.record(st)
+        main.wait_event(ev_join)
+
+
 def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
     """One layer of a planned mixed step: the kernels of the zero-copy mixed
     path, in its order, with its arguments.
@@ -1160,6 +1207,10 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
         gsc.materialize_non_spec(layer, md)
     # FAST: hoist is computed with the capture check, so hoist=True means "not capturing"
     ovl = OVL and S >= OVL_MIN_S and _ovl_ok(p, mixed_qkv, conv_state, OVL_FAST and hoist)
+    early = ovl and OVL_MODE == "sideearly"
+    if early:
+        # fork before the prefill conv: the spec branch's conv update runs beside conv_post
+        ectx = _ovl_begin(OVL_FAST)
     if S > 0 and not ovl:
         _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
                   ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
@@ -1224,6 +1275,20 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
     if not ovl:
         _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
         STATS["layers_fast"] += 1
+        return
+    if early:
+        # chunk + norm (host order first) on the caller's stream, then the spec branch + join
+        _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
+        _ovl_spec_join(ectx, OVL_FAST, (layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate,
+                                        core_attn_out, ssm_state, conv_state, conv_weights, k_scale,
+                                        n_eps, n_sig))
+        STATS["layers_fast"] += 1
+        n_ovl = STATS["ovl_layers"] = STATS.get("ovl_layers", 0) + 1
+        if n_ovl == 1:
+            logger.info(
+                "GDN step plan: spec||prefill overlap engaged (mode=sideearly%s, S=%d, P=%d, ns=%d, vsf=%d)",
+                "-fast" if OVL_FAST else "", S, p.P, p.ns, p.vsf,
+            )
         return
     # ---- spec || prefill overlap: fork after the prefill conv, join before return ----
     if OVL_FAST and OVL_MODE == "side":
