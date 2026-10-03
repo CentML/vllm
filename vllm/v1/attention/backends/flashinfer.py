@@ -617,6 +617,11 @@ class TRTLLMPrefill:
     """Sum over prefill requests of ceil(q_len / 128): the trtllm-gen context
     FMHA launches ctx_tiles * num_q_heads CTAs (attn-pdo wave gate)."""
 
+    pd_ctas: int = 0
+    """attn-pdo wave gate with VLLM_ATTN_PD_WAVE_MODEL=gen: the fmha-sol gen
+    route's predicted CTA count (attn_pd_overlap.PERSISTENT for a Persistent
+    launch); 0 = no prediction (the ctx model is used)."""
+
 
 @dataclass
 class FlashInferTrtllmAPIDecode:
@@ -1589,6 +1594,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         if attn_pd_overlap.WAVE_GATE
                         else 0
                     ),
+                    pd_ctas=(
+                        _pd_gen_ctas(
+                            int(query_lens_prefill_cpu.sum().item()),
+                            num_prefills,
+                            max_q_len_prefill,
+                            max_seq_len,
+                            self.num_kv_heads,
+                        )
+                        if attn_pd_overlap.WAVE_GATE
+                        and attn_pd_overlap.WAVE_MODEL == "gen"
+                        else 0
+                    ),
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -1812,6 +1829,17 @@ _FI_KV_COUNTER_BYTES = int(
 # One buffer per (device, kernel kind): the context and generation kernels of a
 # layer run back to back and may overlap under PDL, so they never share one.
 _FI_KV_COUNTER_BUFS: dict[tuple[torch.device, str], torch.Tensor] = {}
+
+
+def _pd_gen_ctas(T: int, B: int, max_q: int, max_kv: int, hkv: int) -> int:
+    """attn-pdo wave gate (WAVE_MODEL=gen): predicted CTAs of the fmha-sol gen
+    route, PERSISTENT for a Persistent launch, 0 if the launch is not gen-routed."""
+    from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as _gr
+
+    pred = _gr.predict_launch(T, B, max_q, max_kv, hkv)
+    if pred is None:
+        return 0
+    return attn_pd_overlap.PERSISTENT if pred[1] else pred[0]
 
 
 def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | None:
@@ -2242,7 +2270,10 @@ class FlashInferImpl(AttentionImpl):
                 num_prefill_tokens,
                 num_decode_tokens,
                 query.device,
-                ctx_ctas=attn_metadata.prefill.ctx_tiles * self.num_heads
+                ctx_ctas=(
+                    attn_metadata.prefill.pd_ctas
+                    or attn_metadata.prefill.ctx_tiles * self.num_heads
+                )
                 if attn_pd_overlap.WAVE_GATE and num_prefill_tokens > 0
                 else None,
             )

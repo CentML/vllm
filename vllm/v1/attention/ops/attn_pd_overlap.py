@@ -47,6 +47,14 @@ Environment (read at import; default off):
                               leaves no tail to backfill, and the decode beside it
                               only stretches it (exact: the gate only decides
                               fork vs serial). Default 0.
+``VLLM_ATTN_PD_WAVE_MODEL``   ``ctx`` (default; GB300) or ``gen`` (Rubin HE, where
+                              fmha-sol routes every prefill to the trtllm-gen
+                              generation kernels): ctx_ctas is the gen route's
+                              predicted CTA count (flashinfer_prefill_gen_routing.
+                              predict_launch, host-only), and a Persistent gen launch
+                              (no KV split, long imbalanced tail) always forks
+                              (ctx_ctas = PERSISTENT). Exact: it only decides fork
+                              vs serial.
 ``VLLM_ATTN_PD_MIN_WAVES``    2 (waves = ceil(ctx_ctas / SMs)).
 ``VLLM_ATTN_PD_MAX_LAST_FILL`` 0.5 (fraction of the SMs busy in the last wave).
 ``VLLM_ATTN_PD_LOG_EVERY``    log counts every N mixed attention calls (5000; 0 = off):
@@ -78,6 +86,10 @@ LOG_EVERY = int(os.environ.get("VLLM_ATTN_PD_LOG_EVERY", "5000"))
 WAVE_GATE = ENABLED and os.environ.get("VLLM_ATTN_PD_WAVE_GATE", "0") == "1"
 MIN_WAVES = int(os.environ.get("VLLM_ATTN_PD_MIN_WAVES", "2"))
 MAX_LAST_FILL = float(os.environ.get("VLLM_ATTN_PD_MAX_LAST_FILL", "0.5"))
+WAVE_MODEL = os.environ.get("VLLM_ATTN_PD_WAVE_MODEL", "ctx").strip().lower()
+PERSISTENT = -3  # ctx_ctas sentinel (WAVE_MODEL=gen): Persistent gen-route launch
+if WAVE_MODEL not in ("ctx", "gen"):
+    raise ValueError(f"VLLM_ATTN_PD_WAVE_MODEL must be ctx or gen, got {WAVE_MODEL!r}")
 _SMS: dict = {}
 if ORDER not in ("pp", "dly"):
     raise ValueError(f"VLLM_ATTN_PD_ORDER must be pp or dly, got {ORDER!r}")
@@ -90,12 +102,13 @@ if ENABLED:
     logger.info(
         "attention decode||prefill overlap (attn-pdo) enabled: order=%s "
         "min_decode_rows=%d spin_cycles=%d check=%d wave_gate=%s "
-        "(min_waves=%d max_last_fill=%.2f)",
+        "(model=%s min_waves=%d max_last_fill=%.2f)",
         ORDER,
         MIN_DEC_ROWS,
         SPIN_CYC,
         _CHECK[0],
         WAVE_GATE,
+        WAVE_MODEL,
         MIN_WAVES,
         MAX_LAST_FILL,
     )
@@ -212,6 +225,8 @@ def _log_counts() -> None:
 
 
 def _wave_ok(ctx_ctas: int, device: torch.device) -> bool:
+    if ctx_ctas == PERSISTENT:
+        return True
     idx = device.index if device.index is not None else torch.cuda.current_device()
     sms = _SMS.get(idx)
     if sms is None:
@@ -302,3 +317,51 @@ def check_result(fork_out: torch.Tensor, serial_out: torch.Tensor, layer_name: s
         layer_name,
         bad,
     )
+
+
+# ---------------------------------------------------------------------------
+# Host-side gen-route prediction (relocated verbatim from
+# ``flashinfer_prefill_gen_routing.py`` = PR #74's module, which is not on
+# ``mlperf-end-multiturn-v1.0``; see the PR body). Its module-level thresholds
+# are reached lazily through :func:`_gen_routing` (absent module = inert).
+
+_SMS_CACHE: dict[int, int] = {}
+
+
+def _gen_routing():
+    """PR #74's ``flashinfer_prefill_gen_routing`` module, or None when it has
+    not landed yet."""
+    try:
+        from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as gr
+    except ImportError:
+        return None
+    return gr
+
+
+def predict_launch(
+    T: int, B: int, max_q: int, max_kv: int, hkv: int = 2, device_index: int | None = None
+) -> tuple[int, bool] | None:
+    """Host-only prediction of the ``gen`` launch (no device sync): returns
+    ``(ctas, persistent)``, or None when the launch would not take the gen route.
+    Mirrors :func:`gen_vsm` and FlashInfer's trtllm-gen
+    ``computeCtaAndClusterConfig`` for the grouped Q128 kernel:
+    ``numCtasPerSeqQ = ceil(max_q / 16)``, ``base = numCtasPerSeqQ * hkv * B``,
+    ``S = min(ceil(max_kv / 256), max(1, floor(vsm / base)))``. ``S <= 1`` runs
+    the Persistent kernel over the ``base`` tiles, otherwise ``base * S`` CTAs
+    with the multi-CTA KV split. Used by the attn-pdo wave gate
+    (``VLLM_ATTN_PD_WAVE_MODEL=gen``); it never changes the launch itself.
+    """
+    gr = _gen_routing()
+    if gr is None:
+        return None
+    if not (gr.ENABLED and gr._GEN) or not (T <= gr._GEN_MAX_T or B > gr._MAX_B):
+        return None
+    idx = torch.cuda.current_device() if device_index is None else device_index
+    sms = _SMS_CACHE.get(idx)
+    if sms is None:
+        sms = _SMS_CACHE[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    vsm = gr.gen_vsm(sms, T, B, max_q, hkv, gr._max_vsm(sms))
+    nq = -(-max_q // 16)
+    base = nq * hkv * B
+    S = min(-(-max_kv // 256), max(1, vsm // base))
+    return (base, True) if S <= 1 else (base * S, False)
