@@ -137,7 +137,15 @@ OVL = ENABLED and os.environ.get("VLLM_GDN_SPEC_OVERLAP", "0") == "1"
 OVL_MODE = os.environ.get("VLLM_GDN_SPEC_OVERLAP_MODE", "side").strip().lower()
 OVL_MIN_S = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MIN_S", "192"))
 OVL_MAX_NS = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MAX_NS", "0"))
+#   VLLM_GDN_SPEC_OVERLAP_FAST=1 (mode side only; default off): the same fork /
+#       join with ~1/3 of the host cost: two stream switches instead of four,
+#       torch's C entry points (current-stream tuple, set-stream, event record /
+#       wait) instead of the Python wrappers, the caller's Stream object cached by
+#       its (id, device, type) key, and the capture check shared with the hoists.
+#       Same stream operations in the same order -> same GPU dependency graph.
+OVL_FAST = os.environ.get("VLLM_GDN_SPEC_OVERLAP_FAST", "0") == "1"
 _OVL_RES: dict = {}
+_OVL_FAST_RES: dict = {}
 
 HOST_TRIMS = os.environ.get("GGM_OG2", "0") == "1"
 GROUP_MATERIALIZE = (
@@ -1079,14 +1087,38 @@ def _ovl_res(dev):
     return r
 
 
-def _ovl_ok(p, mixed_qkv, conv_state) -> bool:
+def _ovl_fast_res(dev_idx):
+    """[side stream, its (id, device, type) key, fork event, join event, caller key, caller Stream]."""
+    r = _OVL_FAST_RES.get(dev_idx)
+    if r is None:
+        st = torch.cuda.Stream(device=dev_idx, priority=0)
+        r = _OVL_FAST_RES[dev_idx] = [
+            st,
+            (st.stream_id, st.device_index, st.device_type),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+            None,
+            None,
+        ]
+        logger.info(
+            "GDN step plan: spec||prefill overlap stream created (mode=side-fast, stream "
+            "priority %d, caller stream priority %d, min S %d, max ns %d)",
+            st.priority,
+            torch.cuda.current_stream(dev_idx).priority,
+            OVL_MIN_S,
+            OVL_MAX_NS,
+        )
+    return r
+
+
+def _ovl_ok(p, mixed_qkv, conv_state, not_capturing=False) -> bool:
     if OVL_MAX_NS and p.ns > OVL_MAX_NS:
         STATS["ovl_off_ns"] = STATS.get("ovl_off_ns", 0) + 1
         return False
     if (
         p.N <= p.S
         or mixed_qkv.dtype != conv_state.dtype
-        or torch.cuda.is_current_stream_capturing()
+        or (not not_capturing and torch.cuda.is_current_stream_capturing())
     ):
         STATS["ovl_off_other"] = STATS.get("ovl_off_other", 0) + 1
         return False
@@ -1126,7 +1158,8 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
     if not MAT:
         gsc._layer_check(layer)
         gsc.materialize_non_spec(layer, md)
-    ovl = OVL and S >= OVL_MIN_S and _ovl_ok(p, mixed_qkv, conv_state)
+    # FAST: hoist is computed with the capture check, so hoist=True means "not capturing"
+    ovl = OVL and S >= OVL_MIN_S and _ovl_ok(p, mixed_qkv, conv_state, OVL_FAST and hoist)
     if S > 0 and not ovl:
         _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
                   ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
@@ -1193,6 +1226,36 @@ def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
         STATS["layers_fast"] += 1
         return
     # ---- spec || prefill overlap: fork after the prefill conv, join before return ----
+    if OVL_FAST and OVL_MODE == "side":
+        C = torch._C
+        dev_idx = C._cuda_getDevice()
+        r = _OVL_FAST_RES.get(dev_idx) or _ovl_fast_res(dev_idx)
+        key = C._cuda_getCurrentStream(dev_idx)
+        if r[4] != key:
+            r[4] = key
+            r[5] = torch.cuda.Stream(stream_id=key[0], device_index=key[1], device_type=key[2])
+        main, st, ev_fork, ev_join = r[5], r[0], r[2], r[3]
+        EB = C._CudaEventBase
+        EB.record(ev_fork, main)
+        # chunk + norm first (host order), on the caller's stream
+        _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
+        EB.wait(ev_fork, st)
+        C._cuda_setStream(*r[1])
+        try:
+            _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
+                      ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
+        finally:
+            C._cuda_setStream(*key)
+        EB.record(ev_join, st)
+        EB.wait(ev_join, main)
+        STATS["layers_fast"] += 1
+        n_ovl = STATS["ovl_layers"] = STATS.get("ovl_layers", 0) + 1
+        if n_ovl == 1:
+            logger.info(
+                "GDN step plan: spec||prefill overlap engaged (mode=side-fast, S=%d, P=%d, ns=%d, vsf=%d)",
+                S, p.P, p.ns, p.vsf,
+            )
+        return
     main = torch.cuda.current_stream()
     st, cu_st, ev_fork, ev_join = _ovl_res(main.device)
     ev_fork.record(main)
