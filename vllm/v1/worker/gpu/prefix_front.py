@@ -2,9 +2,12 @@
 """Exact decode-batch order for shared-prefix decode attention (rx-cascade "front" grouping). Default OFF.
 
 PREFIX_SPREAD=1 enables it. Inside the uniform decode/verify segment that sort_batch_req_ids puts first, decode requests
-whose FIRST full-attention KV block is shared with at least one other decode request of the step (prefix-cache groups,
-e.g. a common system prompt) are placed contiguously at the head of the segment: largest group first, stock order inside
-a group, then the other requests in stock order. PREFIX_SPREAD_K>0 instead cuts the members into same-group clusters of K
+whose full-attention KV block at depth PREFIX_SPREAD_DEPTH (default 8, i.e. the 9th block; prefix-cache chain hashing
+makes an equal block imply equal ancestors) is shared with at least one other decode request of the step (prefix-cache
+groups, e.g. a common system prompt) are placed contiguously at the head of the segment: largest group first, stock
+order inside a group, then the other requests in stock order. Keying on a deep block (not block 0) keeps groups that
+share only a short common head (e.g. the Qwen3.6 tool list rendered before the salted system prompt: 4 blocks shared by
+every Workato repeat) from being merged into one interleaved group. PREFIX_SPREAD_K>0 instead cuts the members into same-group clusters of K
 and spreads the clusters evenly between the other requests (measured slower than front on Rubin; kept for study).
 
 Why: the split-KV decode attention kernel dispatches CTAs request-major, so adjacent members read the shared prefix pages
@@ -17,6 +20,7 @@ unchanged; with no sharing the stock order is returned as is. Host-only: not a c
 Env:
   PREFIX_SPREAD=1              enable (default 0)
   PREFIX_SPREAD_K=0            0 = front (default); K > 0 = spread clusters of K
+  PREFIX_SPREAD_DEPTH=8        group key = the KV block at this index (requests with fewer blocks are not grouped)
   PREFIX_SPREAD_LOG_EVERY=2000 log group / host-time statistics every N decode steps (0 = off)
 """
 import os
@@ -30,6 +34,7 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("PREFIX_SPREAD", "0").strip() == "1"
 K = int(os.environ.get("PREFIX_SPREAD_K", "0") or 0)
+DEPTH = int(os.environ.get("PREFIX_SPREAD_DEPTH", "8") or 0)
 LOG_EVERY = int(os.environ.get("PREFIX_SPREAD_LOG_EVERY", "2000") or 0)
 STATS = {"steps": 0, "reordered_steps": 0, "groups": 0, "grouped_reqs": 0, "decodes": 0, "host_ns": 0}
 _ENGAGED = [False]
@@ -37,8 +42,8 @@ _ENGAGED = [False]
 
 def log_engage(attn_gid, group_names) -> None:
     logger.info(
-        "prefix-front: shared-prefix decode grouping ON (PREFIX_SPREAD=1, K=%d, %s); full-attention KV group %s of %s",
-        K, "front" if K <= 0 else "spread", attn_gid, group_names)
+        "prefix-front: shared-prefix decode grouping ON (PREFIX_SPREAD=1, K=%d, %s, key depth %d blocks); "
+        "full-attention KV group %s of %s", K, "front" if K <= 0 else "spread", DEPTH, attn_gid, group_names)
 
 
 def spread_segment(seg, first_block, k):

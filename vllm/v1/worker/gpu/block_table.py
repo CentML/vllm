@@ -48,8 +48,10 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
-        # First block id per (group, request index); only tracked with PREFIX_SPREAD=1 (prefix_front.py).
+        # Prefix-group key per (group, request index): the table entry of KV block `_key_depth` (prefix-cache chain
+        # hashing makes equal entries imply equal ancestors); -1 = shorter / unknown. Only with PREFIX_SPREAD=1.
         self.first_block_np = None
+        self._key_depth = 0
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -137,13 +139,18 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
-            if self.first_block_np is not None and start == 0 and block_ids:
-                self.first_block_np[i, req_index] = block_ids[0]
+            if self.first_block_np is not None:
+                pos = self._key_depth * bpk
+                if start == 0:
+                    self.first_block_np[i, req_index] = -1
+                if start <= pos < end:
+                    self.first_block_np[i, req_index] = block_ids[pos - start]
         self._lowc2_nb_dirty = True
 
-    def enable_first_block_tracking(self) -> None:
+    def enable_first_block_tracking(self, depth_blocks: int = 0) -> None:
         import numpy as np
 
+        self._key_depth = max(0, int(depth_blocks))
         self.first_block_np = np.full(
             (self.num_kv_cache_groups, self.max_num_reqs), -1, dtype=np.int64
         )

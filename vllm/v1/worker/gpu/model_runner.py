@@ -696,7 +696,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self._prefix_front_gid = gi
                     break
             if self._prefix_front_gid is not None:
-                self.block_tables.enable_first_block_tracking()
+                self.block_tables.enable_first_block_tracking(prefix_front.DEPTH)
             prefix_front.log_engage(
                 self._prefix_front_gid,
                 [type(g.kv_cache_spec).__name__ for g in kv_cache_config.kv_cache_groups],
