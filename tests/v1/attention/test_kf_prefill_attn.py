@@ -7,6 +7,10 @@
 2. SM107: the kernel through the runtime (plan -> launch) is finite, run-to-run
    bitwise, leaves its merge counters at zero, and its error vs an fp32 reference is
    no worse than the FlashInfer trtllm-gen path's on the same FP8 inputs.
+3. SM107, per-row gate: a q=1 / KV=16 row planned with an optimistic length (an
+   async-spec decode row's upper bound) is wrong while the exact length is fine, and
+   plan() keeps any step with an inexact-length row, or (MIN_KV > 0) a row below
+   MIN_KV next to a long row, on the production path.
 """
 
 import random
@@ -152,6 +156,64 @@ def _flashinfer_prefill(q, kv, bt, reqs, b1, b2):
     return out
 
 
+def _inputs(reqs, width, seed=0):
+    """FP8 Q and paged KV (every page slot random, like stale KV past a row's end)."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    npg = [(L + 127) // 128 for _, L in reqs]
+    pages = sum(npg) + 64
+    kv = (torch.randn(pages, 2, 128, 512, device=dev, generator=gen) * 0.7).to(
+        torch.float8_e4m3fn
+    )
+    perm = torch.randperm(pages, device=dev, generator=gen).to(torch.int32)
+    bt = torch.zeros(len(reqs), width, dtype=torch.int32, device=dev)
+    o = 0
+    for b, n in enumerate(npg):
+        bt[b, :n] = perm[o : o + n]
+        o += n
+    T = sum(r[0] for r in reqs)
+    q = (torch.randn(T, 16, 256, device=dev, generator=gen) * 0.7).to(
+        torch.float8_e4m3fn
+    )
+    return q, kv, bt
+
+
+def _runtime(planned, precise=False):
+    """A runtime with MIN_KV 0 whose compiled forms cover each planned launch."""
+    dev = torch.device("cuda")
+    rt = KfPrefillAttn(dev, torch.zeros(394 << 20, dtype=torch.uint8, device=dev))
+    rt.planner.build()
+    rt.min_kv = 0
+    rt.force_precise = precise  # VLLM_KF_PREFILL_ATTN_PRECISE
+    hp, hb, hm, hmb = rt.host[0]
+    forms = set()
+    for reqs in planned:
+        ql, kvs = [r[0] for r in reqs], [r[1] for r in reqs]
+        res = rt.planner.plan_into(ql, kvs, rt.nsm, hp, hb, hm, hmb, *rt.grids)
+        forms.add(res[7] if precise else res[6])  # precise_variant / variant
+    rt.warmup(precise=False, variants=sorted(forms))
+    return rt
+
+
+def _launch(rt, plan, q, kv):
+    out = torch.full(
+        (q.shape[0], 16, 256), float("nan"), dtype=torch.bfloat16, device=q.device
+    )
+    assert rt.launch(plan, q, kv, out, 0.0625, 1.0)
+    torch.accelerator.synchronize()
+    return out
+
+
+def _row_rel(x, ref, reqs):
+    """Per-row relL2 of x vs ref."""
+    out, o = [], 0
+    for ql, _ in reqs:
+        r = ref[o : o + ql]
+        out.append(float((x[o : o + ql].float() - r).norm() / r.norm()))
+        o += ql
+    return out
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability(107), reason="SM107 kernel"
 )
@@ -169,41 +231,19 @@ def _flashinfer_prefill(q, kv, bt, reqs, b1, b2):
 # 1152-token hybrid block: plan() pads it into the kernel's 2057-stride buffer.
 @pytest.mark.parametrize("width", [MAXP, 2052])
 def test_kernel_through_runtime(reqs, precise, width):
-    dev = torch.device("cuda")
-    gen = torch.Generator(device=dev).manual_seed(0)
-    npg = [(L + 127) // 128 for _, L in reqs]
-    pages = sum(npg) + 64
-    kv = (torch.randn(pages, 2, 128, 512, device=dev, generator=gen) * 0.7).to(
-        torch.float8_e4m3fn
-    )
-    perm = torch.randperm(pages, device=dev, generator=gen).to(torch.int32)
-    bt = torch.zeros(len(reqs), width, dtype=torch.int32, device=dev)
-    o = 0
-    for b, n in enumerate(npg):
-        bt[b, :n] = perm[o : o + n]
-        o += n
-    T = sum(r[0] for r in reqs)
-    q = (torch.randn(T, 16, 256, device=dev, generator=gen) * 0.7).to(
-        torch.float8_e4m3fn
-    )
-    ws = torch.zeros(394 << 20, dtype=torch.uint8, device=dev)
-    rt = KfPrefillAttn(dev, ws)
-    rt.planner.build()
-    rt.min_kv = 0
-    rt.force_precise = precise  # VLLM_KF_PREFILL_ATTN_PRECISE
-    hp, hb, hm, hmb = rt.host[0]
-    variant, precise_variant = rt.planner.plan_into(
-        [r[0] for r in reqs], [r[1] for r in reqs], rt.nsm, hp, hb, hm, hmb, *rt.grids
-    )[6:8]
-    form = precise_variant if precise else variant
-    rt.warmup(precise=False, variants=[form])
-    plan = rt.plan([r[0] for r in reqs], [r[1] for r in reqs], bt)
+    q, kv, bt = _inputs(reqs, width)
+    T = q.shape[0]
+    rt = _runtime([reqs], precise)
+    ql, kvs, exact = [r[0] for r in reqs], [r[1] for r in reqs], [True] * len(reqs)
+    plan = rt.plan(ql, kvs, bt, exact)
     assert plan is not None
-    assert (plan.variant, plan.precise_variant) == (variant, precise_variant)
+    assert rt.compiled.keys() == {plan.precise_variant if precise else plan.variant}
     assert plan.block_tables.stride(0) == MAXP
     outs = []
     for _ in range(2):
-        out = torch.full((T, 16, 256), float("nan"), dtype=torch.bfloat16, device=dev)
+        out = torch.full(
+            (T, 16, 256), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
         assert rt.launch(plan, q, kv, out, 0.0625, 1.0)
         outs.append(out)
     torch.accelerator.synchronize()
@@ -215,6 +255,68 @@ def test_kernel_through_runtime(reqs, precise, width):
     fi = _flashinfer_prefill(q, kv, bt, reqs, 0.0625, 1.0).float()
     rel = lambda x: float((x - ref).norm() / ref.norm())  # noqa: E731
     assert rel(kf_out) <= 1.05 * rel(fi), (rel(kf_out), rel(fi))
-    # Below the KV threshold the step stays on FlashInfer.
-    rt.min_kv = max(r[1] for r in reqs) + 1
-    assert rt.plan([r[0] for r in reqs], [r[1] for r in reqs], bt) is None
+    # Every row below the KV threshold: the step stays on FlashInfer.
+    rt.min_kv = max(kvs) + 1
+    assert rt.plan(ql, kvs, bt, exact) is None
+    assert rt.stats["below_min_kv"] == 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(107), reason="SM107 kernel"
+)
+def test_q1_kv16_row_optimistic_length_is_wrong_and_gated():
+    """The in-situ q=1 / KV=16 failure (VR S4, MIN_KV=0: relL2 0.05-0.43 vs FlashInfer
+    0.006-0.012): the kernel attends past the row's end when plan() gets the row's
+    optimistic async-spec length; with the exact length the row is fine. The
+    builder flags such rows inexact and plan() keeps the step on FlashInfer.
+    """
+    reqs = [[1, 16]]
+    q, kv, bt = _inputs(reqs, 2052)
+    ref = _fp32_reference(q, kv, bt, reqs, 0.0625, 1.0)
+    fi = _flashinfer_prefill(q, kv, bt, reqs, 0.0625, 1.0)
+    (rel_fi,) = _row_rel(fi, ref, reqs)
+    rt = _runtime([[[1, 16]], [[1, 18]]])
+    # Exact length: KF is as good as FlashInfer.
+    plan = rt.plan([1], [16], bt, [True])
+    assert plan is not None
+    (rel_kf,) = _row_rel(_launch(rt, plan, q, kv), ref, reqs)
+    assert rel_kf <= 1.05 * rel_fi, (rel_kf, rel_fi)
+    # Optimistic length (2 rejected drafts): the raw kernel output is wrong.
+    plan = rt.plan([1], [18], bt, [True])
+    assert plan is not None
+    (rel_kf,) = _row_rel(_launch(rt, plan, q, kv), ref, reqs)
+    assert rel_kf > 3 * rel_fi and rel_kf > 0.02, (rel_kf, rel_fi)
+    # The builder marks the row inexact (not prefilling): production path.
+    assert rt.plan([1], [18], bt, [False]) is None
+    assert rt.plan([1], [18], bt, None) is None
+    assert rt.stats["fallback_inexact_kv"] == 2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(107), reason="SM107 kernel"
+)
+@pytest.mark.parametrize("min_kv", [4096, 0])
+def test_mixed_long_and_q1_kv16_rows(min_kv):
+    """One long row co-scheduled with a q=1 / KV=16 row. MIN_KV 4096 gates per row:
+    the short row keeps the whole step on FlashInfer (not just the step's longest KV).
+    MIN_KV 0: both rows run on KF and each is as good as FlashInfer's; an inexact
+    (async-spec decode) short row still keeps the step on FlashInfer.
+    """
+    reqs = [[64, 30000], [1, 16]]
+    ql, kvs = [r[0] for r in reqs], [r[1] for r in reqs]
+    q, kv, bt = _inputs(reqs, 2052)
+    rt = _runtime([reqs, reqs[:1]])
+    rt.min_kv = min_kv
+    assert rt.plan(ql, [30000, 18], bt, [True, False]) is None
+    assert rt.stats["fallback_inexact_kv"] == 1
+    plan = rt.plan(ql, kvs, bt, [True, True])
+    if min_kv:
+        assert plan is None
+        assert rt.stats["fallback_short_row"] == 1
+        assert rt.plan(ql[:1], kvs[:1], bt[:1], [True]) is not None
+        return
+    assert plan is not None
+    ref = _fp32_reference(q, kv, bt, reqs, 0.0625, 1.0)
+    rel_kf = _row_rel(_launch(rt, plan, q, kv), ref, reqs)
+    rel_fi = _row_rel(_flashinfer_prefill(q, kv, bt, reqs, 0.0625, 1.0), ref, reqs)
+    assert all(k <= 1.05 * f for k, f in zip(rel_kf, rel_fi)), (rel_kf, rel_fi)

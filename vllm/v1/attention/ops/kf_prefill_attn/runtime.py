@@ -21,7 +21,9 @@ shared trtllm workspace (FlashInfer keeps its semaphores at the start of the low
 half and caps its partials at half of it); the merge counters self-reset.
 ``warmup()`` builds the planner and compiles every kernel form the planner can
 pick, so nothing compiles while serving; a missing form makes ``plan()`` return
-None (the caller keeps FlashInfer).
+None (the caller keeps FlashInfer). ``plan()`` also returns None unless every
+prefill row has an exact KV length and at least VLLM_KF_PREFILL_ATTN_MIN_KV
+tokens (per-row gate; the step then stays exactly on the production path).
 """
 
 from __future__ import annotations
@@ -64,6 +66,9 @@ class KfPrefillPlan:
     pml: torch.Tensor
     block_tables: torch.Tensor
     """The prefill rows' block table with the kernel's row stride (MAXP)."""
+    query_lens: list[int]
+    seq_lens: list[int]
+    """The per-row lengths the work list was planned with (CPU)."""
 
 
 def search_grids(kmod: Any, preset: str) -> tuple[tuple, tuple, tuple, bool]:
@@ -149,7 +154,11 @@ class KfPrefillAttn:
         self.stats = {
             "plans": 0,
             "launches": 0,
+            # Steps kept on FlashInfer by the per-row gate (plan()): every row
+            # below MIN_KV / some rows below MIN_KV / a row with an inexact length.
             "below_min_kv": 0,
+            "fallback_short_row": 0,
+            "fallback_inexact_kv": 0,
             "fallback_capacity": 0,
             "fallback_variant": 0,
         }
@@ -237,15 +246,33 @@ class KfPrefillAttn:
         )
 
     def plan(
-        self, query_lens: list[int], seq_lens: list[int], block_tables: torch.Tensor
+        self,
+        query_lens: list[int],
+        seq_lens: list[int],
+        block_tables: torch.Tensor,
+        exact_kv: list[bool] | None,
     ) -> KfPrefillPlan | None:
         """Plan one step's prefill launch; None keeps FlashInfer for this step.
         ``block_tables``: the prefill rows' ``[B, W]`` int32 block table, W <= MAXP.
+        ``exact_kv``: per row, whether ``seq_lens`` is the row's exact KV length
+        (None: unknown for every row).
+
+        Per-row gate: the step runs on the kernel only if every row is eligible
+        (exact length and KV >= MIN_KV); otherwise the whole step stays on
+        FlashInfer, so a step is either all-KF or exactly production. An inexact
+        length is an async-spec decode row's optimistic upper bound (the batch
+        split puts non-uniform decode rows in the prefill section): planning it
+        makes the kernel attend past the row's real end (rejected-draft KV).
         """
         if not self.compiled:
             return None
-        if max(seq_lens) < self.min_kv:
-            self.stats["below_min_kv"] += 1
+        if exact_kv is None or not all(exact_kv):
+            self.stats["fallback_inexact_kv"] += 1
+            return None
+        n_short = sum(kv < self.min_kv for kv in seq_lens)
+        if n_short:
+            key = "below_min_kv" if n_short == len(seq_lens) else "fallback_short_row"
+            self.stats[key] += 1
             return None
         if torch.cuda.is_current_stream_capturing():
             return None
@@ -296,6 +323,8 @@ class KfPrefillAttn:
             po=po,
             pml=pml,
             block_tables=bt,
+            query_lens=query_lens,
+            seq_lens=seq_lens,
         )
 
     def _block_tables(self, bt: torch.Tensor) -> torch.Tensor:

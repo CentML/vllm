@@ -1876,7 +1876,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 max_q_len_prefill = int(query_lens_prefill_cpu.max().item())
                 gen_sm_count = None
-                # Precise for prefill rows (CommonAttentionMetadata docs).
+                # Exact on rows still prefilling (CommonAttentionMetadata docs).
                 seq_lens_ub = common_attn_metadata.seq_lens_cpu_upper_bound
                 kf_plan = None
                 kf_rt = get_runtime(self.device) if self.kf_prefill else None
@@ -1887,10 +1887,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     and block_table_tensor.shape[1] <= KF_MAXP
                     and block_table_tensor.stride(1) == 1
                 ):
+                    # The upper bound is exact only on rows still prefilling: a
+                    # non-uniform decode row (require_uniform split above) carries
+                    # async spec decode's optimistic length. plan() keeps such
+                    # steps (and any row below MIN_KV) on the production path.
+                    is_prefilling = common_attn_metadata.is_prefilling
                     kf_plan = kf_rt.plan(
                         query_lens_prefill_cpu.tolist(),
                         seq_lens_ub[prefill_start:num_reqs].tolist(),
                         block_table_tensor[prefill_start:num_reqs],
+                        None
+                        if is_prefilling is None
+                        else is_prefilling[prefill_start:num_reqs].tolist(),
                     )
                 # Kept even with a KF plan: a layer that cannot run KF (forward checks)
                 # then falls back to exactly the production choice.
@@ -2527,18 +2535,39 @@ class FlashInferImpl(AttentionImpl):
                 float(x.flatten()[i].abs()),
             )
 
+        # Per row (a short row's error is diluted in a long row's launch-wide
+        # relL2): WRONG = KF relL2 > 3x FlashInfer's and > 0.02 vs the fp32
+        # reference. kv_mismatch: rows planned with a length other than the
+        # device seq_lens the reference and FlashInfer use.
+        assert prefill.kf is not None
+        cu = prefill.cum_seq_lens_q.tolist()
+        wrong, worst = 0, (-1.0, 0, 0, 0.0, 0.0)
+        for b, (ql, kv) in enumerate(zip(prefill.kf.query_lens, prefill.kf.seq_lens)):
+            rows = slice(cu[b], cu[b + 1])
+            ref_norm = exact[rows].norm().clamp_min(1e-30)
+            rel_kf = float((kf_out[rows] - exact[rows]).norm() / ref_norm)
+            rel_fi = float((fi_out[rows] - exact[rows]).norm() / ref_norm)
+            wrong += rel_kf > 3 * rel_fi and rel_kf > 0.02
+            if rel_kf / max(rel_fi, 1e-30) > worst[0]:
+                worst = (rel_kf / max(rel_fi, 1e-30), ql, kv, rel_kf, rel_fi)
+        dev_kv = prefill.seq_lens.tolist()
         logger.info(
             "KF prefill check: B=%d T=%d max_seq=%d variant=%d | kf~fi relL2 %.3e "
             "max %.3e | kf~fp32 relL2 %.3e max %.3e at |out| %.3e | fi~fp32 relL2 "
-            "%.3e max %.3e at |out| %.3e | finite %s",
+            "%.3e max %.3e at |out| %.3e | finite %s | rows %d wrong %d worst q=%d "
+            "kv=%d kf %.3e fi %.3e | kv_mismatch %d",
             attn_metadata.num_prefills,
             n,
             prefill.max_seq_len,
-            prefill.kf.variant if prefill.kf is not None else -1,
+            prefill.kf.variant,
             *stats(kf_out, fi_out)[:2],
             *stats(kf_out, exact),
             *stats(fi_out, exact),
             bool(torch.isfinite(kf_out).all()),
+            len(prefill.kf.seq_lens),
+            wrong,
+            *worst[1:],
+            sum(a != b for a, b in zip(prefill.kf.seq_lens, dev_kv)),
         )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
