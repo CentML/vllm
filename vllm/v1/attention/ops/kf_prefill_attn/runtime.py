@@ -5,7 +5,8 @@
 Kernel: ``vllm/third_party/kf_prefill_attn/kernel.py`` (verbatim KF solution).
 Contract (the FlashInfer trtllm-gen prefill call site in ``flashinfer.py``): SM107,
 FP8 e4m3 Q ``[T, 16, 256]`` (contiguous), paged FP8 KV ``[P, 2, 128, 512]`` (HND,
-K|V packed, contiguous pages), block table ``[B, 2057]`` int32 (row stride 2057),
+K|V packed, contiguous pages), block table int32 with row stride 2057 (``plan()``
+pads a narrower vLLM table into a 2057-stride buffer),
 causal attention over a cached prefix, BF16 out ``[T, 16, 256]`` (contiguous),
 ``bmm1_scale`` = softmax scale x q_scale x k_scale, ``bmm2_scale`` = v_scale.
 No window, sinks or soft cap.
@@ -61,6 +62,8 @@ class KfPrefillPlan:
     mbin: torch.Tensor
     po: torch.Tensor
     pml: torch.Tensor
+    block_tables: torch.Tensor
+    """The prefill rows' block table with the kernel's row stride (MAXP)."""
 
 
 def search_grids(kmod: Any, preset: str) -> tuple[tuple, tuple, tuple, bool]:
@@ -141,6 +144,7 @@ class KfPrefillAttn:
                 tuple(torch.empty_like(t, device=device) for t in self.host[-1])
             )
         self.slot = 0
+        self.bt_buf: torch.Tensor | None = None
         self.compiled: dict[int, Any] = {}
         self.stats = {
             "plans": 0,
@@ -232,8 +236,12 @@ class KfPrefillAttn:
             self.min_kv,
         )
 
-    def plan(self, query_lens: list[int], seq_lens: list[int]) -> KfPrefillPlan | None:
-        """Plan one step's prefill launch; None keeps FlashInfer for this step."""
+    def plan(
+        self, query_lens: list[int], seq_lens: list[int], block_tables: torch.Tensor
+    ) -> KfPrefillPlan | None:
+        """Plan one step's prefill launch; None keeps FlashInfer for this step.
+        ``block_tables``: the prefill rows' ``[B, W]`` int32 block table, W <= MAXP.
+        """
         if not self.compiled:
             return None
         if max(seq_lens) < self.min_kv:
@@ -260,6 +268,7 @@ class KfPrefillAttn:
         if (precise_variant if self.force_precise else variant) not in self.compiled:
             self.stats["fallback_variant"] += 1
             return None
+        bt = self._block_tables(block_tables)
         dp, db, dm, dmb = self.dev[i]
         dp[:nwork].copy_(hp[:nwork], non_blocking=True)
         db[:nbins].copy_(hb[:nbins], non_blocking=True)
@@ -286,14 +295,33 @@ class KfPrefillAttn:
             mbin=dmb[:nmbin],
             po=po,
             pml=pml,
+            block_tables=bt,
         )
+
+    def _block_tables(self, bt: torch.Tensor) -> torch.Tensor:
+        """The kernel hard-codes the block-table row stride MAXP (2057, vLLM's width
+        for max_model_len 262144 with the fp32-state 2176-token hybrid block). Pass
+        such a table through; copy a narrower one (e.g. 2052 with the bf16-state
+        1152-token block) into a persistent MAXP-stride buffer on the current stream
+        (columns past W are never read: a sequence has at most W pages).
+        """
+        rows, width = bt.shape
+        if width == MAXP and bt.stride() == (MAXP, 1):
+            return bt
+        buf = self.bt_buf
+        if buf is None or buf.shape[0] < rows:
+            # Once (first planned step, or a larger prefill batch than seen so far).
+            buf = self.bt_buf = torch.zeros(
+                max(rows, 256), MAXP, dtype=torch.int32, device=self.device
+            )
+        buf[:rows, :width].copy_(bt)
+        return buf[:rows]
 
     def launch(
         self,
         plan: KfPrefillPlan,
         q: torch.Tensor,
         kv: torch.Tensor,
-        block_tables: torch.Tensor,
         out: torch.Tensor,
         bmm1_scale: float,
         bmm2_scale: float,
@@ -306,7 +334,7 @@ class KfPrefillAttn:
         import cuda.bindings.driver as cuda
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        fn(q, kv, block_tables, out, plan.plan, plan.bins, plan.po, plan.pml,
+        fn(q, kv, plan.block_tables, out, plan.plan, plan.bins, plan.po, plan.pml,
            plan.mrg, plan.mbin, self.cnt_base, float(bmm1_scale) * self.k.LOG2E,
            float(bmm2_scale), plan.nwork, plan.nslot, stream)  # fmt: skip
         self.stats["launches"] += 1

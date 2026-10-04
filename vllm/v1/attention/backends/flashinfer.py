@@ -1884,12 +1884,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kf_rt is not None
                     and not self._kf_drafting
                     and seq_lens_ub is not None
-                    and block_table_tensor.shape[1] == KF_MAXP
-                    and block_table_tensor.stride(0) == KF_MAXP
+                    and block_table_tensor.shape[1] <= KF_MAXP
+                    and block_table_tensor.stride(1) == 1
                 ):
                     kf_plan = kf_rt.plan(
                         query_lens_prefill_cpu.tolist(),
                         seq_lens_ub[prefill_start:num_reqs].tolist(),
+                        block_table_tensor[prefill_start:num_reqs],
                     )
                 # Kept even with a KF plan: a layer that cannot run KF (forward checks)
                 # then falls back to exactly the production choice.
@@ -2465,7 +2466,6 @@ class FlashInferImpl(AttentionImpl):
             prefill.kf,
             query,
             kv_cache,
-            prefill.block_tables,
             out.view(out.shape[0], self.num_heads, self.head_size),
             self.bmm1_scale,
             self.bmm2_scale,
