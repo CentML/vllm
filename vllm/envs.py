@@ -233,6 +233,8 @@ if TYPE_CHECKING:
     VLLM_KF_PREFILL_ATTN_MIN_KV: int = 4096
     VLLM_KF_PREFILL_ATTN_SEARCH: str = "r3"
     VLLM_KF_PREFILL_ATTN_CHECK: int = 0
+    VLLM_KF_PREFILL_ATTN_PRECISE: bool = False
+    VLLM_KF_PREFILL_ATTN_LOG_EVERY: int = 4096
     VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
     VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1831,6 +1833,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # or r2 / full (the solution's own search, ~2 ms/step).
     # VLLM_KF_PREFILL_ATTN_CHECK=N: for the first N launches per layer also run the
     # FlashInfer path and an fp32 reference and log the errors (debug only, slow).
+    # VLLM_KF_PREFILL_ATTN_PRECISE=1: always use the kernel's precise forms (FP32
+    # exp/sum; the solution picks them only above bmm1 1/16 or bmm2 1; slower).
+    # VLLM_KF_PREFILL_ATTN_LOG_EVERY=N: log plan/launch counts and the per-step host
+    # time of plan() every N plans (0 = never).
     "VLLM_KF_PREFILL_ATTN": lambda: bool(int(os.getenv("VLLM_KF_PREFILL_ATTN", "0"))),
     "VLLM_KF_PREFILL_ATTN_MIN_KV": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_MIN_KV", "4096")
@@ -1840,6 +1846,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_KF_PREFILL_ATTN_CHECK": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_CHECK", "0")
+    ),
+    "VLLM_KF_PREFILL_ATTN_PRECISE": lambda: bool(
+        int(os.getenv("VLLM_KF_PREFILL_ATTN_PRECISE", "0"))
+    ),
+    "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
     ),
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
     # layer only for the row each prefill request samples (the speculator's

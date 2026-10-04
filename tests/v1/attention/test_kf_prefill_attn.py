@@ -162,7 +162,8 @@ def _flashinfer_prefill(q, kv, bt, reqs, b1, b2):
         [[16, 50000 + 777 * i] for i in range(16)],
     ],
 )
-def test_kernel_through_runtime(reqs):
+@pytest.mark.parametrize("precise", [False, True])
+def test_kernel_through_runtime(reqs, precise):
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(0)
     npg = [(L + 127) // 128 for _, L in reqs]
@@ -184,13 +185,16 @@ def test_kernel_through_runtime(reqs):
     rt = KfPrefillAttn(dev, ws)
     rt.planner.build()
     rt.min_kv = 0
+    rt.force_precise = precise  # VLLM_KF_PREFILL_ATTN_PRECISE
     hp, hb, hm, hmb = rt.host[0]
-    variant = rt.planner.plan_into(
+    variant, precise_variant = rt.planner.plan_into(
         [r[0] for r in reqs], [r[1] for r in reqs], rt.nsm, hp, hb, hm, hmb, *rt.grids
-    )[6]
-    rt.warmup(precise=False, variants=[variant])
+    )[6:8]
+    form = precise_variant if precise else variant
+    rt.warmup(precise=False, variants=[form])
     plan = rt.plan([r[0] for r in reqs], [r[1] for r in reqs])
-    assert plan is not None and plan.variant == variant
+    assert plan is not None
+    assert (plan.variant, plan.precise_variant) == (variant, precise_variant)
     outs = []
     for _ in range(2):
         out = torch.full((T, 16, 256), float("nan"), dtype=torch.bfloat16, device=dev)
