@@ -10,6 +10,7 @@
 """
 
 import random
+import types
 
 import pytest
 import torch
@@ -58,7 +59,8 @@ def python_setup(monkeypatch):
     """The solution's own setup() on CPU (no compile, no device sync)."""
     monkeypatch.setattr(K, "_NSM", [NSM])
     monkeypatch.setattr(K, "_COMPILED", [object()] * len(K._COMPILED))
-    monkeypatch.setattr(K, "from_dlpack", lambda *a, **k: None)
+    stub = types.SimpleNamespace(mark_layout_dynamic=lambda **k: None)
+    monkeypatch.setattr(K, "from_dlpack", lambda *a, **k: stub)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
     def run(reqs, preset):
