@@ -165,7 +165,10 @@ def _flashinfer_prefill(q, kv, bt, reqs, b1, b2):
     ],
 )
 @pytest.mark.parametrize("precise", [False, True])
-def test_kernel_through_runtime(reqs, precise):
+# 2052 = vLLM's block-table width at max_model_len 262144 with the bf16-state
+# 1152-token hybrid block: plan() pads it into the kernel's 2057-stride buffer.
+@pytest.mark.parametrize("width", [MAXP, 2052])
+def test_kernel_through_runtime(reqs, precise, width):
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(0)
     npg = [(L + 127) // 128 for _, L in reqs]
@@ -174,7 +177,7 @@ def test_kernel_through_runtime(reqs, precise):
         torch.float8_e4m3fn
     )
     perm = torch.randperm(pages, device=dev, generator=gen).to(torch.int32)
-    bt = torch.zeros(len(reqs), MAXP, dtype=torch.int32, device=dev)
+    bt = torch.zeros(len(reqs), width, dtype=torch.int32, device=dev)
     o = 0
     for b, n in enumerate(npg):
         bt[b, :n] = perm[o : o + n]
@@ -194,13 +197,14 @@ def test_kernel_through_runtime(reqs, precise):
     )[6:8]
     form = precise_variant if precise else variant
     rt.warmup(precise=False, variants=[form])
-    plan = rt.plan([r[0] for r in reqs], [r[1] for r in reqs])
+    plan = rt.plan([r[0] for r in reqs], [r[1] for r in reqs], bt)
     assert plan is not None
     assert (plan.variant, plan.precise_variant) == (variant, precise_variant)
+    assert plan.block_tables.stride(0) == MAXP
     outs = []
     for _ in range(2):
         out = torch.full((T, 16, 256), float("nan"), dtype=torch.bfloat16, device=dev)
-        assert rt.launch(plan, q, kv, bt, out, 0.0625, 1.0)
+        assert rt.launch(plan, q, kv, out, 0.0625, 1.0)
         outs.append(out)
     torch.accelerator.synchronize()
     assert bool((rt.cnt == 0).all())
@@ -213,4 +217,4 @@ def test_kernel_through_runtime(reqs, precise):
     assert rel(kf_out) <= 1.05 * rel(fi), (rel(kf_out), rel(fi))
     # Below the KV threshold the step stays on FlashInfer.
     rt.min_kv = max(r[1] for r in reqs) + 1
-    assert rt.plan([r[0] for r in reqs], [r[1] for r in reqs]) is None
+    assert rt.plan([r[0] for r in reqs], [r[1] for r in reqs], bt) is None
