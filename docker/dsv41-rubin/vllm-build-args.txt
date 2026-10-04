@@ -6,6 +6,9 @@
 #   runs on sm_107. Rubin-native cubins are added per kernel instead:
 #   FlashMLA _flashmla_C gets 10.7a (flashmla.cmake), DeepGEMM JITs at runtime.
 # - max_jobs/nvcc_threads sized for one arch on a 176-core Vera node.
+# - Both base images are pinned by digest (the digests the deliverable image was built from). The Docker Hub tag
+#   pytorch/manylinuxaarch64-builder:cuda13.4 moved after that build (2026-10-03), so a tag-only pin no longer
+#   reproduces it.
 CUDA_VERSION=13.4.1
 torch_cuda_arch_list=10.0
 INSTALL_KV_CONNECTORS=true
@@ -14,7 +17,7 @@ TRITON_INSTALL_FROM_SOURCE_REPO=https://github.com/triton-lang/triton.git
 TRITON_INSTALL_FROM_SOURCE_REVISION=3f6e41132b5edf639bfb872ad73d4688765e08b8
 RUN_WHEEL_CHECK=false
 GIT_REPO_CHECK=1
-BUILD_BASE_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
-FINAL_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04
+BUILD_BASE_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4@sha256:487d5f86222afdfda9426da96332ca2603ff0c5024c56bd1b363241240ef7a8e
+FINAL_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.08-cuda13.4-devel-ubuntu24.04@sha256:843a5e81ed49ad2a2787aa10e48e926dc1f9440522a122ec2a637c27039fc77d
 max_jobs=32
 nvcc_threads=2
