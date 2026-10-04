@@ -223,6 +223,10 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int = 16384
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL: bool = True
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
+    VLLM_KF_PREFILL_ATTN: bool = False
+    VLLM_KF_PREFILL_ATTN_MIN_KV: int = 4096
+    VLLM_KF_PREFILL_ATTN_SEARCH: str = "r3"
+    VLLM_KF_PREFILL_ATTN_CHECK: int = 0
     VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
     VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1770,6 +1774,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chunks only.
     "VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS": lambda: int(
         os.getenv("VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS", "64")
+    ),
+    # Kernel Factory paged-FP8 prefill attention (v1/attention/ops/kf_prefill_attn):
+    # replaces the trtllm-gen prefill kernels on SM107 (FP8 Q/KV, head_dim 256, GQA 8,
+    # page 128, BF16 out) for steps whose longest prefill sequence has at least
+    # VLLM_KF_PREFILL_ATTN_MIN_KV tokens. Its host planner (C++) runs once per step;
+    # VLLM_KF_PREFILL_ATTN_SEARCH picks its search space: r3 (default, ~0.2 ms/step)
+    # or r2 / full (the solution's own search, ~2 ms/step).
+    # VLLM_KF_PREFILL_ATTN_CHECK=N: for the first N launches per layer also run the
+    # FlashInfer path and an fp32 reference and log the errors (debug only, slow).
+    "VLLM_KF_PREFILL_ATTN": lambda: bool(int(os.getenv("VLLM_KF_PREFILL_ATTN", "0"))),
+    "VLLM_KF_PREFILL_ATTN_MIN_KV": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_MIN_KV", "4096")
+    ),
+    "VLLM_KF_PREFILL_ATTN_SEARCH": lambda: os.getenv(
+        "VLLM_KF_PREFILL_ATTN_SEARCH", "r3"
+    ),
+    "VLLM_KF_PREFILL_ATTN_CHECK": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_CHECK", "0")
     ),
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
     # layer only for each prefill request's last (sampled) row; the other rows'

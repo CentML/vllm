@@ -155,6 +155,39 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
         module.autotune_kda_qkvg(model)
 
 
+def _kf_prefill_attn_warmup(worker: "Worker") -> None:
+    """Build the KF prefill planner and AOT-compile its kernel forms before serving
+    (vllm/v1/attention/ops/kf_prefill_attn). Only if a FlashInfer metadata builder
+    qualified (``kf_prefill``); the precise (fp32 softmax) forms only if a layer's
+    bmm scales need them.
+    """
+    runner = worker.model_runner
+    builders = [
+        b
+        for groups in getattr(runner, "attn_groups", [])
+        for group in groups
+        for b in group.metadata_builders
+        if getattr(b, "kf_prefill", False)
+    ]
+    if not builders:
+        logger.info("KF prefill attention: no qualifying FlashInfer layer; not used.")
+        return
+    from vllm.v1.attention.backends.flashinfer import (
+        FlashInferImpl,
+        _get_trtllm_workspace_buffer,
+    )
+    from vllm.v1.attention.ops.kf_prefill_attn.runtime import warmup_runtime
+
+    precise = False
+    ctx = runner.vllm_config.compilation_config.static_forward_context
+    for layer in ctx.values():
+        impl = getattr(layer, "impl", None)
+        if isinstance(impl, FlashInferImpl) and hasattr(layer, "_q_scale_float"):
+            bmm1 = impl.scale * layer._q_scale_float * layer._k_scale_float
+            precise |= bmm1 > 0.0625 or layer._v_scale_float > 1.0
+    warmup_runtime(runner.device, _get_trtllm_workspace_buffer(), precise)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -221,6 +254,9 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         # to the shared JIT warmup infrastructure.
         # https://github.com/vllm-project/vllm/pull/47451
         cutedsl_warmup()
+
+    if envs.VLLM_KF_PREFILL_ATTN:
+        _kf_prefill_attn_warmup(worker)
 
     if process_local_only:
         return
