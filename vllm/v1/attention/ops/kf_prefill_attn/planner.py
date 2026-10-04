@@ -36,6 +36,7 @@ Return value of plan_into:
 
 import hashlib
 import os
+from typing import Any
 
 import torch
 
@@ -1022,7 +1023,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
-_MOD: object | None = None
+_MOD: Any = None
 _GRIDS: dict[tuple, torch.Tensor] = {}
 
 

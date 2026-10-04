@@ -110,6 +110,8 @@ class KfPrefillAttn:
         self.nsm = props.multi_processor_count
         self.grids = search_grids(kmod, envs.VLLM_KF_PREFILL_ATTN_SEARCH)
         self.min_kv = envs.VLLM_KF_PREFILL_ATTN_MIN_KV
+        self.force_precise = envs.VLLM_KF_PREFILL_ATTN_PRECISE
+        self.log_every = envs.VLLM_KF_PREFILL_ATTN_LOG_EVERY
         nb = self.nsm + 2
         # Split partials: fp32 [nslot, 256, 128] + stats [nslot, 2, 128] in the
         # upper half of the trtllm workspace.
@@ -140,8 +142,17 @@ class KfPrefillAttn:
             )
         self.slot = 0
         self.compiled: dict[int, Any] = {}
-        self.stats = {"plans": 0, "fallback_capacity": 0, "fallback_variant": 0}
+        self.stats = {
+            "plans": 0,
+            "launches": 0,
+            "below_min_kv": 0,
+            "fallback_capacity": 0,
+            "fallback_variant": 0,
+        }
         self.plan_us = 0.0
+        # Host time per plan() call (whole call / C++ planner only), current window.
+        self._win_total_us: list[float] = []
+        self._win_planner_us: list[float] = []
 
     def _partials(self, nslot: int) -> tuple[torch.Tensor, torch.Tensor]:
         mrow = self.k.MROW
@@ -193,7 +204,7 @@ class KfPrefillAttn:
         )
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         if variants is None:
-            variants = reachable_variants(k.NOPS, precise)
+            variants = reachable_variants(k.NOPS, precise or self.force_precise)
         for v in variants:
             if v in self.compiled:
                 continue
@@ -223,10 +234,14 @@ class KfPrefillAttn:
 
     def plan(self, query_lens: list[int], seq_lens: list[int]) -> KfPrefillPlan | None:
         """Plan one step's prefill launch; None keeps FlashInfer for this step."""
-        if not self.compiled or max(seq_lens) < self.min_kv:
+        if not self.compiled:
+            return None
+        if max(seq_lens) < self.min_kv:
+            self.stats["below_min_kv"] += 1
             return None
         if torch.cuda.is_current_stream_capturing():
             return None
+        t_start = time.perf_counter()
         i = self.slot
         ev = self.events[i]
         if ev is not None:
@@ -236,12 +251,13 @@ class KfPrefillAttn:
         res = self.planner.plan_into(
             query_lens, seq_lens, self.nsm, hp, hb, hm, hmb, *self.grids
         )
-        self.plan_us += (time.perf_counter() - t0) * 1e6
+        t_planned = time.perf_counter()
+        self.plan_us += (t_planned - t0) * 1e6
         nwork, nbins, nmrg, nmbin, nslot, ngrp, variant, precise_variant = res[:8]
         if nwork < 0 or nslot > self.k.NSLOT_CAP or 4 * max(ngrp, 1) + 4 > _CNT_INTS:
             self.stats["fallback_capacity"] += 1
             return None
-        if variant not in self.compiled:
+        if (precise_variant if self.force_precise else variant) not in self.compiled:
             self.stats["fallback_variant"] += 1
             return None
         dp, db, dm, dmb = self.dev[i]
@@ -254,6 +270,10 @@ class KfPrefillAttn:
         ev.record()
         self.slot = (i + 1) % _RING
         self.stats["plans"] += 1
+        self._win_planner_us.append((t_planned - t0) * 1e6)
+        self._win_total_us.append((time.perf_counter() - t_start) * 1e6)
+        if self.log_every > 0 and len(self._win_total_us) >= self.log_every:
+            self._log_window()
         po, pml = self._partials(nslot)
         return KfPrefillPlan(
             variant=variant,
@@ -279,7 +299,7 @@ class KfPrefillAttn:
         bmm2_scale: float,
     ) -> bool:
         """Run one layer's prefill attention into ``out``; False = fall back."""
-        precise = bmm1_scale > _UNIT_BMM1 or bmm2_scale > 1.0
+        precise = self.force_precise or bmm1_scale > _UNIT_BMM1 or bmm2_scale > 1.0
         fn = self.compiled.get(plan.precise_variant if precise else plan.variant)
         if fn is None:
             return False
@@ -289,7 +309,35 @@ class KfPrefillAttn:
         fn(q, kv, block_tables, out, plan.plan, plan.bins, plan.po, plan.pml,
            plan.mrg, plan.mbin, self.cnt_base, float(bmm1_scale) * self.k.LOG2E,
            float(bmm2_scale), plan.nwork, plan.nslot, stream)  # fmt: skip
+        self.stats["launches"] += 1
+        if self.stats["launches"] == 1:
+            logger.info(
+                "KF prefill attention: first launch (form %d, %d work items, "
+                "precise=%s).",
+                plan.precise_variant if precise else plan.variant,
+                plan.nwork,
+                precise,
+            )
         return True
+
+    def _log_window(self) -> None:
+        def pct(xs: list[float]) -> str:
+            xs = sorted(xs)
+            n = len(xs)
+            p50, p90 = xs[n // 2] / 1e3, xs[min(n - 1, int(0.9 * n))] / 1e3
+            return f"p50 {p50:.3f} p90 {p90:.3f} max {xs[-1] / 1e3:.3f}"
+
+        logger.info(
+            "KF prefill attention stats %s (precise=%s); last %d plans, host ms per "
+            "step: plan() %s, C++ planner %s",
+            self.stats,
+            self.force_precise,
+            len(self._win_total_us),
+            pct(self._win_total_us),
+            pct(self._win_planner_us),
+        )
+        self._win_total_us.clear()
+        self._win_planner_us.clear()
 
 
 _RUNTIME: dict[int, KfPrefillAttn | None] = {}
