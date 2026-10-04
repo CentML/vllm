@@ -1779,10 +1779,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Kernel Factory paged-FP8 prefill attention (v1/attention/ops/kf_prefill_attn):
     # replaces the trtllm-gen prefill kernels on SM107 (FP8 Q/KV, head_dim 256, GQA 8,
-    # page 128, BF16 out) for steps whose longest prefill sequence has at least
-    # VLLM_KF_PREFILL_ATTN_MIN_KV tokens. Its host planner (C++) runs once per step;
-    # VLLM_KF_PREFILL_ATTN_SEARCH picks its search space: r3 (default, ~0.2 ms/step)
-    # or r2 / full (the solution's own search, ~2 ms/step).
+    # page 128, BF16 out) for steps whose prefill rows all have at least
+    # VLLM_KF_PREFILL_ATTN_MIN_KV tokens and an exact KV length (per-row gate; any
+    # other step, e.g. one with an async-spec decode row, stays on the production
+    # path; 0 keeps only the exact-length rule). Its host planner (C++) runs once
+    # per step; VLLM_KF_PREFILL_ATTN_SEARCH picks its search space: r3 (default,
+    # ~0.2 ms/step) or r2 / full (the solution's own search, ~2 ms/step).
     # VLLM_KF_PREFILL_ATTN_CHECK=N: for the first N launches per layer also run the
     # FlashInfer path and an fp32 reference and log the errors (debug only, slow).
     # VLLM_KF_PREFILL_ATTN_PRECISE=1: always use the kernel's precise forms (FP32
