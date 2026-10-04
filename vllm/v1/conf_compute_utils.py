@@ -30,6 +30,12 @@ outside Confidential Computing:
   the staging tensor so the next step's H2D cannot overwrite a staging
   buffer whose D2D has not yet drained.
 
+* ``staged_h2d`` is the same idea for one-off uploads and is what
+  ``vllm.utils.torch_utils.async_tensor_h2d`` dispatches to under
+  Confidential Computing, so metadata builders, block-table writers and the
+  V2 model runner's buffer pools get the staged path without call-site
+  changes.
+
 * Deferred D2H readback: the per-step result copy is not issued at step time
   (host-synchronous, it would stall the scheduler thread on the in-flight
   forward) but from ``AsyncGPUModelRunnerOutput.get_output()``, which runs
@@ -70,7 +76,7 @@ def _prep_stream_for_index(device_index: int) -> torch.cuda.Stream:
     return torch.cuda.Stream(device=torch.device(f"cuda:{device_index}"))
 
 
-def _prep_stream(device: torch.device) -> torch.cuda.Stream:
+def prep_stream(device: torch.device) -> torch.cuda.Stream:
     """Return the per-device prep stream.
 
     A single stream suffices: every H2D on it is host-synchronous under
@@ -97,7 +103,7 @@ def prep_stream_ctx(device: torch.device) -> AbstractContextManager:
     """
     if not confidential_compute_enabled():
         return nullcontext()
-    return torch.cuda.stream(_prep_stream(device))
+    return torch.cuda.stream(prep_stream(device))
 
 
 class StagedH2DCopier:
@@ -110,8 +116,15 @@ class StagedH2DCopier:
 
     def __init__(self, gpu_base: torch.Tensor):
         self._gpu = gpu_base
-        # Staging is mutable runtime state, not inference data.
-        with torch.inference_mode(False):
+        # Staging is mutable runtime state, not inference data. Allocate it on
+        # the prep stream: the caching allocator only recycles blocks within
+        # the stream they were freed on, so a compute-stream allocation could
+        # hand back memory a still-running compute kernel just released, and
+        # the prep stream's H2D would overwrite it immediately.
+        with (
+            torch.inference_mode(False),
+            torch.cuda.stream(prep_stream(gpu_base.device)),
+        ):
             self._stage = [torch.empty_like(gpu_base) for _ in range(2)]
         self._idx = 0
 
@@ -126,6 +139,40 @@ class StagedH2DCopier:
         # Computing, so stage_dst is populated on return; the D2D on the
         # current (compute) stream is asynchronous and ordered after the
         # forward's read of the reused buffer.
-        with torch.cuda.stream(_prep_stream(self._gpu.device)):
+        with torch.cuda.stream(prep_stream(self._gpu.device)):
             stage_dst.copy_(cpu_src, non_blocking=True)
         return gpu_dst.copy_(stage_dst, non_blocking=True)
+
+
+def staged_h2d(
+    src: torch.Tensor,
+    *,
+    device: torch.device | str | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Upload a host tensor without blocking on the compute stream.
+
+    The H2D is issued on the idle prep stream, so the host only waits for the
+    transfer itself. Without ``out`` the fresh device tensor is returned with
+    its lifetime tied to the compute stream: it was allocated on the prep
+    stream, and ``record_stream`` keeps the caching allocator from recycling it
+    before the consuming kernel has run. With ``out`` the upload lands in a
+    staging tensor and an asynchronous D2D on the compute stream moves it into
+    ``out``, so an in-flight reader of ``out`` is never overwritten.
+
+    ``src`` must already have the destination dtype: a converting copy would
+    run its cast kernel on the prep stream, unordered with the compute stream.
+    A pageable ``src`` is not host-synchronous under Confidential Computing, so
+    the compute stream is made to wait for the prep stream in that case.
+    """
+    target = out.device if out is not None else torch.device(device)  # type: ignore[arg-type]
+    compute_stream = torch.cuda.current_stream(target)
+    prep = prep_stream(target)
+    with torch.cuda.stream(prep):
+        staged = src.to(device=target, non_blocking=True)
+    if not src.is_pinned():
+        compute_stream.wait_stream(prep)
+    staged.record_stream(compute_stream)
+    if out is None:
+        return staged
+    return out.copy_(staged, non_blocking=True)
