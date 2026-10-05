@@ -9,6 +9,9 @@ import torch
 from torch.nn import Module
 
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fusion.quant_activation import (
+    expose_input_quant_key,
+)
 
 if TYPE_CHECKING:
     import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -84,6 +87,10 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
         replace_parameter(layer, "weight_scale", weight_scale.data)
 
         self.kernel.process_weights_after_loading(layer)
+
+        # Lets maybe_fused_act_quant hand this layer a pre-quantized
+        # activation (only kernels that consume one declare a key).
+        expose_input_quant_key(layer, self.kernel)
 
         layer._already_called_process_weights_after_loading = True
 
