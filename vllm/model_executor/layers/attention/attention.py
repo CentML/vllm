@@ -502,7 +502,10 @@ class Attention(nn.Module, AttentionLayerBase):
         """
         if output_dtype is None:
             output_dtype = query.dtype
-        if self.query_quant is not None:
+        # A query that arrives as FP8 was already quantized by its producer
+        # with self._q_scale (Qwen3NextAttention's qk-norm-RoPE kernel);
+        # callers then pass output_dtype.
+        if self.query_quant is not None and query.dtype != current_platform.fp8_dtype():
             # quantizing with a simple torch operation enables
             # torch.compile to fuse this into previous ops
             # which reduces overheads during decoding.
