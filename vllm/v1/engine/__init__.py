@@ -158,6 +158,13 @@ class EngineCoreRequest(
 
     session_id: str | None = None
 
+    # Prompt prefix-cache block hashes computed by the front-end process
+    # (FEH=1, see vllm/v1/engine/frontend_block_hashing.py): an 8-byte header
+    # followed by the concatenated 32-byte hashes of all full prompt blocks.
+    # Trailing optional field: with array_like + omit_defaults a sender that
+    # leaves it unset encodes exactly the same array as before.
+    prompt_block_hashes: bytes | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
