@@ -296,11 +296,79 @@ def _warm_zero_fresh_state_rows_kernel(
     pool = torch.empty(
         (1, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
     )
-    zero_fresh_state_rows(
-        pool,
-        torch.zeros(1, dtype=torch.int32, device=device),
-        torch.ones(1, dtype=torch.bool, device=device),
+    # Serving passes slices of the batch's index and flag tensors (offset by
+    # prefill_row_start / num_decodes), so either pointer may miss Triton's
+    # 16-byte divisibility specialization: compile all four variants. The
+    # flags are set, so nothing is written.
+    indices = torch.zeros(2, dtype=torch.int32, device=device)
+    flags = torch.ones(2, dtype=torch.bool, device=device)
+    for indices_offset, flags_offset in itertools.product((0, 1), repeat=2):
+        zero_fresh_state_rows(
+            pool,
+            indices[indices_offset : indices_offset + 1],
+            flags[flags_offset : flags_offset + 1],
+        )
+
+
+def _warm_gdn_mtp_recurrence_kernel(
+    runner: "GPUModelRunner",
+    device: torch.device,
+    config: _QwenGDNWarmupConfig,
+    x_dtype: torch.dtype,
+) -> None:
+    """Every launch config of the Triton spec-decode recurrence (batches of at
+    most GDN_MTP_TRITON_MAX_REQUESTS requests). Graph capture compiles it only
+    when the decode graphs run it; with the fused one-launch decode
+    (VLLM_GDN_FUSED_DECODE_MAX_REQS) only eager mixed batches do, at runtime.
+    No request has an accepted source state, so nothing is read from or
+    written to the state.
+    """
+    speculative_config = getattr(runner, "speculative_config", None)
+    num_spec = (
+        0
+        if speculative_config is None
+        else int(speculative_config.num_speculative_tokens or 0)
     )
+    if num_spec <= 0:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        GDN_MTP_TRITON_MAX_REQUESTS,
+    )
+    from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import (
+        gdn_mtp_launch_config,
+        gdn_mtp_recurrence,
+    )
+
+    width = num_spec + 1
+    state = torch.empty(
+        (1, config.hv, config.v, config.k), dtype=config.state_dtype, device=device
+    )
+    launch_configs = set()
+    for num_requests in range(1, GDN_MTP_TRITON_MAX_REQUESTS + 1):
+        launch_config = gdn_mtp_launch_config(num_requests)
+        if launch_config in launch_configs:
+            continue
+        launch_configs.add(launch_config)
+        num_tokens = num_requests * width
+        mixed_qkv = torch.zeros(
+            (num_tokens, config.conv_dim), dtype=config.conv_dtype, device=device
+        )
+        a = torch.zeros((num_tokens, config.hv), dtype=config.conv_dtype, device=device)
+        gdn_mtp_recurrence(
+            mixed_qkv,
+            a,
+            torch.zeros_like(a),
+            config.a_log,
+            config.dt_bias,
+            torch.zeros((num_requests, width), dtype=torch.int32, device=device),
+            torch.arange(0, num_tokens + 1, width, dtype=torch.int32, device=device),
+            torch.zeros(num_requests, dtype=torch.int32, device=device),
+            state,
+            torch.empty(
+                (num_tokens, config.hv, config.v), dtype=x_dtype, device=device
+            ),
+            scale=config.k**-0.5,
+        )
 
 
 def _warm_prefill_checkpoint_kernels(
@@ -632,6 +700,8 @@ def qwen_triton_warmup(
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
     _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
     _warm_zero_fresh_state_rows_kernel(device, gdn_config)
+    if not runner.is_pooling_model:
+        _warm_gdn_mtp_recurrence_kernel(runner, device, gdn_config, model_config.dtype)
     _warm_prefill_checkpoint_kernels(device, gdn_config)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
