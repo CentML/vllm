@@ -2229,9 +2229,10 @@ __global__ __launch_bounds__(kThreads, 2) void materialize_kernel(MatArgs args) 
 
 // [gx-alignc] CTAs/SM bound of the compact kernel: fp32 state 4 (the default fp32 build is 64 regs / 4 CTAs/SM, and
 // 152 SMs x 4 = 608 >= the 480 (key head, layer) CTAs of one active item -> one wave), bf16 3 (rubin-ck's 80-reg build).
-// rubin-ck as shipped used the fixed 3 CTAs/SM for both state types (rebuild with -DGSC_MATC_MINB_F32=3 to match).
+// Default 3 for both state types = rubin-ck as shipped (the Rubin reference build); the GB300 fp32 value 4 is selected
+// with GDN_STATE_COMMIT_MATC_MINB_F32=4 (passed as -DGSC_MATC_MINB_F32 by load()).
 #ifndef GSC_MATC_MINB_F32
-#define GSC_MATC_MINB_F32 4
+#define GSC_MATC_MINB_F32 3
 #endif
 #ifndef GSC_MATC_MINB_BF16
 #define GSC_MATC_MINB_BF16 3
