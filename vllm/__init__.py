@@ -6,12 +6,18 @@
 # version library first.  Such assumption is critical for some customization.
 from .version import __version__, __version_tuple__  # isort:skip
 
+# Opt-in (LCD_FI_OVERLAY=1): FlashInfer CuTe dense-GEMM PDL weight-prefetch
+# overlays, installed before anything can import FlashInfer (vllm/lcd_pdl).
+import os as _lcd_os
 import typing
 
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
 import vllm.env_override  # noqa: F401
+
+if _lcd_os.environ.get("LCD_FI_OVERLAY", "0") == "1":
+    import vllm.lcd_pdl  # noqa: F401
 
 MODULE_ATTRS = {
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
