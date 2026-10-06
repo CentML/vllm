@@ -115,7 +115,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
                 mx_alignment=quant_config.mx_alignment,
             )
 
-        communication = self.all2all_manager.get_communication(self.hidden_size)
+        communication = self.all2all_manager.get_communication()
         received = communication.dispatch(
             dispatch_x,
             topk_ids,
@@ -149,7 +149,7 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
-        communication = self.all2all_manager.get_communication(self.hidden_size)
+        communication = self.all2all_manager.get_communication()
         communication.combine(
             fused_expert_output,
             output=output,

@@ -726,7 +726,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         )
         super().__init__(cpu_group)
         self.initialized = False
-        self.communications: dict[int, NVLinkOneSidedAlltoAll] = {}
+        self.communication: NVLinkOneSidedAlltoAll | None = None
         self.top_k = 0
         self.num_experts = 0
 
@@ -739,7 +739,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         dispatch_format: "QuantFormat | None" = None,
         extra_payload_bytes_per_token: int = 0,
     ) -> None:
-        """Reserve dispatch-format rows and BF16 combine rows, growing as needed."""
+        """Share the largest token, dispatch-row and combine-row capacities."""
         if self.initialized:
             assert top_k == self.top_k, (
                 "FlashInfer one-sided communication does not support "
@@ -761,7 +761,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             dtype=torch.bfloat16,
             dispatch_format=dispatch_format,
         )
-        communication = self.communications.get(hidden_size)
+        communication = self.communication
         if communication is not None:
             previous_max = communication.params.max_tokens_per_rank
             previous_extra = communication.config.extra_payload_bytes_per_token
@@ -771,17 +771,24 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             dispatch_bytes = (
                 params.dispatch_bytes_per_token + extra_payload_bytes_per_token
             )
-            if max_num_tokens <= previous_max and dispatch_bytes <= previous_bytes:
+            if (
+                max_num_tokens <= previous_max
+                and hidden_size <= communication.params.hidden_size
+                and dispatch_bytes <= previous_bytes
+            ):
                 return
-            # A smaller format may need more tokens. Keep the larger row capacity
-            # for earlier layers sharing this workspace, regardless of init order.
-            if dispatch_bytes < previous_bytes:
-                params = replace(
-                    params, dispatch_format=communication.params.dispatch_format
-                )
-                extra_payload_bytes_per_token = previous_extra
+            # Use the larger hidden size for combine capacity. Its dispatch
+            # format may need fewer bytes than another layer's actual payload.
+            if hidden_size < communication.params.hidden_size or (
+                hidden_size == communication.params.hidden_size
+                and dispatch_bytes < previous_bytes
+            ):
+                params = communication.params
             params = replace(
                 params, max_tokens_per_rank=max(max_num_tokens, previous_max)
+            )
+            extra_payload_bytes_per_token = (
+                max(dispatch_bytes, previous_bytes) - params.dispatch_bytes_per_token
             )
 
         from vllm.distributed.device_communicators.mnnvl_compat import (
@@ -799,12 +806,20 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             extra_payload_bytes_per_token=extra_payload_bytes_per_token,
             comm_backend=CustomCommunicator(self.cpu_group),
         )
-        torch.accelerator.empty_cache()
-        replacement = create_communication(bootstrap, params, backend=config)
-        assert isinstance(replacement, NVLinkOneSidedAlltoAll)
         if communication is not None:
-            communication.destroy()
-        self.communications[hidden_size] = replacement
+            # Growth happens during model initialization, before graph capture.
+            # Retire the old workspace on every rank before allocating another.
+            torch.accelerator.synchronize()
+            dist.barrier(group=self.cpu_group)
+            self.cleanup()
+            dist.barrier(group=self.cpu_group)
+        torch.accelerator.empty_cache()
+        # Bootstrap metadata must stay on the CPU even when model layers are
+        # constructed under a CUDA default-device context.
+        with torch.device("cpu"):
+            replacement = create_communication(bootstrap, params, backend=config)
+        assert isinstance(replacement, NVLinkOneSidedAlltoAll)
+        self.communication = replacement
         self.top_k = top_k
         self.num_experts = num_experts
         self.initialized = True
@@ -812,27 +827,28 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             "FlashInfer One-sided NVLink initialized for rank %s, size %s, hidden %s",
             self.rank,
             self.world_size,
-            hidden_size,
+            params.hidden_size,
         )
         dist.barrier(group=self.cpu_group)
 
-    def get_communication(self, hidden_size: int) -> "NVLinkOneSidedAlltoAll":
+    def get_communication(self) -> "NVLinkOneSidedAlltoAll":
         # Resolve at use time: another layer can grow the shared capacity during
         # model construction, replacing the wrapper created for an earlier layer.
-        return self.communications[hidden_size]
+        assert self.communication is not None, "One-sided communication not initialized"
+        return self.communication
 
     def get_handle(self, kwargs):
         return self
 
     def cleanup(self):
-        for communication in self.communications.values():
-            communication.destroy()
-        self.communications.clear()
+        if self.communication is not None:
+            self.communication.destroy()
+            self.communication = None
         self.initialized = False
 
     def checkpoint_prepare(self) -> None:
-        for communication in self.communications.values():
-            communication.alltoall.checkpoint_prepare()
+        if self.communication is not None:
+            self.communication.alltoall.checkpoint_prepare()
 
     def checkpoint_restore(self) -> None:
         if self.initialized:
@@ -841,8 +857,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             )
 
             communicator = CustomCommunicator(self.cpu_group)
-            for communication in self.communications.values():
-                communication.alltoall.checkpoint_restore(communicator)
+            self.get_communication().alltoall.checkpoint_restore(communicator)
 
 
 class MoriAll2AllManager(All2AllManagerBase):

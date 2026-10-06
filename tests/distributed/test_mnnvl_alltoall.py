@@ -324,17 +324,20 @@ def _one_sided_lifecycle_worker(rank, world_size):
         hidden_size=4096,
     )
 
-    # Initialize
-    manager.initialize(**init_kwargs)
+    # Model construction can set CUDA as the default device. Bootstrap
+    # metadata must still be allocated on the CPU.
+    with torch.device(f"{DEVICE}:{rank}"):
+        manager.initialize(**init_kwargs)
+        assert torch.get_default_device() == torch.device(f"{DEVICE}:{rank}")
     assert manager.initialized
-    assert manager.get_communication(4096).params.hidden_size == 4096
+    assert manager.get_communication().params.hidden_size == 4096
 
     torch.distributed.barrier()
 
     # Cleanup
     manager.cleanup()
     assert not manager.initialized
-    assert not manager.communications
+    assert manager.communication is None
 
     torch.distributed.barrier()
 
@@ -363,12 +366,11 @@ def test_one_sided_manager_lifecycle(world_size):
 # Test 2b: One-sided manager grows workspace across heterogeneous MoE layers
 # ---------------------------------------------------------------------------
 #
-# Reserve the union of each hidden size's token and dispatch capacities.
+# Share the largest token, dispatch-row and combine-row capacities across layers.
 # ---------------------------------------------------------------------------
 
 
 def _one_sided_workspace_grow_worker(rank, world_size):
-    from flashinfer.comm.trtllm_moe_alltoall import moe_a2a_get_workspace_size_per_rank
     from flashinfer.fused_moe import QuantFormat
 
     from vllm.distributed.device_communicators.all2all import (
@@ -380,51 +382,98 @@ def _one_sided_workspace_grow_worker(rank, world_size):
 
     base_kwargs = dict(
         max_num_tokens=1024,
-        top_k=2,
+        top_k=4,
         num_experts=world_size * 8,
         hidden_size=4096,
     )
     nvfp4_kwargs = dict(dispatch_format=QuantFormat.NVFP4)
     bf16_kwargs = dict(dispatch_format=QuantFormat.BF16)
 
-    # A quantized-only layer retains the original tightly sized workspace.
+    # A quantized-only layer reserves its actual dispatch row size.
     manager.initialize(**base_kwargs, **nvfp4_kwargs)
-    original = manager.get_communication(4096)
+    original = manager.get_communication()
     assert original.params.dispatch_format == QuantFormat.NVFP4
-    assert original.alltoall.workspace_size_per_rank == (
-        moe_a2a_get_workspace_size_per_rank(
-            world_size, 1024, 4096 // 2 + 4096 // 16 + 2 * 8, 4096 * 2
-        )
-    )
+    assert original.params.dispatch_bytes_per_token == 4096 // 2 + 4096 // 16
+    assert original.config.extra_payload_bytes_per_token == 0
     manager.initialize(**base_kwargs, **bf16_kwargs)
-    bf16 = manager.get_communication(4096)
+    bf16 = manager.get_communication()
     assert bf16 is not original
     assert bf16.params.dispatch_bytes_per_token == 8192
 
     # Token growth for a smaller format must retain earlier BF16 capacity.
     manager.initialize(**{**base_kwargs, "max_num_tokens": 2048}, **nvfp4_kwargs)
-    grown = manager.get_communication(4096)
+    grown = manager.get_communication()
     assert grown is not bf16
     assert grown.params.max_tokens_per_rank == 2048
     assert grown.params.dispatch_bytes_per_token == 8192
 
     # A BF16 row plus scales needs additional dispatch capacity.
     manager.initialize(**base_kwargs, extra_payload_bytes_per_token=256)
-    with_scales = manager.get_communication(4096)
+    with_scales = manager.get_communication()
     assert with_scales is not grown
     assert with_scales.params.max_tokens_per_rank == 2048
     assert with_scales.config.extra_payload_bytes_per_token == 256
     manager.initialize(**base_kwargs, **nvfp4_kwargs)
-    assert manager.get_communication(4096) is with_scales
+    assert manager.get_communication() is with_scales
 
-    # Fixed wrapper geometry must not replace a different layer's hidden size.
+    # A smaller hidden size shares the existing instance, without shrinking it.
     manager.initialize(
         **{**base_kwargs, "hidden_size": 2048},
     )
-    assert manager.get_communication(2048).params.hidden_size == 2048
-    assert manager.get_communication(4096) is with_scales
-    manager.checkpoint_prepare()
-    manager.checkpoint_restore()
+    assert manager.get_communication() is with_scales
+
+    # A wider NVFP4 layer needs more combine capacity, but fewer dispatch bytes
+    # than the narrower BF16 layer. Preserve both requirements independently.
+    manager.initialize(**{**base_kwargs, "hidden_size": 8192}, **nvfp4_kwargs)
+    wider = manager.get_communication()
+    assert wider is not with_scales
+    assert wider.params.hidden_size == 8192
+    assert wider.params.max_tokens_per_rank == 2048
+    assert (
+        wider.params.dispatch_bytes_per_token
+        + wider.config.extra_payload_bytes_per_token
+    ) == 8192 + 256
+
+    # Smaller BF16 rows can increase dispatch capacity without changing the
+    # largest hidden size or the combine capacity.
+    manager.initialize(**{**base_kwargs, "hidden_size": 6144}, **bf16_kwargs)
+    shared = manager.get_communication()
+    assert shared.params.hidden_size == 8192
+    assert shared.params.max_tokens_per_rank == 2048
+    assert (
+        shared.params.dispatch_bytes_per_token
+        + shared.config.extra_payload_bytes_per_token
+    ) == 6144 * 2
+
+    # Alternate real payload widths/formats on the same workspace. The packed
+    # byte case exercises transport; repeat_interleave is synthetic expert work.
+    for hidden, packed in [(6144, False), (8192, True), (2048, False)]:
+        manager.initialize(
+            **{**base_kwargs, "hidden_size": hidden},
+            **(nvfp4_kwargs if packed else bf16_kwargs),
+        )
+        assert manager.get_communication() is shared
+        tokens = rank + 3
+        device = torch.device(f"{DEVICE}:{rank}")
+        width = hidden // 2 if packed else hidden
+        x = torch.arange(tokens * width, device=device).view(tokens, width) % 13
+        x = (x + rank).to(torch.uint8 if packed else torch.bfloat16)
+        ids = torch.arange(4, dtype=torch.int32, device=device).repeat(tokens, 1)
+        weights = torch.ones(tokens, 4, device=device)
+        received = shared.dispatch(x, ids, weights, max_tokens_per_rank=world_size + 2)
+        local = (received.topk_ids >= rank * 8) & (received.topk_ids < (rank + 1) * 8)
+        values = received.hidden_states.to(torch.bfloat16)
+        expected = x.to(torch.bfloat16)
+        if packed:
+            values = values.repeat_interleave(2, dim=-1)
+            expected = expected.repeat_interleave(2, dim=-1)
+        contribution = torch.where(
+            local.any(-1, keepdim=True),
+            values * local.sum(-1, keepdim=True),
+            0,
+        )
+        output = shared.combine(contribution.contiguous())
+        torch.testing.assert_close(output, expected * 4, rtol=0, atol=0)
     manager.cleanup()
 
 
@@ -433,7 +482,7 @@ def _one_sided_workspace_grow_worker(rank, world_size):
 @requires_ptrace
 @pytest.mark.parametrize("world_size", [2])
 def test_one_sided_manager_workspace_grow(world_size):
-    """Preserve capacity and layer geometry when reusing communication objects."""
+    """Share one workspace across hidden sizes without losing capacity."""
     _spawn_workers(
         _one_sided_workspace_grow_worker,
         world_size,
@@ -774,7 +823,7 @@ def _one_sided_data_worker(rank, world_size, *, padded_mxfp8):
         extra_payload_bytes_per_token=layout.extra_payload_bytes_per_token,
     )
     assert manager.initialized
-    communication = manager.get_communication(hidden_size)
+    communication = manager.get_communication()
 
     with _make_forward_context(rank, world_size, tokens_per_rank):
         dp_metadata = get_forward_context().dp_metadata
