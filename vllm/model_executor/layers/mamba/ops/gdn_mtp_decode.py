@@ -19,6 +19,7 @@ it is latency-bound. Here each program owns BLOCK_V value rows, so a
 
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import launcher
 from vllm.triton_utils import tl, tldevice, triton
 
 
@@ -148,6 +149,9 @@ def _gdn_mtp_recurrence_kernel(
                 )
 
 
+_mtp_launch = launcher(_gdn_mtp_recurrence_kernel)
+
+
 def gdn_mtp_launch_config(num_requests: int) -> tuple[int, int]:
     """(BLOCK_V, num_warps): split each (request, head) pair into more programs
     the smaller the batch (latency-bound). Measured on VR (SM107, 212 SMs) at
@@ -191,7 +195,7 @@ def gdn_mtp_recurrence(
     block_v = default_block_v if block_v is None else block_v
     num_warps = default_num_warps if num_warps is None else num_warps
     grid = (num_requests, num_value_heads, dim_v // block_v)
-    _gdn_mtp_recurrence_kernel[grid](
+    _mtp_launch[grid](
         mixed_qkv,
         a,
         b,

@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn import gdn_prefill_census
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -174,6 +175,10 @@ class GDNAttentionMetadata:
     non_spec_token_start: int | None = None
     # Set on steps where a prefill sequence exports an internal checkpoint.
     prefill_checkpoint: GDNPrefillCheckpointMetadata | None = None
+    # VLLM_GDN_HOST_TRIM: the builder found on the host that every row of
+    # prefill_has_initial_state is set, so zeroing the fresh pool rows before
+    # the chunk kernel is a no-op and is skipped.
+    prefill_all_initial_state: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +236,9 @@ class GDNSharedBuild:
     # checkpoint_planned tells "no checkpoint" (None) from "not computed".
     checkpoint_plan: GDNPrefillCheckpointPlan | None = None
     checkpoint_planned: bool = False
+    # VLLM_GDN_HOST_TRIM: every row of prefill_has_initial_state is set
+    # (computed on the host).
+    prefill_all_initial_state: bool = False
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -863,6 +871,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=shared.prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=shared.prefill_has_initial_state,
+            prefill_all_initial_state=shared.prefill_all_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
@@ -1104,12 +1113,43 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_has_initial_state = has_initial_state
         shared.prefill_has_initial_state = prefill_has_initial_state
         shared.prefill_no_initial_state = ~prefill_has_initial_state
+        if GDN_HOST_TRIM:
+            shared.prefill_all_initial_state = self._host_all_initial_state(
+                m, split, non_spec_rows if spec_sequence_masks_cpu is not None else None
+            )
         if self.gdn_prefill_backend == "flashinfer":
             shared.prefill_query_start_loc_i64 = prefill_query_start_loc.to(torch.int64)
             shared.prefill_max_seqlen = int(
                 torch.diff(prefill_query_start_loc_cpu).max()
             )
         return shared
+
+    @staticmethod
+    def _host_all_initial_state(
+        m: CommonAttentionMetadata,
+        split: "GDNBatchSplit",
+        non_spec_rows: torch.Tensor | slice | None,
+    ) -> bool:
+        """Whether every row of prefill_has_initial_state is set, from host
+        values: the same rows of seq_lens - query_lens > 0 as on the device.
+        seq_lens_cpu_upper_bound is exact for prefill rows and only optimistic
+        for async spec-decode rows, which always have computed tokens, so the
+        sign of each row matches the device. False when unknown.
+        """
+        seq_lens_cpu = m.seq_lens_cpu_upper_bound
+        qsl_cpu = m.query_start_loc_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.shape[0] + 1 != qsl_cpu.shape[0]:
+            return False
+        ctx = seq_lens_cpu - (qsl_cpu[1:] - qsl_cpu[:-1])
+        if split.spec_sequence_masks_cpu is not None:
+            if isinstance(non_spec_rows, slice):
+                ctx = ctx[non_spec_rows]
+            else:
+                assert split.non_spec_sequence_masks_cpu is not None
+                ctx = ctx[split.non_spec_sequence_masks_cpu]
+        elif split.num_decodes > 0:
+            ctx = ctx[split.num_decodes :]
+        return bool((ctx > 0).all())
 
     def _decode_buffers_metadata(
         self, split: "GDNBatchSplit", m: CommonAttentionMetadata

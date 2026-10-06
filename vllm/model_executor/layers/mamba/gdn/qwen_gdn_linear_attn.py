@@ -64,6 +64,10 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     enable_cuda_kernel,
     gdn_fused_conv_prep,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
+    GDN_HOST_TRIM,
+    drop_empty_triton_launch_hooks,
+)
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_fused_decode import (
     MAX_FUSED_DECODE_TOKENS,
@@ -383,6 +387,51 @@ def _log_gdn_backend_decision(
         )
 
 
+def _contig(t: torch.Tensor) -> torch.Tensor:
+    return t if t.is_contiguous() else t.contiguous()
+
+
+def _to(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return t if t.dtype == dtype else t.to(dtype)
+
+
+def _rows(t: torch.Tensor, n: int) -> torch.Tensor:
+    """``t[:n]``; ``t`` itself if it has at most ``n`` rows (same view)."""
+    return t if t.size(0) <= n else t[:n]
+
+
+def _host_spec_args(m: GDNAttentionMetadata) -> tuple:
+    """(spec conv slots, spec state slots, accepted counts, cu_seqlens, max
+    query len) of the spec-decode requests: views of the step's metadata,
+    built once per metadata object (VLLM_GDN_HOST_TRIM) instead of once per
+    GDN layer.
+    """
+    n = m.num_spec_decodes
+    c = m.__dict__.get("_host_spec_args")
+    if c is None or c[0] != n:
+        si = m.spec_state_indices_tensor
+        cu = m.spec_query_start_loc
+        acc = m.num_accepted_tokens
+        assert si is not None and cu is not None and acc is not None
+        c = (n, si[:n, 0], si[:n], acc[:n], cu[: n + 1], si.size(1))
+        m.__dict__["_host_spec_args"] = c
+    return c[1:]
+
+
+def _host_layer_views(layer) -> tuple[torch.Tensor, torch.Tensor]:
+    """(conv state view for the conv kernels, 2-D conv weight) of ``layer``,
+    built once per (conv pool, weight) object (VLLM_GDN_HOST_TRIM).
+    """
+    src = layer.kv_cache[0]
+    w = layer.conv1d.weight
+    c = layer.__dict__.get("_host_layer_views")
+    if c is None or c[0] is not src or c[1] is not w:
+        conv_state = src if is_conv_state_dim_first() else src.transpose(-1, -2)
+        c = (src, w, conv_state, w.view(w.size(0), w.size(2)))
+        layer.__dict__["_host_layer_views"] = c
+    return c[2], c[3]
+
+
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -410,29 +459,48 @@ def fi_chunk_gated_delta_rule(
     ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
     copy of ``cu_seqlens``) feed the V-split path; both are optional.
     """
-    from flashinfer.gdn_prefill import (
-        chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
-    )
+    if GDN_HOST_TRIM:
+        # Same tensors as below without the no-op dispatches (contiguous()
+        # of a contiguous tensor and .to() to its own dtype return it).
+        if use_qk_l2norm_in_kernel:
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
+        q = _contig(q.squeeze(0))
+        k = _contig(k.squeeze(0))
+        v = _contig(v.squeeze(0))
+        g = _contig(g.squeeze(0))
+        beta = _contig(beta.squeeze(0))
+        fi_state = (
+            initial_state
+            if state_indices is not None
+            else _to(initial_state, torch.float32)
+        )
+        fi_g = _to(g, torch.float32)
+        fi_beta = _to(beta, torch.float32)
+        if cu_seqlens is not None:
+            cu_seqlens = _to(cu_seqlens, torch.int64)
+    else:
+        if use_qk_l2norm_in_kernel:
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
 
-    if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q)
-        k = l2norm_fwd(k)
+        # use flashinfer implementation
+        q = q.squeeze(0).contiguous()
+        k = k.squeeze(0).contiguous()
+        v = v.squeeze(0).contiguous()
 
-    # use flashinfer implementation
-    q = q.squeeze(0).contiguous()
-    k = k.squeeze(0).contiguous()
-    v = v.squeeze(0).contiguous()
-
-    g = g.squeeze(0).contiguous()
-    beta = beta.squeeze(0).contiguous()
-    # The in-place pool is passed as is (FlashInfer indexes its rows).
-    fi_state = (
-        initial_state if state_indices is not None else initial_state.to(torch.float32)
-    )
-    fi_g = g.to(torch.float32)
-    fi_beta = beta.to(torch.float32)
-    if cu_seqlens is not None:
-        cu_seqlens = cu_seqlens.to(torch.int64)
+        g = g.squeeze(0).contiguous()
+        beta = beta.squeeze(0).contiguous()
+        # The in-place pool is passed as is (FlashInfer indexes its rows).
+        fi_state = (
+            initial_state
+            if state_indices is not None
+            else initial_state.to(torch.float32)
+        )
+        fi_g = g.to(torch.float32)
+        fi_beta = beta.to(torch.float32)
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(torch.int64)
     num_seqs = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
     non_cp_max_tokens = _gdn_fi_non_cp_max_tokens()
     use_non_cp = num_seqs > 1 or q.shape[0] <= non_cp_max_tokens
@@ -471,6 +539,10 @@ def fi_chunk_gated_delta_rule(
                 v_split=v_split,
             )
             return out.unsqueeze(0), fi_state
+    from flashinfer.gdn_prefill import (
+        chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
+    )
+
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -834,6 +906,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        drop_empty_triton_launch_hooks()
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -2009,25 +2082,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
-        # conv_state must be (..., dim, width-1) for the conv kernels.
-        # DS layout stores it that way directly; SD layout needs a transpose.
-        conv_state = (
-            self_kv_cache[0]
-            if is_conv_state_dim_first()
-            else self_kv_cache[0].transpose(-1, -2)
-        )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
+        if GDN_HOST_TRIM:
+            conv_state, conv_weights = _host_layer_views(self)
+            mixed_qkv = _rows(mixed_qkv, num_actual_tokens)
+            b = _rows(b, num_actual_tokens)
+            a = _rows(a, num_actual_tokens)
+        else:
+            # conv_state must be (..., dim, width-1) for the conv kernels.
+            # DS layout stores it that way directly; SD layout needs a
+            # transpose.
+            conv_state = (
+                self_kv_cache[0]
+                if is_conv_state_dim_first()
+                else self_kv_cache[0].transpose(-1, -2)
+            )
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
+            b = b[:num_actual_tokens]
+            a = a[:num_actual_tokens]
 
-        # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
+            # 1. Convolution sequence transformation
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -2035,6 +2115,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec = a
                 b_spec = b
                 mixed_qkv_non_spec = None
+            elif spec_slice is not None and spec_done and GDN_HOST_TRIM:
+                # The caller ran the spec rows: their views are unused.
+                mixed_qkv_spec = a_spec = b_spec = None
+                mixed_qkv_non_spec = mixed_qkv[non_spec_slice]
             elif spec_slice is not None:
                 mixed_qkv_spec = mixed_qkv[spec_slice]
                 a_spec = a[spec_slice]
@@ -2300,10 +2384,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # state are zeroed first. Batches without spec rows index
                 # block_table[:, 0], a strided view; FlashInfer and the zeroing
                 # kernel need unit stride.
-                prefill_state_indices = prefill_state_indices.contiguous()
-                zero_fresh_state_rows(
-                    ssm_state, prefill_state_indices, prefill_has_initial_state
-                )
+                if not GDN_HOST_TRIM:
+                    prefill_state_indices = prefill_state_indices.contiguous()
+                    zero_fresh_state_rows(
+                        ssm_state, prefill_state_indices, prefill_has_initial_state
+                    )
+                else:
+                    prefill_state_indices = _contig(prefill_state_indices)
+                    # The builder saw on the host that every prefill row
+                    # has an initial state: zeroing would be a no-op.
+                    if not attn_metadata.prefill_all_initial_state:
+                        zero_fresh_state_rows(
+                            ssm_state, prefill_state_indices, prefill_has_initial_state
+                        )
                 core_attn_out_non_spec, _ = self.chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -2526,6 +2619,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         Returns whether the gated norm was applied too (CUDA MTP kernel); the
         Triton recurrence leaves it to the caller's norm launch.
         """
+        num_requests = attn_metadata.num_spec_decodes
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if GDN_HOST_TRIM:
+            conv_state, conv_weights = _host_layer_views(self)
+            conv_slots, _, accepted, cu_seqlens, max_query_len = _host_spec_args(
+                attn_metadata
+            )
+            # A mixed batch passes its spec rows only (fewer than
+            # num_actual_tokens): [:num_actual_tokens] would be the same view.
+            n = num_actual_tokens
+            mixed_qkv = causal_conv1d_update(
+                _rows(mixed_qkv, n),
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_slots,
+                num_accepted_tokens=accepted,
+                query_start_loc=cu_seqlens,
+                max_query_len=max_query_len,
+                validate_data=False,
+            )
+            return self._forward_core_decode_spec_post_conv_fused_norm(
+                mixed_qkv=mixed_qkv,
+                b=_rows(b, n),
+                a=_rows(a, n),
+                output_gate=_rows(output_gate, n),
+                core_attn_out=_rows(core_attn_out, n),
+                attn_metadata=attn_metadata,
+            )
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
         num_accepted_tokens = attn_metadata.num_accepted_tokens
@@ -2533,8 +2656,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert cu_seqlens is not None
         assert num_accepted_tokens is not None
 
-        num_requests = attn_metadata.num_spec_decodes
-        num_actual_tokens = attn_metadata.num_actual_tokens
         conv_state = (
             self.kv_cache[0]
             if is_conv_state_dim_first()
@@ -2576,14 +2697,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Spec-decode recurrence; returns whether the gated norm was applied
         (CUDA MTP kernel) or is left to the caller (Triton recurrence).
         """
-        state_indices = attn_metadata.spec_state_indices_tensor
-        cu_seqlens = attn_metadata.spec_query_start_loc
-        num_accepted_tokens = attn_metadata.num_accepted_tokens
-        assert state_indices is not None
-        assert cu_seqlens is not None
-        assert num_accepted_tokens is not None
-
         num_requests = attn_metadata.num_spec_decodes
+        if GDN_HOST_TRIM:
+            _, state_slots, accepted, cu_seqlens, _ = _host_spec_args(attn_metadata)
+        else:
+            state_indices = attn_metadata.spec_state_indices_tensor
+            cu_seqlens = attn_metadata.spec_query_start_loc
+            num_accepted_tokens = attn_metadata.num_accepted_tokens
+            assert state_indices is not None
+            assert cu_seqlens is not None
+            assert num_accepted_tokens is not None
+            state_slots = state_indices[:num_requests]
+            cu_seqlens = cu_seqlens[: num_requests + 1]
+            accepted = num_accepted_tokens[:num_requests]
         if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS:
             gdn_mtp_recurrence(
                 mixed_qkv,
@@ -2591,9 +2717,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b,
                 self.A_log,
                 self.dt_bias,
-                state_indices[:num_requests],
-                cu_seqlens[: num_requests + 1],
-                num_accepted_tokens[:num_requests],
+                state_slots,
+                cu_seqlens,
+                accepted,
                 self.kv_cache[1],
                 core_attn_out,
                 scale=self.head_k_dim**-0.5,
@@ -2605,9 +2731,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b,
             self.A_log,
             self.dt_bias,
-            state_indices[:num_requests],
-            cu_seqlens[: num_requests + 1],
-            num_accepted_tokens[:num_requests],
+            state_slots,
+            cu_seqlens,
+            accepted,
             self.kv_cache[1],
             output_gate,
             self.norm.weight,

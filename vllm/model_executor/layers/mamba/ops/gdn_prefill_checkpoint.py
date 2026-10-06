@@ -10,8 +10,11 @@ same copies with one launch per copy step and no temporaries. All of them only
 move values, so the results are bitwise identical to the ATen indexing.
 """
 
+import math
+
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM, launcher
 from vllm.triton_utils import tl, triton
 
 
@@ -47,6 +50,9 @@ def _store_conv_checkpoint_kernel(
         )
 
 
+_store_conv_launch = launcher(_store_conv_checkpoint_kernel)
+
+
 def store_conv_checkpoint(
     conv_input: torch.Tensor,
     conv_state: torch.Tensor,
@@ -71,7 +77,7 @@ def store_conv_checkpoint(
     assert slots.numel() == num_ckpt
     dim = conv_input.size(1)
     block_d = 1024
-    _store_conv_checkpoint_kernel[(num_ckpt, triton.cdiv(dim, block_d))](
+    _store_conv_launch[(num_ckpt, triton.cdiv(dim, block_d))](
         conv_input,
         conv_state,
         token_indices,
@@ -105,6 +111,9 @@ def _copy_state_rows_kernel(
     tl.store(pool_ptr + dst * stride_slot + offs, val, mask=mask)
 
 
+_copy_rows_launch = launcher(_copy_state_rows_kernel)
+
+
 def copy_state_rows(
     pool: torch.Tensor, dst_slots: torch.Tensor, src_slots: torch.Tensor
 ) -> None:
@@ -116,10 +125,14 @@ def copy_state_rows(
     if num_rows == 0:
         return
     assert src_slots.numel() == num_rows
-    row_numel = pool[0].numel()
-    assert pool[0].is_contiguous()
+    if GDN_HOST_TRIM:
+        # pool[0].numel() without indexing the pool (rows are contiguous).
+        row_numel = math.prod(pool.shape[1:])
+    else:
+        row_numel = pool[0].numel()
+        assert pool[0].is_contiguous()
     block = 4096
-    _copy_state_rows_kernel[(num_rows, triton.cdiv(row_numel, block))](
+    _copy_rows_launch[(num_rows, triton.cdiv(row_numel, block))](
         pool,
         dst_slots,
         src_slots,

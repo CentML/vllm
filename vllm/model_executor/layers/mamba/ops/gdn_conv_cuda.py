@@ -22,6 +22,7 @@ import os
 import torch
 
 from vllm import envs
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
 
 _ext: list = []  # [module] once load() built or loaded it
 
@@ -113,12 +114,21 @@ def gdn_conv_cuda_prep(
     beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
     # Tokens per half-warp: 4 (32-token CTAs) for short sequences, else 8.
     tph = 4 if 1024 * max(num_seqs, 1) > P else 8
+    if GDN_HOST_TRIM:
+        # contiguous() of a contiguous tensor returns it: skip the dispatch.
+        if not cache_indices.is_contiguous():
+            cache_indices = cache_indices.contiguous()
+        if not has_initial_state.is_contiguous():
+            has_initial_state = has_initial_state.contiguous()
+    else:
+        cache_indices = cache_indices.contiguous()
+        has_initial_state = has_initial_state.contiguous()
     ok = _ext[0].run(
         x,
         conv_weights,
         conv_state,
-        cache_indices.contiguous(),
-        has_initial_state.contiguous(),
+        cache_indices,
+        has_initial_state,
         cu_seqlens,
         num_seqs,
         a,
