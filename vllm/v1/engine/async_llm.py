@@ -43,7 +43,7 @@ from vllm.transformers_utils.config import maybe_register_config_serialize_by_va
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
-from vllm.v1.engine import EngineCoreRequest, PauseMode
+from vllm.v1.engine import EngineCoreRequest, PauseMode, gc_admit
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -167,6 +167,8 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
         )
+        # Optional GC observability (VLLM_GC_STATS_S / VLLM_GC_NVTX; default off).
+        gc_admit.init("frontend")
 
         # EngineCore (starts the engine in background process).
         # Hand the renderer to the client so it can start the frontend MM
