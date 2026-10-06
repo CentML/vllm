@@ -29,6 +29,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as libdevice
 from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
+from vllm.platforms import current_platform  # noqa: E402
 
 SF_VEC = 32
 INV_E4M3_MAX = 1.0 / 448.0
@@ -310,17 +311,41 @@ def gdn_gated_rmsnorm_quant_(x, z, weight, eps, activation, q, sf, row0, padded_
         HV=HV, D=D, BT=BT, SIGMOID_GATE=(activation == "sigmoid"), PADDED_SF_COLS=padded_sf_cols, num_warps=4, launch_pdl=_lcd_pdl_on())
 
 
-@triton.jit(do_not_specialize=["LO", "HI", "M"])
-def _nqf_quant_rows_kernel(X, Q, SF_SWZ, LO, HI, M, stride_x, stride_q,
-                           N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
-    """Plain MXFP8 quant of rows [LO, HI) (rows >= M are padding: zero scales, no data)."""
-    row = LO + tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
-    in_rng = row < HI
-    dmask = in_rng & (row < M)
-    for c0 in tl.static_range(0, N, BN):
-        cols = c0 + tl.arange(0, BN)[None, :]
-        yb = tl.load(X + row * stride_x + cols, dmask, other=0.0)
-        _mx_epilogue(yb, row, cols, dmask, in_rng, Q, SF_SWZ, stride_q, c0 // 32, XB, BN, PADDED_SF_COLS)
+# sm_107 (Rubin) keeps the form without the lcd PDL constexpr: its signature matches the recorded HE ewarm key
+# (see 134759f00b). Every other device (GB300 sm_103) builds the gb300/stack/s8g form, which takes
+# launch_pdl=LCD_PDL_TRITON like the other fusion kernels. Same name either way; exact (PDL only orders launches).
+_QR_PDL = not current_platform.is_device_capability(107)
+
+if _QR_PDL:
+
+    @triton.jit(do_not_specialize=["LO", "HI", "M"])
+    def _nqf_quant_rows_kernel(X, Q, SF_SWZ, LO, HI, M, stride_x, stride_q,
+                               N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr, launch_pdl: tl.constexpr = False):
+        """Plain MXFP8 quant of rows [LO, HI) (rows >= M are padding: zero scales, no data)."""
+        if launch_pdl:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
+        row = LO + tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
+        in_rng = row < HI
+        dmask = in_rng & (row < M)
+        for c0 in tl.static_range(0, N, BN):
+            cols = c0 + tl.arange(0, BN)[None, :]
+            yb = tl.load(X + row * stride_x + cols, dmask, other=0.0)
+            _mx_epilogue(yb, row, cols, dmask, in_rng, Q, SF_SWZ, stride_q, c0 // 32, XB, BN, PADDED_SF_COLS)
+
+else:
+
+    @triton.jit(do_not_specialize=["LO", "HI", "M"])
+    def _nqf_quant_rows_kernel(X, Q, SF_SWZ, LO, HI, M, stride_x, stride_q,
+                               N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr, PADDED_SF_COLS: tl.constexpr):
+        """Plain MXFP8 quant of rows [LO, HI) (rows >= M are padding: zero scales, no data)."""
+        row = LO + tl.program_id(0).to(tl.int64) * XB + tl.arange(0, XB)[:, None]
+        in_rng = row < HI
+        dmask = in_rng & (row < M)
+        for c0 in tl.static_range(0, N, BN):
+            cols = c0 + tl.arange(0, BN)[None, :]
+            yb = tl.load(X + row * stride_x + cols, dmask, other=0.0)
+            _mx_epilogue(yb, row, cols, dmask, in_rng, Q, SF_SWZ, stride_q, c0 // 32, XB, BN, PADDED_SF_COLS)
 
 
 def _qr_config(nrows):
@@ -352,7 +377,8 @@ def quant_rows(x, q, sf, lo, hi, m, padded_sf_cols, config=None):
     N = x.shape[-1]
     _nqf_quant_rows_kernel[(triton.cdiv(hi - lo, c["XB"]),)](
         x, q, sf, lo, hi, m, x.stride(0), q.stride(0), N=N, BN=c["BN"], XB=c["XB"],
-        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"])
+        PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"],
+        **({"launch_pdl": _lcd_pdl_on()} if _QR_PDL else {}))
 
 
 @triton.jit(do_not_specialize=["LO", "HI", "LO2", "HI2", "NB1", "M"])
