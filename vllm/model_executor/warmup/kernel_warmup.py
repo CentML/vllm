@@ -16,6 +16,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.engine_jit_warmup import (
+    EWARM_ENABLED,
+    log_engine_warmup_done,
+    register_engine_warmups,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
@@ -29,6 +34,12 @@ from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
 from vllm.model_executor.warmup.mamba_triton_warmup import mamba_triton_warmup
+from vllm.model_executor.warmup.pinned_autotune_cache import (
+    PINNED_AUTOTUNE_RO,
+    check_no_startup_tuning,
+    log_read_only_enabled,
+    verify_pinned_autotune_file,
+)
 from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
     qwen4_exp_qsa_triton_warmup,
 )
@@ -174,7 +185,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             registry = (
                 worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
             )
+            # EWARM=1: extra registrations (top-k/top-p, recorded Triton keys,
+            # FlashInfer GDN chunked prefill) compiled by this warmup pass.
+            ewarm_t0 = register_engine_warmups(registry) if EWARM_ENABLED else None
             registry.warmup()
+            if ewarm_t0 is not None:
+                log_engine_warmup_done(ewarm_t0)
         except Exception:
             logger.exception(
                 "JIT kernel warmup failed after %.2fs.",
@@ -412,9 +428,16 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if is_leader and cache_path.exists():
         with open(cache_path, "rb") as f:
             cached_results = f.read()
+    if PINNED_AUTOTUNE_RO:
+        log_read_only_enabled()
     cached_results = world.broadcast_object(cached_results, src=0)
     if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: verify the bytes just read instead of
+            # writing them back.
+            verify_pinned_autotune_file(cache_path, cached_results)
+        else:
+            write_flashinfer_autotune_cache(cache_path, cached_results)
         world.barrier()
         tuner.load_configs(str(cache_path))
 
@@ -441,4 +464,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     if world.world_size > 1:
         world.barrier()
     if is_leader:
-        tuner.save_configs(str(cache_path))
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: do not save; fail if anything had to be
+            # tuned at start-up.
+            check_no_startup_tuning(tuner, str(cache_path))
+        else:
+            tuner.save_configs(str(cache_path))

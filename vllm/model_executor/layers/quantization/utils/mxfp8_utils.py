@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.model_executor.layers.fusion import norm_quant
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # MXFP8 constants
@@ -189,6 +190,13 @@ def _mxfp8_e4m3_quantize_impl(
     is_sf_swizzled_layout: bool = False,
     alignment: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if norm_quant.NQF:
+        # Activation already quantized by a fused norm / activation producer
+        # (NQF=1, see fusion/norm_quant.py): bit-identical (fp8, scales).
+        hit = norm_quant.consume_stash(x, is_sf_swizzled_layout, alignment)
+        if hit is not None:
+            return hit
+
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
