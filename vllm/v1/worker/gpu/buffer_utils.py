@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import array
+import os
 from collections.abc import Iterable, Sequence
 from functools import partial
 from typing import Any
@@ -29,6 +30,25 @@ _DEFAULT_MAX_CONCURRENCY = 2
 _ARRAY_TYPECODES = {torch.int32: "i", torch.int64: "q", torch.float32: "f"}
 for _dtype, _typecode in _ARRAY_TYPECODES.items():
     assert array.array(_typecode).itemsize == _dtype.itemsize
+
+# One program per (write, BLOCK chunk) instead of one program per write looping
+# over its chunks. A new request's prompt row (all_token_ids: up to ~200k int32
+# read through UVA) took one CTA up to ~220 us on VR at C512 (~90 us per mixed
+# step on average); chunked it is a few us. Pure copy: bitwise either way.
+STAGED_WRITE_CHUNKED = os.environ.get("VLLM_STAGED_WRITE_CHUNKED", "0") == "1"
+
+
+def _write_grid(num_writes: int, cu_lens: Sequence[int], block: int) -> tuple:
+    """Launch grid of _apply_write_kernel for ``num_writes`` writes whose
+    contents end at the cumulative ``cu_lens``.
+    """
+    if not STAGED_WRITE_CHUNKED:
+        return (num_writes,)
+    longest, prev = 0, 0
+    for end in cu_lens:
+        longest = max(longest, end - prev)
+        prev = end
+    return (num_writes, max(triton.cdiv(longest, block), 1))
 
 
 def set_default_max_concurrency(n: int) -> None:
@@ -293,7 +313,7 @@ class StagedWriteTensor:
             write_contents = self.write_contents.copy_to_uva(contents)
 
         # Write diffs to the GPU buffer
-        _apply_write_kernel[(n,)](
+        _apply_write_kernel[_write_grid(n, self._staged_write_cu_lens, 1024)](
             self.gpu,
             self.gpu.stride(0),
             indices_uva,
@@ -303,6 +323,7 @@ class StagedWriteTensor:
             None,
             BLOCK_SIZE=1024,
             MULTI_GROUP=False,
+            CHUNKED=STAGED_WRITE_CHUNKED,
         )
         # Clear the staged writes
         self.clear_staged_writes()
@@ -369,7 +390,7 @@ class FusedStagedWriter:
             dtype=torch.int32,
         )
 
-        _apply_write_kernel[(len(group_ids),)](
+        _apply_write_kernel[_write_grid(len(group_ids), cu_lens, 1024)](
             output_ptrs,
             output_strides,
             indices_uva,
@@ -379,6 +400,7 @@ class FusedStagedWriter:
             group_ids_uva,
             BLOCK_SIZE=1024,
             MULTI_GROUP=True,
+            CHUNKED=STAGED_WRITE_CHUNKED,
         )
         for t in tensors:
             t.clear_staged_writes()
@@ -395,6 +417,7 @@ def _apply_write_kernel(
     write_group_ids_ptr,  # [num_writes], used only when MULTI_GROUP
     BLOCK_SIZE: tl.constexpr,
     MULTI_GROUP: tl.constexpr,
+    CHUNKED: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row_idx = tl.load(write_indices_ptr + pid)
@@ -415,11 +438,18 @@ def _apply_write_kernel(
         row_stride = output_stride
     row_ptr += row_idx * row_stride + start_idx
 
-    for i in range(0, content_len, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
+    if CHUNKED:
+        # Program (write, chunk): one BLOCK_SIZE slice of this write.
+        block = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = block < content_len
         content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
         tl.store(row_ptr + block, content, mask=mask)
+    else:
+        for i in range(0, content_len, BLOCK_SIZE):
+            block = i + tl.arange(0, BLOCK_SIZE)
+            mask = block < content_len
+            content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
+            tl.store(row_ptr + block, content, mask=mask)
 
 
 @triton.jit
