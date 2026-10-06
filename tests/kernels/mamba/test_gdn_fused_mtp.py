@@ -121,6 +121,7 @@ def _build_layer(
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
         _fused_decode_counters=None,
+        _ba_pending=False,
     )
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -137,6 +138,7 @@ def _build_layer(
         "_forward_core_decode_spec_one_launch",
         "_gated_norm_mxfp8",
         "split_ba",
+        "_in_proj_ba_join",
     ):
         setattr(
             layer,

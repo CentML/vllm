@@ -2615,4 +2615,17 @@ def compile_factors() -> dict[str, object]:
     for var in ray_noset_env_vars:
         factors[var] = normalize_value(os.getenv(var))
 
+    # Graph-changing knobs read through os.environ (not registered above), so
+    # they would otherwise not enter the key and a shared or seeded compile
+    # cache could serve one config's graph to another. Salted only when set to
+    # the non-default value, so caches built without the knob stay valid.
+    # VLLM_GDN_BA_LATE_JOIN=1: QwenGatedDeltaNetAttention.forward_cuda passes
+    # the aux-stream BA GEMM input (ba_src) to the fused GDN core op.
+    # (The other os.environ kernel knobs act inside custom ops or the runner,
+    # not in the traced forward: VLLM_GDN_MIXED_FORK, VLLM_ROWDOT_PDL,
+    # VLLM_GDN_MTP_CUDA_PDL, VLLM_GDN_MTP_CUDA_TUNE, VLLM_GDN_HOST_TRIM2,
+    # VLLM_GDN_FUSED_DECODE_MAX_TOKENS, VLLM_STAGED_WRITE_CHUNKED.)
+    if os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1":
+        factors["VLLM_GDN_BA_LATE_JOIN"] = "1"
+
     return factors
