@@ -139,6 +139,12 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         return kMxfp8Dynamic
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # sm_107: add the K=64 Sm107 tactics to FlashInfer's CuTe-DSL mm_mxfp8
+        # autotuner (VLLM_FLASHINFER_MXFP8_K64; no-op elsewhere, once per process).
+        from vllm.model_executor.layers.quantization.utils import flashinfer_mxfp8_k64
+
+        flashinfer_mxfp8_k64.maybe_install()
+
         weight = layer.weight.data  # [N, K]
         N, K = weight.shape
 

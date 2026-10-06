@@ -216,6 +216,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_FILE: str | None = None
+    VLLM_FLASHINFER_MXFP8_K64: bool = True
+    VLLM_FLASHINFER_MXFP8_K64_TACTICS: str = "512,256,256,2;256,256,256,2;256,128,256,2"
+    VLLM_FLASHINFER_MXFP8_K64_MIN_M: int = 256
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1717,6 +1720,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_AUTOTUNE_FILE": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_FILE", None
     ),
+    # sm_107 only: add K=64 (Sm107 kernel) tactics to FlashInfer's autotuned
+    # CuTe-DSL mm_mxfp8 (vllm/model_executor/layers/quantization/utils/
+    # flashinfer_mxfp8_k64.py). Default on; "0", "false" or "off" disables.
+    # No effect on other architectures.
+    "VLLM_FLASHINFER_MXFP8_K64": lambda: os.getenv(
+        "VLLM_FLASHINFER_MXFP8_K64", "1"
+    )
+    not in ("0", "false", "off"),
+    # ";"-separated "tiler_m,tile_n,inst_m,cluster_m" K=64 tactics.
+    "VLLM_FLASHINFER_MXFP8_K64_TACTICS": lambda: os.getenv(
+        "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
+        "512,256,256,2;256,256,256,2;256,128,256,2",
+    ),
+    # Smallest M (rows) for which K=64 tactics are offered.
+    "VLLM_FLASHINFER_MXFP8_K64_MIN_M": lambda: int(
+        os.getenv("VLLM_FLASHINFER_MXFP8_K64_MIN_M", "256")
+    ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
     # CuTe-DSL NVFP4 linear kernel is selected. Empty: skip nothing.
@@ -2304,6 +2324,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_FILE",
+        # Opaque custom-op GEMM tactic sources; not part of traced graphs.
+        "VLLM_FLASHINFER_MXFP8_K64",
+        "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
+        "VLLM_FLASHINFER_MXFP8_K64_MIN_M",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
