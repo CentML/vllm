@@ -72,6 +72,8 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine import frontend_block_hashing
+from vllm.v1.engine import gc_admit
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -113,6 +115,18 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        if os.environ.get("GDN_STATE_COMMIT", "0") == "1":
+            # Deferred GDN state commit: refuse to start before the model loads
+            # if its decode kernel cannot hold 1 + num_speculative_tokens tokens.
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            if gdn_state_commit.guard_enabled():
+                spec = vllm_config.speculative_config
+                gdn_state_commit.check_num_speculative_tokens(
+                    spec.num_speculative_tokens if spec is not None else 0,
+                    "EngineCore",
+                )
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -209,6 +223,9 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        # GB300 study (fix-repin): adaptive main-thread re-pin watchdog, created
+        # on the busy-loop thread (VLLM_ENGINE_MAIN_REPIN); None = off.
+        self._main_repin = None
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -232,6 +249,9 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
             )
+        self._request_block_hasher_block_size = hash_block_size
+        if frontend_block_hashing.FEH_ENABLED:
+            frontend_block_hashing.log_engine_enabled()
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -245,6 +265,8 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
+        # rx-host2: optional freeze-on-admit GC policy (VLLM_GC_FREEZE_ADMIT, default off).
+        gc_admit.init()
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
@@ -615,6 +637,10 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        repin = self._main_repin
+        if repin is not None:
+            repin.note_launch(scheduler_output)
+            t_wait0 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -622,6 +648,8 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        if repin is not None:
+            repin.on_cycle(t_wait0, time.perf_counter(), scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -695,6 +723,8 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
+            if self._main_repin is not None:
+                self._main_repin.note_launch(scheduler_output)
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -713,6 +743,9 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        repin = self._main_repin
+        if repin is not None:
+            t_wait0 = time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -723,6 +756,8 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        if repin is not None:
+            repin.on_cycle(t_wait0, time.perf_counter(), scheduler_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -998,6 +1033,35 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # Prompt block hashes computed by the front-end process (FEH=1). Used
+        # only for requests without multimodal inputs whose hashes match the
+        # engine's hash block size and prompt length; otherwise the request
+        # is hashed here as usual.
+        shipped_hashes = request.prompt_block_hashes
+        prompt_block_hashes: list[BlockHash] | None = None
+        verify_hashes: bytes | None = None
+        if shipped_hashes is not None:
+            request.prompt_block_hashes = None
+            if (
+                frontend_block_hashing.FEH_ENABLED
+                and self.request_block_hasher is not None
+                and not request.mm_features
+            ):
+                hash_block_size = (
+                    getattr(self.scheduler, "hash_block_size", None)
+                    or self._request_block_hasher_block_size
+                )
+                if not frontend_block_hashing.shipped_hashes_usable(
+                    shipped_hashes, request, hash_block_size
+                ):
+                    frontend_block_hashing.count_engine_fallback()
+                elif frontend_block_hashing.FEH_VERIFY:
+                    verify_hashes = shipped_hashes
+                else:
+                    prompt_block_hashes = frontend_block_hashing.unpack_block_hashes(
+                        shipped_hashes
+                    )
+
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
@@ -1006,7 +1070,11 @@ class EngineCore:
                 request.mm_features
             )
 
-        req = Request.from_engine_core_request(request, self.request_block_hasher)
+        # With shipped prompt hashes the hasher only covers blocks beyond them
+        # (none for a fresh prompt); it stays attached for generated tokens.
+        req = Request.from_engine_core_request(
+            request, self.request_block_hasher, block_hashes=prompt_block_hashes
+        )
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
@@ -1014,6 +1082,10 @@ class EngineCore:
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
             self.structured_output_manager.grammar_init(req)
+        if verify_hashes is not None:
+            frontend_block_hashing.verify_block_hashes(req, verify_hashes)
+        elif prompt_block_hashes is not None:
+            frontend_block_hashing.count_engine_used()
         return req, request.current_wave
 
     def _eep_scale_up_before_kv_init(self):
@@ -1024,6 +1096,42 @@ class EngineCore:
     ):
         raise NotImplementedError
 
+
+
+def _maybe_pin_engine_main_thread() -> None:
+    """GB300 study (fix-host): opt-in pinning of the EngineCore MAIN thread only.
+
+    VLLM_ENGINE_MAIN_CPU_MAP="<worker>:<cpus>[,<worker>:<cpus>...]" (cpus = "134" or
+    "130-135"); <worker> is the DP4 worker index (DYN_SYSTEM_PORT - 18081 in the
+    study launcher, else VLLM_ENGINE_WORKER_INDEX). Called at the start of the busy
+    loop, after every helper thread exists, so only this thread moves (Linux
+    sched_setaffinity on the calling thread). Default off. Used to run the engine
+    loop on the node's faster Grace socket (the L3 slow mode is socket-specific).
+    """
+    spec = os.environ.get("VLLM_ENGINE_MAIN_CPU_MAP")
+    if not spec:
+        return
+    port = os.environ.get("DYN_SYSTEM_PORT", "")
+    idx = os.environ.get("VLLM_ENGINE_WORKER_INDEX") or (
+        str(int(port) - 18081) if port.isdigit() else ""
+    )
+    for item in spec.split(","):
+        w, _, cpus = item.partition(":")
+        if w.strip() != idx or not cpus:
+            continue
+        cpu_set: set[int] = set()
+        for part in cpus.split("+"):
+            lo, _, hi = part.partition("-")
+            cpu_set.update(range(int(lo), int(hi or lo) + 1))
+        before = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, cpu_set)
+        logger.info(
+            "EngineCore main thread pinned to CPUs %s (worker %s; was %d CPUs)",
+            sorted(cpu_set),
+            idx,
+            len(before),
+        )
+        return
 
 class EngineShutdownState(IntEnum):
     RUNNING = 0
@@ -1415,6 +1523,10 @@ class EngineCoreProc(EngineCore):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        from vllm.v1.engine import main_repin
+
+        self._main_repin = main_repin.maybe_create()
+        _maybe_pin_engine_main_thread()
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
@@ -1445,6 +1557,7 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            gc_admit.on_idle()
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1769,6 +1882,7 @@ class EngineCoreProc(EngineCore):
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
+                            gc_admit.on_admit()
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -2192,6 +2306,10 @@ class DPEngineCoreProc(EngineCoreProc):
     @fault_tolerant_wrapper
     def run_busy_loop(self):
         """Core busy loop of the EngineCore for data parallel case."""
+        from vllm.v1.engine import main_repin
+
+        self._main_repin = main_repin.maybe_create()
+        _maybe_pin_engine_main_thread()
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
