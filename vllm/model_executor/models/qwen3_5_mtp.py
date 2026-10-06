@@ -359,9 +359,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
             logger.warning("VLLM_MTP_DRAFT_LM_HEAD_MXFP8 ignored: %s.", reason)
             return
         self.draft_lm_head_mxfp8 = Mxfp8DraftLmHead(head.weight.data)
+        from vllm.model_executor.kernels.linear import mxfp8_draft_head
+
         logger.info(
-            "MTP draft lm_head runs as MXFP8 (M <= 32) on a quantized copy of "
+            "MTP draft lm_head runs as MXFP8 (M <= %d) on a quantized copy of "
             "the BF16 head %s.",
+            mxfp8_draft_head._MXFP8_MAX_M,
             tuple(head.weight.shape),
         )
 

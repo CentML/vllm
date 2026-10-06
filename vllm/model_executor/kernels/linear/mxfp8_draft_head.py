@@ -10,9 +10,19 @@ logits as an MXFP8 GEMM (FlashInfer CuTe-DSL, the backend of the model's other
 MXFP8 linears) on a once-quantized copy of the weight: 41 us for M <= 32 rows
 in the served model. Larger M keeps the BF16 GEMM: in serving, the GEMM tactic
 picked for 40-176 draft rows took 83-114 us, slower than BF16 (78-80 us).
+
+The FlashInfer warmup autotune never runs the draft head (serving logged
+"No tuned config covers mxfp8_gemm ... 248320; falling back"), and the
+fallback tactic is the slow one at M 33-63 and >= 176 (VR, M=40: 111 us vs
+47 us tuned). ``Mxfp8DraftLmHead.autotune`` profiles the head at every
+power-of-two M up to the cap during the FlashInfer autotune warmup; with it,
+``VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M`` (default 32, the original cap) can
+extend the MXFP8 head to C512 draft batches (M 64-128: 47-51 us vs 85 us BF16).
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 import torch.nn.functional as F
@@ -25,8 +35,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# Largest draft row count served by the MXFP8 GEMM (Nsight A/B on SM107).
-_MXFP8_MAX_M = 32
+# Largest draft row count served by the MXFP8 GEMM (Nsight A/B on SM107);
+# VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M raises it (use with the warmup autotune).
+_MXFP8_MAX_M = int(os.environ.get("VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M", "32"))
 
 
 def mtp_draft_logits_mxfp8_impl(
@@ -83,3 +94,22 @@ class Mxfp8DraftLmHead(torch.nn.Module):
         return torch.ops.vllm.mtp_draft_logits_mxfp8(
             x, weight, self.weight_q_t, self.weight_scale
         )
+
+    @torch.inference_mode()
+    def autotune(self, weight: torch.Tensor) -> list[int]:
+        """Profile the head's GEMM at M = 1, 2, 4, ... up to the MXFP8 cap.
+        Call inside FlashInfer's ``autotune(tune_mode=True)`` context (the
+        kernel warmup's), whose buckets are powers of two.
+        """
+        ms = []
+        m = 1
+        while m <= _MXFP8_MAX_M:
+            ms.append(m)
+            m *= 2
+        if ms and ms[-1] < _MXFP8_MAX_M:
+            ms.append(_MXFP8_MAX_M)
+        k = weight.shape[1]
+        for m in ms:
+            x = torch.randn(m, k, device=weight.device, dtype=weight.dtype)
+            mtp_draft_logits_mxfp8_impl(x, weight, self.weight_q_t, self.weight_scale)
+        return ms

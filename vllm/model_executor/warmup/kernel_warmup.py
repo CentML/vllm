@@ -5,6 +5,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import os
 import sys
 import time
 from typing import TYPE_CHECKING
@@ -153,6 +154,27 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
     module = sys.modules.get("vllm.models.kimi_k3.nvidia.low_latency_gemm")
     if module is not None:
         module.autotune_kda_qkvg(model)
+
+
+def _autotune_mxfp8_draft_head(runner: "GPUModelRunner") -> None:
+    """Profile the MXFP8 MTP draft lm_head (``Mxfp8DraftLmHead``) inside the
+    autotune context; the dummy runs never reach it. Only when
+    ``VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M`` is set, so the default keeps the
+    previous (fallback-tactic) behavior.
+    """
+    if "VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M" not in os.environ:
+        return
+    from vllm.model_executor.kernels.linear.mxfp8_draft_head import Mxfp8DraftLmHead
+
+    speculator = getattr(runner, "speculator", None)
+    draft = getattr(speculator, "model", None)
+    if draft is None:
+        return
+    for module in draft.modules():
+        head = getattr(module, "draft_lm_head_mxfp8", None)
+        if isinstance(head, Mxfp8DraftLmHead):
+            ms = head.autotune(module.lm_head.weight)
+            logger.info("Autotuned the MXFP8 MTP draft lm_head at M=%s.", ms)
 
 
 def _kf_prefill_attn_warmup(worker: "Worker") -> None:
@@ -477,6 +499,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             _run_flashinfer_autotune_dummy_runs(runner, skip_attn=hisparse_enabled)
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
+            _autotune_mxfp8_draft_head(runner)
     finally:
         set_autotune_process_group(None)
 
