@@ -3,6 +3,7 @@
 
 import torch.nn as nn
 
+from vllm.v1.attention.backends import draft_prefill_pruning
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
@@ -33,6 +34,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        if draft_prefill_pruning.ENABLED:
+            draft_prefill_pruning.install(draft_model)
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
