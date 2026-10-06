@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -68,6 +69,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends import draft_prefill_pruning
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_flashinfer_layout_string,
@@ -77,9 +79,16 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops import flashinfer_decode_splitkv
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
+)
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    ENABLED as PREFILL_GEN_ROUTING_ENABLED,
+)
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    trtllm_batch_context_with_kv_cache as routed_trtllm_batch_context_with_kv_cache,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
@@ -1780,6 +1789,55 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
+# GB300 study (fix-host): opt-in persistent trtllm-gen multi-CTA KV counter buffer.
+# FlashInfer allocates (torch.zeros) a fresh semaphore buffer on every eager
+# trtllm_batch_{context,decode}_with_kv_cache call when none is passed; the
+# kernels reset the semaphores to zero at the end of every launch, so one
+# zero-initialized buffer per device can be reused (FlashInfer's own wrappers do
+# the same). Saves an allocation + memset launch per eager attention call
+# (mixed / piecewise steps). Default off: VLLM_FI_PERSISTENT_KV_COUNTER=1.
+_FI_KV_COUNTER_ENABLED = os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER", "0") == "1"
+_FI_KV_COUNTER_BYTES = int(
+    os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
+)
+# One buffer per (device, kernel kind): the context and generation kernels of a
+# layer run back to back and may overlap under PDL, so they never share one.
+_FI_KV_COUNTER_BUFS: dict[tuple[torch.device, str], torch.Tensor] = {}
+
+
+def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | None:
+    if not _FI_KV_COUNTER_ENABLED:
+        return None
+    buf = _FI_KV_COUNTER_BUFS.get((device, kind))
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            # Never create the persistent buffer inside a graph capture (it
+            # would live in the graph's private pool); FlashInfer allocates.
+            return None
+        buf = torch.zeros(_FI_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
+        _FI_KV_COUNTER_BUFS[(device, kind)] = buf
+        logger.info(
+            "FI persistent KV counter on: kind=%s device=%s bytes=%d",
+            kind,
+            device,
+            _FI_KV_COUNTER_BYTES,
+        )
+    return buf
+
+
+def _fi_kv_counter_kwargs(
+    device: torch.device, batch_size: int, num_qo_heads: int, kind: str
+) -> dict:
+    buf = _fi_kv_counter_buffer(device, kind)
+    if buf is None:
+        return {}
+    # FlashInfer needs round_up(max(batch * heads, sm_count), 8) int32 semaphores.
+    need = (max(batch_size * num_qo_heads, 1024) + 7) // 8 * 8 * 4
+    if need > buf.numel():
+        return {}
+    return {"multi_ctas_kv_counter_buffer": buf}
+
+
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -1860,6 +1918,9 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        # Set (to the layer name) on MTP draft attention layers when draft
+        # prefill pruning is enabled; see draft_prefill_pruning.py.
+        self.draft_prefill_pruning_layer: str | None = None
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -1981,6 +2042,26 @@ class FlashInferImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
 
         """
+        if (
+            self.draft_prefill_pruning_layer is not None
+            and draft_prefill_pruning.CTX.active
+        ):
+            # Opt-in: compute only the draft prefill rows that are sampled.
+            pruned = draft_prefill_pruning.pruned_forward(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
+            if pruned is not None:
+                return pruned
+
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
@@ -2323,7 +2404,15 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
 
-                trtllm_batch_context_with_kv_cache(
+                # Opt-in routing of eligible FP8 prefill launches to the
+                # trtllm-gen generation kernels (FMHA107 / FMHA_GEN); the stock
+                # FlashInfer context entry point otherwise.
+                trtllm_prefill = (
+                    routed_trtllm_batch_context_with_kv_cache
+                    if PREFILL_GEN_ROUTING_ENABLED
+                    else trtllm_batch_context_with_kv_cache
+                )
+                trtllm_prefill(
                     query=prefill_query,
                     kv_cache=mock_kv_cache,
                     workspace_buffer=workspace_buffer,
@@ -2341,6 +2430,12 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
+                    **_fi_kv_counter_kwargs(
+                        prefill_query.device,
+                        attn_metadata.num_prefills,
+                        prefill_query.shape[1],
+                        "ctx",
+                    ),
                 )
 
                 if needs_fp8_out:
@@ -2540,7 +2635,14 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
+                # Opt-in batch-aware split-KV widening (FI_DECODE_SPLITKV); the
+                # stock FlashInfer entry point otherwise.
+                trtllm_decode = (
+                    flashinfer_decode_splitkv.trtllm_batch_decode_with_kv_cache
+                    if flashinfer_decode_splitkv.ENABLED
+                    else trtllm_batch_decode_with_kv_cache
+                )
+                trtllm_decode(
                     query=decode_query,
                     kv_cache=(
                         nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
@@ -2565,6 +2667,12 @@ class FlashInferImpl(AttentionImpl):
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
+                    **_fi_kv_counter_kwargs(
+                        decode_query.device,
+                        decode_query.shape[0],
+                        decode_query.shape[1],
+                        "gen",
+                    ),
                 )
 
                 if use_dcp:
