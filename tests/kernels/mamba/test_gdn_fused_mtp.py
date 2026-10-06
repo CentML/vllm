@@ -579,3 +579,122 @@ def test_one_launch_model_path_matches_three_kernels(
     assert torch.equal(out_scale, ref_scale)
     flips = out_q.view(torch.uint8) != ref_q.view(torch.uint8)
     assert flips.float().mean() < 1e-3
+
+
+@pytest.mark.parametrize("prefill_first", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_mixed_fork_matches_serial(
+    prefill_first: bool, state_dtype: torch.dtype
+) -> None:
+    """VLLM_GDN_MIXED_FORK: a mixed batch whose spec block and prefill rows run on
+    two streams leaves the output and both state pools bitwise equal to the
+    one-stream path, with either half on the side stream.
+    """
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    vllm_config = _make_vllm_config()
+    builder = GDNAttentionMetadataBuilder(
+        kv_cache_spec=MambaSpec(
+            block_size=BLOCK_SIZE,
+            shapes=((16, 64),),
+            dtypes=(torch.float16,),
+            num_speculative_blocks=NUM_SPEC,
+        ),
+        layer_names=[PREFIX],
+        vllm_config=vllm_config,
+        device=device,
+    )
+    # Two spec requests lead the batch, then two prefills (one fresh).
+    batch = BatchSpec(
+        seq_lens=[128, 112, 96, 160], query_lens=[SPEC_TOKENS, SPEC_TOKENS, 64, 160]
+    )
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    common.block_table_tensor.add_(1)
+    with set_current_vllm_config(vllm_config):
+        metadata = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+            num_accepted_tokens=torch.tensor(
+                [2, 1, 1, 1], dtype=torch.int32, device=device
+            ),
+            num_decode_draft_tokens_cpu=torch.tensor(
+                [NUM_SPEC, NUM_SPEC, -1, -1], dtype=torch.int32
+            ),
+        )
+    assert metadata.num_prefills == 2 and metadata.spec_token_start is not None
+    indices = [
+        t
+        for t in (
+            metadata.spec_state_indices_tensor,
+            metadata.non_spec_state_indices_tensor,
+        )
+        if t is not None and t.numel() > 0
+    ]
+    pool_size = max(int(t.max().item()) for t in indices) + 1
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, NUM_SPEC
+        )
+    )
+    conv_state_seed = 0.05 * torch.randn(
+        pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
+    )
+    ssm_state_seed = (
+        0.01 * torch.randn(pool_size, *temporal_state_shape, device=device)
+    ).to(state_dtype)
+    a_log = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = 0.1 * torch.randn(HV, dtype=torch.float32, device=device)
+    conv_weight = 0.1 * torch.randn(
+        CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device
+    )
+    norm_weight = torch.randn(V, dtype=torch.float32, device=device)
+    num_tokens = batch.compute_num_tokens()
+    mixed_qkvz = 0.1 * torch.randn(
+        num_tokens, CONV_DIM + HV * V, dtype=torch.bfloat16, device=device
+    )
+    ba = 0.1 * torch.randn(num_tokens, 2 * HV, dtype=torch.bfloat16, device=device)
+    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
+
+    def run(fork: bool):
+        layer = _build_layer(
+            vllm_config,
+            conv_state_seed.clone(),
+            ssm_state_seed.clone(),
+            a_log,
+            dt_bias,
+            conv_weight,
+            norm_weight,
+            "silu",
+        )
+        context.no_compile_layers = {PREFIX: layer}
+        out = torch.zeros(num_tokens, HV, V, dtype=torch.bfloat16, device=device)
+        with (
+            patch.object(
+                qwen_gdn_linear_attn, "get_forward_context", return_value=context
+            ),
+            patch.object(qwen_gdn_linear_attn, "GDN_MIXED_FORK", fork),
+            patch.object(
+                qwen_gdn_linear_attn,
+                "GDN_MIXED_FORK_PREFILL_FIRST",
+                0 if prefill_first else 1 << 30,
+            ),
+        ):
+            torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                mixed_qkvz.clone(),
+                ba,
+                out,
+                layer_name=_encode_layer_name(PREFIX),
+            )
+        torch.accelerator.synchronize()
+        return layer, out
+
+    ref_layer, ref_out = run(fork=False)
+    layer, out = run(fork=True)
+    # The fork path ran (it creates the side streams on first use).
+    assert qwen_gdn_linear_attn._gdn_mixed_fork_state
+    assert torch.equal(out, ref_out)
+    assert torch.equal(layer.kv_cache[0], ref_layer.kv_cache[0])
+    assert torch.equal(layer.kv_cache[1], ref_layer.kv_cache[1])
