@@ -18,6 +18,7 @@ from vllm.compilation.breakable_cudagraph import (
     eager_break_during_capture,
 )
 from vllm.config import (
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
 )
@@ -154,6 +155,13 @@ GDN_FUSED_DECODE_MAX_REQUESTS = int(
 # MTP kernel, VR 77 requests: 77.0 vs 81.6 us, 48: 48.3 vs 55.3 us) instead of
 # the csrc kernel; VLLM_GDN_MTP_JIT=0 keeps the csrc kernel.
 GDN_MTP_CUDA_JIT = os.environ.get("VLLM_GDN_MTP_JIT", "1") == "1"
+# VLLM_GDN_BA_LATE_JOIN=1: in FULL-graph decode-only spec batches, the main
+# stream waits for the aux-stream in_proj_ba GEMM right before the recurrence
+# (its first reader of b/a) instead of before the conv1d update, so the conv
+# overlaps the GEMM's tail and the cross-stream join latency. The core op then
+# receives the GEMM's input to keep it alive until the join. Every other batch
+# (PIECEWISE pieces must join inside the captured piece) joins as before.
+GDN_BA_LATE_JOIN = os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1"
 # FlashInfer GDN prefill: a single sequence of at most this many tokens runs
 # the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
@@ -1142,6 +1150,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._ba_events[1].wait(torch.cuda.current_stream())
             self._ba_pending = False
 
+    def _uses_fused_gdn_decode(self, dtype: torch.dtype) -> bool:
+        """Whether forward_cuda takes the fused-norm (packed) core op."""
+        return (
+            self.enable_fused_gdn_decode
+            and dtype == torch.bfloat16
+            and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
+        )
+
+    def _ba_join_deferred(self, ba: torch.Tensor) -> bool:
+        """VLLM_GDN_BA_LATE_JOIN: leave the join to the fused core op, which
+        waits right before its first read of b/a. Only inside FULL graphs: a
+        PIECEWISE piece must join the aux stream before the core op (a
+        splitting op) ends the captured piece.
+        """
+        return (
+            GDN_BA_LATE_JOIN
+            and self._ba_pending
+            and self._uses_fused_gdn_decode(ba.dtype)
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+
     def fix_query_key_value_ordering(
         self,
         mixed_qkvz: torch.Tensor,
@@ -1423,6 +1452,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if use_fused_gdn_decode:
             layer_name = _encode_layer_name(self.prefix)
+            # VLLM_GDN_BA_LATE_JOIN: the core op may join the aux-stream BA
+            # GEMM itself; its input must stay alive until then.
+            keep_alive = (
+                {"ba_src": hidden_states}
+                if GDN_BA_LATE_JOIN and self._ba_stream is not None
+                else {}
+            )
             # The core op writes or zeroes every row itself.
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
@@ -1450,6 +1486,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     layer_name=layer_name,
                     out_q=out_q,
                     out_scale=out_scale,
+                    **keep_alive,
                 )
                 output, _ = self.out_proj(
                     QuantizedActivation(
@@ -1466,6 +1503,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ba,
                 core_attn_out,
                 layer_name=layer_name,
+                **keep_alive,
             )
             output, _ = self.out_proj(core_attn_out.flatten(-2))
             return output
@@ -2719,6 +2757,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Spec-decode recurrence; returns whether the gated norm was applied
         (CUDA MTP kernel) or is left to the caller (Triton recurrence).
         """
+        # VLLM_GDN_BA_LATE_JOIN: the deferred aux-stream join (no-op otherwise);
+        # the recurrence is the first reader of b/a.
+        self._in_proj_ba_join()
         num_requests = attn_metadata.num_spec_decodes
         if GDN_HOST_TRIM:
             _, state_slots, accepted, cu_seqlens, _ = _host_spec_args(attn_metadata)
@@ -2840,6 +2881,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if isinstance(attn_metadata_raw, dict):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
+            self._in_proj_ba_join()
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
             # The outputs are uninitialized; hand out_proj the zeros they
             # would have been allocated with.
@@ -2868,6 +2910,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             out_q=out_q,
             out_scale=out_scale,
         )
+        # A deferred join is always taken before the first read of b/a; this
+        # only guarantees that no path returns with the aux stream unjoined.
+        self._in_proj_ba_join()
 
     def _can_use_fused_gdn_mtp_decode(
         self, attn_metadata: GDNAttentionMetadata
@@ -3029,6 +3074,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 and attn_metadata.spec_state_indices_tensor.size(1)
                 <= MAX_FUSED_DECODE_TOKENS
             ):
+                self._in_proj_ba_join()
                 self._forward_core_decode_spec_one_launch(
                     mixed_qkv=mixed_qkv,
                     b=b,
@@ -3070,6 +3116,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self._rms_norm_gated_strided_gate_cuda(core_attn_out, output_gate)
             return
 
+        self._in_proj_ba_join()
         num_actual_tokens = attn_metadata.num_actual_tokens
         if attn_metadata.num_prefills > 0:
             # Mixed batches run eagerly and the core writes every token row.
@@ -3240,10 +3287,12 @@ def qwen_gdn_attention_core_fused_norm_packed(
     layer_name: LayerNameType,
     out_q: torch.Tensor | None = None,
     out_scale: torch.Tensor | None = None,
+    ba_src: torch.Tensor | None = None,
 ) -> None:
     """``out_q``/``out_scale``: out_proj's e4m3 activation and flat swizzled
     UE8M0 scales, written instead of the normed bf16 output (``core_attn_out``
-    is then scratch).
+    is then scratch). ``ba_src`` (VLLM_GDN_BA_LATE_JOIN): the aux-stream BA
+    GEMM's input, passed only to keep it alive until this op joins that stream.
     """
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -3292,10 +3341,13 @@ def gdn_in_proj_ba_join(
 ) -> None:
     """Current stream waits for ``gdn_in_proj_ba_fork``'s aux-stream GEMM.
     ``ba`` is declared mutated to order its readers after the join;
-    ``hidden_states`` and ``mixed_qkvz`` are only dependencies.
+    ``hidden_states`` and ``mixed_qkvz`` are only dependencies. With
+    VLLM_GDN_BA_LATE_JOIN, FULL graphs leave the join to the fused core op.
     """
     layer_name = _resolve_layer_name(layer_name)
     self = get_forward_context().no_compile_layers[layer_name]
+    if self._ba_join_deferred(ba):
+        return
     self._in_proj_ba_join()
 
 
