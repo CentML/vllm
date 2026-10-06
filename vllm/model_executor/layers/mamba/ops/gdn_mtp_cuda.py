@@ -43,6 +43,13 @@ logger = init_logger(__name__)
 _ext: list = []  # [module] once load() built or loaded it
 _tried: list = []
 
+# VLLM_GDN_MTP_CUDA_PDL=1: build the kernel with ``griddepcontrol.wait`` as its
+# first instruction and launch it with programmatic stream serialization, so
+# it launches while the preceding conv1d update (which triggers its dependents
+# early) still runs and waits for it before any global load. Results are
+# unchanged. Off (default): the source and launch are the stock ones.
+GDN_MTP_CUDA_PDL = os.environ.get("VLLM_GDN_MTP_CUDA_PDL", "0") == "1"
+
 
 def build_dir(arch: str) -> str:
     return os.path.join(envs.VLLM_CACHE_ROOT, "gdn_mtp_cuda", f"sm{arch}")
@@ -58,12 +65,13 @@ def load():
     arch = f"{major}{minor}{'a' if major >= 9 else ''}"
     build = build_dir(arch)
     os.makedirs(build, exist_ok=True)
-    digest = hashlib.sha256(_SOURCE.encode()).hexdigest()[:16]
+    source = _pdl_source(_SOURCE) if GDN_MTP_CUDA_PDL else _SOURCE
+    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
     src = os.path.join(build, f"gdn_mtp_cuda_{digest}.cu")
     if not os.path.exists(src):
         tmp = f"{src}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            f.write(_SOURCE)
+            f.write(source)
         os.replace(tmp, src)
     orig = cpp._get_cuda_arch_flags
     cpp._get_cuda_arch_flags = lambda cflags=None: [
@@ -564,3 +572,47 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &gmr::run); }
 """
+
+
+_PDL_LAUNCH = r"""
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = dim3(kNT);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  if (st == at::kFloat)
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mtp_kernel<float>, p));
+  else
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mtp_kernel<__nv_bfloat16>, p));
+"""
+
+
+def _pdl_source(source: str) -> str:
+    """``source`` with the kernel waiting on its PDL predecessor before its
+    first global load and launched with programmatic stream serialization.
+    """
+    replacements = (
+        (
+            "  const int warp = tid >> 5;\n",
+            "  const int warp = tid >> 5;\n"
+            "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n"
+            '  asm volatile("griddepcontrol.wait;" ::: "memory");\n'
+            "#endif\n",
+        ),
+        (
+            "  if (st == at::kFloat)\n"
+            "    mtp_kernel<float><<<grid, kNT, 0, stream>>>(p);\n"
+            "  else\n"
+            "    mtp_kernel<__nv_bfloat16><<<grid, kNT, 0, stream>>>(p);\n",
+            _PDL_LAUNCH,
+        ),
+    )
+    for old, new in replacements:
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    return source
