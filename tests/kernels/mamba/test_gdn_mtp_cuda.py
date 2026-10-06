@@ -142,8 +142,8 @@ def test_gdn_mtp_cuda_tuned_bitwise(tune, state_dtype, width):
     state = args[8]
     res = []
     for ext in (
-        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source("")),
-        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source(tune)),
+        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source("", pdl=False)),
+        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source(tune, pdl=True)),
     ):
         st = state.clone()
         out = torch.full((L, 4, V), 7.0, dtype=torch.bfloat16, device=state.device)
