@@ -72,6 +72,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine import frontend_block_hashing
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -232,6 +233,9 @@ class EngineCore:
             self.request_block_hasher = get_request_block_hasher(
                 hash_block_size, caching_hash_fn
             )
+        self._request_block_hasher_block_size = hash_block_size
+        if frontend_block_hashing.FEH_ENABLED:
+            frontend_block_hashing.log_engine_enabled()
 
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
@@ -998,6 +1002,35 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # Prompt block hashes computed by the front-end process (FEH=1). Used
+        # only for requests without multimodal inputs whose hashes match the
+        # engine's hash block size and prompt length; otherwise the request
+        # is hashed here as usual.
+        shipped_hashes = request.prompt_block_hashes
+        prompt_block_hashes: list[BlockHash] | None = None
+        verify_hashes: bytes | None = None
+        if shipped_hashes is not None:
+            request.prompt_block_hashes = None
+            if (
+                frontend_block_hashing.FEH_ENABLED
+                and self.request_block_hasher is not None
+                and not request.mm_features
+            ):
+                hash_block_size = (
+                    getattr(self.scheduler, "hash_block_size", None)
+                    or self._request_block_hasher_block_size
+                )
+                if not frontend_block_hashing.shipped_hashes_usable(
+                    shipped_hashes, request, hash_block_size
+                ):
+                    frontend_block_hashing.count_engine_fallback()
+                elif frontend_block_hashing.FEH_VERIFY:
+                    verify_hashes = shipped_hashes
+                else:
+                    prompt_block_hashes = frontend_block_hashing.unpack_block_hashes(
+                        shipped_hashes
+                    )
+
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
@@ -1006,7 +1039,11 @@ class EngineCore:
                 request.mm_features
             )
 
-        req = Request.from_engine_core_request(request, self.request_block_hasher)
+        # With shipped prompt hashes the hasher only covers blocks beyond them
+        # (none for a fresh prompt); it stays attached for generated tokens.
+        req = Request.from_engine_core_request(
+            request, self.request_block_hasher, block_hashes=prompt_block_hashes
+        )
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
@@ -1014,6 +1051,10 @@ class EngineCore:
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
             self.structured_output_manager.grammar_init(req)
+        if verify_hashes is not None:
+            frontend_block_hashing.verify_block_hashes(req, verify_hashes)
+        elif prompt_block_hashes is not None:
+            frontend_block_hashing.count_engine_used()
         return req, request.current_wave
 
     def _eep_scale_up_before_kv_init(self):
