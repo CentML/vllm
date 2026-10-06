@@ -55,6 +55,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from vllm.model_executor.layers.row_gather import gather_rows3
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -570,7 +571,14 @@ class Qwen3NextAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        out_rows: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """With ``out_rows`` (MTP draft prefill, VLLM_MTP_DRAFT_PREFILL_ROWS),
+        attention still runs over (and writes the KV of) every row, then only
+        ``out_rows`` of its output, the gate and ``residual`` go on: returns
+        ``(o_proj output, residual)`` for those rows.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
         if self.use_qk_norm_rope_tokens:
             q, k, v, gate = self._project_qkv_gate_tokens(qkv, positions)
@@ -582,15 +590,29 @@ class Qwen3NextAttention(nn.Module):
                 output_dtype=qkv.dtype,
                 kv_cache_written=self.qk_norm_rope_kv_cache,
             )
-            attn_output = attn_output.view(gate.shape) * torch.sigmoid(gate)
-            output, _ = self.o_proj(attn_output.flatten(1))
-            return output
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        attn_output = self.attn(q, k, v)
-        if gate is not None:
+            attn_output = attn_output.view(gate.shape)
+            if out_rows is not None:
+                assert residual is not None
+                attn_output, gate, residual = gather_rows3(
+                    attn_output, gate, residual, out_rows
+                )
             attn_output = attn_output * torch.sigmoid(gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+            output, _ = self.o_proj(attn_output.flatten(1))
+        else:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            attn_output = self.attn(q, k, v)
+            if out_rows is not None:
+                assert residual is not None and gate is not None
+                attn_output, gate, residual = gather_rows3(
+                    attn_output, gate, residual, out_rows
+                )
+            if gate is not None:
+                attn_output = attn_output * torch.sigmoid(gate)
+            output, _ = self.o_proj(attn_output)
+        if out_rows is None:
+            return output
+        assert residual is not None
+        return output, residual
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -684,8 +706,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor,
+        out_rows: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        """``out_rows`` (full-attention layers only): rows kept after the
+        attention; every later op of the layer runs on those rows only.
+        """
         full_num_tokens = positions.shape[-1]
 
         if residual is None:
@@ -701,10 +727,19 @@ class Qwen3NextDecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states=hidden_states)
         elif self.layer_type == "full_attention":
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-            )
+            if out_rows is None:
+                hidden_states = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                )
+            else:
+                assert not self.use_attn_reduce_scatter_for_moe
+                hidden_states, residual = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    out_rows=out_rows,
+                    residual=residual,
+                )
         else:
             raise ValueError("Invalid layer_type")
 

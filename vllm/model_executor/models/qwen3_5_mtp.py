@@ -66,6 +66,7 @@ logger = init_logger(__name__)
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
+        "out_rows": 0,
     }
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
@@ -156,7 +157,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        out_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``out_rows`` (VLLM_MTP_DRAFT_PREFILL_ROWS): the MTP layer writes the
+        draft KV of every row, then keeps only these rows after its attention;
+        the output has ``out_rows.shape[0]`` rows in that order.
+        """
         # Branch on the inputs, not the rank: the drafter is built entirely on
         # the last PP stage, where `is_first_rank` is False.
         if intermediate_tensors is None:
@@ -176,12 +182,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         mtp_layer = self.layers[current_step_idx]
         if mtp_layer.use_attn_reduce_scatter_for_moe:
             assert hidden_states.shape[0] == positions.shape[-1]
+            assert out_rows is None
             hidden_states = sequence_parallel_chunk(hidden_states)
             assert residual is None
         hidden_states, residual = mtp_layer(
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
+            out_rows=out_rows,
         )
 
         if not get_pp_group().is_last_rank:
@@ -216,6 +224,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
+        "out_rows": 0,
     }
 )
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
@@ -227,6 +236,9 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    # forward(out_rows=...) keeps only those rows after the MTP attention
+    # (VLLM_MTP_DRAFT_PREFILL_ROWS, AutoRegressiveSpeculator).
+    supports_draft_out_rows = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -299,10 +311,16 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        out_rows: torch.Tensor | None = None,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            out_rows=out_rows,
         )
         return hidden_states
 
