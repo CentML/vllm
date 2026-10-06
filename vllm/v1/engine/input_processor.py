@@ -30,7 +30,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreRequest, frontend_block_hashing
 
 logger = init_logger(__name__)
 
@@ -73,6 +73,8 @@ class InputProcessor:
         self.process_inputs_async = make_async(
             self.process_inputs, executor=self.renderer._executor
         )
+        if frontend_block_hashing.FEH_ENABLED:
+            frontend_block_hashing.log_frontend_enabled()
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -418,7 +420,7 @@ class InputProcessor:
                     )
                 )
 
-        return EngineCoreRequest(
+        request = EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
@@ -435,6 +437,13 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
         )
+        if frontend_block_hashing.FEH_ENABLED:
+            # Hash the prompt blocks here instead of on the EngineCore input
+            # thread; EngineCore falls back to its own hashing if unusable.
+            frontend_block_hashing.attach_prompt_block_hashes(
+                self.cache_config, request
+            )
+        return request
 
     def _validate_prompt_len(
         self,
