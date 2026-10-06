@@ -159,8 +159,12 @@ def test_uva_pool_copy_to_gpu_preserves_shape_and_out(use_out, input_type):
 @pytest.mark.skipif(not is_uva_available(), reason="UVA is not available.")
 @pytest.mark.parametrize("uva_target", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
-def test_staged_write_inflight(uva_target, dtype):
-    """Preserve every generation until its consumer finishes before slot reuse."""
+@pytest.mark.parametrize("chunked", [False, True])
+def test_staged_write_inflight(uva_target, dtype, chunked, monkeypatch):
+    """Preserve every generation until its consumer finishes before slot reuse,
+    with one program per write or per (write, chunk) (VLLM_STAGED_WRITE_CHUNKED).
+    """
+    monkeypatch.setattr(buffer_utils, "STAGED_WRITE_CHUNKED", chunked)
     device = torch.device("cuda:0")
     with torch.accelerator.device_index(device.index):
         state = StagedWriteTensor(
