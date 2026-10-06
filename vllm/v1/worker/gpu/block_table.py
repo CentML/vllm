@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 
 import torch
@@ -12,6 +13,9 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+# GB300 lowc2: skip the per-step num_blocks re-copy when no block ids were appended.
+_NUM_BLOCKS_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
 
 
 class BlockTables:
@@ -44,6 +48,10 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        # Prefix-group key per (group, request index): the table entry of KV block `_key_depth` (prefix-cache chain
+        # hashing makes equal entries imply equal ancestors); -1 = shorter / unknown. Only with PREFIX_SPREAD=1.
+        self.first_block_np = None
+        self._key_depth = 0
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -131,6 +139,21 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+            if self.first_block_np is not None:
+                pos = self._key_depth * bpk
+                if start == 0:
+                    self.first_block_np[i, req_index] = -1
+                if start <= pos < end:
+                    self.first_block_np[i, req_index] = block_ids[pos - start]
+        self._lowc2_nb_dirty = True
+
+    def enable_first_block_tracking(self, depth_blocks: int = 0) -> None:
+        import numpy as np
+
+        self._key_depth = max(0, int(depth_blocks))
+        self.first_block_np = np.full(
+            (self.num_kv_cache_groups, self.max_num_reqs), -1, dtype=np.int64
+        )
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -144,6 +167,13 @@ class BlockTables:
             self.fused_writer.apply(
                 self.block_tables, self.block_table_ptrs, self.block_table_strides
             )
+        if _NUM_BLOCKS_DIRTY_GATE:
+            # GB300 lowc2 (VLLM_SAMPLER_STATE_DIRTY=1): num_blocks.np changes only
+            # in append_block_ids; skip re-copying it into the next pool slot on
+            # steps without block-table writes (exact, as for the sampler state).
+            if not getattr(self, "_lowc2_nb_dirty", True):
+                return
+            self._lowc2_nb_dirty = False
         self.num_blocks.copy_to_uva()
 
     def gather_block_tables(

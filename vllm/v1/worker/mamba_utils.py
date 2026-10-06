@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -15,6 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.mamba.ops import gdn_state_commit
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
@@ -29,6 +31,13 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
+
+# Deferred GDN state commit (GDN_STATE_COMMIT=1, not the layout-only control mode):
+# the align-mode copy kernels below move the GDN conv state only; the GDN ssm state
+# and its in-page token log are committed by gdn_state_commit.materialize.
+_GDN_STATE_COMMIT_DEFERRED = (
+    gdn_state_commit.enabled() and not gdn_state_commit.layout_only()
+)
 
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
@@ -631,6 +640,212 @@ def precopy_mamba_align_fused_kernel(
     )
 
 
+# [rubin-ck] VLLM_MAMBA_ALIGN_COMPACT=G (default 0 = off). The stock fused align copies launch
+# (num_reqs, num_states, TEMPORAL_TILES) CTAs and almost all of them leave at the per-request
+# decision (a request crosses a block boundary only every ~block_size / AL steps), so at
+# B ~ 100 they cost ~25 us each in CTA launch / retire alone. The compact kernels below take the
+# same per-request decision for every request in each program (one vector load round), list the
+# active requests in ascending batch order (cumsum), and run the unchanged per-request body for
+# list entries pid0, pid0 + G, ... with a (G, num_states, TEMPORAL_TILES) grid. Same stores
+# (bytes and num_accepted_tokens_out), so the result is bitwise identical.
+def mamba_align_compact() -> int:
+    return gdn_state_commit.align_compact()
+
+
+# [gx-alignc] VLLM_MAMBA_ALIGN_CONV_Z1=1 (default 0 = off): when every copied state is a conv state (conv_width > 0;
+# e.g. the deferred GDN state commit, whose copy specs are conv-only), launch the fused align copies with grid z = 1
+# instead of _TEMPORAL_TILES. _copy_mamba_state_block returns at once for conv states on tile_idx > 0, and the
+# num_accepted_tokens_out store is guarded by tile_idx == 0, so the bytes written are identical with 16x fewer CTAs.
+# With any temporal state the context keeps the full tile grid. Applies to the original and the compact kernels.
+_MAMBA_ALIGN_CONV_Z1 = os.environ.get("VLLM_MAMBA_ALIGN_CONV_Z1", "0") == "1"
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def postprocess_mamba_fused_compact_kernel(
+    num_accepted_tokens_ptr,
+    mamba_state_idx_ptr,
+    num_scheduled_tokens_ptr,
+    num_computed_tokens_ptr,
+    num_draft_tokens_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    num_accepted_tokens_out_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    block_size: tl.constexpr,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr = False,
+    PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    TEMPORAL_TILES: tl.constexpr = 1,
+    BLOCK_R: tl.constexpr = 1024,
+):
+    """postprocess_mamba_fused_kernel over the requests whose needs_copy decision is taken."""
+    pid0 = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
+    num_progs = tl.num_programs(0)
+
+    offs = tl.arange(0, BLOCK_R)
+    in_range = offs < num_reqs
+    if HAS_IDX_MAPPING:
+        req_v = tl.load(idx_mapping_ptr + offs, mask=in_range, other=-1)
+        valid = in_range & (req_v >= 0)
+    else:
+        req_v = offs
+        valid = in_range
+    acc_v = tl.load(num_accepted_tokens_ptr + req_v, mask=valid, other=1)
+    if PRECOMPUTED_NEW_COMPUTED:
+        new_v = tl.load(num_computed_tokens_ptr + req_v, mask=valid, other=0)
+        run_v = new_v - acc_v + 1
+    else:
+        sch_v = tl.load(num_scheduled_tokens_ptr + req_v, mask=valid, other=0)
+        cmp_v = tl.load(num_computed_tokens_ptr + req_v, mask=valid, other=0)
+        drf_v = tl.load(num_draft_tokens_ptr + req_v, mask=valid, other=0)
+        run_v = cmp_v + sch_v - drf_v
+        new_v = run_v + acc_v - 1
+    aligned_v = (new_v // block_size) * block_size
+    active = valid & (aligned_v >= run_v)
+    act_i = active.to(tl.int32)
+    csum = tl.cumsum(act_i, axis=0)
+    count = tl.sum(act_i, axis=0)
+
+    for k in range(pid0, count, num_progs):
+        batch_idx = tl.sum(tl.where(active & (csum == k + 1), offs, 0), axis=0)
+        # ---- unchanged per-request body of postprocess_mamba_fused_kernel (needs_copy holds)
+        if HAS_IDX_MAPPING:
+            req_idx = tl.load(idx_mapping_ptr + batch_idx)
+        else:
+            req_idx = batch_idx
+        num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
+        src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
+        if PRECOMPUTED_NEW_COMPUTED:
+            new_num_computed = tl.load(num_computed_tokens_ptr + req_idx)
+            num_tokens_running_state = new_num_computed - num_accepted + 1
+        else:
+            num_scheduled = tl.load(num_scheduled_tokens_ptr + req_idx)
+            num_computed = tl.load(num_computed_tokens_ptr + req_idx)
+            num_draft = tl.load(num_draft_tokens_ptr + req_idx)
+            num_tokens_running_state = num_computed + num_scheduled - num_draft
+            new_num_computed = num_tokens_running_state + num_accepted - 1
+        aligned_new_computed = (new_num_computed // block_size) * block_size
+        accept_token_bias = aligned_new_computed - num_tokens_running_state
+        dest_block_idx = aligned_new_computed // block_size - 1
+        if (src_block_idx == dest_block_idx) & (state_idx == 0) & (tile_idx == 0):
+            tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+        if (src_block_idx != dest_block_idx) | (accept_token_bias != 0):
+            if HAS_IDX_MAPPING:
+                bt_row_idx = batch_idx
+            else:
+                bt_row_idx = req_idx
+            _copy_mamba_state_block(
+                state_idx,
+                bt_row_idx,
+                src_block_idx,
+                dest_block_idx,
+                accept_token_bias,
+                block_table_ptrs_ptr,
+                block_table_stride_req,
+                state_base_addrs_ptr,
+                state_block_strides_ptr,
+                state_elem_sizes_ptr,
+                state_inner_sizes_ptr,
+                state_conv_widths_ptr,
+                state_group_indices_ptr,
+                state_dim_row_count_ptr,
+                state_dim_row_stride_ptr,
+                tile_idx,
+                COPY_BLOCK_SIZE,
+                CONV_STATE_DIM_FIRST,
+                TEMPORAL_TILES,
+            )
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def precopy_mamba_align_fused_compact_kernel(
+    mamba_state_idx_ptr,
+    src_col_ptr,
+    token_bias_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr = True,
+    TEMPORAL_TILES: tl.constexpr = 1,
+    BLOCK_R: tl.constexpr = 1024,
+):
+    """precopy_mamba_align_fused_kernel over the requests that cross a block boundary."""
+    pid0 = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
+    num_progs = tl.num_programs(0)
+
+    offs = tl.arange(0, BLOCK_R)
+    in_range = offs < num_reqs
+    if HAS_IDX_MAPPING:
+        req_v = tl.load(idx_mapping_ptr + offs, mask=in_range, other=-1)
+        valid = in_range & (req_v >= 0)
+    else:
+        req_v = offs
+        valid = in_range
+    src_v = tl.load(src_col_ptr + req_v, mask=valid, other=-1)
+    dst_v = tl.load(mamba_state_idx_ptr + req_v, mask=valid, other=-1)
+    active = valid & (src_v >= 0) & (src_v != dst_v)
+    act_i = active.to(tl.int32)
+    csum = tl.cumsum(act_i, axis=0)
+    count = tl.sum(act_i, axis=0)
+
+    for k in range(pid0, count, num_progs):
+        batch_idx = tl.sum(tl.where(active & (csum == k + 1), offs, 0), axis=0)
+        # ---- unchanged per-request body of precopy_mamba_align_fused_kernel (a boundary is crossed)
+        if HAS_IDX_MAPPING:
+            req_idx = tl.load(idx_mapping_ptr + batch_idx)
+        else:
+            req_idx = batch_idx
+        src_col = tl.load(src_col_ptr + req_idx)
+        dst_col = tl.load(mamba_state_idx_ptr + req_idx)
+        token_bias = tl.load(token_bias_ptr + req_idx)
+        _copy_mamba_state_block(
+            state_idx,
+            batch_idx,
+            src_col,
+            dst_col,
+            token_bias,
+            block_table_ptrs_ptr,
+            block_table_stride_req,
+            state_base_addrs_ptr,
+            state_block_strides_ptr,
+            state_elem_sizes_ptr,
+            state_inner_sizes_ptr,
+            state_conv_widths_ptr,
+            state_group_indices_ptr,
+            state_dim_row_count_ptr,
+            state_dim_row_stride_ptr,
+            tile_idx,
+            COPY_BLOCK_SIZE,
+            CONV_STATE_DIM_FIRST,
+            TEMPORAL_TILES,
+        )
+
+
 @triton.jit
 def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
@@ -809,6 +1024,9 @@ class MambaSpecDecodeGPUContext:
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
+    # [gx-alignc] grid z of the fused align copies: _TEMPORAL_TILES, or 1 when VLLM_MAMBA_ALIGN_CONV_Z1=1 and every
+    # state is a conv state (set by initialize_from_forward_context).
+    align_copy_tiles: int = _TEMPORAL_TILES
 
     # persistent output for the once-per-step, all-group aligned-index launch.
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
@@ -969,6 +1187,11 @@ class MambaSpecDecodeGPUContext:
                 mamba_state_copy_funcs,
                 block_tables,
             )
+        if _GDN_STATE_COMMIT_DEFERRED and self.is_initialized:
+            # per-layer pointer table for the deferred-commit materialize kernel
+            gdn_state_commit._build_worker_table(
+                self, kv_cache_config, forward_context
+            )
 
     def _populate_metadata(
         self,
@@ -978,6 +1201,7 @@ class MambaSpecDecodeGPUContext:
         block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
+        num_temporal = 0  # [gx-alignc] VLLM_MAMBA_ALIGN_CONV_Z1 needs conv-only states
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
             layer_names = kv_cache_group.layer_names
@@ -1041,6 +1265,7 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
+                        num_temporal += 1
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
@@ -1071,6 +1296,15 @@ class MambaSpecDecodeGPUContext:
                     idx += 1
 
         assert idx == self.num_states
+        if _MAMBA_ALIGN_CONV_Z1 and num_temporal == 0 and idx > 0:
+            self.align_copy_tiles = 1
+            logger.info(
+                "mamba align copies: conv-only states (%d), grid z = 1 "
+                "(VLLM_MAMBA_ALIGN_CONV_Z1=1)",
+                idx,
+            )
+        else:
+            self.align_copy_tiles = _TEMPORAL_TILES
 
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
@@ -1158,9 +1392,20 @@ class MambaSpecDecodeGPUContext:
         )
 
         total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        compact = mamba_align_compact()
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
+        kernel = postprocess_mamba_fused_kernel
+        extra = {}
+        if compact:  # [rubin-ck] same copies over the active requests only
+            logger.info_once("mamba align copies: compact postprocess grid (VLLM_MAMBA_ALIGN_COMPACT=%d)", compact)
+            kernel = postprocess_mamba_fused_compact_kernel
+            extra = {"BLOCK_R": max(16, triton.next_power_of_2(self.num_accepted_tokens_out.numel()))}
 
-        postprocess_mamba_fused_kernel[grid](
+        kernel[grid](
             num_accepted_tokens_gpu,
             mamba_state_idx_gpu,
             num_scheduled_tokens_gpu,
@@ -1183,7 +1428,19 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            **extra,
         )
+        if _GDN_STATE_COMMIT_DEFERRED:
+            # block-boundary checkpoints of the GDN ssm state (+ token log)
+            gdn_state_commit.worker_postprocess(
+                self,
+                num_reqs,
+                num_accepted_tokens_gpu,
+                mamba_state_idx_gpu,
+                num_scheduled_tokens_gpu,
+                num_computed_tokens_gpu,
+                num_draft_tokens_gpu,
+            )
 
     def run_fused_precopy(
         self,
@@ -1208,8 +1465,19 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
-        precopy_mamba_align_fused_kernel[grid](
+        compact = mamba_align_compact()
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
+        kernel = precopy_mamba_align_fused_kernel
+        extra = {}
+        if compact:  # [rubin-ck] same copies over the requests that cross a block boundary only
+            logger.info_once("mamba align copies: compact precopy grid (VLLM_MAMBA_ALIGN_COMPACT=%d)", compact)
+            kernel = precopy_mamba_align_fused_compact_kernel
+            extra = {"BLOCK_R": max(16, triton.next_power_of_2(self.num_accepted_tokens_out.numel()))}
+        kernel[grid](
             state_idx_gpu,
             src_col_gpu,
             token_bias_gpu,
@@ -1229,7 +1497,13 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            **extra,
         )
+        if _GDN_STATE_COMMIT_DEFERRED:
+            # align-mode block migration of the GDN ssm state (+ token log)
+            gdn_state_commit.worker_precopy(
+                self, num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu, idx_mapping
+            )
 
     def run_fused_postprocess_align(
         self,
@@ -1258,8 +1532,19 @@ class MambaSpecDecodeGPUContext:
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
         total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
-        postprocess_mamba_fused_kernel[grid](
+        compact = mamba_align_compact()
+        grid = (
+            min(compact, num_reqs) if compact else num_reqs,
+            total_states,
+            self.align_copy_tiles,
+        )
+        kernel = postprocess_mamba_fused_kernel
+        extra = {}
+        if compact:  # [rubin-ck] same copies over the active requests only
+            logger.info_once("mamba align copies: compact postprocess grid (VLLM_MAMBA_ALIGN_COMPACT=%d)", compact)
+            kernel = postprocess_mamba_fused_compact_kernel
+            extra = {"BLOCK_R": max(16, triton.next_power_of_2(self.num_accepted_tokens_out.numel()))}
+        kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,
             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
@@ -1284,7 +1569,18 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            **extra,
         )
+        if _GDN_STATE_COMMIT_DEFERRED:
+            # block-boundary checkpoints of the GDN ssm state (+ token log)
+            gdn_state_commit.worker_postprocess_align(
+                self,
+                num_reqs,
+                num_accepted_tokens_gpu,
+                state_idx_gpu,
+                new_num_computed_tokens_gpu,
+                idx_mapping,
+            )
 
 
 @dataclasses.dataclass
