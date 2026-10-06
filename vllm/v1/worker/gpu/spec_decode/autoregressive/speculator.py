@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends import draft_prefill_pruning
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -17,6 +18,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -178,6 +180,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.on_prefill_end(self.max_num_reqs)
 
         if self.num_speculative_steps == 1:
+            if draft_prefill_pruning.ENABLED:
+                draft_prefill_pruning.mark_ready()
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -198,6 +202,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
+        if draft_prefill_pruning.ENABLED:
+            draft_prefill_pruning.mark_ready()
 
     @torch.inference_mode()
     def propose(
@@ -387,6 +393,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens_cpu_upper_bound,
         )
         self.on_multi_step_decode_end(num_reqs)
+        if self.draft_vocab_head is not None and not (dummy_run or is_profile):
+            draft_vocab_head.observe_target(
+                self.draft_vocab_head,
+                last_sampled,
+                input_batch.idx_mapping,
+                num_sampled,
+            )
+            draft_vocab_head.maybe_log(self.draft_vocab_head)
 
         return self.draft_tokens[:num_reqs]
 
@@ -474,14 +488,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        last_hidden_states, hidden_states = self._run_model(
-            num_tokens,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            mm_inputs=mm_inputs,
-        )
+        # Opt-in draft prefill pruning (no-op context unless enabled).
+        with draft_prefill_pruning.prefill_scope(
+            self, num_reqs, attn_metadata, cudagraph_runtime_mode
+        ):
+            last_hidden_states, hidden_states = self._run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                mm_inputs=mm_inputs,
+            )
         if self.pcp_manager is not None:
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states

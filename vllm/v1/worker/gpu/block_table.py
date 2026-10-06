@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 
 import torch
@@ -12,6 +13,9 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+# GB300 lowc2: skip the per-step num_blocks re-copy when no block ids were appended.
+_NUM_BLOCKS_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
 
 
 class BlockTables:
@@ -131,6 +135,7 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+        self._lowc2_nb_dirty = True
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -144,6 +149,13 @@ class BlockTables:
             self.fused_writer.apply(
                 self.block_tables, self.block_table_ptrs, self.block_table_strides
             )
+        if _NUM_BLOCKS_DIRTY_GATE:
+            # GB300 lowc2 (VLLM_SAMPLER_STATE_DIRTY=1): num_blocks.np changes only
+            # in append_block_ids; skip re-copying it into the next pool slot on
+            # steps without block-table writes (exact, as for the sampler state).
+            if not getattr(self, "_lowc2_nb_dirty", True):
+                return
+            self._lowc2_nb_dirty = False
         self.num_blocks.copy_to_uva()
 
     def gather_block_tables(

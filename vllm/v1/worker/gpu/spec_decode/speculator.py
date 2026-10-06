@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import torch.nn as nn
+import os
+from vllm.triton_utils import tl, triton
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
@@ -33,6 +35,7 @@ from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -198,6 +201,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.supports_mm_inputs = False
         self.pcp_manager: PCPManager | None = None
+        # Opt-in reduced-vocabulary greedy draft head (VLLM_DRAFT_LMH_VOCAB).
+        self.draft_vocab_head: draft_vocab_head.DraftVocabHead | None = None
 
     @abstractmethod
     def load_draft_model(
@@ -217,6 +222,18 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
         self._validate_local_argmax_reduction()
+        if draft_vocab_head.ENABLED:
+            if (
+                self.speculative_config.draft_sample_method != "greedy"
+                or self.use_local_argmax_reduction
+                or self.enable_adaptive_verification
+                or self.draft_watermarker is not None
+            ):
+                raise ValueError(
+                    "VLLM_DRAFT_LMH_VOCAB needs greedy drafts without local "
+                    "argmax reduction, adaptive verification or watermarking."
+                )
+            self.draft_vocab_head = draft_vocab_head.maybe_build(self.model)
 
         all_attn_layers = set[str](
             get_layers_from_vllm_config(
@@ -408,6 +425,11 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.draft_vocab_head is not None:
+            # Greedy draft over the token-id subset (draft proposals only).
+            return draft_vocab_head.sample(
+                self.draft_vocab_head, self.model, hidden_states
+            )
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             sampled = gumbel_sample(
@@ -433,7 +455,10 @@ class DraftModelSpeculator(BaseSpeculator):
             return self.model.get_top_tokens(hidden_states)
         else:
             logits = self.model.compute_logits(hidden_states)
-            sampled = logits.argmax(dim=-1)
+            if _SPLIT_ROW_ARGMAX and logits.is_cuda and logits.shape[-1] >= 65536:
+                sampled = fast_argmax(logits)
+            else:
+                sampled = logits.argmax(dim=-1)
         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
         return sampled
 
@@ -535,3 +560,55 @@ class DraftModelSpeculator(BaseSpeculator):
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
+
+
+# ============================================================================
+# Split-row argmax for large vocabularies (greedy draft sampling).
+_SPLIT_ROW_ARGMAX = os.environ.get('VLLM_DRAFT_SPLIT_ROW_ARGMAX', '1') == '1'
+
+
+
+_ARGMAX_CHUNK = 4096
+_ARGMAX_BUF: dict = {}
+
+
+@triton.jit
+def _argmax_stage1(X, stride, VAL, IDX, V: tl.constexpr, CHUNK: tl.constexpr,
+                   NCH_PAD: tl.constexpr):
+    row = tl.program_id(0)
+    c = tl.program_id(1)
+    offs = c * CHUNK + tl.arange(0, CHUNK)
+    x = tl.load(X + row.to(tl.int64) * stride + offs, mask=offs < V,
+                other=-float("inf")).to(tl.float32)
+    m = tl.max(x, axis=0)
+    i = tl.min(tl.where(x == m, offs, 2147483647), axis=0)
+    tl.store(VAL + row * NCH_PAD + c, m)
+    tl.store(IDX + row * NCH_PAD + c, i)
+
+
+@triton.jit
+def _argmax_stage2(VAL, IDX, OUT, NCH: tl.constexpr, NCH_PAD: tl.constexpr):
+    row = tl.program_id(0)
+    j = tl.arange(0, NCH_PAD)
+    v = tl.load(VAL + row * NCH_PAD + j, mask=j < NCH, other=-float("inf"))
+    i = tl.load(IDX + row * NCH_PAD + j, mask=j < NCH, other=2147483647)
+    m = tl.max(v, axis=0)
+    best = tl.min(tl.where(v == m, i, 2147483647), axis=0)
+    tl.store(OUT + row, best.to(tl.int64))
+
+
+def fast_argmax(x: torch.Tensor) -> torch.Tensor:
+    """argmax over the last dim of a 2D tensor; returns int64 [N]."""
+    assert x.ndim == 2 and x.stride(1) == 1
+    n, v = x.shape
+    out = torch.empty(n, dtype=torch.int64, device=x.device)
+    if n == 0:
+        return out
+    nch = triton.cdiv(v, _ARGMAX_CHUNK)
+    nch_pad = triton.next_power_of_2(nch)
+    val = torch.empty((n, nch_pad), dtype=torch.float32, device=x.device)
+    idx = torch.empty((n, nch_pad), dtype=torch.int32, device=x.device)
+    _argmax_stage1[(n, nch)](x, x.stride(0), val, idx, V=v, CHUNK=_ARGMAX_CHUNK,
+                             NCH_PAD=nch_pad, num_warps=4)
+    _argmax_stage2[(n,)](val, idx, out, NCH=nch, NCH_PAD=nch_pad, num_warps=1)
+    return out
