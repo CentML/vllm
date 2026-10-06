@@ -76,14 +76,17 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.worker import fused_kv_block_copy
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import cudagraph_profile_cleanup
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -166,6 +169,10 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.gpu.suffix_staging import (
+    SUFFIX_STAGING_ENABLED,
+    get_suffix_staging_start,
+)
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
@@ -392,6 +399,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     vllm_config=self.vllm_config,
                     model_config=self.vllm_config.model_config,
                 )
+            if fused_kv_block_copy.ENABLED:
+                # compile the one-launch KV block copy kernel before serving
+                fused_kv_block_copy.warmup()
             if self.lora_config:
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
@@ -461,6 +471,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "reasoning_config": self.vllm_config.reasoning_config,
                 "return_sampling_mask": self.model_config.return_sampling_mask,
             }
+            # The sampler applies top-k/top-p with the same Triton kernels as
+            # the V1 TopKTopPSampler, which registers their JIT warmups in its
+            # __init__. Register them here as well: registrations made outside
+            # an active registry are dropped, and these kernels would otherwise
+            # JIT-compile on the first top-k/top-p sampling step.
+            with self.jit_warmup_registry.activate():
+                register_top_k_top_p_warmups()
             if self.vllm_config.watermark_config is None:
                 self.sampler = Sampler(**sampler_kwargs)
             else:
@@ -970,9 +987,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             self.pooling_runner.clear()
 
-    @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
+        if cudagraph_profile_cleanup.ENABLED:
+            # CFIX / CFIX_RESET: eager persistent-buffer allocation before the
+            # capture, release of tables pinning the profiling KV cache after it
+            return cudagraph_profile_cleanup.profile_cudagraph_memory(
+                self, self._profile_cudagraph_memory_impl
+            )
+        return self._profile_cudagraph_memory_impl()
+
+    @torch.inference_mode()
+    def _profile_cudagraph_memory_impl(self) -> int:
         return _profile_cudagraph_memory(self)
 
     def needs_cudagraph_capture(self) -> bool:
@@ -985,8 +1011,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.cudagraph_manager.needs_capture()
         )
 
-    @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
+        if cudagraph_profile_cleanup.ENABLED:
+            # CFIX / CFIX_RESET: eager persistent-buffer allocation before the
+            # real capture and post-capture diagnostics
+            return cudagraph_profile_cleanup.capture_model(
+                self,
+                lambda: self._capture_model_impl(profile_only=profile_only),
+                profile_only,
+            )
+        return self._capture_model_impl(profile_only=profile_only)
+
+    @torch.inference_mode()
+    def _capture_model_impl(self, *, profile_only: bool = False) -> int:
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs
@@ -1120,12 +1157,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
+            # Opt-in: stage only the token suffix that can still be read.
+            staging_start = (
+                get_suffix_staging_start(new_req_data) if SUFFIX_STAGING_ENABLED else 0
+            )
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                staging_start=staging_start,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
