@@ -585,6 +585,19 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
 
+    # 3. opt-in model rewrites that change the traced graph without changing
+    #    any config field (the key does not include the traced sources).
+    if os.environ.get("SEG_FOLD", "0") == "1":
+        # MoE runners whose shared expert was folded into the routed experts
+        # call torch.ops.seg.fold_moe (see fused_moe/shared_expert_fold.py).
+        factors.append("seg-fold-v1")
+    if os.environ.get("NQF", "0") != "0":
+        # Fused residual-add + norm + MXFP8 quant (see
+        # model_executor/layers/fusion/norm_quant.py).
+        from vllm.model_executor.layers.fusion import norm_quant
+
+        factors.extend(norm_quant.compile_hash_factors())
+
     return factors
 
 

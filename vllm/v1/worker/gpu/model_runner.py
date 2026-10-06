@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import (
@@ -461,6 +462,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "reasoning_config": self.vllm_config.reasoning_config,
                 "return_sampling_mask": self.model_config.return_sampling_mask,
             }
+            # The sampler applies top-k/top-p with the same Triton kernels as
+            # the V1 TopKTopPSampler, which registers their JIT warmups in its
+            # __init__. Register them here as well: registrations made outside
+            # an active registry are dropped, and these kernels would otherwise
+            # JIT-compile on the first top-k/top-p sampling step.
+            with self.jit_warmup_registry.activate():
+                register_top_k_top_p_warmups()
             if self.vllm_config.watermark_config is None:
                 self.sampler = Sampler(**sampler_kwargs)
             else:
