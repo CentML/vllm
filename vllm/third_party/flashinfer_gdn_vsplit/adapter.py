@@ -23,6 +23,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
 
 from .gdn_chunked_vs import GatedDeltaNetChunkedKernel
 
@@ -37,6 +38,13 @@ def _num_sm(dev_index: int) -> int:
 @functools.cache
 def _cache(*key):
     return {}
+
+
+# VLLM_GDN_HOST_TRIM: compiled kernel by raw key; (workspace, CUstream) by
+# raw stream handle (the persistent kernel's workspace size depends only on
+# the SM count).
+_fast_compiled: dict = {}
+_fast_ws: dict = {}
 
 
 def _io(t):
@@ -76,10 +84,42 @@ def chunk_gated_delta_rule_vsplit(
     HQ, HV, DK = q.size(1), v.size(1), q.size(2)
     assert DK == 128 and v.size(2) == 128
     assert cu_seqlens.dtype == torch.int32
-    is_GQA = HQ >= HV
     use_init = initial_state is not None
     store_final = output_state is not None
     use_idx = state_indices is not None
+    if GDN_HOST_TRIM:
+        # Same compiled kernel and arguments; the key, the workspace (scratch
+        # for per-CTA TMA descriptors, written before use) and the stream
+        # object are looked up instead of rebuilt per call.
+        dev = q.device.index
+        fkey = (
+            dev, q.dtype,
+            (initial_state if use_init else output_state).dtype
+            if (use_init or store_final) else None,
+            HQ, HV, use_init, store_final,
+            state_indices.dtype if use_idx else None,
+            initial_state.stride()[1:] if (use_idx and use_init) else None,
+            output_state.stride()[1:] if (use_idx and store_final) else None,
+            v_split,
+        )
+        compiled = _fast_compiled.get(fkey)
+        if compiled is not None:
+            handle = torch._C._cuda_getCurrentRawStream(dev)
+            ws_stream = _fast_ws.get(handle)
+            if ws_stream is None:
+                ws = torch.empty(
+                    GatedDeltaNetChunkedKernel.get_workspace_size(
+                        _num_sm(dev), cu_seqlens.size(0) - 1, HQ, HV, True),
+                    dtype=torch.int8, device=q.device)
+                ws_stream = (ws, cuda.CUstream(handle))
+                _fast_ws[handle] = ws_stream
+            compiled(q, k, v, gate, beta, output, cu_seqlens,
+                     initial_state if use_init else None,
+                     output_state if store_final else None,
+                     state_indices if use_idx else None, None, None, 0, scale,
+                     ws_stream[0], ws_stream[1])
+            return
+    is_GQA = HQ >= HV
     st_dtype = (initial_state if use_init else output_state).dtype if (use_init or store_final) else torch.float32
     B = cu_seqlens.size(0) - 1
     dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
@@ -130,3 +170,5 @@ def chunk_gated_delta_rule_vsplit(
     c["compiled"](q, k, v, gate, beta, output, cu_seqlens,
                   initial_state if use_init else None, output_state if store_final else None,
                   state_indices if use_idx else None, None, None, 0, scale, ws, stream)
+    if GDN_HOST_TRIM:
+        _fast_compiled[fkey] = c["compiled"]

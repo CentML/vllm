@@ -5,9 +5,16 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+from typing import Any
+
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
+    GDN_HOST_TRIM,
+    arch_support_pdl,
+    launcher,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -1040,6 +1047,9 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+_conv1d_update_launch = launcher(_causal_conv1d_update_kernel)
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1103,7 +1113,8 @@ def causal_conv1d_update(
         assert activation in ["silu", "swish"]
 
     original_x_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    if not GDN_HOST_TRIM or original_x_dtype != conv_state.dtype:
+        x = x.to(conv_state.dtype)
     if out is None:
         out = x
     else:
@@ -1169,13 +1180,22 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
-    def grid(META):
-        return (
-            batch,
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    grid: Any
+    if GDN_HOST_TRIM:
+        grid = (batch, triton.cdiv(dim, 256))
+        launch_pdl = arch_support_pdl()
+    else:
 
-    _causal_conv1d_update_kernel[grid](
+        def grid_fn(META):
+            return (
+                batch,
+                triton.cdiv(dim, META["BLOCK_N"]),
+            )
+
+        grid = grid_fn
+        launch_pdl = current_platform.is_arch_support_pdl()
+
+    _conv1d_update_launch[grid](
         # Pointers to matrices
         x,
         weight,
@@ -1218,10 +1238,12 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
-        launch_pdl=current_platform.is_arch_support_pdl(),
+        launch_pdl=launch_pdl,
     )
     if unsqueeze:
         out = out.squeeze(-1)
+    if GDN_HOST_TRIM and out.dtype == original_x_dtype:
+        return out
     return out.to(original_x_dtype)
 
 

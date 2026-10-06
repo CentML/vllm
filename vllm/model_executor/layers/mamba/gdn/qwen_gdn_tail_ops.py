@@ -16,6 +16,8 @@
   in place through ``state_indices``.
 """
 
+import math
+
 import torch
 
 from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
@@ -24,7 +26,15 @@ from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     mxfp8_quantize_row,
     mxfp8_store_swizzled_scales,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
+    GDN_HOST_TRIM,
+    arch_support_pdl,
+    launcher,
+)
 from vllm.platforms import current_platform
+from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+    calc_rows_per_block,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -107,6 +117,9 @@ def _gdn_gated_norm_mxfp8_kernel(
     mxfp8_store_swizzled_scales(scale_ptr, row, tl.arange(0, BLOCK // 32), sf, K // 32)
 
 
+_norm_launch = launcher(_gdn_gated_norm_mxfp8_kernel)
+
+
 def gdn_mxfp8_scale_numel(num_tokens: int, hidden: int) -> int:
     """Bytes of the flat F8_128x4 UE8M0 scale buffer for [num_tokens, hidden]."""
     return (
@@ -124,10 +137,6 @@ def _gdn_norm_mxfp8_num_warps(
     with >= 2-row tiles any >= 2 heads per warp matches. 8 warps: fastest on
     VR at T = 2144..8192 (sweep 2/4/8/16).
     """
-    from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
-        calc_rows_per_block,
-    )
-
     if num_norm_rows > 0 and calc_rows_per_block(num_norm_rows, device) == 1:
         return min(block_h, 32)
     return min(8, max(block_h // 2, 1))
@@ -158,15 +167,18 @@ def gdn_gated_norm_mxfp8(
     """
     num_rows, heads, head_dim = x.shape
     hidden = heads * head_dim
-    assert z.shape == x.shape
-    assert x.stride(-1) == 1 and z.stride(-1) == 1
-    assert x.stride(1) == head_dim and z.stride(1) == head_dim
-    assert weight.shape == (head_dim,) and weight.is_contiguous()
-    assert head_dim == triton.next_power_of_2(head_dim) and hidden % MXFP8_BLOCK == 0
-    assert out_q.shape == (num_rows, hidden) and out_q.is_contiguous()
-    assert out_q.dtype == torch.float8_e4m3fn
-    scale_numel = gdn_mxfp8_scale_numel(num_rows, hidden)
-    assert out_scale.numel() == scale_numel and out_scale.dtype == torch.uint8
+    if not GDN_HOST_TRIM:
+        assert z.shape == x.shape
+        assert x.stride(-1) == 1 and z.stride(-1) == 1
+        assert x.stride(1) == head_dim and z.stride(1) == head_dim
+        assert weight.shape == (head_dim,) and weight.is_contiguous()
+        assert (
+            head_dim == triton.next_power_of_2(head_dim) and hidden % MXFP8_BLOCK == 0
+        )
+        assert out_q.shape == (num_rows, hidden) and out_q.is_contiguous()
+        assert out_q.dtype == torch.float8_e4m3fn
+        scale_numel = gdn_mxfp8_scale_numel(num_rows, hidden)
+        assert out_scale.numel() == scale_numel and out_scale.dtype == torch.uint8
     valid_from_ptr = isinstance(num_valid, torch.Tensor)
     if num_rows == 0:
         return
@@ -176,8 +188,10 @@ def gdn_gated_norm_mxfp8(
         norm_rows[1] - norm_rows[0], block_h, x.device
     )
     # PDL below 4096 rows, as the fused RMSNorm -> MXFP8 producer.
-    launch_pdl = num_rows < 4096 and current_platform.is_arch_support_pdl()
-    _gdn_gated_norm_mxfp8_kernel[(padded_rows,)](
+    launch_pdl = num_rows < 4096 and (
+        arch_support_pdl() if GDN_HOST_TRIM else current_platform.is_arch_support_pdl()
+    )
+    _norm_launch[(padded_rows,)](
         x,
         z,
         weight,
@@ -246,6 +260,9 @@ def _zero_fresh_state_rows_kernel(
         )
 
 
+_zero_launch = launcher(_zero_fresh_state_rows_kernel)
+
+
 def zero_fresh_state_rows(
     pool: torch.Tensor,
     state_indices: torch.Tensor,
@@ -259,11 +276,16 @@ def zero_fresh_state_rows(
     if num_seqs == 0:
         return
     assert state_indices.is_contiguous() and has_initial_state.is_contiguous()
-    row_numel = pool[0].numel()
-    assert pool[0].is_contiguous()
+    if GDN_HOST_TRIM:
+        # pool[0].numel() without indexing the pool (the caller's pool rows
+        # are contiguous).
+        row_numel = math.prod(pool.shape[1:])
+    else:
+        row_numel = pool[0].numel()
+        assert pool[0].is_contiguous()
     assert has_initial_state.numel() == num_seqs
     block = 4096
-    _zero_fresh_state_rows_kernel[(num_seqs, triton.cdiv(row_numel, block))](
+    _zero_launch[(num_seqs, triton.cdiv(row_numel, block))](
         pool,
         state_indices,
         has_initial_state,
