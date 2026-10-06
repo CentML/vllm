@@ -221,6 +221,35 @@ def gen_vsm(
     return real_sms if S <= 1 else max(real_sms, S * base)
 
 
+_SMS_CACHE: dict[int, int] = {}
+
+
+def predict_launch(
+    T: int, B: int, max_q: int, max_kv: int, hkv: int = 2, device_index: int | None = None
+) -> tuple[int, bool] | None:
+    """Host-only prediction of the ``gen`` launch (no device sync): returns
+    ``(ctas, persistent)``, or None when the launch would not take the gen route.
+    Mirrors :func:`gen_vsm` and FlashInfer's trtllm-gen
+    ``computeCtaAndClusterConfig`` for the grouped Q128 kernel:
+    ``numCtasPerSeqQ = ceil(max_q / 16)``, ``base = numCtasPerSeqQ * hkv * B``,
+    ``S = min(ceil(max_kv / 256), max(1, floor(vsm / base)))``. ``S <= 1`` runs
+    the Persistent kernel over the ``base`` tiles, otherwise ``base * S`` CTAs
+    with the multi-CTA KV split. Used by the attn-pdo wave gate
+    (``VLLM_ATTN_PD_WAVE_MODEL=gen``); it never changes the launch itself.
+    """
+    if not (ENABLED and _GEN) or not (T <= _GEN_MAX_T or B > _MAX_B):
+        return None
+    idx = torch.cuda.current_device() if device_index is None else device_index
+    sms = _SMS_CACHE.get(idx)
+    if sms is None:
+        sms = _SMS_CACHE[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    vsm = gen_vsm(sms, T, B, max_q, hkv, _max_vsm(sms))
+    nq = -(-max_q // 16)
+    base = nq * hkv * B
+    S = min(-(-max_kv // 256), max(1, vsm // base))
+    return (base, True) if S <= 1 else (base * S, False)
+
+
 def _gen(
     query: torch.Tensor,
     kv_cache: Any,

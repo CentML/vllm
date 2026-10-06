@@ -327,51 +327,19 @@ def check_result(fork_out: torch.Tensor, serial_out: torch.Tensor, layer_name: s
 
 
 # ---------------------------------------------------------------------------
-# Host-side gen-route prediction (relocated verbatim from
-# ``flashinfer_prefill_gen_routing.py`` = PR #74's module, which is not on
-# ``mlperf-end-multiturn-v1.0``; see the PR body). Its module-level thresholds
-# are reached lazily through :func:`_gen_routing` (absent module = inert).
-
-_SMS_CACHE: dict[int, int] = {}
+# Host-side gen-route helpers. ``predict_launch`` lives in
+# ``flashinfer_prefill_gen_routing.py`` (PR #74's module); its module-level
+# thresholds are reached lazily through :func:`_gen_routing`.
 
 
 def _gen_routing():
-    """PR #74's ``flashinfer_prefill_gen_routing`` module, or None when it has
-    not landed yet."""
+    """PR #74's ``flashinfer_prefill_gen_routing`` module, or None when it is
+    not importable."""
     try:
         from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as gr
     except ImportError:
         return None
     return gr
-
-
-def predict_launch(
-    T: int, B: int, max_q: int, max_kv: int, hkv: int = 2, device_index: int | None = None
-) -> tuple[int, bool] | None:
-    """Host-only prediction of the ``gen`` launch (no device sync): returns
-    ``(ctas, persistent)``, or None when the launch would not take the gen route.
-    Mirrors :func:`gen_vsm` and FlashInfer's trtllm-gen
-    ``computeCtaAndClusterConfig`` for the grouped Q128 kernel:
-    ``numCtasPerSeqQ = ceil(max_q / 16)``, ``base = numCtasPerSeqQ * hkv * B``,
-    ``S = min(ceil(max_kv / 256), max(1, floor(vsm / base)))``. ``S <= 1`` runs
-    the Persistent kernel over the ``base`` tiles, otherwise ``base * S`` CTAs
-    with the multi-CTA KV split. Used by the attn-pdo wave gate
-    (``VLLM_ATTN_PD_WAVE_MODEL=gen``); it never changes the launch itself.
-    """
-    gr = _gen_routing()
-    if gr is None:
-        return None
-    if not (gr.ENABLED and gr._GEN) or not (T <= gr._GEN_MAX_T or B > gr._MAX_B):
-        return None
-    idx = torch.cuda.current_device() if device_index is None else device_index
-    sms = _SMS_CACHE.get(idx)
-    if sms is None:
-        sms = _SMS_CACHE[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
-    vsm = gr.gen_vsm(sms, T, B, max_q, hkv, gr._max_vsm(sms))
-    nq = -(-max_q // 16)
-    base = nq * hkv * B
-    S = min(-(-max_kv // 256), max(1, vsm // base))
-    return (base, True) if S <= 1 else (base * S, False)
 
 
 def would_route_gen(T: int, B: int, max_q: int) -> bool:
