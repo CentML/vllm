@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -39,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
+from vllm.v1.worker import fused_kv_block_copy
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
@@ -682,7 +684,92 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 layer.impl._v_scale_cache = None
 
 
+# Direct block->block copy kernel for copy-on-write partial prefix
+# hits. Stock code does `blocks[dst] = blocks[src]` = an index gather into a temp
+# plus an index_put (4 bytes of HBM traffic per byte copied, 2
+# launches per storage). This copies src rows straight into dst rows (2 bytes of
+# traffic per byte, 16-byte vector accesses, one launch per storage).
+_FUSED_BLOCK_COPY = os.environ.get("VLLM_FUSED_KV_BLOCK_COPY", "1") == "1"
+
+
+@triton.jit
+def _copy_block_rows_kernel(
+    base_ptr,  # int32 view of the storage
+    src_ptr,
+    dst_ptr,
+    row_elems,  # int32 elements per scheduler block
+    row_stride,  # int32 elements between scheduler blocks
+    BLOCK: tl.constexpr,
+    ITERS: tl.constexpr,
+):
+    pair = tl.program_id(0)
+    chunk = tl.program_id(1)
+    src = tl.load(src_ptr + pair).to(tl.int64)
+    dst = tl.load(dst_ptr + pair).to(tl.int64)
+    s_base = base_ptr + src * row_stride
+    d_base = base_ptr + dst * row_stride
+    start = chunk.to(tl.int64) * (BLOCK * ITERS)
+    for i in tl.static_range(ITERS):
+        offs = start + i * BLOCK + tl.arange(0, BLOCK)
+        m = offs < row_elems
+        v = tl.load(s_base + offs, mask=m)
+        tl.store(d_base + offs, v, mask=m)
+
+
+def _fused_copy_rows(blocks: torch.Tensor, src: torch.Tensor, dst: torch.Tensor) -> bool:
+    """blocks: [num_blocks, ...] view whose rows are contiguous. Returns False if
+    the layout is not supported (caller falls back to indexing)."""
+    try:
+        # .view (never .flatten/.reshape): a silent copy would drop the writes
+        rows = blocks.view(blocks.shape[0], -1)
+    except RuntimeError:
+        return False
+    if rows.stride(1) != 1:
+        return False
+    src = src.contiguous()
+    dst = dst.contiguous()
+    nbytes = rows.shape[1] * rows.element_size()
+    stride_bytes = rows.stride(0) * rows.element_size()
+    if nbytes % 4 or stride_bytes % 4 or rows.data_ptr() % 16:
+        return False
+    try:
+        storage_elems = rows.untyped_storage().nbytes() // 4
+        base = torch.empty(0, dtype=torch.int32, device=rows.device)
+        base.set_(rows.untyped_storage(), rows.storage_offset() * rows.element_size() // 4,
+                  (storage_elems - rows.storage_offset() * rows.element_size() // 4,))
+    except Exception:
+        return False
+    row_elems = nbytes // 4
+    BLOCK, ITERS = 2048, 8
+    grid = (src.numel(), triton.cdiv(row_elems, BLOCK * ITERS))
+    _copy_block_rows_kernel[grid](
+        base, src, dst, row_elems, stride_bytes // 4,
+        BLOCK=BLOCK, ITERS=ITERS, num_warps=8,
+    )
+    return True
+
+
 def copy_kv_cache_blocks_inplace(
+    kv_caches: Iterable[torch.Tensor],
+    num_blocks: int,
+    kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+) -> None:
+    if fused_kv_block_copy.ENABLED:
+        # VLLM_FUSED_KV_BLOCK_COPY_MULTI=1: all storages in one launch when the
+        # copies provably commute; otherwise the per-storage path below
+        fused_kv_block_copy.copy_kv_cache_blocks_inplace(
+            kv_caches,
+            num_blocks,
+            kv_cache_block_copies,
+            _copy_kv_cache_blocks_inplace_per_storage,
+        )
+        return
+    _copy_kv_cache_blocks_inplace_per_storage(
+        kv_caches, num_blocks, kv_cache_block_copies
+    )
+
+
+def _copy_kv_cache_blocks_inplace_per_storage(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
@@ -691,6 +778,13 @@ def copy_kv_cache_blocks_inplace(
         return
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    # Direct copies are only equivalent to gather-then-scatter when no block is
+    # both a source and a destination and destinations are unique.
+    fused_ok = (
+        _FUSED_BLOCK_COPY
+        and len(np.unique(indices_np[:, 1])) == len(indices_np)
+        and not np.intersect1d(indices_np[:, 0], indices_np[:, 1]).size
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -728,7 +822,8 @@ def copy_kv_cache_blocks_inplace(
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+        if not (fused_ok and _fused_copy_rows(blocks, src, dst)):
+            blocks[dst] = blocks[src]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
