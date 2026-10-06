@@ -23,6 +23,7 @@ elements (different fp32 summation order); accumulation stays fp32.
 from __future__ import annotations
 
 import functools
+import os
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,12 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+# VLLM_ROWDOT_PDL=1: launch the row-dot kernel with PDL. It waits on the
+# predecessor (griddepcontrol.wait) before its first load, so its launch and
+# CTA setup overlap the tail of the preceding kernel (the shared expert's
+# down_proj GEMM); results are unchanged. Off by default.
+ROWDOT_PDL = os.environ.get("VLLM_ROWDOT_PDL", "0") == "1"
 
 # (N, K) -> (largest M served, backend). Measured on VR-288GB (SM107) with the
 # DRAM clock locked at 4752 MHz; above the bound cuBLAS is as fast or faster.
@@ -54,8 +61,11 @@ def _rowdot_kernel(
     stride_xm,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
 ):
     """``out[m] = sum_k x[m, k] * w[k]`` for BLOCK_M rows per program."""
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0)
     offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_K)
@@ -80,8 +90,19 @@ def _rowdot(
     if out is None:
         out = torch.empty((m, 1), dtype=x.dtype, device=x.device)
     block_k = min(2048, triton.next_power_of_2(k))
+    launch_pdl = ROWDOT_PDL and current_platform.is_arch_support_pdl()
     _rowdot_kernel[(m,)](
-        x, weight, out, m, k, x.stride(0), BLOCK_M=1, BLOCK_K=block_k, num_warps=4
+        x,
+        weight,
+        out,
+        m,
+        k,
+        x.stride(0),
+        BLOCK_M=1,
+        BLOCK_K=block_k,
+        LAUNCH_PDL=launch_pdl,
+        launch_pdl=launch_pdl,
+        num_warps=4,
     )
     return out
 
