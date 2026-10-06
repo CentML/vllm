@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs, gdn_step_plan
+from vllm.v1.attention.backends import gdn_fused_metadata
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -22,6 +25,21 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+gdn_fused_metadata.log_config()
+
+# Deferred GDN state commit (GDN_STATE_COMMIT=1, not in the layout-only control
+# mode), see vllm/model_executor/layers/mamba/ops/gdn_state_commit.
+_GDN_STATE_COMMIT_DEFERRED = (
+    os.environ.get("GDN_STATE_COMMIT", "0") == "1"
+    and os.environ.get("GDN_STATE_COMMIT_LAYOUT_ONLY", "0") != "1"
+)
+# Load-time guard of the deferred GDN state commit (both modes; see
+# gdn_state_commit.check_num_speculative_tokens).
+_GDN_STATE_COMMIT_GUARD = (
+    os.environ.get("GDN_STATE_COMMIT", "0") == "1"
+    and os.environ.get("GDN_STATE_COMMIT_GUARD", "1") != "0"
+)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -65,6 +83,12 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
+    # True when every spec-decode request precedes every non-spec
+    # request in the batch, i.e. spec tokens are exactly [0, num_spec_decode_tokens)
+    # and non-spec tokens are [num_spec_decode_tokens, num_actual_tokens). Lets the
+    # GDN layer replace index_select/index_copy with contiguous slices.
+    spec_tokens_are_prefix: bool = False
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -72,6 +96,8 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    # host-side longest prefill chunk (for FlashInfer CP routing; 0 = unknown)
+    prefill_max_seqlen: int = 0
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -163,6 +189,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        if _GDN_STATE_COMMIT_GUARD:
+            # the deferred state commit's decode kernel holds at most MAX_T
+            # tokens per spec row: refuse to start on a wider row
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            gdn_state_commit.check_num_speculative_tokens(
+                self.num_spec, "GDNAttentionMetadataBuilder"
+            )
 
     def _build_chunk_metadata(
         self,
@@ -214,7 +248,75 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
+        if gdn_fused_metadata.ENABLED:
+            # VLLM_GDN_FUSED_MD=1: one Triton launch per KV-cache group for the
+            # spec-decode step shapes (see gdn_fused_metadata); None = regular
+            md = gdn_fused_metadata.build(
+                self,
+                lambda: self._build_full(
+                    common_prefix_len,
+                    common_attn_metadata,
+                    num_accepted_tokens,
+                    num_decode_draft_tokens_cpu,
+                    fast_build,
+                ),
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+            )
+            if md is not None:
+                if gdn_layer_graphs.ENABLED:
+                    gdn_layer_graphs.after_build(self, md)
+                return md
+        if gdn_step_plan.MDREUSE:
+            # GGM_MDREUSE=1: derive the metadata of the other GDN KV-cache groups
+            # of a step from the first group's full build (see gdn_step_plan)
+            md = gdn_step_plan.mdreuse_build(
+                self,
+                self._build_full,
+                common_prefix_len,
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                fast_build,
+            )
+        else:
+            md = self._build_full(
+                common_prefix_len,
+                common_attn_metadata,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                fast_build,
+            )
+        if gdn_layer_graphs.ENABLED:
+            # VLLM_GDN_LAYER_GRAPHS=1: pack the step into the graphs' static
+            # buffers (see gdn_layer_graphs)
+            gdn_layer_graphs.after_build(self, md)
+        return md
+
+    def _build_full(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        fast_build: bool = False,
+        defer: bool = True,
+    ) -> GDNAttentionMetadata:
         m = common_attn_metadata
+        # GGM_LAZY=1: metadata read only by the FLA / Triton-conv fallback paths is
+        # computed on demand (gdn_step_plan.fill_lazy) instead of here
+        lazy: list | None = [] if gdn_step_plan.LAZY and defer else None
+        # VLLM_GDN_STEP_PLAN_LAZY_IDX=1 (with GGM_LAZY): the spec / non-spec token
+        # permutation of mixed batches, read only by fallback paths, is deferred too
+        lazy_idx = lazy is not None and gdn_step_plan.LAZY_IDX
+        # the deferred state commit post-step below uses the caller's arguments
+        gsc_args = (
+            (num_accepted_tokens, num_decode_draft_tokens_cpu)
+            if _GDN_STATE_COMMIT_DEFERRED
+            else None
+        )
+        spec_tokens_are_prefix = False
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
@@ -314,12 +416,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
+                # CPU-only check (no GPU sync): spec requests first?
+                spec_tokens_are_prefix = bool(
+                    spec_sequence_masks_cpu[:num_spec_decodes].all().item()
                 )
-                index = torch.argsort(spec_token_masks, stable=True)
+                if lazy_idx:
+                    spec_token_masks = gdn_step_plan.LazyT(
+                        torch.repeat_interleave,
+                        (spec_sequence_masks, query_lens),
+                        {"output_size": query_start_loc_cpu[-1].item()},
+                    )
+                    index = gdn_step_plan.LazyT(
+                        torch.argsort, (spec_token_masks,), {"stable": True}
+                    )
+                else:
+                    spec_token_masks = torch.repeat_interleave(
+                        spec_sequence_masks,
+                        query_lens,
+                        output_size=query_start_loc_cpu[-1].item(),
+                    )
+                    index = torch.argsort(spec_token_masks, stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
@@ -369,6 +485,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_query_start_loc: torch.Tensor | None = None
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
+        prefill_max_seqlen = 0
         if num_prefills > 0:
             # In a mixed non-spec batch, decodes are peeled off to the recurrent
             # kernel (decode-first front slice), so build chunk metadata from the
@@ -390,11 +507,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
                 prefill_state_indices = non_spec_state_indices_tensor
 
-            chunk_indices, chunk_offsets = self._build_chunk_metadata(
-                prefill_query_start_loc,
-                prefill_query_start_loc_cpu,
-                query_start_loc.device,
+            prefill_max_seqlen = int(
+                (prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]).max()
             )
+            if lazy is not None:
+                lazy.append(
+                    (
+                        self._build_chunk_metadata,
+                        "chunk",
+                        (
+                            prefill_query_start_loc,
+                            prefill_query_start_loc_cpu,
+                            query_start_loc.device,
+                        ),
+                        {},
+                    )
+                )
+                chunk_indices, chunk_offsets = None, None
+            else:
+                chunk_indices, chunk_offsets = self._build_chunk_metadata(
+                    prefill_query_start_loc,
+                    prefill_query_start_loc_cpu,
+                    query_start_loc.device,
+                )
 
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()
@@ -402,12 +537,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
-                    device=query_start_loc.device,
+            if lazy is not None:
+                lazy.append(
+                    (
+                        compute_causal_conv1d_metadata,
+                        "ccm",
+                        (non_spec_query_start_loc_cpu,),
+                        {"device": query_start_loc.device},
+                    )
                 )
-            )
+                nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+            else:
+                nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                    compute_causal_conv1d_metadata(
+                        non_spec_query_start_loc_cpu,
+                        device=query_start_loc.device,
+                    )
+                )
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
@@ -507,6 +653,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            prefill_max_seqlen=prefill_max_seqlen,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
@@ -515,10 +662,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
+            spec_tokens_are_prefix=spec_tokens_are_prefix,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
+        if gsc_args is not None:
+            # single state slot per request: broadcast spec_state_indices to width
+            # 1 + num_spec and record the accepted counts of non-spec readers
+            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
+
+            gdn_state_commit.postprocess_metadata(self, attn_metadata, *gsc_args)
+        if lazy_idx:
+            gdn_step_plan.check_lazy_indices(
+                attn_metadata,
+                lambda: self._build_full(
+                    common_prefix_len,
+                    common_attn_metadata,
+                    num_accepted_tokens,
+                    num_decode_draft_tokens_cpu,
+                    fast_build,
+                    defer=False,
+                ),
+            )
+        if lazy:
+            gdn_step_plan.defer_metadata(attn_metadata, lazy)
         return attn_metadata
 
     def build_for_cudagraph_capture(
@@ -544,4 +712,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
+        if gdn_fused_metadata.ENABLED:
+            # capture metadata always comes from the regular build
+            with gdn_fused_metadata.capture_guard():
+                return self.build(
+                    0, m, num_accepted_tokens, num_decode_draft_tokens_cpu
+                )
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)

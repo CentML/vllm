@@ -850,6 +850,21 @@ _MIN_PER_GRAPH_BYTES = 1 << 20
 def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     """Estimate the GPU memory needed for CUDA graph capture.
 
+    See _profile_cudagraph_memory.
+    """
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
+    if gdn_layer_graphs.ENABLED:
+        # GDN layer graphs recorded during profiling are dropped afterwards
+        return gdn_layer_graphs.profile_cudagraph_memory(
+            lambda: _profile_cudagraph_memory(runner)
+        )
+    return _profile_cudagraph_memory(runner)
+
+
+def _profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
+    """Estimate the GPU memory needed for CUDA graph capture.
+
     Called during memory profiling, *before* the real KV cache is allocated,
     so that ``Worker.determine_available_memory`` can reserve headroom for
     graph capture. Bootstraps a minimal KV cache, runs ``capture_model()``
