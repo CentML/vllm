@@ -71,8 +71,9 @@ from vllm.v1.engine import (
     ReconfigureRankType,
     UtilityOutput,
     UtilityResult,
+    frontend_block_hashing,
+    gc_admit,
 )
-from vllm.v1.engine import frontend_block_hashing
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -256,6 +257,8 @@ class EngineCore:
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
+        # Optional GC observability / freeze-on-admit (VLLM_GC_*; default off).
+        gc_admit.init("engine")
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
@@ -1553,6 +1556,7 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            gc_admit.on_idle()
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1885,6 +1889,7 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                        gc_admit.on_admit()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request
