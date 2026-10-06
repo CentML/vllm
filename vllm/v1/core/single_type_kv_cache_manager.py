@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, ClassVar
 
@@ -46,6 +47,51 @@ if TYPE_CHECKING:
     from vllm.v1.hisparse.coordinator import HiSparseCoordinator
 
 logger = init_logger(__name__)
+
+# Opt-in "prev + curr" Mamba checkpoint retention (align mode only).
+#
+# A request that resumes from a cached Mamba state checkpoint ("prev") and then
+# registers a strictly deeper checkpoint on the same token path ("curr") makes
+# "prev" redundant for any request that extends it: every such request can
+# resume from "curr" instead (a strict improvement). Only a request that
+# branches off between "prev" and "curr" could still use "prev". With this flag
+# on, "prev" is dropped from the prefix cache as soon as "curr" exists and no
+# other request references "prev"; its block goes back to the front of the free
+# queue like any uncached free block. Shared-prefix junction checkpoints and
+# checkpoints held by more than one request are never dropped. Outputs are
+# unaffected: this only changes which evictable cache entries survive.
+_MAMBA_DROP_SUPERSEDED_STATE_ENV = "VLLM_MAMBA_DROP_SUPERSEDED_STATE"
+# Bound on remembered junction checkpoint hashes per Mamba group.
+_MAX_JUNCTION_HASHES = 65536
+
+
+def _mamba_drop_superseded_state_enabled() -> bool:
+    return os.getenv(_MAMBA_DROP_SUPERSEDED_STATE_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Opt-in: a running request keeps a reference on its own deepest prompt
+# checkpoint (the state it will resume from on its next turn) until it is
+# freed, instead of releasing it into the LRU free queue right after the
+# prefill step that wrote it. Without this, a long decode (thousands of output
+# tokens) ages the checkpoint out of the LRU while the conversation is still
+# active, and the next turn recomputes its whole context. On free, the pinned
+# checkpoint is released last, i.e. at the MRU end of the free queue.
+_MAMBA_PIN_OWN_CKPT_ENV = "VLLM_MAMBA_PIN_OWN_CKPT"
+# Opt-in (requires the pin): when a request registers a deeper checkpoint on
+# its own prompt (e.g. the prefix-match-unit partial tail after the
+# block-aligned replay boundary), drop the hash of its shallower own
+# checkpoint unless another request references it or it is a shared-prefix
+# junction. Any request extending this prompt resumes from the deeper one.
+_MAMBA_DROP_OWN_SUPERSEDED_ENV = "VLLM_MAMBA_DROP_OWN_SUPERSEDED"
+
+
+def _env_on(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1481,6 +1527,236 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+        # Opt-in superseded-checkpoint dropping (see the comment on
+        # _MAMBA_DROP_SUPERSEDED_STATE_ENV at the top of this module).
+        self.drop_superseded_state = (
+            self.mamba_cache_mode == "align"
+            and self.enable_caching
+            and _mamba_drop_superseded_state_enabled()
+        )
+        if self.drop_superseded_state:
+            logger.info_once(
+                "%s=1: dropping superseded Mamba prefix-cache checkpoints "
+                "(prev+curr retention).",
+                _MAMBA_DROP_SUPERSEDED_STATE_ENV,
+            )
+            # request_id -> (hit block, its hash, hit length in tokens).
+            self._consumed_state: dict[
+                str, tuple[KVCacheBlock, BlockHashWithGroupId, int]
+            ] = {}
+            # block_id -> hash: superseded blocks still held by their consumer;
+            # dropped from the prefix cache when that consumer releases them.
+            self._drop_on_release: dict[int, BlockHashWithGroupId] = {}
+            # Hashes of shared-prefix junction checkpoints (never dropped).
+            self._junction_hashes: OrderedDict[BlockHashWithGroupId, None] = (
+                OrderedDict()
+            )
+            self.num_superseded_states_dropped = 0
+        align_caching = self.mamba_cache_mode == "align" and self.enable_caching
+        self.pin_own_ckpt = align_caching and _env_on(_MAMBA_PIN_OWN_CKPT_ENV)
+        self.drop_own_superseded = self.pin_own_ckpt and _env_on(
+            _MAMBA_DROP_OWN_SUPERSEDED_ENV
+        )
+        # request_id -> the request's pinned own checkpoint block (holds +1 ref).
+        self._own_pin: dict[str, KVCacheBlock] = {}
+        self.num_own_checkpoints_pinned = 0
+        self.num_own_checkpoints_dropped = 0
+        if self.pin_own_ckpt:
+            logger.info_once(
+                "%s=1: running requests pin their own latest Mamba checkpoint "
+                "until freed (%s=%d).",
+                _MAMBA_PIN_OWN_CKPT_ENV,
+                _MAMBA_DROP_OWN_SUPERSEDED_ENV,
+                int(self.drop_own_superseded),
+            )
+
+    # ------------------------------------------------------------------
+    # Own-checkpoint pinning helpers (no-ops unless enabled).
+    # ------------------------------------------------------------------
+    def _is_junction_block(self, request: Request, block: KVCacheBlock) -> bool:
+        junction = request.shared_prefix_boundary
+        return bool(junction) and block.block_hash_num_tokens == junction
+
+    def _pin_own_checkpoint(self, request: Request, block: KVCacheBlock) -> None:
+        """``block`` was just registered as a checkpoint of ``request``'s prompt."""
+        if block.is_null or block.block_hash is None:
+            return
+        if self._is_junction_block(request, block):
+            return
+        request_id = request.request_id
+        prev = self._own_pin.get(request_id)
+        if prev is block:
+            return
+        new_tokens = block.block_hash_num_tokens or 0
+        if prev is not None and (prev.block_hash_num_tokens or 0) >= new_tokens:
+            return
+        block.ref_cnt += 1
+        self._own_pin[request_id] = block
+        self.num_own_checkpoints_pinned += 1
+        if prev is not None:
+            self._release_own_pin(request_id, prev, superseded=True)
+
+    def _release_own_pin(
+        self, request_id: str, block: KVCacheBlock, superseded: bool
+    ) -> None:
+        if (
+            superseded
+            and self.drop_own_superseded
+            and block.block_hash is not None
+            and (
+                not self.drop_superseded_state
+                or block.block_hash not in self._junction_hashes
+            )
+        ):
+            in_table = sum(
+                1 for b in self.req_to_blocks.get(request_id, ()) if b is block
+            )
+            if block.ref_cnt - 1 - in_table == 0:
+                # Nobody else references it: forget the hash so the block goes
+                # back to the pool as an ordinary (reuse-first) free block.
+                if self.block_pool._maybe_evict_cached_block(block):
+                    self.num_own_checkpoints_dropped += 1
+        self.block_pool.free_blocks([block])
+
+    # ------------------------------------------------------------------
+    # Superseded-checkpoint dropping helpers (no-ops unless enabled).
+    # ------------------------------------------------------------------
+    def _drop_cached_state(self, block: KVCacheBlock) -> None:
+        """Remove ``block`` from the prefix cache. If it is already free, move it
+        to the front of the free queue (it is now an ordinary free block).
+        """
+        if not self.block_pool._maybe_evict_cached_block(block):
+            return
+        if block.ref_cnt == 0 and not block.is_null:
+            queue = self.block_pool.free_block_queue
+            queue.remove(block)
+            queue.prepend_n([block])
+        self.num_superseded_states_dropped += 1
+        if self.num_superseded_states_dropped % 1000 == 0:
+            logger.debug(
+                "Mamba group %d dropped %d superseded state checkpoints",
+                self.kv_cache_group_id,
+                self.num_superseded_states_dropped,
+            )
+
+    def _before_release(self, block: KVCacheBlock) -> None:
+        """Called right before this manager drops its reference to ``block``."""
+        expected_hash = self._drop_on_release.pop(block.block_id, None)
+        if (
+            expected_hash is not None
+            and block.block_hash == expected_hash
+            and block.ref_cnt == 1
+            and expected_hash not in self._junction_hashes
+        ):
+            # Sole owner is the consumer that superseded it: drop the hash so
+            # free_blocks() treats it as an uncached (reuse-first) block.
+            self._drop_cached_state(block)
+
+    def _mark_superseded(self, request_id: str) -> None:
+        entry = self._consumed_state.pop(request_id, None)
+        if entry is None:
+            return
+        block, block_hash, _ = entry
+        if (
+            block.is_null
+            or block.block_hash != block_hash
+            or block_hash in self._junction_hashes
+        ):
+            # Already evicted/reused, or a shared-prefix junction.
+            return
+        if block.ref_cnt == 0:
+            # Consumer already released it; it sits in the free queue as LRU.
+            self._drop_cached_state(block)
+        elif block.ref_cnt == 1 and any(
+            b is block for b in self.req_to_blocks.get(request_id, ())
+        ):
+            # Still held only by the consumer; drop when it releases it.
+            self._drop_on_release[block.block_id] = block_hash
+        # ref_cnt > 1: another running request also resumed from it (shared
+        # prefix); keep it.
+
+    def _record_junction_hashes(self, request: Request, start: int, end: int) -> None:
+        junction = request.shared_prefix_boundary
+        if not junction:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        for idx in range(start, min(end, len(blocks))):
+            block = blocks[idx]
+            if block.is_null or block.block_hash is None:
+                continue
+            if (idx + 1) * self.block_size == junction // self.block_size * (
+                self.block_size
+            ) or block.block_hash_num_tokens == junction:
+                self._junction_hashes[block.block_hash] = None
+                self._junction_hashes.move_to_end(block.block_hash)
+                while len(self._junction_hashes) > _MAX_JUNCTION_HASHES:
+                    self._junction_hashes.popitem(last=False)
+
+    def _after_cache_blocks(
+        self,
+        request: Request,
+        num_cached_blocks_before: int,
+        num_cached_blocks_after: int,
+        partial_hash: BlockHashWithGroupId | None,
+    ) -> None:
+        """Track junction checkpoints; once this request registered a checkpoint
+        deeper than the one it resumed from, mark the latter superseded.
+        """
+        request_id = request.request_id
+        if num_cached_blocks_after > num_cached_blocks_before:
+            self._record_junction_hashes(
+                request, num_cached_blocks_before, num_cached_blocks_after
+            )
+        consumed = self._consumed_state.get(request_id)
+        if consumed is None:
+            return
+        hit_tokens = consumed[2]
+        deeper = False
+        if partial_hash is not None:
+            # A partial-tail checkpoint is only registered past the hit.
+            deeper = True
+        else:
+            blocks = self.req_to_blocks[request_id]
+            for idx in range(
+                num_cached_blocks_after - 1, num_cached_blocks_before - 1, -1
+            ):
+                if idx >= len(blocks):
+                    continue
+                block = blocks[idx]
+                if (
+                    not block.is_null
+                    and block.block_hash is not None
+                    and (idx + 1) * self.block_size > hit_tokens
+                ):
+                    deeper = True
+                    break
+        if deeper:
+            self._mark_superseded(request_id)
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if not self.drop_superseded_state or num_local_computed_tokens <= 0:
+            return
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks and not req_blocks[-1].is_null:
+            hit_block = req_blocks[-1]
+            if hit_block.block_hash is not None:
+                self._consumed_state[request_id] = (
+                    hit_block,
+                    hit_block.block_hash,
+                    num_local_computed_tokens,
+                )
 
     @classmethod
     def find_longest_cache_hit(
@@ -1636,6 +1912,8 @@ class MambaManager(SingleTypeKVCacheManager):
         for i in range(last_block - 1, first_block - 1, -1):
             if blocks[i].is_null:
                 continue
+            if self.drop_superseded_state:
+                self._before_release(blocks[i])
             freed.append(blocks[i])
             blocks[i] = self._null_block
         if freed:
@@ -1669,6 +1947,8 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
+                    if self.drop_superseded_state:
+                        self._before_release(blocks[last_state_block_idx])
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
@@ -1899,6 +2179,11 @@ class MambaManager(SingleTypeKVCacheManager):
                         self.block_pool.move_block_hashes(source_block, cow_block)
                         self._pending_cow_copies.append((source_block, cow_block))
                         source_block.ref_cnt += 1
+                        if self._own_pin.get(request_id) is source_block:
+                            # The checkpoint now lives in cow_block: move the pin.
+                            cow_block.ref_cnt += 1
+                            self._own_pin[request_id] = cow_block
+                            self.block_pool.free_blocks([source_block])
                         producer_tail = self._producer_partial_tail_reqs.pop(
                             request_id, None
                         )
@@ -1973,7 +2258,19 @@ class MambaManager(SingleTypeKVCacheManager):
                 for entry in self._pending_boundary_state_offloads
                 if entry[0] != request_id
             ]
-        return super().pop_blocks_for_free(request_id)
+            if self.drop_superseded_state:
+                self._consumed_state.pop(request_id, None)
+                if self._drop_on_release:
+                    for block in self.req_to_blocks.get(request_id, ()):
+                        if not block.is_null:
+                            self._before_release(block)
+        pinned = self._own_pin.pop(request_id, None)
+        blocks = super().pop_blocks_for_free(request_id)
+        if pinned is not None:
+            # Callers free in reverse order: the pinned checkpoint goes last
+            # (MRU end of the free queue).
+            return [pinned] + list(blocks)
+        return blocks
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only
@@ -1998,12 +2295,26 @@ class MambaManager(SingleTypeKVCacheManager):
             replay_boundaries=replay_boundaries,
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+        partial_hash = None
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(
                 request, num_tokens, retention_interval=retention_interval
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+        if self.drop_superseded_state:
+            self._after_cache_blocks(
+                request, num_cached_blocks_before, num_cached_blocks_after, partial_hash
+            )
+        if self.pin_own_ckpt:
+            blocks = self.req_to_blocks[request.request_id]
+            for idx in range(num_cached_blocks_before, num_cached_blocks_after):
+                if idx < len(blocks):
+                    self._pin_own_checkpoint(request, blocks[idx])
+            if partial_hash is not None:
+                tail = self._partial_hit_reqs.get(request.request_id)
+                if tail is not None:
+                    self._pin_own_checkpoint(request, tail[1])
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
