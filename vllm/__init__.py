@@ -13,6 +13,13 @@ import typing
 # other modules are imported.
 import vllm.env_override  # noqa: F401
 
+# Opt-in (LCD_FI_OVERLAY=1): FlashInfer CuTe dense-GEMM PDL weight-prefetch
+# overlays, installed before anything can import FlashInfer (vllm/lcd_pdl).
+import os as _lcd_os
+
+if _lcd_os.environ.get("LCD_FI_OVERLAY", "0") == "1":
+    import vllm.lcd_pdl  # noqa: F401
+
 MODULE_ATTRS = {
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
     "EngineArgs": ".engine.arg_utils:EngineArgs",

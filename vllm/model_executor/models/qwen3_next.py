@@ -18,12 +18,14 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import fused_qkv_prologue
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
     resolve_layer_fused_shared_expert,
 )
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+from vllm.model_executor.layers.fusion import norm_quant
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -241,6 +243,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
+        if (
+            norm_quant.NQF
+            and getattr(self.experts, "_nqf_defer", False)
+            and not self.is_sequence_parallel
+            and not (self.replicate_shared_expert and self.shared_expert is not None)
+        ):
+            # NQF=1: the runner may return the deferred (shared, routed) pair
+            # for the next fused residual-add + norm (see norm_quant).
+            orig_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            out = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+            if isinstance(out, tuple):
+                pair = (out[0].view(orig_shape), out[1].view(orig_shape))
+                return pair  # type: ignore[return-value]
+            return out.view(orig_shape)
+
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
@@ -270,6 +288,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
 
 class Qwen3NextAttention(nn.Module):
+    # Set per layer by norm_quant.configure_decoder_layer (NQF=1) when the
+    # sigmoid gate-mul can produce o_proj's MXFP8 input.
+    _nqf_gate: bool = False
+    # Set per layer by fused_qkv_prologue.configure_attention (EWS=1) when the
+    # fused QKV prologue (FP8 query + KV-cache write) replaces the stock path.
+    _ews_qkv_on: bool = False
+
     def __init__(
         self,
         config: Qwen3NextConfig,
@@ -382,6 +407,8 @@ class Qwen3NextAttention(nn.Module):
             and supports_dtype
             and (text_only or supports_mrope)
         )
+        if fused_qkv_prologue.ENABLED:
+            fused_qkv_prologue.configure_attention(self)
 
     def _project_qkv_gate(
         self,
@@ -394,6 +421,9 @@ class Qwen3NextAttention(nn.Module):
         split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
         gating is disabled.
         """
+        if self._ews_qkv_on:
+            # q is returned in FP8 and K/V are already in the KV cache.
+            return fused_qkv_prologue.project_qkv_gate(self, qkv, positions)
         if self.use_fused_qk_norm_rope_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -453,8 +483,24 @@ class Qwen3NextAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
-        if gate is not None:
-            attn_output = attn_output * torch.sigmoid(gate)
+        if gate is not None and gate.shape[-1] == 2 * attn_output.shape[-1]:
+            # gb300 glue (GLUE_EWS_NOGATE): gate = the [q | gate]-interleaved QKV columns
+            if norm_quant.NQF and norm_quant.gate_mul_qkv_fusable(self, attn_output, gate):
+                attn_output = torch.ops.nqf.gate_mul_mxfp8_qkv(
+                    attn_output, gate, self.head_dim
+                )
+            else:
+                g = gate.reshape(-1, self.num_heads, 2 * self.head_dim)
+                g = g[:, :, self.head_dim :].reshape(attn_output.shape)
+                attn_output = attn_output * torch.sigmoid(g)
+        elif gate is not None:
+            if norm_quant.NQF and norm_quant.gate_mul_fusable(self, attn_output, gate):
+                # sigmoid gate-mul fused with the o_proj MXFP8 input quant
+                attn_output = torch.ops.nqf.gate_mul_mxfp8(
+                    attn_output, gate.reshape(attn_output.shape)
+                )
+            else:
+                attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
         return output
 

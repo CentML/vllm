@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
+from vllm.model_executor.layers.fused_moe.flashinfer_exact_routing import (
+    maybe_install as maybe_install_exact_moe_routing,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
@@ -218,6 +221,11 @@ def FusedMoEFactory(
         MoERunner: Configured MoE execution pipeline ready for forward passes
 
     """
+    # Opt-in (GS2_ROUTE): build FlashInfer's trtllm fused-MoE module with the
+    # exact single-CTA routing permutation. Must precede the first trtllm MoE
+    # call, so it runs when MoE layers are constructed.
+    maybe_install_exact_moe_routing()
+
     vllm_config = get_current_vllm_config()
 
     layer_name = prefix
