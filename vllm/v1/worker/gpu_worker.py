@@ -58,6 +58,9 @@ from vllm.distributed.weight_transfer import (
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
+from vllm.model_executor.warmup.triton_compile_recorder import (
+    maybe_install_triton_compile_recorder,
+)
 from vllm.multimodal.gpu_ipc_memory import reserve_mm_ipc_gpu_memory
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import (
@@ -195,6 +198,10 @@ class Worker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        # Optional Triton compile recorder (VLLM_JIT_WARMUP_RECORD_DIR); must
+        # be installed before the first Triton compile in this process.
+        maybe_install_triton_compile_recorder()
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
