@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch.nn as nn
 
 from vllm import envs
@@ -12,6 +14,12 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
+
+# VLLM_MTP_DRAFT_PREFILL_ROWS=1: after its attention (which writes the draft KV
+# of every row), the MTP layer of the draft prefill runs only on each request's
+# last accepted row, the one the speculator samples (o_proj, MoE and norms at
+# M = requests instead of M = verified tokens). Off by default.
+MTP_DRAFT_PREFILL_ROWS = os.environ.get("VLLM_MTP_DRAFT_PREFILL_ROWS", "0") == "1"
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
@@ -40,6 +48,18 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         )
         if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
             _enable_draft_prefill_prune(draft_model)
+        if MTP_DRAFT_PREFILL_ROWS:
+            if getattr(draft_model, "supports_draft_out_rows", False) and (
+                self.dp_size == 1
+            ):
+                self.enable_draft_out_rows()
+                logger.info("MTP draft prefill row pruning on")
+            else:
+                logger.warning(
+                    "MTP draft prefill row pruning off: needs a draft model "
+                    "with out_rows support (%s) and no data parallelism",
+                    type(draft_model).__name__,
+                )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
