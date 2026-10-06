@@ -221,6 +221,15 @@ class Sampler:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
 
+        # One-pass bf16->fp32 copy + penalties + chunk max feeding the
+        # split-row top-k/top-p, when no other logits processor is active.
+        if not skip_top_k_top_p:
+            fast = self.sampling_states.fused_sampling_fast_path(
+                logits, self, expanded_idx_mapping, idx_mapping_np, input_ids,
+                expanded_local_pos)
+            if fast is not None:
+                return fast
+
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
