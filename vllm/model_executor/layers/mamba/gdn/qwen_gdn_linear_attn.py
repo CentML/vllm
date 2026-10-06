@@ -178,6 +178,35 @@ _gdn_vsplit_tried: list = []
 GDN_FI_VSPLIT_NON_CP_MAX_TOKENS = int(
     os.environ.get("VLLM_GDN_FI_VSPLIT_NON_CP_MAX_TOKENS", "8192")
 )
+# Mixed batches (spec-decode rows + prefill rows): the spec rows' MTP recurrence
+# and the prefill rows' conv + chunked prefill touch disjoint state slots and
+# output rows, so with VLLM_GDN_MIXED_FORK=1 the two halves run on two streams
+# (same kernels and inputs: bitwise). Steps with at least
+# VLLM_GDN_MIXED_FORK_PREFILL_FIRST prefill tokens run the prefill half on a
+# high-priority side stream (its one-CTA-per-SM chunk kernel is dispatched first
+# and the MTP kernel fills the SMs it leaves); smaller ones run the spec half on
+# a side stream. VR microbench (r4 mixed track), per GDN layer, 64 spec
+# requests: -3 us at <= 1000 prefill tokens, -15 us at 2000, -29 us at 3000+.
+GDN_MIXED_FORK = os.environ.get("VLLM_GDN_MIXED_FORK", "0") == "1"
+GDN_MIXED_FORK_PREFILL_FIRST = int(
+    os.environ.get("VLLM_GDN_MIXED_FORK_PREFILL_FIRST", "1500")
+)
+_gdn_mixed_fork_state: list = []  # [(spec_stream, prefill_stream, fork, join)]
+
+
+def _gdn_mixed_fork_streams() -> tuple:
+    """Per-process side streams and events of the mixed-batch fork."""
+    if not _gdn_mixed_fork_state:
+        _, high = torch.cuda.Stream.priority_range()
+        _gdn_mixed_fork_state.append(
+            (
+                torch.cuda.Stream(),
+                torch.cuda.Stream(priority=high),
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+            )
+        )
+    return _gdn_mixed_fork_state[0]
 
 
 def _gdn_fi_non_cp_max_tokens() -> int:
@@ -3069,21 +3098,48 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec_rows = slice(
                 spec_start, spec_start + attn_metadata.num_spec_decode_tokens
             )
-            spec_normalized = self._forward_core_decode_spec_fused_norm(
-                mixed_qkv=mixed_qkv[spec_rows],
-                b=b[spec_rows],
-                a=a[spec_rows],
-                output_gate=output_gate[spec_rows],
-                core_attn_out=core_attn_out[spec_rows],
-                attn_metadata=attn_metadata,
-            )
-            self._forward_core(
-                mixed_qkv=mixed_qkv,
-                b=b,
-                a=a,
-                core_attn_out=core_attn_out,
-                spec_done=True,
-            )
+
+            def spec_half() -> bool:
+                return self._forward_core_decode_spec_fused_norm(
+                    mixed_qkv=mixed_qkv[spec_rows],
+                    b=b[spec_rows],
+                    a=a[spec_rows],
+                    output_gate=output_gate[spec_rows],
+                    core_attn_out=core_attn_out[spec_rows],
+                    attn_metadata=attn_metadata,
+                )
+
+            def prefill_half() -> None:
+                self._forward_core(
+                    mixed_qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    core_attn_out=core_attn_out,
+                    spec_done=True,
+                )
+
+            if GDN_MIXED_FORK and not torch.cuda.is_current_stream_capturing():
+                # Both halves only read mixed_qkv/b/a/output_gate, and write
+                # disjoint rows of core_attn_out and disjoint conv/SSM slots.
+                spec_stream, prefill_stream, fork, join = _gdn_mixed_fork_streams()
+                main = torch.cuda.current_stream()
+                fork.record(main)
+                if attn_metadata.num_prefill_tokens >= GDN_MIXED_FORK_PREFILL_FIRST:
+                    with torch.cuda.stream(prefill_stream):
+                        fork.wait(prefill_stream)
+                        prefill_half()
+                        join.record(prefill_stream)
+                    spec_normalized = spec_half()
+                else:
+                    with torch.cuda.stream(spec_stream):
+                        fork.wait(spec_stream)
+                        spec_normalized = spec_half()
+                        join.record(spec_stream)
+                    prefill_half()
+                join.wait(main)
+            else:
+                spec_normalized = spec_half()
+                prefill_half()
             if spec_normalized:
                 non_spec_start = attn_metadata.non_spec_token_start
                 norm_rows = (
