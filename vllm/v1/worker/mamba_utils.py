@@ -656,6 +656,10 @@ def precopy_mamba_align_fused_kernel(
 _COMPACT_SLOTS = 4
 # Work entry: (block-table row, src column, dst column, token bias).
 _COMPACT_ENTRY = 4
+# Requests per plan iteration. A constant, so the plan kernel compiles once (in
+# the warmup dummy runs) instead of once per power-of-two batch size during
+# serving (jit_monitor caught that on the first perf run).
+_COMPACT_PLAN_BLOCK = 256
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -1340,7 +1344,7 @@ class MambaSpecDecodeGPUContext:
             IS_PRECOPY=is_precopy,
             HAS_IDX_MAPPING=idx_mapping is not None,
             PRECOMPUTED_NEW_COMPUTED=precomputed_new_computed,
-            BLOCK=min(triton.next_power_of_2(max(num_reqs, 16)), 1024),
+            BLOCK=_COMPACT_PLAN_BLOCK,
             num_warps=4,
         )
         _compact_mamba_copy_kernel[(self.num_states, _TEMPORAL_TILES, _COMPACT_SLOTS)](
