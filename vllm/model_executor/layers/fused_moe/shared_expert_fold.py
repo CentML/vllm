@@ -57,6 +57,7 @@ from vllm.model_executor.layers.fused_moe.shared_expert_kernels import (
     seg_route_fold,
 )
 from vllm.model_executor.layers.fusion import norm_quant
+from vllm.model_executor.layers import lcd2_bf16 as _lcd2
 
 logger = init_logger(__name__)
 
@@ -107,7 +108,12 @@ def _fold_moe_impl(x: torch.Tensor, layer_name, no_finalize: bool) -> torch.Tens
     if M == 0:
         return torch.empty_like(x)
     STATS["calls"] += 1
-    logits = F.linear(x, st["w264"])
+    if _lcd2.RTR:
+        # LCD2_BF16=tiny: TinyGEMM2 router GEMM for decode-size M ([M, 272]
+        # logits, read through their row stride); F.linear above LCD2_MAXM
+        logits = _lcd2.router_logits(x, st)
+    else:
+        logits = F.linear(x, st["w264"])
     ids, wts = seg_route_fold(logits, E_ROUTED, TOPK)
     from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 
@@ -304,6 +310,8 @@ def fold_block(block, name: str, zeros: torch.Tensor) -> None:
         ],
         0,
     ).contiguous()
+    if _lcd2.RTR:
+        _lcd2.prep_router(st)
     st["I"] = r.moe_config.intermediate_size_per_partition
     st["qc"] = re.quant_method.moe_quant_config
     st["tune_max"] = fi_moe_largest_bucket(r.moe_config)
