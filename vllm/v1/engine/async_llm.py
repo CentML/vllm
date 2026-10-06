@@ -527,6 +527,7 @@ class AsyncLLM(EngineClient):
 
         # Register locally before the first await so concurrent tasks see this request.
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        gc_admit.on_admit_frontend()
 
         # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)

@@ -22,7 +22,11 @@ nothing (check the ``collected`` counts of the stats line).
 Env (read once at import):
     VLLM_GC_FREEZE_ADMIT=1             EngineCore: gc.freeze() after each ADD
                                        request is preprocessed (input thread)
-    VLLM_GC_FREEZE_ADMIT_GUARD_S=S     leak guard period, idle only (default 30)
+    VLLM_GC_FREEZE_ADMIT_FRONTEND=1    AsyncLLM process: gc.freeze() after each
+                                       request is registered (leak guard runs
+                                       inline, rate-limited)
+    VLLM_GC_FREEZE_ADMIT_GUARD_S=S     leak guard period (default 30; EngineCore
+                                       runs it only while idle)
     VLLM_GC_FREEZE_ADMIT_GUARD_RSS_MB  RSS growth since the last guard that
                                        triggers unfreeze + collect + refreeze
                                        (default 4096)
@@ -57,6 +61,7 @@ COUNT_S = float(os.environ.get("VLLM_GC_FREEZE_ADMIT_COUNT_S", "300"))
 GUARD = int(os.environ.get("VLLM_GC_FREEZE_ADMIT_GUARD", "4000000"))
 STATS_S = float(os.environ.get("VLLM_GC_STATS_S", "0") or 0)
 NVTX = os.environ.get("VLLM_GC_NVTX", "0") == "1"
+FRONTEND_MODE = int(os.environ.get("VLLM_GC_FREEZE_ADMIT_FRONTEND", "0") or 0)
 
 
 def _rss() -> int | None:
@@ -162,14 +167,16 @@ def init(role: str = "engine") -> None:
         TM.win0 = time.perf_counter()
         gc.callbacks.append(_stats_cb)
         logger.info("[gcf] %s: gc timing line every %.0f s", role, STATS_S)
-    if MODE <= 0 or role != "engine":
+    armed = MODE > 0 if role == "engine" else FRONTEND_MODE > 0
+    if not armed:
         return
     S.base = gc.get_freeze_count()
     S.base_rss = _rss()
     S.last_guard = S.last_count = time.monotonic()
     logger.info(
-        "[gcf] GC freeze-on-admit on: frozen=%d rss=%.0f MB thresholds=%s "
-        "guard: rss +%d MB / frozen +%d (idle only, every >=%.0f / %.0f s)",
+        "[gcf] %s GC freeze-on-admit on: frozen=%d rss=%.0f MB thresholds=%s "
+        "guard: rss +%d MB / frozen +%d (every >=%.0f / %.0f s)",
+        role,
         S.base,
         (S.base_rss or 0) / 2**20,
         gc.get_threshold(),
@@ -190,9 +197,27 @@ def on_admit() -> None:
     S.admits += 1
 
 
+def on_admit_frontend() -> None:
+    """Front end (AsyncLLM process) after a request is registered: same freeze,
+    with the leak guard checked inline (rate-limited; the front end is never
+    idle under load).
+    """
+    if FRONTEND_MODE <= 0:
+        return
+    gc.freeze()
+    S.admits += 1
+    _guard()
+
+
 def on_idle() -> None:
     """Engine idle (no work): rate-limited leak guard and stats line."""
-    if MODE <= 0 or S.base is None:
+    if MODE <= 0:
+        return
+    _guard()
+
+
+def _guard() -> None:
+    if S.base is None:
         return
     now = time.monotonic()
     if now - S.last_guard < GUARD_S:
