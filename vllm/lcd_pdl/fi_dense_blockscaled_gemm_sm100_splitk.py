@@ -51,7 +51,7 @@ _PFWS_TRIG = _os.environ.get("PFWS_TRIG", "0") == "1"
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
-from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
 
 from cutlass.cutlass_dsl import (
     T,
