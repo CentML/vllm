@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
 
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
