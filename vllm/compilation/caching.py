@@ -585,6 +585,40 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
 
+    # 3. opt-in model rewrites that change the traced graph without changing
+    #    any config field (the key does not include the traced sources).
+    if os.environ.get("SEG_FOLD", "0") == "1":
+        # MoE runners whose shared expert was folded into the routed experts
+        # call torch.ops.seg.fold_moe (see fused_moe/shared_expert_fold.py).
+        factors.append("seg-fold-v1")
+    if os.environ.get("EWS", "0") == "1":
+        # Fused QKV prologue (model_executor/layers/attention/
+        # fused_qkv_prologue.py) and GDN output allocation (mamba/gdn/
+        # gdn_out_alloc.py) change the traced graph.
+        qkv = int(os.environ.get("VLLM_FUSED_QKV_PROLOGUE", "1") == "1")
+        tpp = os.environ.get("EWS_QKV_TPP", "1")
+        zeros = int(os.environ.get("VLLM_GDN_OUT_ZERO_PAD_ROWS_ONLY", "1") == "1")
+        factors.append(f"ews-v1-qkv{qkv}-tpp{tpp}-z{zeros}")
+        if os.environ.get("GLUE_EWS_NOGATE", "0") == "1":
+            # gb300 glue: Qwen3NextAttention.forward reads the gate from the
+            # [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv or a
+            # slice + sigmoid) and ews_qkv_prologue's output loses the gate.
+            factors.append("ews-nogate-v1")
+    if os.environ.get("NQF", "0") != "0":
+        # Fused residual-add + norm + MXFP8 quant (see
+        # model_executor/layers/fusion/norm_quant.py).
+        from vllm.model_executor.layers.fusion import norm_quant
+
+        factors.extend(norm_quant.compile_hash_factors())
+    if (
+        os.environ.get("LCD2_BF16", "0") == "tiny"
+        and os.environ.get("LCD2_BA", "1") == "1"
+    ):
+        # TinyGEMM2 in_proj_ba (model_executor/layers/lcd2_bf16.py): the GDN
+        # forward calls torch.ops.vllm.lcd2_bf16_linear with the _lcd2_ba_b
+        # buffer instead of self.in_proj_ba.
+        factors.append("lcd2-ba-v1")
+
     return factors
 
 

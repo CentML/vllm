@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
@@ -21,6 +22,10 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
+
+# Deferred GDN state commit (GDN_STATE_COMMIT=1): the GDN state page also holds a
+# token log. See vllm/model_executor/layers/mamba/ops/gdn_state_commit.
+_GDN_STATE_COMMIT = os.environ.get("GDN_STATE_COMMIT", "0") == "1"
 
 ConvStateLayoutType = Literal["SD", "DS"]
 
@@ -124,10 +129,18 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return cls._mamba_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+        if _GDN_STATE_COMMIT:
+            # (conv, ssm, token log)
+            conv, ssm = dtypes
+            assert ssm in (torch.float32, torch.bfloat16), (
+                "gdn_state_commit supports fp32 / bf16 SSM state"
+            )
+            return conv, ssm, torch.bfloat16
+        return dtypes
 
     @classmethod
     def kda_state_dtype(
@@ -292,6 +305,15 @@ class MambaStateShapeCalculator:
             head_v_dim,
             head_k_dim,
         )
+        if _GDN_STATE_COMMIT:
+            # (conv, ssm, token log as bf16 elements)
+            from vllm.model_executor.layers.mamba.ops.gdn_state_commit import (
+                log_bytes,
+            )
+
+            H, HV = num_k_heads // tp_world_size, num_v_heads // tp_world_size
+            assert head_k_dim == 128 and head_v_dim == 128
+            return conv_state_shape, temporal_state_shape, (log_bytes(H, HV) // 2,)
         return conv_state_shape, temporal_state_shape
 
     @classmethod
@@ -436,6 +458,13 @@ class MambaStateCopyFuncCalculator:
 
     @classmethod
     def gated_delta_net_state_copy_func(cls):
+        if (
+            _GDN_STATE_COMMIT
+            and os.environ.get("GDN_STATE_COMMIT_LAYOUT_ONLY", "0") != "1"
+        ):
+            # the stock align copy kernels move the conv state only; the GDN ssm
+            # state and its token log are moved by gdn_state_commit.materialize
+            return (get_conv_copy_spec,)
         return (get_conv_copy_spec, get_temporal_copy_spec)
 
     @classmethod
