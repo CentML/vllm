@@ -24,6 +24,16 @@ import os
 from vllm.platforms import current_platform
 
 GDN_HOST_TRIM = os.environ.get("VLLM_GDN_HOST_TRIM", "0") == "1"
+# Second round of exact host trims for host-bound C32 mixed / prefill-only
+# steps (same kernels and values; fewer launches and less per-step Python):
+# - prefill-only batches hand the row-strided b/a views straight to the fused
+#   conv-prep kernel (which reads them strided) instead of copying them
+#   compact first (2 launches per GDN layer);
+# - the GDN metadata builders compute the state-slot gather indices once per
+#   step instead of once per KV-cache group (they depend on seq_lens only);
+# - the causal_conv1d_fn metadata (H2D copies + fills) is built on first use,
+#   i.e. never when every layer takes the fused conv-prep path.
+GDN_HOST_TRIM2 = os.environ.get("VLLM_GDN_HOST_TRIM2", "0") == "1"
 
 _pdl: list[bool] = []
 

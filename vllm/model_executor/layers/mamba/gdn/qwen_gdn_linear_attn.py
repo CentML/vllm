@@ -66,6 +66,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
 )
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
+    GDN_HOST_TRIM2,
     drop_empty_triton_launch_hooks,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
@@ -459,6 +460,26 @@ def _host_layer_views(layer) -> tuple[torch.Tensor, torch.Tensor]:
         c = (src, w, conv_state, w.view(w.size(0), w.size(2)))
         layer.__dict__["_host_layer_views"] = c
     return c[2], c[3]
+
+
+def _fused_conv_prep_applies(layer, attn_metadata: GDNAttentionMetadata) -> bool:
+    """Whether ``layer._forward_core`` runs the prefill rows' conv1d and
+    post-conv prep in one gdn_fused_conv_prep launch (the same condition as
+    its ``fused_conv_prep``: prefill rows without peeled-off non-spec decodes,
+    FlashInfer exp(g), no conv bias, few sequences).
+    """
+    non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+    return (
+        GDN_FUSED_CONV_PREP
+        and attn_metadata.num_prefills > 0
+        and not (
+            attn_metadata.spec_sequence_masks is None and attn_metadata.num_decodes > 0
+        )
+        and layer.chunk_gated_delta_rule.expects_exp_g
+        and layer.conv1d.bias is None
+        and non_spec_query_start_loc is not None
+        and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
+    )
 
 
 def fi_chunk_gated_delta_rule(
@@ -3156,10 +3177,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     + attn_metadata.num_decode_tokens,
                 )
         else:
+            # VLLM_GDN_HOST_TRIM2: when the fused conv prep is the only reader
+            # of b/a (prefill-only batch), it takes the row-strided views as
+            # they are; otherwise they are made compact as before.
+            strided_ba = (
+                GDN_HOST_TRIM2
+                and attn_metadata.spec_sequence_masks is None
+                and attn_metadata.num_decodes == 0
+                and _fused_conv_prep_applies(self, attn_metadata)
+            )
             self._forward_core(
                 mixed_qkv=mixed_qkv,
-                b=b.contiguous(),
-                a=a.contiguous(),
+                b=b if strided_ba else b.contiguous(),
+                a=a if strided_ba else a.contiguous(),
                 core_attn_out=core_attn_out,
             )
         if quantize:
