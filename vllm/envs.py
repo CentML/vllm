@@ -130,6 +130,8 @@ if TYPE_CHECKING:
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD: int = 8192
     VLLM_GDN_PREFILL_CHECKPOINT: bool = False
+    VLLM_GDN_VSPLIT_CG0SPLIT: bool = False
+    VLLM_GDN_VSPLIT_C1REORDER: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1246,6 +1248,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the prefill into an extra chunk that ends at the checkpoint.
     "VLLM_GDN_PREFILL_CHECKPOINT": lambda: bool(
         int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT", "0"))
+    ),
+    # V-split GDN chunked-prefill kernel (third_party/flashinfer_gdn_vsplit),
+    # launches with an initial state only. CG0SPLIT: v_split=2 launches run the
+    # two V-slice CTAs of a head as a 2-CTA cluster that splits the
+    # V-independent WY prep (A_inv / W_qkv) by chunk pair and shares it over
+    # DSMEM. C1REORDER: issue the state-update GEMM before the output GEMM and
+    # drain chunk c's output after state c+1 is published. Both are meant to
+    # keep the output unchanged; this is not verified bitwise.
+    "VLLM_GDN_VSPLIT_CG0SPLIT": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_CG0SPLIT", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_C1REORDER": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_C1REORDER", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
@@ -2504,6 +2519,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         # Worker-side KV block copy path; not part of traced graphs.
         "VLLM_KV_COW_ONE_LAUNCH",
+        # Variants of the custom-op GDN prefill kernel; not part of traced graphs.
+        "VLLM_GDN_VSPLIT_CG0SPLIT",
+        "VLLM_GDN_VSPLIT_C1REORDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

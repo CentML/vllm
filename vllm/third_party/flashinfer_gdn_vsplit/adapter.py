@@ -22,6 +22,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
 
@@ -45,6 +46,22 @@ def _cache(*key):
 # the SM count).
 _fast_compiled: dict = {}
 _fast_ws: dict = {}
+
+# Exact kernel variants (default off; see vllm/envs.py). Both are part of the
+# compile key and of the GDN_HOST_TRIM fast-path key.
+_CG0_SPLIT = envs.VLLM_GDN_VSPLIT_CG0SPLIT
+_C1_REORDER = envs.VLLM_GDN_VSPLIT_C1REORDER
+
+
+def _cg0_split(v_split: int, use_init: bool) -> bool:
+    """v_split=2 launches with an initial state run as 2-CTA clusters (the two
+    V slices of a head) whose CG0 warpgroups split the V-independent WY prep
+    (A_inv / W_qkv) by chunk pair and share it through DSMEM."""
+    return _CG0_SPLIT and int(v_split) == 2 and bool(use_init)
+
+
+def _c1_reorder(use_init: bool) -> bool:
+    return _C1_REORDER and bool(use_init)
 
 
 def _io(t):
@@ -100,7 +117,7 @@ def chunk_gated_delta_rule_vsplit(
             state_indices.dtype if use_idx else None,
             initial_state.stride()[1:] if (use_idx and use_init) else None,
             output_state.stride()[1:] if (use_idx and store_final) else None,
-            v_split,
+            v_split, _cg0_split(v_split, use_init), _c1_reorder(use_init),
         )
         compiled = _fast_compiled.get(fkey)
         if compiled is not None:
@@ -128,7 +145,7 @@ def chunk_gated_delta_rule_vsplit(
            str(state_indices.dtype) if use_idx else "none",
            tuple(initial_state.stride()[1:]) if (use_idx and use_init) else None,
            tuple(output_state.stride()[1:]) if (use_idx and store_final) else None,
-           int(v_split))
+           int(v_split), _cg0_split(v_split, use_init), _c1_reorder(use_init))
     c = _cache(*key)
     dv = 128 // v_split
     if "compiled" not in c:
@@ -141,7 +158,8 @@ def chunk_gated_delta_rule_vsplit(
             mma_tiler_qk=(64, 64, 128), mma_tiler_qs=(dv, 64, 128), mma_tiler_qkv=(dv, 64, 64),
             mma_tiler_kv=(dv, 128, 64), max_active_clusters=num_sm, num_sm=num_sm, is_GQA=is_GQA,
             use_initial_state=use_init, store_final_state=store_final, enable_checkpoints=False,
-            is_persistent=True, v_split=v_split)
+            is_persistent=True, v_split=v_split,
+            cg0_split=_cg0_split(v_split, use_init), c1_reorder=_c1_reorder(use_init))
 
         def dyn(t, nd):
             x = from_dlpack(t, assumed_align=16)
