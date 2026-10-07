@@ -494,3 +494,126 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+class _PrunedAttentionDraftModel(torch.nn.Module):
+    """Single-layer draft whose prefill attention goes through FlashInfer's
+    pruned path: only the rows it returns are computed, every other prefill row
+    is zero-filled. Decode rows are computed. Output rows are gathered by
+    ``out_rows`` like a draft model with out_rows support.
+    """
+
+    def __init__(self, impl, prefill, num_decodes, num_decode_tokens):
+        super().__init__()
+        self.impl = impl
+        self.prefill = prefill
+        self.num_decodes = num_decodes
+        self.num_decode_tokens = num_decode_tokens
+
+    def forward(self, input_ids, positions, hidden_states, inputs_embeds, out_rows):
+        num_heads, head_size = self.impl.num_heads, self.impl.head_size
+        # Row t's query (and computed attention output) is t + 1: never zero.
+        query = (
+            (torch.arange(input_ids.shape[0], dtype=torch.float32) + 1)
+            .view(-1, 1, 1)
+            .expand(-1, num_heads, head_size)
+            .contiguous()
+        )
+        out = torch.full_like(query, float("nan"))
+        ndt = self.num_decode_tokens
+        out[:ndt] = query[:ndt]
+        self.impl._draft_prefill_last_rows(
+            query[ndt:],
+            None,
+            None,
+            self.prefill,
+            self.impl.draft_prefill_last_token_indices,
+            self.num_decodes,
+            ndt,
+            self.prefill.seq_lens.shape[0],
+            out[ndt:],
+        )
+        return out.view(out.shape[0], -1)[out_rows]
+
+
+def test_draft_prefill_prune_with_rows_samples_computed_rows(monkeypatch):
+    """VLLM_MTP_DRAFT_PREFILL_PRUNE with VLLM_MTP_DRAFT_PREFILL_ROWS: the rows
+    the speculator samples (last accepted rows) must be rows the pruned
+    attention computed, including for prefill-bucket requests whose draft
+    tokens were partly rejected.
+    """
+    flashinfer_module = pytest.importorskip("vllm.v1.attention.backends.flashinfer")
+
+    def fake_trtllm_decode(**kwargs):
+        kwargs["out"].copy_(kwargs["query"])
+
+    monkeypatch.setattr(
+        flashinfer_module, "trtllm_batch_decode_with_kv_cache", fake_trtllm_decode
+    )
+    impl = object.__new__(flashinfer_module.FlashInferImpl)
+    impl.num_heads, impl.head_size = 2, 2
+    impl.bmm1_scale = impl.bmm2_scale = 1.0
+    impl.window_left, impl.sinks = -1, None
+    impl._trtllm_gen_decode_launch_config = lambda *args: (1, None)
+
+    # (query_len, seq_len, num_rejected): one 3-token spec decode, then a
+    # prefill-bucket request with 2 of its draft tokens rejected and a
+    # chunked prefill.
+    reqs = [(3, 40, 1), (5, 100, 2), (8, 1000, 0)]
+    num_decodes, num_decode_tokens = 1, 3
+    num_reqs = len(reqs)
+    num_tokens = sum(q_len for q_len, _, _ in reqs)
+    last_token_indices = torch.zeros(8, dtype=torch.int64)
+    start = 0
+    for i, (q_len, _, num_rejected) in enumerate(reqs):
+        last_token_indices[i] = start + q_len - num_rejected - 1
+        start += q_len
+    prefill = SimpleNamespace(
+        cum_seq_lens_q=torch.tensor([0, 5, 13], dtype=torch.int32),
+        seq_lens=torch.tensor([100, 1000], dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        max_seq_len=1000,
+    )
+
+    hidden_size = impl.num_heads * impl.head_size
+    speculator = _make_speculator(monkeypatch, torch.empty(0))
+    speculator.model = _PrunedAttentionDraftModel(
+        impl, prefill, num_decodes, num_decode_tokens
+    )
+    impl.draft_prefill_last_token_indices = last_token_indices
+    speculator.last_token_indices = last_token_indices
+    speculator.max_num_reqs = last_token_indices.shape[0]
+    speculator.draft_out_rows = True
+    speculator._draft_row_ids = torch.arange(num_tokens)
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(num_tokens, dtype=torch.int32),
+        positions=torch.arange(num_tokens),
+    )
+    speculator.hidden_states = torch.zeros(num_tokens, hidden_size)
+    speculator.idx_mapping = torch.arange(num_reqs, dtype=torch.int32)
+    speculator.draft_tokens = torch.zeros((num_reqs, 1), dtype=torch.int64)
+    speculator.sample_src_positions = torch.zeros(num_reqs, dtype=torch.int64)
+    speculator.temperature = speculator.seeds = speculator.draft_logits = None
+    speculator.current_draft_step = torch.tensor(0)
+    sampled = []
+
+    def fake_sample_draft(hidden_states, *args):
+        sampled.append(hidden_states.clone())
+        return torch.zeros(hidden_states.shape[0], dtype=torch.int64)
+
+    speculator.sample_draft = fake_sample_draft
+
+    speculator._prefill(
+        num_reqs,
+        num_tokens,
+        attn_metadata=None,
+        slot_mappings=None,
+        num_tokens_across_dp=None,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+    )
+
+    (sample_hidden_states,) = sampled
+    expected = (last_token_indices[:num_reqs].float() + 1).view(-1, 1)
+    torch.testing.assert_close(
+        sample_hidden_states, expected.expand(-1, hidden_size), rtol=0, atol=0
+    )
