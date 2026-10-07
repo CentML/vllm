@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in PDL weight prefetch for FlashInfer's CuTe-DSL dense MXFP8 GEMMs.
 
-Port of the FlashInfer-overlay half of CentML/vllm#135 (Stanley Phoong,
-"[lcd] F126 PDL triton/FI switch"), re-based on the stock FlashInfer
-0.6.18.post1 files of image d9612d2e (the Triton half of #135 patches kernels
-this stack does not have).
+The overlay modules are FlashInfer 0.6.18.post1's stock CuTe-DSL dense GEMM
+sources with the changes listed below.
 
 At decode sizes every dense MXFP8 linear (in_proj_qkvz, out_proj, qkv_proj,
 o_proj, shared expert, MTP layer, MXFP8 draft lm_head) runs FlashInfer's
@@ -53,8 +51,8 @@ _MAP = {
         "fi_dense_blockscaled_gemm_sm100_splitk.py"
     ),
 }
-# sha256 of the stock FlashInfer 0.6.18.post1 file (image d9612d2e) each
-# overlay is derived from.
+# sha256 of the stock FlashInfer 0.6.18.post1 file each overlay is derived
+# from.
 _BASE_SHA = {
     "flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100": (
         "aad93031b1145c43195d1af2cbeb310c91df5c000310df26dfea768be949f705"
