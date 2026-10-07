@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import flashinfer.decode as flashinfer_decode
 import numpy as np
@@ -83,6 +84,10 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
+)
+from vllm.v1.attention.ops.kf_decode_attn.runtime import MAXP as KF_DECODE_MAXP
+from vllm.v1.attention.ops.kf_decode_attn.runtime import (
+    get_runtime as get_kf_decode_runtime,
 )
 from vllm.v1.attention.ops.kf_prefill_attn.runtime import MAXP as KF_MAXP
 from vllm.v1.attention.ops.kf_prefill_attn.runtime import (
@@ -893,6 +898,14 @@ class FlashInferTrtllmAPIDecode:
     dcp_query_start_loc: torch.Tensor | None = None
     """Decode query boundaries for masking empty DCP shards during reduction."""
 
+    kf_block_tables: torch.Tensor | None = None
+    """VLLM_KF_DECODE_ATTN: the decode rows' block table with row stride
+    KF_DECODE_MAXP when this batch runs on the Kernel Factory decode kernel."""
+
+    kf_q: int = 0
+    """Query tokens per request (uniform; graph-padded rows have none) for the
+    Kernel Factory decode kernel."""
+
 
 @dataclass
 class FlashInferMetadata:
@@ -1164,6 +1177,36 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             == FlashInferDecodeKernel.TRTLLM_GEN
             and not self.use_dcp
         )
+        # Kernel Factory decode kernel (VLLM_KF_DECODE_ATTN): the trtllm-gen decode
+        # envelope plus the geometry it hard-codes (16 q / 2 kv heads, kernel page
+        # 128). Its block-table rows have stride KF_DECODE_MAXP: build() copies the
+        # decode rows into this persistent buffer (graphs read it at a fixed
+        # address). Device-trimmed query lengths (adaptive verification) excluded.
+        self.kf_decode = (
+            envs.VLLM_KF_DECODE_ATTN
+            and current_platform.is_device_capability(107)
+            and self.flashinfer_trtllm_api_decode_kernel
+            == FlashInferDecodeKernel.TRTLLM_GEN
+            and self.q_data_type_decode == FP8_DTYPE
+            and self.kv_cache_dtype == FP8_DTYPE
+            and self.head_dim == 256
+            and self.num_qo_heads == 16
+            and self.num_kv_heads == 2
+            and self.page_size == 128
+            and not self.use_dcp
+            and not self.use_trtllm_gen_varlen_decode
+        )
+        self._kf_bt: torch.Tensor | None = None
+        if self.kf_decode:
+            self._kf_bt = torch.zeros(
+                (max(1, min(envs.VLLM_KF_DECODE_ATTN_MAX_BL, 32)), KF_DECODE_MAXP),
+                dtype=torch.int32,
+                device=device,
+            )
+        # (data_ptr, rows) of the table last copied, and the draft step being built:
+        # draft steps after the first reuse the first step's block table.
+        self._kf_bt_src = (0, 0)
+        self._kf_draft_index = 0
         self._init_reorder_batch_threshold(
             1,
             supports_spec_as_decode=(
@@ -1585,6 +1628,45 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len.copy_to_gpu(num_reqs)
         return paged_kv_indices
 
+    def _kf_decode_route(
+        self,
+        block_table_tensor: torch.Tensor,
+        qo_indptr_cpu: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        uniform: bool,
+    ) -> tuple[torch.Tensor, int] | None:
+        """VLLM_KF_DECODE_ATTN: whether this step's decode rows run on the Kernel
+        Factory kernel; if so, their block table in the MAXP-stride buffer and Q.
+
+        The kernel reads the decode query as [num_decodes, Q] rows. That holds for a
+        uniform batch and for a graph-padded one (real rows of Q tokens, then
+        zero-length padding requests whose seq_len is 0 and whose rows it skips).
+        """
+        rt = get_kf_decode_runtime(self.device)
+        if rt is None:
+            return None
+        q = num_decode_tokens // num_decodes
+        if not uniform:
+            qo = qo_indptr_cpu[: num_decodes + 1].numpy()
+            lens = qo[1:] - qo[:-1]
+            nreal = int(np.count_nonzero(lens))
+            uniform = (
+                q * num_decodes == num_decode_tokens
+                and nreal > 0
+                and bool((lens[:nreal] == q).all())
+                and not lens[nreal:].any()
+            )
+        assert self._kf_bt is not None
+        width = block_table_tensor.shape[1]
+        if not rt.route(q, num_decodes, uniform and width <= KF_DECODE_MAXP):
+            return None
+        src = (block_table_tensor.data_ptr(), num_decodes)
+        if self._kf_draft_index == 0 or src != self._kf_bt_src:
+            self._kf_bt[:num_decodes, :width].copy_(block_table_tensor[:num_decodes])
+            self._kf_bt_src = src
+        return self._kf_bt[:num_decodes], q
+
     def build_for_drafting(
         self,
         common_attn_metadata: CommonAttentionMetadata,
@@ -1594,10 +1676,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # the pruned last-row path (VLLM_MTP_DRAFT_PREFILL_PRUNE) or FlashInfer, and a
         # second plan per step would only add host time.
         self._kf_drafting = True
+        self._kf_draft_index = draft_index
         try:
             return super().build_for_drafting(common_attn_metadata, draft_index)
         finally:
             self._kf_drafting = False
+            self._kf_draft_index = 0
 
     def build(
         self,
@@ -2061,6 +2145,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         qo_indptr[: num_decodes + 1] if self.use_dcp else None
                     ),
                 )
+                if self.kf_decode:
+                    kf = self._kf_decode_route(
+                        block_table_tensor,
+                        qo_indptr_cpu,
+                        num_decodes,
+                        num_decode_tokens,
+                        q_cu_seq_lens is None,
+                    )
+                    if kf is not None:
+                        decode = attn_metadata.decode
+                        assert isinstance(decode, FlashInferTrtllmAPIDecode)
+                        decode.kf_block_tables, decode.kf_q = kf
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0
@@ -2255,6 +2351,9 @@ class FlashInferImpl(AttentionImpl):
         # check re-runs this forward on the FlashInfer path.
         self._kf_checks_left = envs.VLLM_KF_PREFILL_ATTN_CHECK
         self._kf_off = False
+        # Kernel Factory decode kernel: per-layer debug comparisons left
+        # (VLLM_KF_DECODE_ATTN_CHECK; eager launches only).
+        self._kf_dec_checks_left = envs.VLLM_KF_DECODE_ATTN_CHECK
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -2568,6 +2667,136 @@ class FlashInferImpl(AttentionImpl):
             wrong,
             *worst[1:],
             sum(a != b for a, b in zip(prefill.kf.seq_lens, dev_kv)),
+        )
+
+    def _kf_decode(
+        self,
+        decode: FlashInferTrtllmAPIDecode,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: Any,
+    ) -> bool:
+        """Run this layer's decode rows on the Kernel Factory kernel (the builder
+        routed the batch: decode.kf_block_tables). Returns False (nothing launched)
+        if this layer is outside the kernel's contract; the caller then takes the
+        trtllm-gen path.
+        """
+        runtime = get_kf_decode_runtime(query.device)
+        assert runtime is not None and decode.kf_block_tables is not None
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.dtype != torch.bfloat16
+            or not out.is_contiguous()
+            or query.dtype != FP8_DTYPE
+            or query.shape[0] != decode.seq_lens.shape[0] * decode.kf_q
+            or self.window_left != -1
+            or self.sinks is not None
+            or self.logits_soft_cap
+            or self.o_sf_scale is not None
+            or self.need_to_return_lse_for_decode
+            or not kf_supported_kv(kv_cache)
+        ):
+            runtime.stats["skip_contract"] += 1
+            logger.warning_once(
+                "KF decode attention: layer outside the kernel contract "
+                "(out %s, q %s %s, window %s, sinks %s, lse %s, kv %s %s); "
+                "using trtllm-gen.",
+                getattr(out, "dtype", None),
+                query.dtype,
+                tuple(query.shape),
+                self.window_left,
+                self.sinks is not None,
+                self.need_to_return_lse_for_decode,
+                tuple(kv_cache.shape),
+                kv_cache.stride(),
+            )
+            return False
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        return runtime.launch(
+            query,
+            kv_cache,
+            decode.kf_block_tables,
+            decode.seq_lens,
+            out,
+            decode.kf_q,
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+
+    def _check_kf_decode(
+        self,
+        decode: FlashInferTrtllmAPIDecode,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: torch.Tensor,
+        trtllm_decode: Any,
+    ) -> None:
+        """VLLM_KF_DECODE_ATTN_CHECK: re-run this layer's decode rows on trtllm-gen
+        and compare both with an fp32 reference on the same FP8 inputs over the
+        real (seq_len > 0) rows (debug only; syncs). ``tail`` is the final-gate
+        rule: KF relL2 <= trtllm-gen's and KF max|d| <= trtllm-gen's + 4 bf16 ulp
+        at max(|KF out at its worst element|, trtllm-gen max|d|).
+        """
+        self._kf_dec_checks_left -= 1
+        seq = decode.seq_lens.tolist()
+        rows = [b for b, s in enumerate(seq) if s > 0]
+        if not rows:
+            return
+        ref = torch.empty_like(out)
+        trtllm_decode(ref)
+        q = decode.kf_q
+        assert decode.kf_block_tables is not None
+        idx = torch.cat([torch.arange(b * q, (b + 1) * q) for b in rows]).to(
+            query.device
+        )
+        kv = kv_cache  # the HND [P, Hkv, page, 2D] view the kernel read
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        exact = _fp32_paged_prefill_reference(
+            query.index_select(0, idx),
+            kv,
+            decode.kf_block_tables[rows],
+            [i * q for i in range(len(rows) + 1)],
+            [seq[b] for b in rows],
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+        n = query.shape[0]
+        kf_out = out.view(n, self.num_heads, self.head_size).index_select(0, idx)
+        fi_out = ref.view(n, self.num_heads, self.head_size).index_select(0, idx)
+        kf_out, fi_out = kf_out.float(), fi_out.float()
+
+        def stats(x: torch.Tensor, y: torch.Tensor) -> tuple[float, float, float]:
+            d = (x - y).abs()
+            i = int(d.argmax())
+            return (
+                float(d.norm() / y.norm().clamp_min(1e-30)),
+                float(d.max()),
+                float(x.flatten()[i].abs()),
+            )
+
+        kf_rel, kf_max, kf_at = stats(kf_out, exact)
+        fi_rel, fi_max, fi_at = stats(fi_out, exact)
+        basis = max(kf_at, fi_max)
+        ulp = 2.0 ** (math.floor(math.log2(basis)) - 7) if basis > 0 else 0.0
+        finite = bool(torch.isfinite(kf_out).all())
+        tail = finite and kf_rel <= fi_rel and kf_max <= fi_max + 4 * ulp
+        logger.info(
+            "KF decode check: Q=%d BL=%d real=%d max_seq=%d | kf~fi relL2 %.3e "
+            "max %.3e | kf~fp32 relL2 %.3e max %.3e at |out| %.3e | fi~fp32 relL2 "
+            "%.3e max %.3e at |out| %.3e | finite %s | tail %s",
+            q,
+            len(seq),
+            len(rows),
+            max(seq),
+            *stats(kf_out, fi_out)[:2],
+            kf_rel,
+            kf_max,
+            kf_at,
+            fi_rel,
+            fi_max,
+            fi_at,
+            finite,
+            "PASS" if tail else "FAIL",
         )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
@@ -3318,34 +3547,64 @@ class FlashInferImpl(AttentionImpl):
                     decode_query,
                     workspace_buffer,
                 )
-                with _flashinfer_decode_sm_count(sm_count):
-                    trtllm_batch_decode_with_kv_cache(
-                        query=decode_query,
-                        kv_cache=(
-                            nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
-                        ),
-                        workspace_buffer=workspace_buffer,
-                        block_tables=block_tables_decode,
-                        seq_lens=seq_lens_decode,
-                        max_seq_len=attn_metadata.decode.max_seq_len,
-                        bmm1_scale=self.bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
-                        window_left=self.window_left,
-                        sinks=self.sinks,
-                        o_sf_scale=self.o_sf_scale,
-                        out=out,
-                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
-                        backend=attn_metadata.decode.kernel.value,
-                        q_len_per_req=q_len_per_req,
-                        max_q_len=max_q_len,
-                        cum_seq_lens_q=q_cu_seq_lens,
-                        kv_cache_sf=(
-                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                        ),
-                        lse=lse,
-                        return_lse=self.need_to_return_lse_for_decode,
-                        multi_ctas_kv_counter_buffer=counter_buffer,
+                trt_decode = attn_metadata.decode
+
+                def trtllm_decode(o: Any) -> None:
+                    with _flashinfer_decode_sm_count(sm_count):
+                        trtllm_batch_decode_with_kv_cache(
+                            query=decode_query,
+                            kv_cache=(
+                                nvfp4_kv_data
+                                if self.is_kvcache_nvfp4
+                                else kv_cache_tuple
+                            ),
+                            workspace_buffer=workspace_buffer,
+                            block_tables=block_tables_decode,
+                            seq_lens=seq_lens_decode,
+                            max_seq_len=trt_decode.max_seq_len,
+                            bmm1_scale=self.bmm1_scale,
+                            bmm2_scale=self.bmm2_scale,
+                            window_left=self.window_left,
+                            sinks=self.sinks,
+                            o_sf_scale=self.o_sf_scale,
+                            out=o,
+                            kv_layout=get_flashinfer_layout_string(
+                                self.kv_cache_layout
+                            ),
+                            backend=trt_decode.kernel.value,
+                            q_len_per_req=q_len_per_req,
+                            max_q_len=max_q_len,
+                            cum_seq_lens_q=q_cu_seq_lens,
+                            kv_cache_sf=(
+                                nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                            ),
+                            lse=lse,
+                            return_lse=self.need_to_return_lse_for_decode,
+                            multi_ctas_kv_counter_buffer=counter_buffer,
+                        )
+
+                if (
+                    attn_metadata.decode.kf_block_tables is not None
+                    and not use_dcp
+                    and not needs_fp8_out
+                    and self._kf_decode(
+                        attn_metadata.decode, decode_query, kv_cache_permute, out
                     )
+                ):
+                    # Kernel Factory decode kernel ran (see _kf_decode).
+                    if (
+                        self._kf_dec_checks_left > 0
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        self._check_kf_decode(
+                            attn_metadata.decode,
+                            decode_query,
+                            kv_cache_permute,
+                            out,
+                            trtllm_decode,
+                        )
+                else:
+                    trtllm_decode(out)
 
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)
