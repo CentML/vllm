@@ -108,3 +108,49 @@ class FastLaunch:
             None,
             *bound_args.values(),
         )
+
+    def bind(self, *args, **kwargs) -> tuple[Any, list[str], list[Any]] | None:
+        """(compiled kernel, parameter names, bound values) that ``run`` would
+        launch for these arguments, or None when ``run`` would take the JIT
+        path (hooks, debug, changed globals, kernel not compiled yet). The
+        caller may relaunch the kernel with ``launch_bound`` and values whose
+        specialization (dtypes, pointer alignment, specialized ints,
+        constexprs) equals these.
+        """
+        fn = self.fn
+        if self._options is None:
+            self._options = {
+                "debug": fn.debug or knobs.runtime.debug,
+                "instrumentation_mode": knobs.compilation.instrumentation_mode,
+            }
+        if self._off or "debug" in kwargs or self._slow():
+            return None
+        device = driver.active.get_current_device()
+        kernel_cache, kernel_key_cache, _, _, binder = fn.device_caches[device]
+        bound_args, specialization, options = binder(*args, **kwargs, **self._options)
+        kernel = kernel_cache.get(
+            compute_cache_key(kernel_key_cache, specialization, options)
+        )
+        if kernel is None:
+            return None
+        return kernel, list(bound_args.keys()), list(bound_args.values())
+
+
+def launch_bound(kernel: Any, grid: tuple[int, ...], values: list[Any]) -> None:
+    """Launch a kernel returned by ``FastLaunch.bind`` on the current stream,
+    exactly as ``FastLaunch.run`` does.
+    """
+    device = driver.active.get_current_device()
+    n = len(grid)
+    kernel.run(
+        grid[0],
+        grid[1] if n > 1 else 1,
+        grid[2] if n > 2 else 1,
+        driver.active.get_current_stream(device),
+        kernel.function,
+        kernel.packed_metadata,
+        None,
+        None,
+        None,
+        *values,
+    )
