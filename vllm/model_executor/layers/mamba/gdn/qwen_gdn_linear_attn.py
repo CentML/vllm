@@ -1350,13 +1350,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """VLLM_GDN_BA_LATE_JOIN: leave the join to the fused core op, which
         waits right before its first read of b/a. Only inside FULL graphs: a
         PIECEWISE piece must join the aux stream before the core op (a
-        splitting op) ends the captured piece.
+        splitting op) ends the captured piece. The V2 model runner captures
+        FULL graphs with runtime mode NONE, so a capturing stream under mode
+        NONE is a FULL-graph capture too.
         """
-        return (
+        if not (
             GDN_BA_LATE_JOIN
             and self._ba_pending
             and self._uses_fused_gdn_decode(ba.dtype)
-            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            return False
+        mode = get_forward_context().cudagraph_runtime_mode
+        return mode == CUDAGraphMode.FULL or (
+            mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
         )
 
     def fix_query_key_value_ordering(
