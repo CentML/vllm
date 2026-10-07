@@ -10,7 +10,6 @@ from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 import os
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample import topk_topp_subchunk
 
 NO_LOGPROBS = -1
 _NP_INT64_MIN = np.iinfo(np.int64).min
@@ -391,10 +390,6 @@ def fused_prep(logits_in, penalties, expanded_idx_mapping, input_ids, expanded_l
     """Returns (fp32 logits with penalties applied, row count). Also fills the chunk-max
     buffer so a following fast_top_k_top_p(..., cmax_ready=True) can skip its first pass.
     `penalties` is a vLLM PenaltiesState or None."""
-    if topk_topp_subchunk.ENABLED:
-        # also records sub-chunk maxima for the tighter candidate threshold
-        return topk_topp_subchunk.fused_prep(logits_in, penalties, expanded_idx_mapping,
-                                             input_ids, expanded_local_pos)
     B, V = logits_in.shape
     out = torch.empty((B, V), dtype=torch.float32, device=logits_in.device)
     nch = triton.cdiv(V, _CHUNK)
@@ -446,10 +441,6 @@ def fast_top_k_top_p(
     cmax_ready: bool = False,
 ) -> torch.Tensor:
     """In-place top-k(+top-p) masking; requires every k <= kmax <= FAST_TOPK_KMAX."""
-    if topk_topp_subchunk.ENABLED:
-        # same contract, candidate threshold from sub-chunk maxima (fewer overflow rows)
-        return topk_topp_subchunk.fast_top_k_top_p(logits, k, p, kmax, mask_value, fallback,
-                                                   cmax_ready)
     assert logits.ndim == 2 and logits.dtype == torch.float32
     assert 1 <= kmax <= FAST_TOPK_KMAX
     if logits.stride(1) != 1:
