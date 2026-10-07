@@ -160,15 +160,19 @@ class KfDecodeAttn:
         bmm1_scale: float,
         bmm2_scale: float,
     ) -> bool:
-        """One layer's decode attention into ``out``; False = not launched."""
+        """One layer's decode attention into ``out``; False = not launched.
+        ``q`` / ``out``: ``[BL * q_len, 16, 256]`` (the kernel takes q as
+        ``[BL, q_len, 16, 256]`` and out flat).
+        """
         bl = seq_lens.shape[0]
         f = self.forms.get((q_len, bl))
         if f is None:
             return False
         fn, po, pml, cnt = f
-        fn(q.view(torch.uint8), kv.view(torch.uint8), block_tables, seq_lens,
-           out.view(-1), po, pml, cnt, float(bmm1_scale), float(bmm2_scale),
-           self.grid, self.k.EVICT_FIRST)  # fmt: skip
+        q4 = q.view(bl, q_len, HQ, HDIM).view(torch.uint8)
+        fn(q4, kv.view(torch.uint8), block_tables, seq_lens, out.view(-1), po, pml,
+           cnt, float(bmm1_scale), float(bmm2_scale), self.grid,
+           self.k.EVICT_FIRST)  # fmt: skip
         self.stats["launches"] += 1
         if self.stats["launches"] == 1:
             logger.info("KF decode attention: first launch (Q %d, BL %d).", q_len, bl)

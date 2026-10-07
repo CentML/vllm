@@ -188,7 +188,7 @@ def test_kernel_through_runtime(q_len, lens):
         outs.append(out)
     torch.accelerator.synchronize()
     assert bool((rt.cnt == 0).all())
-    real = torch.tensor([L > 0 for L in lens]).repeat_interleave(q_len)
+    real = torch.tensor([L > 0 for L in lens], device="cuda").repeat_interleave(q_len)
     assert torch.equal(outs[0][real], outs[1][real])
 
     # Captured at other (shorter) lengths, replayed on these: the split comes from
