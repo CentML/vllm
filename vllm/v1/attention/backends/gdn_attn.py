@@ -9,7 +9,10 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
+    GDN_HOST_TRIM,
+    GDN_HOST_TRIM2,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -156,6 +159,10 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # VLLM_GDN_HOST_TRIM2: returns (nums_dict, batch_ptr,
+    # token_chunk_offset_ptr), built on the first call (once per step for all
+    # GDN groups); the three fields above are then None.
+    conv1d_metadata_fn: Callable[[], tuple] | None = None
 
     # Per-step copies shared by every GDN layer so no layer re-derives them
     # (set when num_prefills > 0): int64 state indices (ATen indexing converts
@@ -238,6 +245,31 @@ class GDNSharedBuild:
     # VLLM_GDN_HOST_TRIM: every row of prefill_has_initial_state is set
     # (computed on the host).
     prefill_all_initial_state: bool = False
+    # VLLM_GDN_HOST_TRIM2: (seq_lens tensor, (block_size, num spec blocks),
+    # int64 [num_reqs, 1 + num spec blocks] block-table column indices) of
+    # mamba_get_block_table_tensor's "align" gather, shared by the GDN groups.
+    state_gather_indices: tuple | None = None
+    # VLLM_GDN_HOST_TRIM2: lazy causal_conv1d_fn metadata (see
+    # GDNAttentionMetadata.conv1d_metadata_fn).
+    conv1d_metadata_fn: Callable[[], tuple] | None = None
+
+
+def _lazy_conv1d_metadata(
+    shared: GDNSharedBuild, query_start_loc_cpu: torch.Tensor, device: torch.device
+) -> Callable[[], tuple]:
+    """VLLM_GDN_HOST_TRIM2: compute_causal_conv1d_metadata of the step on the
+    first call, kept on ``shared`` for every GDN group. Only causal_conv1d_fn
+    reads it, which the fused conv-prep path never calls.
+    """
+
+    def get() -> tuple:
+        if shared.batch_ptr is None:
+            shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(query_start_loc_cpu, device=device)
+            )
+        return shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr
+
+    return get
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -712,12 +744,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_sequence_masks_cpu = split.spec_sequence_masks_cpu
         # The state indices are the only metadata read from this group's block
         # table; everything else is in the shared part.
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
+        if GDN_HOST_TRIM2 and self.vllm_config.cache_config.mamba_cache_mode not in (
+            "all",
+            "none",
+        ):
+            block_table_tensor = torch.gather(
+                m.block_table_tensor, 1, self._state_gather_indices(shared, m)
+            )
+        else:
+            block_table_tensor = mamba_get_block_table_tensor(
+                m.block_table_tensor,
+                m.seq_lens,
+                self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
         if spec_sequence_masks_cpu is None:
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
@@ -882,6 +922,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=shared.nums_dict,
             batch_ptr=shared.batch_ptr,
             token_chunk_offset_ptr=shared.token_chunk_offset_ptr,
+            conv1d_metadata_fn=shared.conv1d_metadata_fn,
             prefill_state_indices_i64=prefill_state_indices_i64,
             prefill_no_initial_state=shared.prefill_no_initial_state,
             prefill_query_start_loc_i64=shared.prefill_query_start_loc_i64,
@@ -1095,12 +1136,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if spec_sequence_masks_cpu is not None:
             has_initial_state = has_initial_state[non_spec_rows]
         shared.has_initial_state = has_initial_state
-        shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
-            compute_causal_conv1d_metadata(
-                non_spec_query_start_loc_cpu,
-                device=query_start_loc.device,
+        if GDN_HOST_TRIM2:
+            shared.conv1d_metadata_fn = _lazy_conv1d_metadata(
+                shared, non_spec_query_start_loc_cpu, query_start_loc.device
             )
-        )
+        else:
+            shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc_cpu,
+                    device=query_start_loc.device,
+                )
+            )
         if spec_sequence_masks is None and num_decodes > 0:
             prefill_has_initial_state = has_initial_state[num_decodes:]
         else:
@@ -1117,6 +1163,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 torch.diff(prefill_query_start_loc_cpu).max()
             )
         return shared
+
+    def _state_gather_indices(
+        self, shared: GDNSharedBuild, m: CommonAttentionMetadata
+    ) -> torch.Tensor:
+        """VLLM_GDN_HOST_TRIM2: the column indices mamba_get_block_table_tensor
+        ("align") gathers, built with the same ops but once per step for every
+        GDN group with this (block_size, num_speculative_blocks): they depend
+        on seq_lens only, which all groups of a step share.
+        """
+        spec = self.kv_cache_spec
+        key = (spec.block_size, spec.num_speculative_blocks)
+        c = shared.state_gather_indices
+        if c is None or c[0] is not m.seq_lens or c[1] != key:
+            start_indices = (m.seq_lens - 1) // spec.block_size
+            start_indices.clamp_(min=0)
+            offsets = torch.arange(
+                1 + spec.num_speculative_blocks,
+                device=m.block_table_tensor.device,
+                dtype=torch.int32,
+            )
+            indices = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
+            c = (m.seq_lens, key, indices)
+            shared.state_gather_indices = c
+        return c[2]
 
     @staticmethod
     def _host_all_initial_state(

@@ -510,6 +510,16 @@ def causal_conv1d_fn(
     x = x.to(conv_states.dtype)
     out = torch.empty_like(x)
     if metadata is not None:
+        if (
+            metadata.batch_ptr is None
+            and getattr(metadata, "conv1d_metadata_fn", None) is not None
+        ):
+            # VLLM_GDN_HOST_TRIM2: the step's metadata is built on first use.
+            (
+                metadata.nums_dict,
+                metadata.batch_ptr,
+                metadata.token_chunk_offset_ptr,
+            ) = metadata.conv1d_metadata_fn()
         nums_dict = metadata.nums_dict
         args = nums_dict
         batch_ptr = metadata.batch_ptr

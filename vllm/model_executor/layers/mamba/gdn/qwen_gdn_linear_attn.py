@@ -67,6 +67,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
 )
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
+    GDN_HOST_TRIM2,
     drop_empty_triton_launch_hooks,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
@@ -2067,6 +2068,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             o.index_copy_(1, idx, o_tail.to(o.dtype))
         return o
 
+    def _uses_fused_conv_prep(self, attn_metadata: GDNAttentionMetadata) -> bool:
+        """Whether _forward_core runs the prefill rows' conv1d and post-conv
+        prep in one gdn_fused_conv_prep launch (prefill rows without peeled-off
+        non-spec decodes, FlashInfer exp(g), no conv bias, few sequences).
+        """
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        return (
+            GDN_FUSED_CONV_PREP
+            and attn_metadata.num_prefills > 0
+            and not (
+                attn_metadata.spec_sequence_masks is None
+                and attn_metadata.num_decodes > 0
+            )
+            and self.chunk_gated_delta_rule.expects_exp_g
+            and self.conv1d.bias is None
+            and non_spec_query_start_loc is not None
+            and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
+        )
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -2215,15 +2235,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         # Prefill rows without peeled-off decodes (FlashInfer backend, which
         # takes exp(g)) run conv1d and the post-conv prep in one kernel below.
-        fused_conv_prep = (
-            GDN_FUSED_CONV_PREP
-            and attn_metadata.num_prefills > 0
-            and not (spec_sequence_masks is None and attn_metadata.num_decodes > 0)
-            and self.chunk_gated_delta_rule.expects_exp_g
-            and self.conv1d.bias is None
-            and non_spec_query_start_loc is not None
-            and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
-        )
+        fused_conv_prep = self._uses_fused_conv_prep(attn_metadata)
         if (
             attn_metadata.num_prefills > 0
             and attn_metadata.prefill_checkpoint is not None
@@ -3196,10 +3208,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     + attn_metadata.num_decode_tokens,
                 )
         else:
+            # VLLM_GDN_HOST_TRIM2: when the fused conv prep is the only reader
+            # of b/a (prefill-only batch), it takes the row-strided views as
+            # they are; otherwise they are made compact as before.
+            strided_ba = (
+                GDN_HOST_TRIM2
+                and attn_metadata.spec_sequence_masks is None
+                and attn_metadata.num_decodes == 0
+                and self._uses_fused_conv_prep(attn_metadata)
+            )
             self._forward_core(
                 mixed_qkv=mixed_qkv,
-                b=b.contiguous(),
-                a=a.contiguous(),
+                b=b if strided_ba else b.contiguous(),
+                a=a if strided_ba else a.contiguous(),
                 core_attn_out=core_attn_out,
             )
         if quantize:
