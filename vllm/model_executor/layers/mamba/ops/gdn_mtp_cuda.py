@@ -24,6 +24,12 @@ from registers with streaming stores. The kernel moves 1 state read + 1 write pe
 token (bandwidth-bound at C512 batch sizes): VR, 4 tokens/request, 77 requests:
 77.0 vs 81.6 us; 48 requests 48.3 vs 55.3 us; bytes-only floor ~72 us at 77.
 
+``run_quant`` (VLLM_GDN_MTP_FUSED_QUANT builds) writes out_proj's MXFP8
+activation instead of the bf16 output: the e4m3 values and F8_128x4 UE8M0
+scales that ``gdn_gated_norm_mxfp8(norm_rows=(0, 0))`` writes from the bf16
+output (bitwise), including the zeros of the rows no request owns, so that
+separate quant launch is dropped.
+
 The CUDA source is kept in this module (``_SOURCE``) so the package ships only
 Python; ``load()`` builds it with torch.utils.cpp_extension (nvcc, ninja) for the
 current device's arch-specific target under VLLM_CACHE_ROOT (concurrent
@@ -59,11 +65,20 @@ GDN_MTP_CUDA_PDL = os.environ.get("VLLM_GDN_MTP_CUDA_PDL", "0") == "1"
 # the stock kernel.
 GDN_MTP_CUDA_TUNE = os.environ.get("VLLM_GDN_MTP_CUDA_TUNE", "")
 
+# VLLM_GDN_MTP_FUSED_QUANT=1: also build the kernel variant whose epilogue
+# writes out_proj's MXFP8 activation (e4m3 + swizzled UE8M0 scales, every row of
+# the activation including the padding) instead of the bf16 output, bitwise
+# equal to the separate gdn_gated_norm_mxfp8 launch it replaces in decode-only
+# spec batches. Off (default): that variant is not built.
+GDN_MTP_FUSED_QUANT = os.environ.get("VLLM_GDN_MTP_FUSED_QUANT", "0") == "1"
 
-def tuned_source(tune: str, pdl: bool) -> str:
-    """The kernel source with the ``tune`` macros (``"K=V+..."``) prepended."""
+
+def tuned_source(tune: str, pdl: bool, quant: bool = False) -> str:
+    """The kernel source with the ``tune`` macros (``"K=V+..."``) prepended;
+    ``quant``: also the fused-quant variant (``run_quant``).
+    """
     source = _pdl_source(_SOURCE) if pdl else _SOURCE
-    defines = ""
+    defines = "#define GMR_QO 1\n" if quant else ""
     for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         key, val = item.split("=")
         assert key in ("RPT", "MINB", "RS", "EARLY_ST", "PF", "LASTN", "FADD2"), key
@@ -79,7 +94,7 @@ def load():
     """Build (or load the cached build of) the extension for the current device."""
     if _ext:
         return _ext[0]
-    ext = build(tuned_source(GDN_MTP_CUDA_TUNE, GDN_MTP_CUDA_PDL))
+    ext = build(tuned_source(GDN_MTP_CUDA_TUNE, GDN_MTP_CUDA_PDL, GDN_MTP_FUSED_QUANT))
     _ext.append(ext)
     return ext
 
@@ -125,8 +140,9 @@ def enable() -> bool:
         try:
             load()
             logger.info(
-                "GDN MTP decode: register-resident CUDA kernel built and enabled%s.",
+                "GDN MTP decode: register-resident CUDA kernel built and enabled%s%s.",
                 f" (tune {GDN_MTP_CUDA_TUNE})" if GDN_MTP_CUDA_TUNE else "",
+                " with the fused out_proj MXFP8 quant" if GDN_MTP_FUSED_QUANT else "",
             )
         except Exception:
             logger.warning(
@@ -156,11 +172,18 @@ def gdn_mtp_cuda(
     scale: float,
     norm_eps: float,
     output_gate_activation: str,
+    out_q: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> bool:
     """Run the kernel; False (nothing launched) if the layout contract is not
     met, so the caller keeps the csrc kernel. Requires ``enable()`` first.
+
+    ``out_q``/``out_scale`` (VLLM_GDN_MTP_FUSED_QUANT): write out_proj's
+    MXFP8 activation into them (``[R, HV * V]`` e4m3, R >= the token rows, and
+    the flat F8_128x4 scales of R rows) instead of ``out``, which is then not
+    written; rows ``>= cu_seqlens[-1]`` get zero values and scales.
     """
-    return _ext[0].run(
+    args = (
         mixed_qkv,
         a,
         b,
@@ -173,9 +196,12 @@ def gdn_mtp_cuda(
         output_gate,
         norm_weight,
         out,
-        float(scale),
-        float(norm_eps),
-        output_gate_activation == "sigmoid",
+    )
+    gate_sigmoid = output_gate_activation == "sigmoid"
+    if out_q is None:
+        return _ext[0].run(*args, float(scale), float(norm_eps), gate_sigmoid)
+    return _ext[0].run_quant(
+        *args, out_q, out_scale, float(scale), float(norm_eps), gate_sigmoid
     )
 
 
@@ -184,6 +210,7 @@ _SOURCE = r"""
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 
 namespace gmr {
@@ -196,6 +223,7 @@ namespace gmr {
 // GMR_EARLY_ST 1: issue the snapshot stores before the reductions, GMR_PF N > 0:
 // L2-prefetch the source state of the CTA N blocks ahead, GMR_LASTN 1: skip
 // S_t k_{t+1} on the last token (unused), GMR_FADD2 1: packed adds in sum4.
+// GMR_QO 1: also build the fused-quant kernel (run_quant; kQ below).
 #ifndef GMR_RPT
 #define GMR_RPT 8
 #endif
@@ -216,6 +244,9 @@ namespace gmr {
 #endif
 #ifndef GMR_EARLY_ST
 #define GMR_EARLY_ST 0
+#endif
+#ifndef GMR_QO
+#define GMR_QO 0
 #endif
 
 constexpr int kK = 128;
@@ -249,10 +280,48 @@ struct Params {
   int dtb_type;  // 0 fp32, 1 bf16, 2 fp16
   int norm_w_bf16, sigmoid_gate;
   float scale, eps;
+  // kQ (run_quant): out_proj's MXFP8 activation is written instead of `out`.
+  uint8_t* q;   // e4m3 [q_rows, HV * kV], contiguous
+  uint8_t* sf;  // F8_128x4 UE8M0 scales of [sf_rows, HV * 4]
+  int q_rows;   // rows of q (>= the requests' tokens)
+  int sf_rows;  // q_rows rounded up to 128
 };
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(__expf(x)); }
+
+// MXFP8 of out_proj's activation, bit-identical to _gdn_gated_norm_mxfp8_kernel
+// (qwen_gdn_tail_ops.py; FlashInfer's mxfp8_quantize rule) on the bf16 output:
+// per 32-value block the UE8M0 exponent of amax / 448 rounded up, then e4m3 (RN,
+// satfinite) of value * 2^(127 - e); IEEE multiplies (no FTZ, no contraction).
+__device__ __forceinline__ float mul_rn(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+__device__ __forceinline__ uint32_t ue8m0(float amax) {
+  const float nm = mul_rn(amax, 1.0f / 448.0f);
+  const uint32_t bits = __float_as_uint(nm);
+  const uint32_t e = (bits >> 23) & 255u;
+  const uint32_t m = bits & 0x7FFFFFu;
+  const uint32_t bump = (m != 0u && !(e == 0u && m <= 0x400000u)) ? 1u : 0u;
+  const uint32_t sf = e + bump < 254u ? e + bump : 254u;
+  return nm <= 0.0f ? 0u : sf;
+}
+
+__device__ __forceinline__ uint8_t e4m3(float y, uint32_t sf) {
+  const float inv = __uint_as_float(sf == 0u ? 0u : (254u - sf) << 23);
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(mul_rn(y, inv), __NV_SATFINITE, __NV_E4M3));
+}
+
+// Byte offset of the scales of groups 4 * head .. 4 * head + 3 of `row` (one
+// 32-bit word) in F8_128x4: [row / 128, group / 4, row % 32, row % 128 / 32,
+// group % 4], HV * 4 groups per row (a multiple of 4: no column padding).
+__device__ __forceinline__ int64_t sf_word(int row, int head, int HV) {
+  return static_cast<int64_t>(row >> 7) * (128 * 4 * HV) + head * 512 + (row & 31) * 16 +
+         ((row & 127) >> 5) * 4;
+}
 
 template <typename S>
 struct Io;
@@ -341,7 +410,9 @@ struct RowSum {
   }
 };
 
-template <typename S>
+// kQ: write out_proj's MXFP8 activation (p.q, p.sf) of every row of q instead
+// of the bf16 output (p.out is not written).
+template <typename S, bool kQ>
 __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
   __shared__ __align__(16) float s_q[kMaxT][kK];
   __shared__ __align__(16) float s_k[kMaxT][kK];
@@ -369,13 +440,41 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
   const int bos = __ldg(p.cu + req);
   const int T = __ldg(p.cu + req + 1) - bos;
   const int acc = __ldg(p.acc + req);
-  if (T <= 0) return;
+  // kQ: rows [nv, sf_rows) belong to no request (FULL-graph padding rows, then
+  // the 128-row scale padding). As _gdn_gated_norm_mxfp8_kernel does for rows
+  // >= num_valid, they get zero values (rows < q_rows) and zero scales; CTA
+  // (req, hv) zeroes head hv of rows nv + req + k * N, once, on whichever exit.
+  const int nv = kQ ? __ldg(p.cu + gridDim.x) : 0;
+  const auto zero_pad = [&]() {
+    const int n = static_cast<int>(gridDim.x);
+    const int first = nv + req;
+    const int nq = first < p.q_rows ? (p.q_rows - first + n - 1) / n : 0;
+    for (int x = tid; x < nq * (kV / 16); x += kNT) {
+      const int64_t row = first + static_cast<int64_t>(x / (kV / 16)) * n;
+      reinterpret_cast<uint4*>(p.q + (row * p.HV + hv) * kV)[x % (kV / 16)] = make_uint4(0u, 0u, 0u, 0u);
+    }
+    const int ns = first < p.sf_rows ? (p.sf_rows - first + n - 1) / n : 0;
+    for (int x = tid; x < ns; x += kNT) *reinterpret_cast<uint32_t*>(p.sf + sf_word(first + x * n, hv, p.HV)) = 0u;
+  };
+  if (T <= 0) {
+    if constexpr (kQ) zero_pad();
+    return;
+  }
   int src = 0;
 #pragma unroll
   for (int t = 0; t < kMaxT; ++t) src = t == acc - 1 ? slots[t] : src;
   if (src <= 0 || T > kMaxT) {
-    for (int x = tid; x < T * kV; x += kNT)
-      p.out[(static_cast<int64_t>(bos + x / kV) * p.HV + hv) * kV + x % kV] = __float2bfloat16(0.0f);
+    if constexpr (kQ) {
+      // the quant of the zero output: zero values and scales
+      for (int x = tid; x < T * (kV / 16); x += kNT)
+        reinterpret_cast<uint4*>(p.q + (static_cast<int64_t>(bos + x / (kV / 16)) * p.HV + hv) * kV)[x % (kV / 16)] =
+            make_uint4(0u, 0u, 0u, 0u);
+      for (int x = tid; x < T; x += kNT) *reinterpret_cast<uint32_t*>(p.sf + sf_word(bos + x, hv, p.HV)) = 0u;
+      zero_pad();
+    } else {
+      for (int x = tid; x < T * kV; x += kNT)
+        p.out[(static_cast<int64_t>(bos + x / kV) * p.HV + hv) * kV + x % kV] = __float2bfloat16(0.0f);
+    }
     return;
   }
 
@@ -661,19 +760,47 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
     const float rstd = rsqrtf(ss / static_cast<float>(kV) + p.eps);
+    if constexpr (kQ) {
+      // Lane holds value v = lane + 32 * i: each i is one 32-value MXFP8 block,
+      // quantized from the bf16 value the two-kernel path stores and re-reads.
+      const int row = bos + t;
+      uint8_t* const qr = p.q + (static_cast<int64_t>(row) * p.HV + hv) * kV;
+      uint32_t word = 0u;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int v = lane + 32 * i;
-      p.out[(static_cast<int64_t>(bos + t) * p.HV + hv) * kV + v] = __float2bfloat16(ov[i] * rstd * s_g[t][v]);
+      for (int i = 0; i < 4; ++i) {
+        const int v = lane + 32 * i;
+        const float y = __bfloat162float(__float2bfloat16(ov[i] * rstd * s_g[t][v]));
+        float amax = fabsf(y);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        const uint32_t e = ue8m0(amax);
+        qr[v] = e4m3(y, e);
+        word |= e << (8 * i);
+      }
+      if (lane == 0) *reinterpret_cast<uint32_t*>(p.sf + sf_word(row, hv, p.HV)) = word;
+    } else {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int v = lane + 32 * i;
+        p.out[(static_cast<int64_t>(bos + t) * p.HV + hv) * kV + v] = __float2bfloat16(ov[i] * rstd * s_g[t][v]);
+      }
     }
   }
+  if constexpr (kQ) zero_pad();
 }
 
-// false if the layout contract is not met (caller keeps the csrc kernel)
-bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
-         torch::Tensor dt_bias, torch::Tensor si, torch::Tensor cu, torch::Tensor acc,
-         torch::Tensor state, torch::Tensor gate, torch::Tensor norm_w, torch::Tensor out,
-         double scale, double eps, bool sigmoid_gate) {
+template <typename S, bool kQ>
+void launch(const dim3 grid, const cudaStream_t stream, const Params& p) {
+  mtp_kernel<S, kQ><<<grid, kNT, 0, stream>>>(p);
+}
+
+// false if the layout contract is not met (caller keeps the csrc kernel).
+// q, sf (run_quant): out_proj's e4m3 activation [>= L, HV * kV] and its flat
+// F8_128x4 scales, written instead of `out`.
+bool run_impl(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+              torch::Tensor dt_bias, torch::Tensor si, torch::Tensor cu, torch::Tensor acc,
+              torch::Tensor state, torch::Tensor gate, torch::Tensor norm_w, torch::Tensor out,
+              const torch::Tensor* q, const torch::Tensor* sf, double scale, double eps, bool sigmoid_gate) {
   if (qkv.scalar_type() != at::kBFloat16 || a.scalar_type() != at::kBFloat16 ||
       b.scalar_type() != at::kBFloat16 || gate.scalar_type() != at::kBFloat16 ||
       out.scalar_type() != at::kBFloat16)
@@ -712,7 +839,21 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
     return false;
   if (out.dim() != 3 || out.size(0) != L || out.size(1) != HV || out.size(2) != kV || !out.is_contiguous())
     return false;
-  if (N == 0 || L == 0) return true;
+  int64_t sf_rows = 0;
+  if (q != nullptr) {
+    if (q->scalar_type() != at::kFloat8_e4m3fn || q->dim() != 2 || q->size(0) < L ||
+        q->size(1) != (int64_t)HV * kV || !q->is_contiguous() ||
+        (reinterpret_cast<uintptr_t>(q->data_ptr()) % 16) != 0)
+      return false;
+    sf_rows = (q->size(0) + 127) / 128 * 128;
+    if (sf->scalar_type() != at::kByte || !sf->is_contiguous() || sf->numel() != sf_rows * HV * 4 ||
+        (reinterpret_cast<uintptr_t>(sf->data_ptr()) % 4) != 0)
+      return false;
+    // The grid also zeroes the rows no request owns; without requests there is
+    // no grid, so the caller keeps the separate quant.
+    if (N == 0) return false;
+  }
+  if (N == 0 || (L == 0 && q == nullptr)) return true;
   Params p;
   p.qkv = (const __nv_bfloat16*)qkv.data_ptr();
   p.a = (const __nv_bfloat16*)a.data_ptr();
@@ -726,6 +867,10 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
   p.gate = (const __nv_bfloat16*)gate.data_ptr();
   p.norm_w = norm_w.data_ptr();
   p.out = (__nv_bfloat16*)out.data_ptr();
+  p.q = q != nullptr ? (uint8_t*)q->data_ptr() : nullptr;
+  p.sf = q != nullptr ? (uint8_t*)sf->data_ptr() : nullptr;
+  p.q_rows = q != nullptr ? (int)q->size(0) : 0;
+  p.sf_rows = (int)sf_rows;
   p.s_qkv = qkv.stride(0);
   p.s_a = a.stride(0);
   p.s_b = b.stride(0);
@@ -743,17 +888,48 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
   const c10::cuda::CUDAGuard guard(qkv.device());
   auto stream = c10::cuda::getCurrentCUDAStream();
   const dim3 grid((unsigned)N, (unsigned)HV);
-  if (st == at::kFloat)
-    mtp_kernel<float><<<grid, kNT, 0, stream>>>(p);
+  if (q == nullptr) {
+    if (st == at::kFloat)
+      launch<float, false>(grid, stream, p);
+    else
+      launch<__nv_bfloat16, false>(grid, stream, p);
+  }
+#if GMR_QO
+  else if (st == at::kFloat)
+    launch<float, true>(grid, stream, p);
   else
-    mtp_kernel<__nv_bfloat16><<<grid, kNT, 0, stream>>>(p);
+    launch<__nv_bfloat16, true>(grid, stream, p);
+#endif
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return true;
 }
 
+bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+         torch::Tensor dt_bias, torch::Tensor si, torch::Tensor cu, torch::Tensor acc,
+         torch::Tensor state, torch::Tensor gate, torch::Tensor norm_w, torch::Tensor out,
+         double scale, double eps, bool sigmoid_gate) {
+  return run_impl(qkv, a, b, a_log, dt_bias, si, cu, acc, state, gate, norm_w, out, nullptr, nullptr, scale,
+                  eps, sigmoid_gate);
+}
+
+#if GMR_QO
+bool run_quant(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
+               torch::Tensor dt_bias, torch::Tensor si, torch::Tensor cu, torch::Tensor acc,
+               torch::Tensor state, torch::Tensor gate, torch::Tensor norm_w, torch::Tensor out,
+               torch::Tensor q, torch::Tensor sf, double scale, double eps, bool sigmoid_gate) {
+  return run_impl(qkv, a, b, a_log, dt_bias, si, cu, acc, state, gate, norm_w, out, &q, &sf, scale, eps,
+                  sigmoid_gate);
+}
+#endif
+
 }  // namespace gmr
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &gmr::run); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &gmr::run);
+#if GMR_QO
+  m.def("run_quant", &gmr::run_quant);
+#endif
+}
 """
 
 
@@ -768,10 +944,7 @@ _PDL_LAUNCH = r"""
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  if (st == at::kFloat)
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mtp_kernel<float>, p));
-  else
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mtp_kernel<__nv_bfloat16>, p));
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, mtp_kernel<S, kQ>, p));
 """
 
 
@@ -788,10 +961,7 @@ def _pdl_source(source: str) -> str:
             "#endif\n",
         ),
         (
-            "  if (st == at::kFloat)\n"
-            "    mtp_kernel<float><<<grid, kNT, 0, stream>>>(p);\n"
-            "  else\n"
-            "    mtp_kernel<__nv_bfloat16><<<grid, kNT, 0, stream>>>(p);\n",
+            "  mtp_kernel<S, kQ><<<grid, kNT, 0, stream>>>(p);\n",
             _PDL_LAUNCH,
         ),
     )

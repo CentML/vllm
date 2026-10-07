@@ -4,6 +4,8 @@
 float64 reference.
 """
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -173,3 +175,141 @@ def test_gdn_mtp_cuda_rejects_unsupported_layout():
         qkv, ab, ab, vec, vec, si, cu, acc, state, gate, w, out, 1.0, EPS, "silu"
     )
     assert torch.all(out == 7.0)
+
+
+@functools.cache
+def _ext(tune: str, quant: bool):
+    # Tuned builds with PDL, as deployed (VLLM_GDN_MTP_CUDA_PDL=1).
+    return gdn_mtp_cuda.build(
+        gdn_mtp_cuda.tuned_source(tune, pdl=tune != "", quant=quant)
+    )
+
+
+def _decode_batch(n, width, pad, state_dtype, H=16, HV=32):
+    """A FULL-graph-shaped decode-only spec batch (Qwen3.6-35B-A3B heads): n
+    requests of ``width`` tokens, then ``pad`` graph-padding requests without
+    tokens; the activation has the graph's (n + pad) * width rows. Request 1
+    has an invalid source (num_accepted 0), request 2 skips the state of token
+    1, the last request runs width - 1 tokens. The norm weight puts three of
+    every head's four MXFP8 blocks in scale corners: values 32..63 around the
+    UE8M0 subnormal rounding edge (amax / 448 just below 2^-126), 64..95 zero,
+    96..127 bf16 subnormals.
+    """
+    device = torch.device("cuda")
+    N = n + pad
+    lens = [width] * n + [0] * pad
+    if n > 2:
+        lens[n - 1] = width - 1
+    acc = torch.randint(1, width + 1, (N,), dtype=torch.int32)
+    if n > 1:
+        acc[1] = 0
+    cu = torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32)
+    slots = 1 + N * width
+    si = (torch.randperm(slots - 1) + 1)[: N * width].view(N, width).to(torch.int32)
+    if n > 2:
+        si[2, 1] = 0
+    rows = N * width
+    qkv_w = 2 * H * K + HV * V
+    qkv = torch.randn(rows, qkv_w + 64, device=device).to(torch.bfloat16)[:, :qkv_w]
+    ba = torch.randn(rows, 2 * HV, device=device).to(torch.bfloat16)
+    b, a = ba[:, :HV], ba[:, HV:]
+    A_log = torch.log(torch.empty(HV, device=device).uniform_(1, 16))
+    dt_bias = torch.randn(HV, device=device)
+    state = (0.05 * torch.randn(slots, HV, V, K, device=device)).to(state_dtype)
+    gate = torch.randn(rows, HV, V, device=device).to(torch.bfloat16)
+    w = 1 + 0.1 * torch.randn(V, device=device)
+    w[32:64] *= 2.0**-120
+    w[64:96] = 0
+    w[96:] *= 2.0**-130
+    si, cu, acc = si.to(device), cu.to(device), acc.to(device)
+    return (qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w.to(torch.bfloat16))
+
+
+def _poisoned(rows, HV, device):
+    """bf16 output, e4m3 values and UE8M0 scales filled with NaN encodings."""
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_mxfp8_scale_numel,
+    )
+
+    out = torch.full((rows, HV, V), float("nan"), dtype=torch.bfloat16, device=device)
+    q = torch.full((rows, HV * V), 0x7F, dtype=torch.uint8, device=device)
+    numel = gdn_mxfp8_scale_numel(rows, HV * V)
+    scale = torch.full((numel,), 0xFF, dtype=torch.uint8, device=device)
+    return out, q.view(torch.float8_e4m3fn), scale
+
+
+@pytest.mark.parametrize(
+    "tune", ["", "RS=1+PF=212", "RS=1+LASTN=1+FADD2=1+PF=212", "RPT=4+MINB=1+RS=1"]
+)
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("width", [5, 6])
+@pytest.mark.parametrize("n", [1, 8, 56, 72, 96])
+def test_gdn_mtp_cuda_fused_quant_bitwise(tune, state_dtype, width, n):
+    """VLLM_GDN_MTP_FUSED_QUANT: run_quant writes the e4m3 values and swizzled
+    scales of the two-kernel path it replaces (run, then gdn_gated_norm_mxfp8
+    with norm_rows=(0, 0) and the device row count), bit for bit, into
+    NaN-poisoned buffers, graph-padding rows and 128-row scale padding
+    included. The state writes are unchanged; the bf16 output is not written.
+    """
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_gated_norm_mxfp8,
+    )
+
+    torch.manual_seed(10 * n + width)
+    pad = n % 3
+    args = _decode_batch(n, width, pad, state_dtype)
+    cu, state, gate, w = args[6], args[8], args[9], args[10]
+    rows, HV = gate.shape[0], gate.shape[1]
+    N = n + pad
+
+    ref_state = state.clone()
+    out, ref_q, ref_scale = _poisoned(rows, HV, gate.device)
+    run_args = list(args)
+    run_args[8] = ref_state
+    assert _ext(tune, False).run(*run_args, out, K**-0.5, EPS, False)
+    gdn_gated_norm_mxfp8(
+        out, gate, w, EPS, "silu", ref_q, ref_scale, (0, 0), cu[N : N + 1]
+    )
+
+    new_state = state.clone()
+    new_out, q, scale = _poisoned(rows, HV, gate.device)
+    run_args[8] = new_state
+    assert _ext(tune, True).run_quant(*run_args, new_out, q, scale, K**-0.5, EPS, False)
+
+    assert torch.equal(new_state, ref_state)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(scale, ref_scale)
+    assert not (q.view(torch.uint8) & 0x7F == 0x7F).any()
+    assert not (scale == 0xFF).any()
+    assert torch.isnan(new_out).all()
+    if n >= 8:
+        # Blocks whose amax / 448 is an fp32 subnormal that rounds up to
+        # UE8M0 1 (0 with flush-to-zero multiplies) are covered.
+        blocks = out[: int(cu[N])].float().abs().view(-1, 32).amax(-1)
+        edge = (blocks > 448 * 2.0**-127) & (blocks < 448 * 2.0**-126)
+        assert int(edge.sum()) > 0
+
+
+def test_gdn_mtp_cuda_fused_quant_rejects_bad_outputs():
+    """run_quant launches nothing and returns False (the caller keeps the
+    separate quant) for outputs it cannot write, or without requests (no grid
+    to zero the rows).
+    """
+    torch.manual_seed(0)
+    run_quant = _ext("", True).run_quant
+    args = list(_decode_batch(3, 4, 0, torch.bfloat16, H=1, HV=2))
+    rows, HV, device = args[0].shape[0], 2, args[0].device
+    out, q, scale = _poisoned(rows, HV, device)
+    _, short_q, _ = _poisoned(rows - 1, HV, device)
+    no_requests = list(args)
+    no_requests[5] = args[5][:0]
+    no_requests[6] = args[6][:1]
+    no_requests[7] = args[7][:0]
+    for run_args, q_, scale_ in (
+        (args, short_q, scale),
+        (args, q.view(torch.uint8), scale),
+        (args, q, scale[:-4]),
+        (no_requests, q, scale),
+    ):
+        assert not run_quant(*run_args, out, q_, scale_, K**-0.5, EPS, False)
+    assert (q.view(torch.uint8) == 0x7F).all() and (scale == 0xFF).all()
