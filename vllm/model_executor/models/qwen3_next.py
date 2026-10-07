@@ -18,7 +18,6 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.attention import fused_qkv_prologue
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -291,9 +290,6 @@ class Qwen3NextAttention(nn.Module):
     # Set per layer by norm_quant.configure_decoder_layer (NQF=1) when the
     # sigmoid gate-mul can produce o_proj's MXFP8 input.
     _nqf_gate: bool = False
-    # Set per layer by fused_qkv_prologue.configure_attention (EWS=1) when the
-    # fused QKV prologue (FP8 query + KV-cache write) replaces the stock path.
-    _ews_qkv_on: bool = False
 
     def __init__(
         self,
@@ -407,8 +403,6 @@ class Qwen3NextAttention(nn.Module):
             and supports_dtype
             and (text_only or supports_mrope)
         )
-        if fused_qkv_prologue.ENABLED:
-            fused_qkv_prologue.configure_attention(self)
 
     def _project_qkv_gate(
         self,
@@ -421,9 +415,6 @@ class Qwen3NextAttention(nn.Module):
         split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
         gating is disabled.
         """
-        if self._ews_qkv_on:
-            # q is returned in FP8 and K/V are already in the KV cache.
-            return fused_qkv_prologue.project_qkv_gate(self, qkv, positions)
         if self.use_fused_qk_norm_rope_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1

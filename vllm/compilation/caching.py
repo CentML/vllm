@@ -591,14 +591,6 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
         # MoE runners whose shared expert was folded into the routed experts
         # call torch.ops.seg.fold_moe (see fused_moe/shared_expert_fold.py).
         factors.append("seg-fold-v1")
-    if os.environ.get("EWS", "0") == "1":
-        # Fused QKV prologue (model_executor/layers/attention/
-        # fused_qkv_prologue.py) and GDN output allocation (mamba/gdn/
-        # gdn_out_alloc.py) change the traced graph.
-        qkv = int(os.environ.get("VLLM_FUSED_QKV_PROLOGUE", "1") == "1")
-        tpp = os.environ.get("EWS_QKV_TPP", "1")
-        zeros = int(os.environ.get("VLLM_GDN_OUT_ZERO_PAD_ROWS_ONLY", "1") == "1")
-        factors.append(f"ews-v1-qkv{qkv}-tpp{tpp}-z{zeros}")
     if os.environ.get("NQF", "0") != "0":
         # Fused residual-add + norm + MXFP8 quant (see
         # model_executor/layers/fusion/norm_quant.py).
