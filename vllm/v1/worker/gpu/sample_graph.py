@@ -453,7 +453,7 @@ class SamplerGraphs:
 
     def precapture(self) -> None:
         """Capture the verify-sampler graphs of B = PRECAPTURE sizes at engine
-        start, for every pool-slot parity of the rotating request / sampler
+        start, for every pool-slot parity of the rotating sampler
         state buffers, using a scratch request-state row (the last row; any
         real request that later takes it overwrites all of its state)."""
         r = self.runner
@@ -481,10 +481,10 @@ class SamplerGraphs:
         rs = r.req_states
         # A 1-token "prompt" on the scratch row, so per-request state that is
         # initialised from the prompt (e.g. the penalties bincount) is well-formed.
+        # prompt_len / prefill_len are fixed-address DeviceParams: no rotation.
         rs.prompt_len.np[row] = 1
         rs.prefill_len.np[row] = 1
-        rs.prompt_len.copy_to_uva()
-        rs.prefill_len.copy_to_uva()
+        rs.lens.sync()
         smp.add_request(row, 1, sp)
         if hasattr(smp, "_lowc2_dirty"):
             smp._lowc2_dirty = True
@@ -498,34 +498,35 @@ class SamplerGraphs:
             r.sample(hs[: b * k], batches[b], None)
         torch.cuda.current_stream().synchronize()
 
-        def rotate_sampler():
-            # Same call serving makes (rotates every sampler-state pool together;
-            # with the lowc2 dirty gate, mark dirty so it really rotates).
+        # The DeviceParamTable / StagedWriteTensor states keep one device
+        # address; only the UvaBackedTensor states (logit bias, bad words,
+        # logprob token ids, trace replay, ...) rotate through a buffer pool,
+        # one slot per Sampler.apply_staged_writes. Capture every slot parity.
+        n_s = max(
+            (
+                getattr(o, name).pool.max_concurrency
+                for o, name, sub in self._state_ptr_getters()
+                if sub and hasattr(getattr(o, name), "pool")
+            ),
+            default=1,
+        )
+        n_cap = 0
+        for _ in range(n_s):
+            for b in reversed(sizes):
+                ib = batches[b]
+                key = self._eligible_key(hs[: b * k], ib, None)
+                if key is None or key in self.graphs:
+                    continue
+                if len(self.graphs) >= MAX_GRAPHS:
+                    break
+                if self._capture(key, hs[: b * k], ib) is not None:
+                    self.precaptured.add(key)
+                    n_cap += 1
+            # Same call serving makes; with the state dirty gate, mark dirty so
+            # the pools really rotate.
             if hasattr(smp, "_lowc2_dirty"):
                 smp._lowc2_dirty = True
             smp.apply_staged_writes()
-
-        def rotate_reqs():
-            rs.prompt_len.copy_to_uva()
-            rs.prefill_len.copy_to_uva()
-
-        n_s = smp.sampling_states.temperature.pool.max_concurrency
-        n_r = rs.prompt_len.pool.max_concurrency
-        n_cap = 0
-        for _ in range(n_s):
-            for _ in range(n_r):
-                for b in reversed(sizes):
-                    ib = batches[b]
-                    key = self._eligible_key(hs[: b * k], ib, None)
-                    if key is None or key in self.graphs:
-                        continue
-                    if len(self.graphs) >= MAX_GRAPHS:
-                        break
-                    if self._capture(key, hs[: b * k], ib) is not None:
-                        self.precaptured.add(key)
-                        n_cap += 1
-                rotate_reqs()
-            rotate_sampler()
         torch.cuda.current_stream().synchronize()
         _inc("precaptured", n_cap)
         logger.info(
