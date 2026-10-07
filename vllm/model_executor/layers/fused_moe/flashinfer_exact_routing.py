@@ -51,6 +51,18 @@ Environment:
   ``GS2_ROUTE_PACKED`` (default 1: packed top-K input), ``GS2_ROUTE_LARGE``
   (default 1: also after the large-batch score kernels), ``GS2_ROUTE_AGG``
   (warp-aggregated atomics), ``GS2_ROUTE_LOG``.
+* ``VLLM_MOE_PDL_FC`` (default ``0``): ``1`` additionally builds the module
+  with :data:`PDL_FC_PATCH` applied to ``trtllm_fused_moe_kernel_launcher.cu``
+  (module name suffix ``_pdlfc``): every ``routing_runner.run`` call passes
+  ``enable_pdl=false``, so routing / permutation kernels are never
+  PDL-launched and never wait on or trigger a programmatic edge, while FC1 /
+  FC2 keep the caller's ``enable_pdl``. FlashInfer's sm_107 MoE PDL clamp
+  (``_device_support_moe_pdl``) is bypassed only after that patched module has
+  been generated; until then (or if the patch does not apply) MoE PDL stays
+  off. Launch attributes only: numerics are unchanged. Works with or without
+  ``GS2_ROUTE``; ignored (with a warning) when
+  ``VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0`` (per-call MoE PDL) or
+  ``GS2_ROUTE_PREBUILT`` is set (that module lacks the launcher patch).
 
 FlashInfer adapter: FlashInfer builds the module through the module-level
 function ``flashinfer.fused_moe.core.gen_trtllm_gen_fused_moe_sm100_module``
@@ -129,10 +141,23 @@ _BASE_SOURCE_SHA256 = {
     ),
 }
 
+# Routing-never-PDL launcher (VLLM_MOE_PDL_FC=1): FC1 / FC2 PDL-launched,
+# routing never.
+LAUNCHER_SOURCE_NAME = "trtllm_fused_moe_kernel_launcher.cu"
+# sha256 of the FlashInfer 0.6.18.post1 launcher PDL_FC_PATCH was generated against.
+_LAUNCHER_BASE_SHA256 = "7b7adacc9117eb64869bb68b96818af9588a85651afd83cb4a27abaae54152bf"
+_PDL_MARK = b"[vllm moe-pdl-fc] routing never PDL"
+# Set once gen() has produced the launcher-patched module spec; the clamp
+# bypass returns False until then, so routing can never run PDL-launched from
+# an unpatched module.
+_PDL_MODULE_READY = False
+
 _HUNK_RE = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _FILE_RE = re.compile(rb"^\+\+\+ b/(\S+)")
 
+# Whether the GS2_ROUTE module is installed (single_cta_routing_covers).
 _installed = False
+_pdl_fc_installed = False
 
 
 def _split_lines(data: bytes) -> list[bytes]:
@@ -253,6 +278,43 @@ def patched_sources(stock_sources: list[Path], out_dir: Path) -> dict[Path, Path
     return result
 
 
+def patched_launcher_source(stock_source: Path, out_dir: Path) -> Path:
+    """Return the path of the launcher with :data:`PDL_FC_PATCH` applied
+    (routing never PDL), generating it in ``out_dir`` from ``stock_source``.
+    Raises if the patch does not apply exactly or does not cover every
+    ``routing_runner.run`` call.
+    """
+    original = stock_source.read_bytes()
+    if hashlib.sha256(original).hexdigest() != _LAUNCHER_BASE_SHA256:
+        logger.warning(
+            "[moe-pdl-fc] %s differs from the FlashInfer source the launcher "
+            "patch was generated against; applying it with exact context matching",
+            stock_source,
+        )
+    patched = apply_unified_diff(original, PDL_FC_PATCH.encode())
+    n_sites = patched.count(b"routing_runner.run(")
+    n_marked = patched.count(_PDL_MARK)
+    if n_sites == 0 or n_marked != n_sites:
+        raise RuntimeError(
+            f"[moe-pdl-fc] launcher patch covers {n_marked} of {n_sites} "
+            "routing_runner.run call sites; refusing to enable MoE PDL"
+        )
+    out = out_dir / LAUNCHER_SOURCE_NAME
+    _write_if_changed(out, patched)
+    return out
+
+
+def _moe_pdl_fc_supported(device) -> bool:
+    """Replacement for FlashInfer's ``_device_support_moe_pdl`` under
+    VLLM_MOE_PDL_FC=1: PDL for the MoE runner (FC1 / FC2) wherever the device
+    supports PDL, but only once the routing-never-PDL module is in use."""
+    if not _PDL_MODULE_READY:
+        return False
+    from flashinfer.fused_moe import core
+
+    return bool(core.device_support_pdl(device))
+
+
 def _module_cache_key(spec) -> str:
     import flashinfer
     import torch
@@ -339,17 +401,43 @@ def _with_module_cache(spec):
     return out
 
 
+def _pdl_fc_enabled() -> bool:
+    """``VLLM_MOE_PDL_FC``, unless a setting it cannot compose with is set."""
+    if not envs.VLLM_MOE_PDL_FC:
+        return False
+    if envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0:
+        # Both control FlashInfer's _device_support_moe_pdl: per call for
+        # VLLM_FI_SM107_MOE_PDL_MAX_TOKENS, globally here.
+        logger.warning_once(
+            "[moe-pdl-fc] VLLM_MOE_PDL_FC ignored: "
+            "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0 selects the per-call MoE PDL"
+        )
+        return False
+    if ENABLED and PREBUILT:
+        logger.warning_once(
+            "[moe-pdl-fc] VLLM_MOE_PDL_FC ignored: the GS2_ROUTE_PREBUILT "
+            "module is built without the routing-never-PDL launcher"
+        )
+        return False
+    return True
+
+
 def maybe_install() -> None:
     """Build (or load the prebuilt) FlashInfer trtllm fused-MoE module from the
-    patched routing sources (no-op unless ``GS2_ROUTE`` enables it; idempotent).
+    patched routing sources (``GS2_ROUTE``) and / or the routing-never-PDL
+    launcher (``VLLM_MOE_PDL_FC=1``). No-op unless one of them is enabled;
+    idempotent.
     """
-    global _installed
-    if not ENABLED or _installed:
+    global _installed, _pdl_fc_installed
+    if _installed or _pdl_fc_installed:
+        return
+    pdl_fc = _pdl_fc_enabled()
+    if not (ENABLED or pdl_fc):
         return
     from flashinfer.fused_moe import core
     from flashinfer.jit import env as jit_env
 
-    prebuilt = Path(PREBUILT) if PREBUILT else None
+    prebuilt = Path(PREBUILT) if ENABLED and PREBUILT else None
     if prebuilt is not None and envs.VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE:
         logger.warning(
             "exact MoE routing: GS2_ROUTE_PREBUILT is set; ignoring "
@@ -360,12 +448,23 @@ def maybe_install() -> None:
     orig = core.gen_trtllm_gen_fused_moe_sm100_module
 
     def gen(enable_rubin=False):
+        global _PDL_MODULE_READY
         spec = orig(enable_rubin=enable_rubin)
-        name = f"{spec.name}_{TAG}"
-        mapping = patched_sources(
-            list(spec.sources), jit_env.FLASHINFER_GEN_SRC_DIR / "vllm_patched" / name
-        )
-        srcs = [mapping.get(Path(p), p) for p in spec.sources]
+        name = f"{spec.name}_{TAG}" if ENABLED else spec.name
+        if pdl_fc:
+            name = f"{name}_pdlfc"
+        out_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "vllm_patched" / name
+        srcs = list(spec.sources)
+        mapping: dict[Path, Path] = {}
+        if ENABLED:
+            mapping = patched_sources(srcs, out_dir)
+            srcs = [mapping.get(Path(p), p) for p in srcs]
+        lsrc = None
+        if pdl_fc:
+            stock_l = [p for p in srcs if Path(p).name == LAUNCHER_SOURCE_NAME]
+            assert stock_l, f"{LAUNCHER_SOURCE_NAME} not in spec sources"
+            lsrc = patched_launcher_source(Path(stock_l[0]), out_dir)
+            srcs = [lsrc if Path(p).name == LAUNCHER_SOURCE_NAME else p for p in srcs]
         new = dataclasses.replace(spec, name=name, sources=srcs)
         if prebuilt is not None:
             # JitSpecNvcc loads ``aot_path`` without building when it exists.
@@ -379,20 +478,40 @@ def maybe_install() -> None:
             # The persistent cache would load before the prebuilt module and
             # shadow it, so it only applies to JIT builds.
             new = _with_module_cache(new)
-        logger.info(
-            "exact MoE routing: module %s -> %s (%s), patched sources %s",
-            spec.name,
-            new.name,
-            f"prebuilt {prebuilt}" if prebuilt is not None else "JIT",
-            sorted(str(p) for p in mapping.values()),
-        )
+        if ENABLED:
+            logger.info(
+                "exact MoE routing: module %s -> %s (%s), patched sources %s",
+                spec.name,
+                new.name,
+                f"prebuilt {prebuilt}" if prebuilt is not None else "JIT",
+                sorted(str(p) for p in mapping.values()),
+            )
+        if pdl_fc:
+            _PDL_MODULE_READY = True
+            logger.info(
+                "[moe-pdl-fc] MoE PDL subset engaged: module %s -> %s, launcher "
+                "source %s (all routing_runner.run sites enable_pdl=false); "
+                "FC1/FC2 PDL on, routing PDL off",
+                spec.name,
+                new.name,
+                lsrc,
+            )
         return new
 
     # FlashInfer adapter (see module docstring).
     core.gen_trtllm_gen_fused_moe_sm100_module = gen
     if hasattr(core, "_get_trtllm_moe_sm100_module_impl"):
         core._get_trtllm_moe_sm100_module_impl.cache_clear()
-    _installed = True
+    if pdl_fc:
+        # Bypass FlashInfer's sm_107 clamp for the MoE runner only; returns
+        # False until gen() has produced the patched module.
+        core._device_support_moe_pdl = _moe_pdl_fc_supported
+        logger.info(
+            "[moe-pdl-fc] FlashInfer _device_support_moe_pdl replaced "
+            "(FC1/FC2 PDL once the routing-never-PDL module is built)"
+        )
+    _installed = ENABLED
+    _pdl_fc_installed = pdl_fc
 
 
 _PREBUILT_CLS: dict[type, type] = {}
@@ -793,4 +912,74 @@ FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_rout
      bool const canUseCoop =
          (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
      bool useCoop = false;
+"""
+
+
+# Unified diff against FlashInfer 0.6.18.post1 csrc/trtllm_fused_moe_kernel_launcher.cu
+# (installed as flashinfer/data/csrc/...), applied when VLLM_MOE_PDL_FC=1.
+PDL_FC_PATCH = r"""Subject: [PATCH] trtllm fused MoE launcher: routing kernels never PDL-launched
+
+Unified diff against FlashInfer 0.6.18.post1 (tag 8bc3b578)
+csrc/trtllm_fused_moe_kernel_launcher.cu
+(sha256 7b7adacc9117eb64869bb68b96818af9588a85651afd83cb4a27abaae54152bf;
+installed as flashinfer/data/csrc/...).
+
+FlashInfer passes one enable_pdl to Routing::Runner::run and to
+MoE::Runner::run (FC1 / FC2 / activation / finalize). On sm_107 its
+Python layer clamps enable_pdl off for the whole chain (core.py
+_device_support_moe_pdl, upstream #4806: intermittent unspecified launch
+failures / hangs reported at the routing kernel launch with PDL on).
+
+This patch passes enable_pdl = false to all four routing_runner.run(...)
+call sites, so the routing / permutation kernels (routingCustom block,
+dyn-block, cluster, coop, init-expert-counts, and vLLM's 0001 gs2 kernel)
+are launched without the programmatic-stream-serialization attribute and,
+since every routing wait / trigger is guarded by mUsePdl, never wait on or
+trigger a programmatic edge. The MoE runner keeps the caller's enable_pdl,
+so FC1 / FC2 can be PDL-launched (FC1 then launches only when the routing
+grid has exited; FC2 overlaps FC1's tail). Numerics are unchanged (launch
+attributes only).
+
+Applied and built by vllm/model_executor/layers/fused_moe/
+flashinfer_exact_routing.py when VLLM_MOE_PDL_FC=1; that module also
+bypasses FlashInfer's sm_107 clamp only while this patched module is in use.
+
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu	2026-10-02 21:59:16
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu	2026-10-02 21:59:16
+@@ -1516,7 +1516,7 @@
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -2612,7 +2612,7 @@
+         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+         use_routing_scales_on_input, use_deep_seek_fp8,
+         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+-        norm_topk_prob, replay_ptr, enable_pdl);
++        norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -3305,7 +3305,7 @@
+                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
+                        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
+                        static_cast<RoutingMethodType>(routing_method_type), routing_stream,
+-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
++                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ 
+     check_moe();
+     prepare_moe(moe_tactic);
+@@ -4403,7 +4403,7 @@
+       static_cast<int*>(buffers.num_non_exiting_ctas.data_ptr()), dtype_elt, routing_bias_dtype,
+       use_routing_scales_on_input, use_deep_seek_fp8,
+       static_cast<RoutingMethodType>(routing_method_type), stream, routing_logits_dtype,
+-      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), enable_pdl);
++      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), /*enable_pdl=*/false);  // [vllm moe-pdl-fc] routing never PDL
+ }
+ 
+ /// Allocate graph-stable routing metadata storage for each requested tile without launching work.
 """

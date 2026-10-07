@@ -311,6 +311,7 @@ if TYPE_CHECKING:
     VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
     VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
+    VLLM_MOE_PDL_FC: bool = False
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2129,6 +2130,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")
     ),
+    # 1: build the trtllm-gen MoE module with routing kernels never
+    # PDL-launched and let FC1/FC2 use PDL on SM107 at every token count
+    # (flashinfer_exact_routing). Ignored when VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+    # > 0 or GS2_ROUTE_PREBUILT is set.
+    "VLLM_MOE_PDL_FC": lambda: os.getenv("VLLM_MOE_PDL_FC", "0") == "1",
     # Persistent directory for the JIT-built exact-routing FlashInfer MoE module
     # (GS2_ROUTE, flashinfer_exact_routing), keyed by a hash of its build
     # inputs; ignored with GS2_ROUTE_PREBUILT. Empty = no cache.

@@ -221,8 +221,9 @@ def FusedMoEFactory(
         MoERunner: Configured MoE execution pipeline ready for forward passes
 
     """
-    # Opt-in (GS2_ROUTE): build FlashInfer's trtllm fused-MoE module with the
-    # single-CTA routing permutation. Must precede the first trtllm MoE call,
+    # Opt-in (GS2_ROUTE, VLLM_MOE_PDL_FC): build FlashInfer's trtllm fused-MoE
+    # module with the single-CTA routing permutation and / or routing never
+    # PDL-launched. Must precede the first trtllm MoE call,
     # so it runs when MoE layers are constructed.
     maybe_install_exact_moe_routing()
 
