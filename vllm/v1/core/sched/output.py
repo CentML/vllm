@@ -10,6 +10,8 @@ from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
 
 if TYPE_CHECKING:
+    import array
+
     import numpy as np
     import numpy.typing as npt
     import torch
@@ -48,6 +50,9 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+    # VLLM_PROMPT_TOKEN_ARRAY (v2 model runner): prefill_token_ids as an int32
+    # array.array, built off the step's critical path; same values.
+    prefill_token_array: "array.array | None" = None
 
     @classmethod
     def from_request(
@@ -56,6 +61,7 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
         uses_mrope: bool = False,
+        prefill_token_array: "array.array | None" = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -73,6 +79,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            prefill_token_array=prefill_token_array,
         )
 
     @property

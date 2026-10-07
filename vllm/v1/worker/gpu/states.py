@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import array
+
 import numpy as np
 import torch
 
@@ -97,7 +99,7 @@ class RequestState:
         self,
         req_id: str,
         prompt_len: int,
-        all_token_ids: list[int],
+        all_token_ids: "list[int] | array.array",
         num_computed_tokens: int,
         max_tokens: int,
     ) -> None:

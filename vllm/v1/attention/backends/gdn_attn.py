@@ -255,22 +255,42 @@ class GDNSharedBuild:
     conv1d_metadata_fn: Callable[[], tuple] | None = None
 
 
-def _lazy_conv1d_metadata(
-    shared: GDNSharedBuild, query_start_loc_cpu: torch.Tensor, device: torch.device
-) -> Callable[[], tuple]:
-    """VLLM_GDN_HOST_TRIM2: compute_causal_conv1d_metadata of the step on the
-    first call, kept on ``shared`` for every GDN group. Only causal_conv1d_fn
-    reads it, which the fused conv-prep path never calls.
+class LazyConv1dMetadata:
+    """VLLM_GDN_HOST_TRIM2: compute_causal_conv1d_metadata of the step, built
+    on the first call and kept on ``shared`` for every GDN group. Only
+    causal_conv1d_fn reads it, which the fused conv-prep path never calls.
+    Two instances are equal when they build the same metadata.
     """
 
-    def get() -> tuple:
+    __slots__ = ("shared", "query_start_loc_cpu", "device")
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(
+        self,
+        shared: GDNSharedBuild,
+        query_start_loc_cpu: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        self.shared = shared
+        self.query_start_loc_cpu = query_start_loc_cpu
+        self.device = device
+
+    def __call__(self) -> tuple:
+        shared = self.shared
         if shared.batch_ptr is None:
             shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(query_start_loc_cpu, device=device)
+                compute_causal_conv1d_metadata(
+                    self.query_start_loc_cpu, device=self.device
+                )
             )
         return shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr
 
-    return get
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, LazyConv1dMetadata)
+            and self.device == other.device
+            and torch.equal(self.query_start_loc_cpu, other.query_start_loc_cpu)
+        )
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -1149,7 +1169,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state = has_initial_state[non_spec_rows]
         shared.has_initial_state = has_initial_state
         if GDN_HOST_TRIM2:
-            shared.conv1d_metadata_fn = _lazy_conv1d_metadata(
+            shared.conv1d_metadata_fn = LazyConv1dMetadata(
                 shared, non_spec_query_start_loc_cpu, query_start_loc.device
             )
         else:
