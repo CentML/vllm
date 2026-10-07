@@ -459,6 +459,7 @@ def gdn_fused_conv_prep(
     head_k_dim: int,
     head_v_dim: int,
     tile: tuple[int, int] | None = None,
+    out: tuple[torch.Tensor, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Conv1d + SiLU + conv-state update + post-conv prep of prefill rows.
 
@@ -469,6 +470,8 @@ def gdn_fused_conv_prep(
     limit. a, b: [P, HV] (row-strided).
 
     Returns q, k: [P, H, K]; v: [P, HV, V] (x dtype); exp(g), beta: [P, HV] fp32.
+    ``out``: contiguous buffers of those shapes and dtypes to write and return
+    instead of allocating them.
     ``tile`` forces the Triton kernel with that (BT, ST) (the warmup compiles
     both).
     """
@@ -480,7 +483,7 @@ def gdn_fused_conv_prep(
     assert x.stride(1) == 1 and x.shape[1] == 2 * H * K + HV * V
     assert cu_seqlens.dtype == torch.int32
     if _cuda_kernel_ready and tile is None:
-        out = _cuda_kernel_ready[0](
+        result = _cuda_kernel_ready[0](
             x,
             conv_weights,
             conv_state,
@@ -494,14 +497,18 @@ def gdn_fused_conv_prep(
             num_k_heads,
             head_k_dim,
             head_v_dim,
+            out=out,
         )
-        if out is not None:
-            return out
-    q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
-    k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
-    v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
-    g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
-    beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        if result is not None:
+            return result
+    if out is not None:
+        q, k, v, g, beta = out
+    else:
+        q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
+        k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
+        v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
+        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
     if P == 0:
         return q, k, v, g, beta
     if tile is None:

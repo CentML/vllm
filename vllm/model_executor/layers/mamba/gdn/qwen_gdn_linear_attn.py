@@ -5,6 +5,7 @@
 import dataclasses
 import enum
 import os
+import weakref
 from typing import Literal
 
 import torch
@@ -43,10 +44,12 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+    StatePoolGroup,
     gdn_gated_norm_mxfp8,
     gdn_mxfp8_scale_numel,
     gdn_norm_launch_config,
     zero_fresh_state_rows,
+    zero_fresh_state_rows_layers,
 )
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -57,6 +60,7 @@ from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+    causal_conv1d_update_spec_step,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
     FUSED_CONV_TILE_LONG,
@@ -68,7 +72,9 @@ from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
     GDN_HOST_TRIM2,
+    GDN_HOST_TRIM3,
     drop_empty_triton_launch_hooks,
+    step_conv_bufs,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import gdn_mtp_recurrence
 from vllm.model_executor.layers.mamba.ops.gdn_mtp_fused_decode import (
@@ -502,6 +508,113 @@ def _host_layer_views(layer) -> tuple[torch.Tensor, torch.Tensor]:
         c = (src, w, conv_state, w.view(w.size(0), w.size(2)))
         layer.__dict__["_host_layer_views"] = c
     return c[2], c[3]
+
+
+def _htrim3_prefill_indices(m: GDNAttentionMetadata) -> torch.Tensor:
+    """``prefill_state_indices`` made contiguous (the in-place chunk kernel
+    and the zeroing need unit stride) once per metadata object and stream
+    (VLLM_GDN_HOST_TRIM3) instead of once per GDN layer.
+    """
+    idx = m.prefill_state_indices
+    assert idx is not None
+    if idx.is_contiguous():
+        return idx
+    handle = torch._C._cuda_getCurrentRawStream(idx.device.index)
+    cache = m.__dict__.get("_htrim3_prefill_indices")
+    if cache is None:
+        cache = m.__dict__["_htrim3_prefill_indices"] = {}
+    c = cache.get(handle)
+    if c is None:
+        c = cache[handle] = idx.contiguous()
+    return c
+
+
+# VLLM_GDN_HOST_TRIM3 (ZERO): layer names of a metadata group -> (weak refs
+# to their SSM pools, the StatePoolGroup over them or None if one launch
+# cannot cover them). Weak: a released KV cache is not kept alive.
+_htrim3_zero_groups: dict[
+    tuple[str, ...], tuple[tuple[weakref.ref, ...], StatePoolGroup | None]
+] = {}
+
+
+def _htrim3_zero_group(
+    names: tuple[str, ...], layers_by_name: dict, layer
+) -> StatePoolGroup | None:
+    layers = []
+    for name in names:
+        L = layers_by_name.get(name)
+        if L is None or type(L) is not type(layer):
+            return None
+        layers.append(L)
+    pools = tuple(L.kv_cache[1] for L in layers)
+    entry = _htrim3_zero_groups.get(names)
+    if (
+        entry is not None
+        and len(entry[0]) == len(pools)
+        and all(r() is p for r, p in zip(entry[0], pools))
+    ):
+        return entry[1]
+    group = None
+    if all(
+        L.chunk_gated_delta_rule.updates_state_in_place(p.dtype)
+        for L, p in zip(layers, pools)
+    ) and StatePoolGroup.compatible(pools):
+        group = StatePoolGroup(pools)
+    _htrim3_zero_groups[names] = (tuple(weakref.ref(p) for p in pools), group)
+    return group
+
+
+def _htrim3_launch_group_zero(layer, m: GDNAttentionMetadata) -> frozenset:
+    """Zero the fresh SSM pool rows of every GDN layer reading ``m`` in one
+    launch, with the indices and flags each layer's own zeroing would use;
+    returns the names of the layers covered (empty: nothing launched).
+    """
+    if m.num_prefills == 0:
+        return frozenset()
+    if not layer.chunk_gated_delta_rule.updates_state_in_place(layer.kv_cache[1].dtype):
+        return frozenset()
+    if torch.cuda.is_current_stream_capturing():
+        return frozenset()
+    checkpoint = m.prefill_checkpoint
+    if checkpoint is not None:
+        # _chunk_prefill_with_checkpoint's head chunk.
+        indices = checkpoint.split_state_indices
+        flags = checkpoint.split_has_initial_state
+    elif m.prefill_all_initial_state:
+        return frozenset()  # every layer skips the (no-op) zeroing
+    else:
+        indices = _htrim3_prefill_indices(m)
+        flags = m.prefill_has_initial_state
+    if flags is None:
+        return frozenset()
+    forward_context = get_forward_context()
+    layers_by_name = getattr(forward_context, "no_compile_layers", None)
+    raw = forward_context.attn_metadata
+    if not isinstance(layers_by_name, dict) or not isinstance(raw, dict):
+        return frozenset()
+    names = tuple(name for name, md in raw.items() if md is m)
+    if layer.prefix not in names:
+        return frozenset()
+    group = _htrim3_zero_group(names, layers_by_name, layer)
+    if group is None:
+        return frozenset()
+    zero_fresh_state_rows_layers(group, indices, flags)
+    return frozenset(names)
+
+
+def _htrim3_group_zero(layer, m: GDNAttentionMetadata) -> bool:
+    """VLLM_GDN_HOST_TRIM3 (ZERO): whether this step's fresh SSM pool rows of
+    ``layer`` were zeroed by the one launch for all GDN layers that read
+    ``m``. The first of them to call this makes that launch on its stream
+    (the mixed-batch path calls it before forking, so either half's stream
+    is ordered after it). Only the layers' own prefill chunk touches those
+    rows within the step, so zeroing them earlier is exact. False: the
+    caller zeroes them itself, as without the flag.
+    """
+    done = m.__dict__.get("_htrim3_zeroed")
+    if done is None:
+        done = m.__dict__["_htrim3_zeroed"] = _htrim3_launch_group_zero(layer, m)
+    return layer.prefix in done
 
 
 def _fused_conv_prep_applies(layer, attn_metadata: GDNAttentionMetadata) -> bool:
@@ -2078,11 +2191,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state: torch.Tensor,
         checkpoint: GDNPrefillCheckpointMetadata,
         out: torch.Tensor | None,
+        zeroed: bool = False,
     ) -> torch.Tensor:
         """Prefill chunk whose checkpointed sequences also leave their state at
         the checkpoint in the checkpoint slots (see
         ``GDNPrefillCheckpointMetadata``). Same results as running each
         checkpointed sequence as two consecutive chunks split there.
+        ``zeroed``: the fresh rows of the head chunk were zeroed already
+        (VLLM_GDN_HOST_TRIM3 group launch).
         """
         # 1. Heads (and unsplit sequences) from their initial state; the tails
         # here are throwaway sequences on the checkpoint slots.
@@ -2097,7 +2213,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             checkpoint.split_query_start_loc_i32,
             checkpoint.split_max_seqlen,
             checkpoint.split_state_indices,
-            checkpoint.split_has_initial_state,
+            None if zeroed else checkpoint.split_has_initial_state,
             checkpoint.split_no_initial_state,
             checkpoint.split_chunk_indices,
             checkpoint.split_chunk_offsets,
@@ -2381,6 +2497,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b_prefill = b_non_spec
 
             if fused_conv_prep:
+                assert mixed_qkv_non_spec is not None
+                conv_bufs = (
+                    step_conv_bufs(
+                        forward_context,
+                        mixed_qkv_non_spec.shape[0],
+                        self.num_k_heads // self.tp_size,
+                        self.head_k_dim,
+                        self.A_log.shape[0],
+                        self.head_v_dim,
+                        mixed_qkv_non_spec.dtype,
+                        mixed_qkv_non_spec.device,
+                    )
+                    if GDN_HOST_TRIM3
+                    else None
+                )
                 (
                     query_non_spec,
                     key_non_spec,
@@ -2401,6 +2532,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_k_heads=self.num_k_heads // self.tp_size,
                     head_k_dim=self.head_k_dim,
                     head_v_dim=self.head_v_dim,
+                    out=conv_bufs,
                 )
             else:
                 (
@@ -2511,6 +2643,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state,
                     attn_metadata.prefill_checkpoint,
                     non_spec_out,
+                    zeroed=GDN_HOST_TRIM3 and _htrim3_group_zero(self, attn_metadata),
                 )
             elif self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
                 # FlashInfer reads and updates the pool rows in place through
@@ -2518,7 +2651,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # state are zeroed first. Batches without spec rows index
                 # block_table[:, 0], a strided view; FlashInfer and the zeroing
                 # kernel need unit stride.
-                if not GDN_HOST_TRIM:
+                if GDN_HOST_TRIM3:
+                    prefill_state_indices = _htrim3_prefill_indices(attn_metadata)
+                    if not attn_metadata.prefill_all_initial_state and (
+                        not _htrim3_group_zero(self, attn_metadata)
+                    ):
+                        zero_fresh_state_rows(
+                            ssm_state, prefill_state_indices, prefill_has_initial_state
+                        )
+                elif not GDN_HOST_TRIM:
                     prefill_state_indices = prefill_state_indices.contiguous()
                     zero_fresh_state_rows(
                         ssm_state, prefill_state_indices, prefill_has_initial_state
@@ -2766,18 +2907,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # A mixed batch passes its spec rows only (fewer than
             # num_actual_tokens): [:num_actual_tokens] would be the same view.
             n = num_actual_tokens
-            mixed_qkv = causal_conv1d_update(
-                _rows(mixed_qkv, n),
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=conv_slots,
-                num_accepted_tokens=accepted,
-                query_start_loc=cu_seqlens,
-                max_query_len=max_query_len,
-                validate_data=False,
-            )
+            if GDN_HOST_TRIM3 and attn_metadata.num_prefills > 0:
+                # Mixed step (eager): the launch is bound once per step.
+                mixed_qkv = causal_conv1d_update_spec_step(
+                    attn_metadata,
+                    _rows(mixed_qkv, n),
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_slots,
+                    accepted,
+                    cu_seqlens,
+                    max_query_len,
+                )
+            else:
+                mixed_qkv = causal_conv1d_update(
+                    _rows(mixed_qkv, n),
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=conv_slots,
+                    num_accepted_tokens=accepted,
+                    query_start_loc=cu_seqlens,
+                    max_query_len=max_query_len,
+                    validate_data=False,
+                )
             return self._forward_core_decode_spec_post_conv_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=_rows(b, n),
@@ -3269,6 +3425,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # disjoint rows of core_attn_out and disjoint conv/SSM slots.
                 spec_stream, prefill_stream, fork, join = _gdn_mixed_fork_streams()
                 main = torch.cuda.current_stream()
+                if GDN_HOST_TRIM3:
+                    # The group's fresh-row zeroing (first layer) goes before
+                    # the fork, so the prefill half's stream is ordered
+                    # after it whichever stream that is.
+                    _htrim3_group_zero(self, attn_metadata)
                 fork.record(main)
                 if attn_metadata.num_prefill_tokens >= GDN_MIXED_FORK_PREFILL_FIRST:
                     with torch.cuda.stream(prefill_stream):

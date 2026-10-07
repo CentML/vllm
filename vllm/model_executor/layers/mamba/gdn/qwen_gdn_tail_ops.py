@@ -17,6 +17,7 @@
 """
 
 import math
+import weakref
 
 import torch
 
@@ -293,5 +294,106 @@ def zero_fresh_state_rows(
         pool.stride(0),
         ROW_NUMEL=row_numel,
         BLOCK=block,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _zero_fresh_state_rows_layers_kernel(
+    pool_ptr,
+    offsets_ptr,
+    indices_ptr,
+    has_initial_state_ptr,
+    stride_slot,
+    ROW_NUMEL: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ELEMS_16B: tl.constexpr,
+):
+    # _zero_fresh_state_rows_kernel on the pool of layer program_id(2), at
+    # pool_ptr + offsets[layer] 16-byte units (the scaling keeps the 16-byte
+    # alignment of pool_ptr provable, so the stores stay vectorized).
+    seq = tl.program_id(0)
+    if tl.load(has_initial_state_ptr + seq) == 0:
+        base = pool_ptr + tl.load(offsets_ptr + tl.program_id(2)) * ELEMS_16B
+        slot = tl.load(indices_ptr + seq).to(tl.int64)
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(
+            base + slot * stride_slot + offs,
+            tl.zeros((BLOCK,), dtype=pool_ptr.dtype.element_ty),
+            mask=offs < ROW_NUMEL,
+        )
+
+
+_zero_layers_launch = launcher(_zero_fresh_state_rows_layers_kernel)
+
+
+class StatePoolGroup:
+    """The SSM pools of several GDN layers as one zeroing target: pool 0
+    plus the other pools' 16-byte offsets from it (device int64). The pools
+    are held weakly (a cached group must not keep a released KV cache alive);
+    the caller launches only while they are the live pools of its layers.
+    """
+
+    __slots__ = ("refs", "offsets", "row_numel", "stride_slot", "elems_16b")
+
+    def __init__(self, pools: tuple[torch.Tensor, ...]) -> None:
+        self.refs = tuple(weakref.ref(p) for p in pools)
+        ref = pools[0]
+        es = ref.element_size()
+        base = ref.data_ptr()
+        offsets = [(p.data_ptr() - base) // 16 for p in pools]
+        self.offsets = torch.tensor(offsets, dtype=torch.int64, device=ref.device)
+        self.row_numel = math.prod(ref.shape[1:])
+        self.stride_slot = ref.stride(0)
+        self.elems_16b = 16 // es
+
+    @staticmethod
+    def compatible(pools: tuple[torch.Tensor, ...]) -> bool:
+        """Whether one launch can address every pool: same dtype, row shape and
+        slot stride, contiguous rows, 16-byte aligned starts.
+        """
+        ref = pools[0]
+        if 16 % ref.element_size():
+            return False
+        for p in pools:
+            if (
+                p.dtype != ref.dtype
+                or p.device != ref.device
+                or p.shape[1:] != ref.shape[1:]
+                or p.stride(0) != ref.stride(0)
+                or not p[0].is_contiguous()
+                or p.data_ptr() % 16
+            ):
+                return False
+        return True
+
+
+def zero_fresh_state_rows_layers(
+    group: StatePoolGroup,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+) -> None:
+    """``zero_fresh_state_rows(pool, state_indices, has_initial_state)`` for
+    every pool of ``group`` in one launch (the same elements are zeroed).
+    """
+    num_seqs = state_indices.numel()
+    if num_seqs == 0:
+        return
+    assert state_indices.is_contiguous() and has_initial_state.is_contiguous()
+    assert has_initial_state.numel() == num_seqs
+    block = 4096
+    pool = group.refs[0]()
+    assert pool is not None
+    _zero_layers_launch[
+        (num_seqs, triton.cdiv(group.row_numel, block), len(group.refs))
+    ](
+        pool,
+        group.offsets,
+        state_indices,
+        has_initial_state,
+        group.stride_slot,
+        ROW_NUMEL=group.row_numel,
+        BLOCK=block,
+        ELEMS_16B=group.elems_16b,
         num_warps=4,
     )

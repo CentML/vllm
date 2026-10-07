@@ -5,7 +5,7 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -1255,6 +1255,228 @@ def causal_conv1d_update(
     if GDN_HOST_TRIM and out.dtype == original_x_dtype:
         return out
     return out.to(original_x_dtype)
+
+
+class _SpecConvLaunch(NamedTuple):
+    """A bound spec-row ``_causal_conv1d_update_kernel`` launch (see
+    ``causal_conv1d_update_spec_step``).
+    """
+
+    key: tuple
+    # (conv_state_indices, num_accepted_tokens, query_start_loc, max_query_len)
+    indices: tuple
+    kernel: Any
+    grid: tuple[int, int]
+    values: list
+    # Positions of the per-layer tensors in ``values``.
+    i_x: int
+    i_w: int
+    i_bias: int
+    i_state: int
+    i_out: int
+
+
+_spec_conv_fast: list = []
+
+
+def _spec_conv_key(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+) -> tuple:
+    """Everything the launch arguments and the kernel specialization depend
+    on besides the step's index tensors: dtypes, shapes, strides and 16-byte
+    alignment of the per-layer tensors.
+    """
+    return (
+        x.dtype,
+        x.dim(),
+        x.stride(),
+        x.size(1),
+        x.data_ptr() % 16 == 0,
+        conv_state.dtype,
+        conv_state.shape,
+        conv_state.stride(),
+        conv_state.data_ptr() % 16 == 0,
+        weight.dtype,
+        weight.shape,
+        weight.stride(),
+        weight.data_ptr() % 16 == 0,
+        None if bias is None else (bias.dtype, bias.data_ptr() % 16 == 0),
+        activation,
+    )
+
+
+def _bind_spec_conv_launch(
+    key: tuple,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+) -> _SpecConvLaunch | None:
+    """The launch ``causal_conv1d_update`` makes for these arguments (varlen
+    spec decoding, ``out=None``, default ``null_block_id``), bound once; None
+    if that form does not apply or the kernel is not compiled yet.
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    if (
+        activation not in ("silu", "swish")
+        or x.dim() != 2
+        or x.dtype != conv_state.dtype
+    ):
+        return None
+    batch = conv_state_indices.size(0)
+    dim = x.size(1)
+    seqlen = max_query_len
+    _, width = weight.shape
+    num_cache_lines, _, _ = conv_state.size()
+    stride_w_dim, stride_w_width = weight.stride()
+    stride_x_token, stride_x_dim = x.stride()
+    stride_state_seq, stride_state_dim, stride_state_token = conv_state.stride()
+    # num_accepted_tokens is set: the effective state length.
+    state_len = width - 1 + (seqlen - 1)
+    if not _spec_conv_fast:
+        from vllm.triton_utils.fast_launch import FastLaunch, launch_bound
+
+        fast = FastLaunch(_causal_conv1d_update_kernel)
+        _spec_conv_fast.extend((fast, launch_bound))
+    bound = _spec_conv_fast[0].bind(
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        num_accepted_tokens,
+        query_start_loc,
+        None,
+        None,
+        x,  # out = x
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        0,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_state_seq,
+        stride_state_dim,
+        stride_state_token,
+        conv_state_indices.stride(0),
+        0,
+        stride_x_dim,
+        stride_x_token,
+        NULL_BLOCK_ID,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=True,
+        IS_VARLEN=True,
+        IS_APC_ENABLED=False,
+        IS_SPEC_DECODING=True,
+        NP2_STATELEN=triton.next_power_of_2(state_len),
+        HAS_NULL_BLOCK=NULL_BLOCK_ID is not None,
+        BLOCK_N=256,
+        launch_pdl=arch_support_pdl(),
+    )
+    if bound is None:
+        return None
+    kernel, names, values = bound
+    return _SpecConvLaunch(
+        key=key,
+        indices=(
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+        ),
+        kernel=kernel,
+        grid=(batch, triton.cdiv(dim, 256)),
+        values=values,
+        i_x=names.index("x_ptr"),
+        i_w=names.index("w_ptr"),
+        i_bias=names.index("bias_ptr"),
+        i_state=names.index("conv_state_ptr"),
+        i_out=names.index("o_ptr"),
+    )
+
+
+def causal_conv1d_update_spec_step(
+    md: Any,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+) -> torch.Tensor:
+    """VLLM_GDN_HOST_TRIM3 (HOIST_CONV): ``causal_conv1d_update(x,
+    conv_state, weight, bias, activation, conv_state_indices=...,
+    num_accepted_tokens=..., query_start_loc=..., max_query_len=...,
+    validate_data=False)`` for the spec rows of the step whose metadata is
+    ``md``. The first GDN layer of the step binds the launch (compiled kernel
+    and argument list); every layer whose tensors have the same key and
+    whose index tensors are the same objects relaunches it with its own x,
+    weight, bias and conv state: the same kernel with the same arguments as
+    the wrapper's launch. Anything else takes the wrapper. Returns x (updated
+    in place, as the wrapper does when x has the conv state's dtype).
+    """
+    key = _spec_conv_key(x, conv_state, weight, bias, activation)
+    launch = md.__dict__.get("_htrim3_spec_conv")
+    if launch is None:
+        launch = _bind_spec_conv_launch(
+            key,
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+        )
+        md.__dict__["_htrim3_spec_conv"] = launch or False
+    if (
+        launch
+        and launch.key == key
+        and launch.indices[0] is conv_state_indices
+        and launch.indices[1] is num_accepted_tokens
+        and launch.indices[2] is query_start_loc
+        and launch.indices[3] == max_query_len
+    ):
+        values = launch.values.copy()
+        values[launch.i_x] = x
+        values[launch.i_out] = x
+        values[launch.i_w] = weight
+        values[launch.i_bias] = bias
+        values[launch.i_state] = conv_state
+        _spec_conv_fast[1](launch.kernel, launch.grid, values)
+        return x
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        validate_data=False,
+    )
 
 
 if current_platform.is_cpu():

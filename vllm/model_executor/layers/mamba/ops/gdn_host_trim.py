@@ -21,6 +21,8 @@ that no prefill row is fresh (an exact no-op):
 
 import os
 
+import torch
+
 from vllm.platforms import current_platform
 
 GDN_HOST_TRIM = os.environ.get("VLLM_GDN_HOST_TRIM", "0") == "1"
@@ -36,8 +38,69 @@ GDN_HOST_TRIM = os.environ.get("VLLM_GDN_HOST_TRIM", "0") == "1"
 # - the int64 copy of the prefill state indices (gather path only) is not
 #   built when the chunk kernel updates the SSM pool in place.
 GDN_HOST_TRIM2 = os.environ.get("VLLM_GDN_HOST_TRIM2", "0") == "1"
+# Third round (exact; same kernels, arguments and values), for the GDN layers
+# of steps with prefill rows:
+# - BUFS: the fused conv prep writes q/k/v/exp(g)/beta into buffers allocated
+#   once per (step, stream) and shared by all GDN layers of the step (every
+#   KV-cache group), instead of 5 allocations per layer;
+# - ZERO: the fresh SSM pool rows of all GDN layers sharing a metadata object
+#   are zeroed by one launch at the first of them (before the mixed-batch
+#   fork), instead of one launch per layer; the contiguous prefill state
+#   indices are made once per metadata object;
+# - HOIST_CONV: the spec rows' causal_conv1d_update launch of a mixed step is
+#   bound once (compiled kernel and arguments) and relaunched for every layer
+#   whose tensors have the same specialization, skipping the wrapper and the
+#   Triton binder.
+GDN_HOST_TRIM3 = os.environ.get("VLLM_GDN_HOST_TRIM3", "0") == "1"
 
 _pdl: list[bool] = []
+
+
+def step_conv_bufs(
+    step,
+    num_rows: int,
+    num_k_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...] | None:
+    """VLLM_GDN_HOST_TRIM3 (BUFS): the q, k [num_rows, H, K], v
+    [num_rows, HV, V] (``dtype``) and exp(g), beta [num_rows, HV] (fp32)
+    outputs of the prefill conv prep, allocated on the first call per (step,
+    current stream) and returned again to every later GDN layer of the step
+    on that stream. ``step`` is the step's forward context: the buffers live
+    in it, so they are freed with it at the end of the step (one set per
+    stream, the peak of the per-layer allocations, held across the step).
+    Each layer consumes them (chunk kernel, checkpoint tails) on the stream
+    that wrote them before the next layer overwrites them, so sharing equals
+    the per-layer allocations. None while capturing a CUDA graph (the caller
+    allocates).
+    """
+    index = device.index
+    handle = torch._C._cuda_getCurrentRawStream(
+        torch.accelerator.current_device_index() if index is None else index
+    )
+    cache = step.__dict__.get("_htrim3_conv_bufs")
+    if cache is None:
+        cache = step.__dict__["_htrim3_conv_bufs"] = {}
+    key = (num_rows, num_k_heads, head_k_dim, num_v_heads, head_v_dim, dtype)
+    entry = cache.get(handle)
+    if entry is not None and entry[0] == key:
+        return entry[1]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    P, H, K, HV, V = key[:5]
+    bufs = (
+        torch.empty(P, H, K, dtype=dtype, device=device),
+        torch.empty(P, H, K, dtype=dtype, device=device),
+        torch.empty(P, HV, V, dtype=dtype, device=device),
+        torch.empty(P, HV, dtype=torch.float32, device=device),
+        torch.empty(P, HV, dtype=torch.float32, device=device),
+    )
+    cache[handle] = (key, bufs)
+    return bufs
 
 
 def arch_support_pdl() -> bool:

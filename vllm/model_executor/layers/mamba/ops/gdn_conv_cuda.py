@@ -96,9 +96,11 @@ def gdn_conv_cuda_prep(
     num_k_heads: int,
     head_k_dim: int,
     head_v_dim: int,
+    out: tuple[torch.Tensor, ...] | None = None,
 ):
     """gdn_fused_conv_prep on the CUDA kernel; None if the kernel's layout
     contract (bf16, head dims 128, width 4, 16-byte aligned rows) is not met.
+    ``out``: (q, k, v, g, beta) buffers to write instead of allocating them.
     Call ``load()`` first (the warmup does).
     """
     H, K, V = num_k_heads, head_k_dim, head_v_dim
@@ -107,11 +109,14 @@ def gdn_conv_cuda_prep(
         return None
     P = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
-    q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
-    k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
-    v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
-    g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
-    beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+    if out is not None:
+        q, k, v, g, beta = out
+    else:
+        q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
+        k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
+        v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
+        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
     # Tokens per half-warp: 4 (32-token CTAs) for short sequences, else 8.
     tph = 4 if 1024 * max(num_seqs, 1) > P else 8
     if GDN_HOST_TRIM:

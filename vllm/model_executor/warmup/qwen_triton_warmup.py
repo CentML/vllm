@@ -308,6 +308,24 @@ def _warm_zero_fresh_state_rows_kernel(
             indices[indices_offset : indices_offset + 1],
             flags[flags_offset : flags_offset + 1],
         )
+    from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM3
+
+    if not GDN_HOST_TRIM3:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        StatePoolGroup,
+        zero_fresh_state_rows_layers,
+    )
+
+    # The one-launch zeroing of a layer group, same four variants.
+    other = torch.empty_like(pool)  # alive for the launches (held weakly)
+    group = StatePoolGroup((pool, other))
+    for indices_offset, flags_offset in itertools.product((0, 1), repeat=2):
+        zero_fresh_state_rows_layers(
+            group,
+            indices[indices_offset : indices_offset + 1],
+            flags[flags_offset : flags_offset + 1],
+        )
 
 
 def _warm_gdn_mtp_recurrence_kernel(
