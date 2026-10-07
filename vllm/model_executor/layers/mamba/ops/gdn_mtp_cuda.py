@@ -440,26 +440,26 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
   const int bos = __ldg(p.cu + req);
   const int T = __ldg(p.cu + req + 1) - bos;
   const int acc = __ldg(p.acc + req);
-  // kQ: rows [nv, sf_rows) belong to no request (FULL-graph padding rows, then
-  // the 128-row scale padding). As _gdn_gated_norm_mxfp8_kernel does for rows
-  // >= num_valid, they get zero values (rows < q_rows) and zero scales; CTA
-  // (req, hv) zeroes head hv of rows nv + req + k * N, once, on whichever exit.
-  const int nv = kQ ? __ldg(p.cu + gridDim.x) : 0;
-  const auto zero_pad = [&]() {
+  if constexpr (kQ) {
+    // Rows [nv, sf_rows) belong to no request (FULL-graph padding rows, then
+    // the 128-row scale padding). As _gdn_gated_norm_mxfp8_kernel does for
+    // rows >= num_valid, they get zero values (rows < q_rows) and zero scales:
+    // CTA (req, hv) zeroes head hv of rows nv + req + k * N, one row per warp
+    // (lanes 0-7: the 128 e4m3 bytes, lane 8: the 4 scales). Issued here,
+    // ahead of the state loads (VR: cheaper than in their shadow or at exit).
+    const int nv = __ldg(p.cu + gridDim.x);
     const int n = static_cast<int>(gridDim.x);
-    const int first = nv + req;
-    const int nq = first < p.q_rows ? (p.q_rows - first + n - 1) / n : 0;
-    for (int x = tid; x < nq * (kV / 16); x += kNT) {
-      const int64_t row = first + static_cast<int64_t>(x / (kV / 16)) * n;
-      reinterpret_cast<uint4*>(p.q + (row * p.HV + hv) * kV)[x % (kV / 16)] = make_uint4(0u, 0u, 0u, 0u);
+    for (int row = nv + req + warp * n; row < p.sf_rows; row += kNW * n) {
+      if (lane < kV / 16) {
+        if (row < p.q_rows)
+          reinterpret_cast<uint4*>(p.q + (static_cast<int64_t>(row) * p.HV + hv) * kV)[lane] =
+              make_uint4(0u, 0u, 0u, 0u);
+      } else if (lane == kV / 16) {
+        *reinterpret_cast<uint32_t*>(p.sf + sf_word(row, hv, p.HV)) = 0u;
+      }
     }
-    const int ns = first < p.sf_rows ? (p.sf_rows - first + n - 1) / n : 0;
-    for (int x = tid; x < ns; x += kNT) *reinterpret_cast<uint32_t*>(p.sf + sf_word(first + x * n, hv, p.HV)) = 0u;
-  };
-  if (T <= 0) {
-    if constexpr (kQ) zero_pad();
-    return;
   }
+  if (T <= 0) return;
   int src = 0;
 #pragma unroll
   for (int t = 0; t < kMaxT; ++t) src = t == acc - 1 ? slots[t] : src;
@@ -470,7 +470,6 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
         reinterpret_cast<uint4*>(p.q + (static_cast<int64_t>(bos + x / (kV / 16)) * p.HV + hv) * kV)[x % (kV / 16)] =
             make_uint4(0u, 0u, 0u, 0u);
       for (int x = tid; x < T; x += kNT) *reinterpret_cast<uint32_t*>(p.sf + sf_word(bos + x, hv, p.HV)) = 0u;
-      zero_pad();
     } else {
       for (int x = tid; x < T * kV; x += kNT)
         p.out[(static_cast<int64_t>(bos + x / kV) * p.HV + hv) * kV + x % kV] = __float2bfloat16(0.0f);
@@ -761,23 +760,27 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
     for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
     const float rstd = rsqrtf(ss / static_cast<float>(kV) + p.eps);
     if constexpr (kQ) {
-      // Lane holds value v = lane + 32 * i: each i is one 32-value MXFP8 block,
-      // quantized from the bf16 value the two-kernel path stores and re-reads.
+      // Quantize the bf16 value the two-kernel path stores and re-reads, with
+      // lane holding values 4 * lane .. 4 * lane + 3: an MXFP8 block is 8 lanes
+      // (3 shuffle levels), one 32-bit e4m3 store per lane, and lane 8 * i
+      // stores the scale byte of block i. Same per-value product as below.
       const int row = bos + t;
-      uint8_t* const qr = p.q + (static_cast<int64_t>(row) * p.HV + hv) * kV;
-      uint32_t word = 0u;
+      float y[4];
+      float amax = 0.0f;
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int v = lane + 32 * i;
-        const float y = __bfloat162float(__float2bfloat16(ov[i] * rstd * s_g[t][v]));
-        float amax = fabsf(y);
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-        const uint32_t e = ue8m0(amax);
-        qr[v] = e4m3(y, e);
-        word |= e << (8 * i);
+      for (int c = 0; c < 4; ++c) {
+        const int v = 4 * lane + c;
+        y[c] = __bfloat162float(__float2bfloat16(s_o[t][v] * rstd * s_g[t][v]));
+        amax = fmaxf(amax, fabsf(y[c]));
       }
-      if (lane == 0) *reinterpret_cast<uint32_t*>(p.sf + sf_word(row, hv, p.HV)) = word;
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+      const uint32_t e = ue8m0(amax);
+      uint32_t packed = 0u;
+#pragma unroll
+      for (int c = 0; c < 4; ++c) packed |= static_cast<uint32_t>(e4m3(y[c], e)) << (8 * c);
+      reinterpret_cast<uint32_t*>(p.q + (static_cast<int64_t>(row) * p.HV + hv) * kV)[lane] = packed;
+      if ((lane & 7) == 0) p.sf[sf_word(row, hv, p.HV) + lane / 8] = static_cast<uint8_t>(e);
     } else {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
@@ -786,7 +789,6 @@ __global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
       }
     }
   }
-  if constexpr (kQ) zero_pad();
 }
 
 template <typename S, bool kQ>
