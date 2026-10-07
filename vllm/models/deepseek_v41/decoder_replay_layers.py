@@ -29,6 +29,7 @@ from vllm.compilation.breakable_cudagraph import (
 )
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import (
+    RANK_LOCAL_BATCH,
     ForwardContext,
     get_forward_context,
     is_forward_context_available,
@@ -200,6 +201,10 @@ class DecoderReplayLayers:
         outer_padding = context.is_padding
         context.is_padding = self._padding[:num_tokens]
         self._inherit_batch_context(context)
+        # Ranks replay these graphs independently, each sized for its own replay
+        # rows: what a graph bakes in must not depend on this capture size where
+        # it has to match across ranks (RANK_LOCAL_BATCH).
+        context.additional_kwargs[RANK_LOCAL_BATCH] = True
         graph = BreakableCUDAGraphCapture(pool=self.graph_pool)
         try:
             with override_forward_context(context), graph:
@@ -207,6 +212,7 @@ class DecoderReplayLayers:
                 outputs = weak_ref_tensors(outputs)
         finally:
             context.is_padding = outer_padding
+            context.additional_kwargs.pop(RANK_LOCAL_BATCH, None)
         self._graphs[num_tokens] = graph
         self._graph_outputs[num_tokens] = tuple(outputs)
         bisect.insort(self._graph_sizes, num_tokens)

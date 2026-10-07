@@ -594,6 +594,50 @@ def test_sm107_rank_consistent_capacity(monkeypatch):
         select(fake, 20000)
 
 
+def test_sm107_rank_local_batch_uses_largest_profile(monkeypatch):
+    """DSv4.1 bounded-replay seam graphs are captured per replay size and each
+    rank replays the size of its own replay rows, so the capacity profile baked
+    into such a graph must be the same for every size: the largest one. A rank
+    trimming a prefill to 128 rows (graph 144) and an idle rank replaying the
+    whole 3072-token dummy batch must launch the same workspace."""
+    import vllm.forward_context as fc
+    from vllm.models.deepseek_v4.nvidia.fi_moe import DeepseekV4MegaMoEExpertsFI
+
+    caps = [128, 256, 512, 1024, 2048, 3072]
+    fake = SimpleNamespace(
+        _dp_size=4,
+        _sp_size=1,
+        max_num_tokens=3072,
+        _profile_caps=caps,
+        _profiles={c: ("k", c, "w") for c in caps},
+    )
+    fake._rank_consistent_num_tokens = (
+        lambda n: DeepseekV4MegaMoEExpertsFI._rank_consistent_num_tokens(fake, n)
+    )
+    select = DeepseekV4MegaMoEExpertsFI._select_profile
+    # Seam capture of the 144-row replay graph: all ranks capture size 144 and
+    # the batch's DP metadata says 144 everywhere, yet the graph must hold 3072.
+    dp = SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([144, 144, 144, 144]))
+    ctx = SimpleNamespace(dp_metadata=dp, additional_kwargs={fc.RANK_LOCAL_BATCH: True})
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+    assert select(fake, 144)[1] == 3072
+    assert select(fake, 6)[1] == 3072
+    # The batch graphs (no flag) keep the DP-synced ladder.
+    ctx.additional_kwargs = {}
+    assert select(fake, 144)[1] == 256
+    # A context without additional_kwargs (older producers) behaves as before.
+    monkeypatch.setattr(
+        fc, "get_forward_context", lambda: SimpleNamespace(dp_metadata=dp)
+    )
+    assert select(fake, 144)[1] == 256
+    # DP=1: every rank holds the same batch; the flag does not matter.
+    fake._dp_size = 1
+    monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+    ctx.additional_kwargs = {fc.RANK_LOCAL_BATCH: True}
+    assert select(fake, 144)[1] == 256
+
+
 def test_sm107_shared_mode_resolution():
     from vllm.models.deepseek_v4.nvidia.fi_moe import (
         resolve_sm107_shared_mode,

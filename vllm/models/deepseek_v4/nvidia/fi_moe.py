@@ -703,15 +703,23 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         if self._dp_size <= 1:
             return num_tokens
         from vllm.forward_context import (
+            RANK_LOCAL_BATCH,
             get_forward_context,
             is_forward_context_available,
         )
 
-        dp_metadata = (
-            get_forward_context().dp_metadata
-            if is_forward_context_available()
-            else None
-        )
+        context = get_forward_context() if is_forward_context_available() else None
+        if (getattr(context, "additional_kwargs", None) or {}).get(RANK_LOCAL_BATCH):
+            # A rank-local batch (DSv4.1 bounded-replay seam graph, captured per
+            # replay size and replayed at a size each rank picks for itself):
+            # the profile is baked into the graph, so only the largest one is
+            # the same on every rank whatever sizes the ranks replay.
+            logger.info_once(
+                "FlashInfer SM107 MegaMoE: rank-local batches (bounded-replay "
+                "seam graphs) use the largest capacity profile."
+            )
+            return sm107_max_tokens_per_rank(self.max_num_tokens, self._sp_size)
+        dp_metadata = context.dp_metadata if context is not None else None
         if dp_metadata is None:
             # No cross-rank token counts: fall back to the largest profile,
             # which every rank selects identically. That is the per-rank cap
