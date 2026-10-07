@@ -254,6 +254,18 @@ def cublaslt_mm_mxfp8(
 # (25600, 6144), wq_b (32768, 1280).
 _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
     (1792, 5120): [
+        # below 1536: b1024 y1 small-M winners (cuBLASLt / Sm107 tactics 1.06-1.81x vs cute-dsl at M 256..1408:
+        # DSpark draft graph, bounded-replay trimmed layers, decode-heavy steps)
+        (256, "cublaslt"),
+        (512, "cublaslt"),
+        (640, "t256x64_i256_c2x1_s1_p0"),
+        (768, "t256x64_i256_c2x1_s0_p0"),
+        (896, "cublaslt"),
+        (1024, "cublaslt"),
+        (1152, "cublaslt"),
+        (1260, "cublaslt"),
+        (1280, "cublaslt"),
+        (1408, "cublaslt"),
         (1536, "cublaslt"),
         (1800, "cublaslt"),
         (2046, "t256x192_i256_c2x1_s0_p0"),
@@ -262,6 +274,17 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (3072, "cublaslt"),
     ],
     (4096, 1280): [
+        # below 1536: b1024 y1 small-M winners
+        (256, "cublaslt"),
+        (512, "cublaslt"),
+        (640, "cublaslt"),
+        (768, "cublaslt"),
+        (896, "t256x192_i256_c2x1_s1_p0"),
+        (1024, "cublaslt"),
+        (1152, "cublaslt"),
+        (1260, "cublaslt"),
+        (1280, "cublaslt"),
+        (1408, "cublaslt"),
         (1536, "cublaslt"),
         (1800, "cublaslt"),
         (2046, "cublaslt"),
@@ -270,6 +293,17 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (3072, "t256x256_i256_c2x1_s0_p0"),
     ],
     (5120, 8192): [
+        # below 1536: b1024 y1 small-M winners
+        (256, "t256x64_i256_c2x1_s0_p0"),
+        (512, "cublaslt"),
+        (640, "cublaslt"),
+        (768, "t256x192_i256_c2x1_s1_p0"),
+        (896, "t256x192_i256_c2x1_s1_p0"),
+        (1024, "t256x256_i256_c4x1_s0_p0"),
+        (1152, "cublaslt"),
+        (1260, "cublaslt"),
+        (1280, "cublaslt"),
+        (1408, "t512x256_i256_c2x1_s1_p0"),
         (1536, "t512x256_i256_c2x1_s0_p0"),
         (1800, "t512x256_i256_c2x1_s0_p0"),
         (2046, "t512x256_i256_c2x1_s0_p0"),
@@ -278,6 +312,17 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (3072, "t256x256_i256_c4x1_s0_p0"),
     ],
     (5120, 15360): [
+        # below 1536: b1024 y1 small-M winners
+        (256, "cublaslt"),
+        (512, "cublaslt"),
+        (640, "t256x128_i256_c2x1_s1_p0"),
+        (768, "t256x192_i256_c2x1_s1_p0"),
+        (896, "t256x192_i256_c2x1_s1_p0"),
+        (1024, "t256x256_i256_c2x1_s0_p0"),
+        (1152, "cublaslt"),
+        (1260, "cublaslt"),
+        (1280, "t256x256_i256_c2x1_s1_p0"),
+        (1408, "t512x256_i256_c2x1_s0_p0"),
         (1536, "t512x256_i256_c2x1_s0_p0"),
         (1800, "t512x256_i256_c2x1_s0_p0"),
         (2046, "t512x256_i256_c2x1_s0_p0"),
@@ -286,6 +331,17 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (3072, "t256x256_i256_c4x1_s0_p0"),
     ],
     (25600, 6144): [
+        # below 1536: b1024 y1 small-M winners
+        (256, "t256x256_i256_c2x1_s0_p0"),
+        (512, "t512x256_i256_c2x1_s0_p0"),
+        (640, "cublaslt"),
+        (768, "cublaslt"),
+        (896, "t512x256_i256_c2x1_s0_p0"),
+        (1024, "t512x256_i256_c2x1_s0_p0"),
+        (1152, "cublaslt"),
+        (1260, "cublaslt"),
+        (1280, "cublaslt"),
+        (1408, "t512x256_i256_c2x1_s0_p0"),
         (1536, "t512x256_i256_c2x1_s0_p0"),
         (1800, "t512x256_i256_c2x1_s0_p0"),
         (2046, "t512x256_i256_c2x1_s0_p0"),
@@ -321,6 +377,17 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (3072, "t256x256_i256_c4x1_s0_p0"),
     ],
     (32768, 1280): [
+        # below 1536: b1024 y1 small-M winners
+        (256, "t256x192_i256_c2x2_s0_p0"),
+        (512, "t256x256_i256_c2x2_s0_p0"),
+        (640, "cublaslt"),
+        (768, "t256x256_i256_c2x1_s0_p0"),
+        (896, "t256x256_i256_c2x1_s1_p0"),
+        (1024, "t256x256_i256_c2x1_s0_p0"),
+        (1152, "t256x256_i256_c2x2_s0_p0"),
+        (1260, "t256x256_i256_c2x2_s0_p0"),
+        (1280, "t256x256_i256_c2x2_s0_p0"),
+        (1408, "t256x192_i256_c2x1_s0_p0"),
         (1536, "cublaslt"),
         (1800, "t256x256_i256_c2x1_s0_p0"),
         (2046, "t256x256_i256_c2x1_s0_p0"),

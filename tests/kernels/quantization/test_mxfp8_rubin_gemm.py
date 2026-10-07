@@ -39,14 +39,25 @@ def test_rubin_mxfp8_backends_match_cute_dsl(k, n, m):
         assert ((out.float() - ref.float()).abs().max() / den).item() < 1e-2
 
 
-# (N, K) keys of rubin._AUTO_TABLE whose entries are checked one by one:
-# the DSV4.1 shared expert's gate_up / down (separate linears when the routed
-# experts run FlashInfer MegaMoE).
-_TABLE_SHAPES = [(4608, 5120), (5120, 2304)]
+# (N, K) keys of rubin._AUTO_TABLE whose entries (below max_m) are checked one
+# by one: the DSV4.1 shared expert's gate_up / down (separate linears when the
+# routed experts run FlashInfer MegaMoE), and the small-M (< 1536) entries of
+# the 6 MR-tabled dense linears (wqa_wkv, idx_wq_b, wo_b, dspark_in,
+# engram_wkv, wq_b).
+_TABLE_SHAPES = [
+    (4608, 5120, None),
+    (5120, 2304, None),
+    (1792, 5120, 1536),
+    (4096, 1280, 1536),
+    (5120, 8192, 1536),
+    (5120, 15360, 1536),
+    (25600, 6144, 1536),
+    (32768, 1280, 1536),
+]
 
 
-@pytest.mark.parametrize("n,k", _TABLE_SHAPES)
-def test_rubin_auto_table_entries_dispatch_and_match_cute_dsl(n, k):
+@pytest.mark.parametrize("n,k,max_m", _TABLE_SHAPES)
+def test_rubin_auto_table_entries_dispatch_and_match_cute_dsl(n, k, max_m):
     """Every _AUTO_TABLE entry of these shapes is what select_backend picks at
     its M, its Sm107 tactic can implement that GEMM (otherwise the dispatch
     silently falls back to cute-dsl), and its output matches cute-dsl."""
@@ -59,6 +70,8 @@ def test_rubin_auto_table_entries_dispatch_and_match_cute_dsl(n, k):
     w_q, w_sf = mxfp8_quantize(w, is_sf_swizzled_layout=True)
     b = w_q.t()
     for m, choice in R._AUTO_TABLE[(n, k)]:
+        if max_m is not None and m >= max_m:
+            continue
         assert R._lookup(R._AUTO_TABLE, m, n, k) == choice
         a = torch.randn(m, k, device="cuda", generator=g).bfloat16()
         a_q, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout=True)
