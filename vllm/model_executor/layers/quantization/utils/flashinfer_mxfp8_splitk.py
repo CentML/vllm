@@ -9,13 +9,17 @@ M <= 32, with tile N tied to M (8/16/32). Above that every dense MXFP8 GEMM
 runs the persistent kernel with one tile per CTA, so the K = 4096 GEMMs
 (out_proj / o_proj, N = 2048) stream all of K serially on 64-176 CTAs.
 
-This module ADDS split-K tactics with tile N 32/64/128 and s K-slices for
+This module ADDS split-K tactics with tile N 64/128 and 2 or 4 K-slices for
 32 < M <= ``VLLM_MXFP8_SPLITK_MIDM_MAX_M`` to the CuTe-DSL MXFP8 runner's
 tactic list, so FlashInfer's autotuner picks per M bucket between them and
-the stock tactics. The kernel is FlashInfer's split-K kernel class (the
-``vllm/lcd_pdl`` overlay when it is installed) with the tile-N whitelist
-widened; its mainloop already carries the SFB slicing for tile N 64 (the same
-code as the persistent kernel) and its grid is one K-cluster per output tile.
+the stock tactics. The kernel is ``vllm/lcd_pdl/
+fi_dense_blockscaled_gemm_sm100_splitk_midm.py``: FlashInfer's split-K kernel
+(with the lcd_pdl PFWS weight prefetch) extended to several token tiles (SFB
+slicing for tile N 64) and with a cheaper reduction: each peer stages its
+fp32 partial subtile in its own idle A stage buffers and sends it with one
+bulk DSMEM copy (the stock kernel issues one ``st.async`` + remote mbarrier
+update per 16 B, which costs ~2.5 us per call at tile N 64), all sends before
+any owner waits.
 
 Numerics: each K-slice accumulates in fp32; the owner CTA of an epilogue
 subtile adds the peers' partials in fixed slot order, then applies alpha and
@@ -25,11 +29,11 @@ fp32 summation order (1-ulp class).
 
 Tactic encoding (JSON-safe, round-trips through the autotune cache file):
 ``(1072, tile_n, split_k)``. A tactic is offered only when the output is
-contiguous, ``K % (128 * split_k) == 0``, the DSMEM mailbox
-``(split_k - 1) * 128 * tile_n * 4`` B is at most 96 KiB, and the grid
-(``ceil(N/128) * ceil(M/tile_n)`` K-clusters) fits in two waves. The wrapped
-runner keeps the base runner's class name, so autotune file keys do not
-change; a file that contains a ``1072`` tactic needs this module enabled.
+contiguous, ``K % (128 * split_k) == 0`` and the grid
+(``ceil(N/128) * ceil(M/tile_n)`` K-clusters of ``split_k`` CTAs) fits in one
+wave. The wrapped runner keeps the base runner's class name, so autotune file
+keys do not change; a file that contains a ``1072`` tactic needs this module
+enabled.
 
 ``VLLM_MXFP8_MAX_CLUSTER_CTAS`` (setting experiment for the mixed-batch grids
 capped at 176/184 CTAs by 8/4-CTA clusters): when > 0, stock persistent
@@ -53,9 +57,8 @@ logger = init_logger(__name__)
 TACTIC_TAG = 1072
 TILE_M = 128
 TILE_K = 128
-MAX_MAILBOX_BYTES = 96 * 1024
-SUPPORTED_TILE_N = (32, 64, 128)
-SUPPORTED_SPLIT_K = (2, 4, 8)
+SUPPORTED_TILE_N = (64, 128)
+SUPPORTED_SPLIT_K = (2, 4)
 _LOCK = threading.Lock()
 _KERNEL_CACHE: dict = {}
 STATS = {"calls": 0, "tactic_offers": 0, "cluster_dropped": 0}
@@ -100,10 +103,10 @@ def offer(m: int, n: int, k: int, tile_n: int, split_k: int, max_m: int) -> bool
         return False
     if k % (TILE_K * split_k) != 0 or n % 8 != 0:
         return False
-    if (split_k - 1) * TILE_M * tile_n * 4 > MAX_MAILBOX_BYTES:
+    if tile_n not in SUPPORTED_TILE_N or split_k not in SUPPORTED_SPLIT_K:
         return False
     clusters = -(-n // TILE_M) * -(-m // tile_n)
-    return clusters <= 2 * _max_active_clusters(split_k)
+    return clusters <= _max_active_clusters(split_k)
 
 
 def cluster_ctas(tactic: Any) -> int:
@@ -119,15 +122,9 @@ def cluster_ctas(tactic: Any) -> int:
 
 @functools.cache
 def _kernel_cls():
-    """FlashInfer's split-K kernel class (overlay if installed) with the
-    tile-N whitelist widened to the mid-M tiles."""
-    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
-        Sm100BlockScaledSplitKGemmKernel,
+    from vllm.lcd_pdl.fi_dense_blockscaled_gemm_sm100_splitk_midm import (
+        Sm100BlockScaledSplitKMidMGemmKernel,
     )
-
-    class Sm100BlockScaledSplitKMidMGemmKernel(Sm100BlockScaledSplitKGemmKernel):
-        SUPPORTED_MMA_TILER_MN = tuple((TILE_M, n) for n in (8, 16, *SUPPORTED_TILE_N))
-        SUPPORTED_SPLIT_K_SLICES = SUPPORTED_SPLIT_K
 
     return Sm100BlockScaledSplitKMidMGemmKernel
 
