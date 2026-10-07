@@ -221,6 +221,40 @@ def _kf_prefill_attn_warmup(worker: "Worker") -> None:
     warmup_runtime(runner.device, _get_trtllm_workspace_buffer(), precise)
 
 
+def _kf_decode_attn_warmup(worker: "Worker") -> None:
+    """AOT-compile and load every reachable form of the KF decode kernel before
+    CUDA-graph capture (vllm/v1/attention/ops/kf_decode_attn): Q in {1, 1 + k}
+    (MTP verify and draft step 1, later draft steps), restricted to
+    VLLM_KF_DECODE_ATTN_QLENS if set, x BL 1..VLLM_KF_DECODE_ATTN_MAX_BL. Only if
+    a FlashInfer metadata builder qualified (``kf_decode``).
+    """
+    runner = worker.model_runner
+    if not any(
+        getattr(b, "kf_decode", False)
+        for groups in getattr(runner, "attn_groups", [])
+        for group in groups
+        for b in group.metadata_builders
+    ):
+        logger.info("KF decode attention: no qualifying FlashInfer layer; not used.")
+        return
+    from vllm.v1.attention.ops.kf_decode_attn.runtime import (
+        parse_qlens,
+        warmup_runtime,
+    )
+
+    spec = runner.vllm_config.speculative_config
+    qlens = {1}
+    if spec is not None and spec.num_speculative_tokens:
+        qlens.add(1 + spec.num_speculative_tokens)
+    allowed = parse_qlens(envs.VLLM_KF_DECODE_ATTN_QLENS)
+    if allowed is not None:
+        qlens &= allowed
+    if not qlens:
+        logger.info("KF decode attention: VLLM_KF_DECODE_ATTN_QLENS routes nothing.")
+        return
+    warmup_runtime(runner.device, qlens)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -295,6 +329,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     if envs.VLLM_KF_PREFILL_ATTN:
         _kf_prefill_attn_warmup(worker)
+    if envs.VLLM_KF_DECODE_ATTN:
+        _kf_decode_attn_warmup(worker)
 
     if process_local_only:
         return

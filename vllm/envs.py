@@ -238,6 +238,11 @@ if TYPE_CHECKING:
     VLLM_KF_PREFILL_ATTN_CHECK: int = 0
     VLLM_KF_PREFILL_ATTN_PRECISE: bool = False
     VLLM_KF_PREFILL_ATTN_LOG_EVERY: int = 4096
+    VLLM_KF_DECODE_ATTN: bool = False
+    VLLM_KF_DECODE_ATTN_MAX_BL: int = 8
+    VLLM_KF_DECODE_ATTN_QLENS: str = ""
+    VLLM_KF_DECODE_ATTN_CHECK: int = 0
+    VLLM_KF_DECODE_ATTN_LOG_EVERY: int = 0
     VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
     VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1877,6 +1882,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
     ),
+    # Kernel Factory paged-FP8 decode attention (v1/attention/ops/kf_decode_attn):
+    # replaces the trtllm-gen decode kernel on SM107 (FP8 Q/KV, head_dim 256, 16 q /
+    # 2 kv heads, page 128, BF16 out) for uniform decode batches (MTP verify, draft
+    # steps; graph-padded rows allowed) of at most VLLM_KF_DECODE_ATTN_MAX_BL
+    # launched requests; larger batches keep trtllm-gen. Its KV split comes from the
+    # device seq_lens (FULL CUDA graph safe); no host plan.
+    # VLLM_KF_DECODE_ATTN_QLENS: comma list of query widths routed to the kernel
+    # (empty = 1 and 1 + num_speculative_tokens). VLLM_KF_DECODE_ATTN_CHECK=N: for
+    # the first N eager launches per layer also run trtllm-gen and an fp32 reference
+    # and log the errors (debug only, slow; graph replays are never checked).
+    # VLLM_KF_DECODE_ATTN_LOG_EVERY=N: log routing counts every N decode steps.
+    "VLLM_KF_DECODE_ATTN": lambda: bool(int(os.getenv("VLLM_KF_DECODE_ATTN", "0"))),
+    "VLLM_KF_DECODE_ATTN_MAX_BL": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_MAX_BL", "8")
+    ),
+    "VLLM_KF_DECODE_ATTN_QLENS": lambda: os.getenv("VLLM_KF_DECODE_ATTN_QLENS", ""),
+    "VLLM_KF_DECODE_ATTN_CHECK": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_CHECK", "0")
+    ),
+    "VLLM_KF_DECODE_ATTN_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_LOG_EVERY", "0")
+    ),
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
     # layer only for the row each prefill request samples (the speculator's
     # last_token_indices); the other rows' outputs are discarded.
@@ -2530,6 +2557,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_GDN_VSPLIT_CG0SPLIT",
         "VLLM_GDN_VSPLIT_C1REORDER",
         "VLLM_GDN_FI_VSPLIT_V1",
+        # Kernel choice inside the attention op (KF decode attention);
+        # not part of traced graphs.
+        "VLLM_KF_DECODE_ATTN",
+        "VLLM_KF_DECODE_ATTN_MAX_BL",
+        "VLLM_KF_DECODE_ATTN_QLENS",
+        "VLLM_KF_DECODE_ATTN_CHECK",
+        "VLLM_KF_DECODE_ATTN_LOG_EVERY",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
