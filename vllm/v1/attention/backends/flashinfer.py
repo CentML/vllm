@@ -765,6 +765,11 @@ class FlashInferBackend(AttentionBackend):
             )
         if not use_large_pages:
             return [16, 32, 64]
+        # The Kernel Factory prefill/decode kernels hard-code page 128. A hybrid
+        # block divisible by 256 (e.g. 1280 tokens: MTP k=6 with a bf16 GDN state)
+        # would otherwise select 256 and silently turn both KF kernels off.
+        if envs.VLLM_KF_PREFILL_ATTN or envs.VLLM_KF_DECODE_ATTN:
+            return [16, 32, 64, 128]
         return [16, 32, 64, 128, 256, 512, 1024]
 
     @staticmethod
