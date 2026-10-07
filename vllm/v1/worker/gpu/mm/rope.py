@@ -5,6 +5,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig
 from vllm.model_executor.models.interfaces import SupportsMRoPE
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -46,6 +47,13 @@ class RopeState:
 
         self.prefill_positions: StagedWriteTensor | None = None
         self.prefill_delta: UvaBackedTensor | None = None
+        # Per-request flag (1 = no multimodal features): the kernel computes
+        # such a request's positions as plain 1D positions (identical in every
+        # dim, delta 0) instead of reading staged prefill positions, which
+        # avoids building and staging an O(prompt_len) position table on the
+        # host. Unused in linear mode, where every request is text-only.
+        self.text_only: UvaBackedTensor | None = None
+        self.text_only_fast_path = False
         if not linear_prefill_positions:
             # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
             # wasting a lot of CPU memory.
@@ -56,6 +64,8 @@ class RopeState:
                 uva_instead_of_gpu=True,
             )
             self.prefill_delta = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+            self.text_only = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+            self.text_only_fast_path = envs.VLLM_MROPE_TEXT_ONLY_FAST_PATH
         self.positions = torch.zeros(
             (num_dims, max_num_tokens + 1), dtype=torch.int64, device=device
         )
@@ -74,12 +84,18 @@ class RopeState:
                 )
             return
 
+        assert self.prefill_delta is not None
+        assert self.prefill_positions is not None
+        assert self.text_only is not None
+        if self.text_only_fast_path and not mm_features:
+            self.prefill_delta.np[req_idx] = 0
+            self.text_only.np[req_idx] = 1
+            return
+        self.text_only.np[req_idx] = 0
         mrope_model = cast(SupportsMRoPE, model)
         prefill_positions, delta = mrope_model.get_mrope_input_positions(
             prefill_token_ids, mm_features
         )
-        assert self.prefill_delta is not None
-        assert self.prefill_positions is not None
         self.prefill_delta.np[req_idx] = delta
 
         for i in range(self.num_dims):
@@ -91,8 +107,10 @@ class RopeState:
             return
         assert self.prefill_positions is not None
         assert self.prefill_delta is not None
+        assert self.text_only is not None
         self.prefill_positions.apply_write()
         self.prefill_delta.copy_to_uva()
+        self.text_only.copy_to_uva()
 
     def get_positions(self, num_tokens: int) -> torch.Tensor:
         return self.positions[:, :num_tokens]
@@ -123,6 +141,8 @@ class RopeState:
             positions
         )
         self.prefill_delta.np[req_idx] = delta
+        # Only requests with multimodal features get here, and those always
+        # have text_only == 0, so the kernel reads the updated positions.
 
     def prepare_positions(
         self,
@@ -132,8 +152,9 @@ class RopeState:
         num_computed_tokens: torch.Tensor,
     ) -> None:
         num_reqs = idx_mapping.shape[0]
-        # The linear kernel does not dereference either pointer. Supplying the
-        # output tensor keeps its Triton signature identical to the general path.
+        # The linear kernel does not dereference the staged-path pointers.
+        # Supplying the output tensor keeps its Triton signature identical to
+        # the general path.
         prefill_positions = (
             self.prefill_positions.gpu
             if self.prefill_positions is not None
@@ -142,6 +163,7 @@ class RopeState:
         prefill_delta = (
             self.prefill_delta.gpu if self.prefill_delta is not None else self.positions
         )
+        text_only = self.text_only.gpu if self.text_only is not None else self.positions
         _prepare_rope_positions_kernel[(num_reqs,)](
             self.positions,
             self.positions.stride(0),
@@ -149,6 +171,7 @@ class RopeState:
             self.num_dims * self.max_model_len,
             self.max_model_len,
             prefill_delta,
+            text_only,
             idx_mapping,
             query_start_loc,
             prefill_lens,
@@ -197,6 +220,7 @@ def _prepare_rope_positions_kernel(
     prefill_positions_stride0,
     prefill_positions_stride1,
     prefill_delta_ptr,
+    text_only_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
     prefill_lens_ptr,
@@ -218,6 +242,10 @@ def _prepare_rope_positions_kernel(
 
     if not USE_LINEAR_PREFILL:
         delta = tl.load(prefill_delta_ptr + req_state_idx)
+        # Text-only requests never staged prefill positions: their M-RoPE
+        # positions equal the 1D positions (delta == 0).
+        text_only = tl.load(text_only_ptr + req_state_idx)
+        is_prefill = is_prefill & (text_only == 0)
 
     for i in range(0, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)

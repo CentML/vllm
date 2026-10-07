@@ -90,6 +90,7 @@ def test_linear_rope_state_contract(monkeypatch):
 
     assert state.prefill_positions is None
     assert state.prefill_delta is None
+    assert state.text_only is None
     model = _MRoPEModel(supports_linear_text_mrope=True)
 
     state.init_prefill_positions(
@@ -111,6 +112,125 @@ def test_linear_rope_state_contract(monkeypatch):
         )
 
     model.get_positions.assert_not_called()
+    # No per-request text_only flag is staged or uploaded in linear mode.
+    state.apply_staged_writes()
+
+
+class _MixedMRoPEModel:
+    """Text-only positions are arange(L) in every dim with delta 0; requests
+    with multimodal features get distinct per-dim positions and a nonzero
+    delta, so they must be read from the staged buffer."""
+
+    MM_DELTA = -7
+
+    def __init__(self):
+        self.get_positions = Mock(side_effect=self._get_positions)
+
+    def _get_positions(self, input_tokens, mm_features):
+        positions = torch.arange(len(input_tokens))
+        if not mm_features:
+            return positions.unsqueeze(0).expand(3, -1), 0
+        return torch.stack([positions // (d + 1) for d in range(3)]), self.MM_DELTA
+
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        return self.get_positions(input_tokens, mm_features)
+
+
+def _staged_state(
+    device: torch.device, max_num_reqs=4, max_num_tokens=8, max_model_len=16
+):
+    return rope.RopeState(
+        num_dims=3,
+        max_num_reqs=max_num_reqs,
+        max_num_tokens=max_num_tokens,
+        max_model_len=max_model_len,
+        device=device,
+    )
+
+
+@pytest.mark.parametrize("fast_path", [True, False])
+def test_text_only_fast_path_host_staging(monkeypatch, fast_path):
+    """With multimodal ingress, text-only requests skip the host position
+    table (fast path on) while multimodal requests are still staged."""
+    monkeypatch.setenv("VLLM_MROPE_TEXT_ONLY_FAST_PATH", "1" if fast_path else "0")
+    state = _staged_state(torch.device("cpu"))
+    assert state.text_only_fast_path is fast_path
+    model = _MixedMRoPEModel()
+    staged = state.prefill_positions._staged_write_indices
+
+    # A reused slot: a multimodal request first, then a text-only one.
+    state.init_prefill_positions(0, model, [1, 2, 3], mm_features=[object()])
+    assert state.text_only.np[0] == 0
+    assert state.prefill_delta.np[0] == _MixedMRoPEModel.MM_DELTA
+    assert staged == [0, 1, 2]
+    state.init_prefill_positions(0, model, [1, 2, 3, 4], mm_features=[])
+
+    if fast_path:
+        assert model.get_positions.call_count == 1
+        assert staged == [0, 1, 2]
+        assert state.text_only.np[0] == 1
+    else:
+        assert model.get_positions.call_count == 2
+        assert staged == [0, 1, 2, 0, 1, 2]
+        assert state.text_only.np[0] == 0
+    assert state.prefill_delta.np[0] == 0
+
+    # The staged position writes need the Triton write kernel; only the
+    # per-request flag upload is checked here.
+    state.prefill_positions.clear_staged_writes()
+    state.apply_staged_writes()
+    torch.testing.assert_close(
+        state.text_only.gpu.cpu(), torch.from_numpy(state.text_only.np)
+    )
+
+
+def _mixed_batch_positions(device, fast_path, monkeypatch) -> list[torch.Tensor]:
+    monkeypatch.setenv("VLLM_MROPE_TEXT_ONLY_FAST_PATH", "1" if fast_path else "0")
+    prompt_lens = [100, 1500, 3000, 777]
+    has_mm = [False, True, False, True]
+    max_reqs = 8
+    state = _staged_state(
+        device, max_num_reqs=max_reqs, max_num_tokens=4096, max_model_len=8192
+    )
+    model = _MixedMRoPEModel()
+    for req_idx, (length, mm) in enumerate(zip(prompt_lens, has_mm)):
+        mm_features = [object()] if mm else []
+        state.init_prefill_positions(req_idx, model, [7] * length, mm_features)
+    state.apply_staged_writes()
+
+    num_reqs = len(prompt_lens)
+    prefill_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+    prefill_lens[:num_reqs] = torch.tensor(prompt_lens, dtype=torch.int32)
+    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    outs = []
+    # Chunked prefill, the prefill tail, then decode steps.
+    for step, (frac, max_query_len) in enumerate(
+        [(0.5, 512), (0.99, 200), (1.0, 4), (1.0, 4)]
+    ):
+        computed = [min(int(n * frac), n) + step for n in prompt_lens]
+        query_lens = [
+            max_query_len if c >= n else min(max_query_len, n - c)
+            for c, n in zip(computed, prompt_lens)
+        ]
+        num_computed = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        num_computed[:num_reqs] = torch.tensor(computed, dtype=torch.int32)
+        query_start_loc = torch.tensor(
+            [0] + query_lens, dtype=torch.int32, device=device
+        ).cumsum(0, dtype=torch.int32)
+        state.prepare_positions(idx_mapping, query_start_loc, prefill_lens, num_computed)
+        outs.append(state.get_positions(int(query_start_loc[-1])).clone())
+    return outs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
+def test_text_only_fast_path_matches_staged_positions(monkeypatch):
+    """Kernel-computed text-only positions are bit-identical to the staged
+    ones, also with multimodal requests in the same batch."""
+    device = torch.device("cuda")
+    staged = _mixed_batch_positions(device, False, monkeypatch)
+    fast = _mixed_batch_positions(device, True, monkeypatch)
+    for ref, out in zip(staged, fast):
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
