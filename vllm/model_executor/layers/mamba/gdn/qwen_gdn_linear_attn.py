@@ -30,7 +30,6 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -1507,18 +1506,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_decode:
-            if gdn_out_alloc.ENABLED:
-                # empty + zero only the padding rows (all real rows are written
-                # by the core op); see gdn_out_alloc.py
-                core_attn_out = torch.ops.vllm.ews_gdn_out_alloc(
-                    hidden_states, self.num_v_heads // self.tp_size, self.head_v_dim
-                )
-            else:
-                core_attn_out = torch.zeros(
-                    (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
+            core_attn_out = torch.zeros(
+                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
             torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
                 mixed_qkvz,
                 ba,
