@@ -86,7 +86,6 @@ from vllm.v1.watermarking.spec_decode import (
 from vllm.v1.worker import fused_kv_block_copy
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
-from vllm.v1.worker.gpu import cudagraph_profile_cleanup
 from vllm.v1.worker.gpu import sample_graph
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
@@ -1007,18 +1006,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.pooling_runner is not None:
             self.pooling_runner.clear()
 
+    @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
         """Estimate the GPU memory required to capture CUDA graphs."""
-        if cudagraph_profile_cleanup.ENABLED:
-            # CFIX / CFIX_RESET: eager persistent-buffer allocation before the
-            # capture, release of tables pinning the profiling KV cache after it
-            return cudagraph_profile_cleanup.profile_cudagraph_memory(
-                self, self._profile_cudagraph_memory_impl
-            )
-        return self._profile_cudagraph_memory_impl()
-
-    @torch.inference_mode()
-    def _profile_cudagraph_memory_impl(self) -> int:
         return _profile_cudagraph_memory(self)
 
     def needs_cudagraph_capture(self) -> bool:
@@ -1032,7 +1022,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     def capture_model(self, *, profile_only: bool = False) -> int:
-        size = self._capture_model_cfix(profile_only=profile_only)
+        size = self._capture_model_impl(profile_only=profile_only)
         if (
             not profile_only
             and sample_graph.ENABLED
@@ -1049,17 +1039,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logger.warning("sampler graph pre-capture failed: %r", e)
                 torch.cuda.synchronize()
         return size
-
-    def _capture_model_cfix(self, *, profile_only: bool = False) -> int:
-        if cudagraph_profile_cleanup.ENABLED:
-            # CFIX / CFIX_RESET: eager persistent-buffer allocation before the
-            # real capture and post-capture diagnostics
-            return cudagraph_profile_cleanup.capture_model(
-                self,
-                lambda: self._capture_model_impl(profile_only=profile_only),
-                profile_only,
-            )
-        return self._capture_model_impl(profile_only=profile_only)
 
     @torch.inference_mode()
     def _capture_model_impl(self, *, profile_only: bool = False) -> int:
