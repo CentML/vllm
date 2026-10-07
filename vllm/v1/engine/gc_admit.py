@@ -69,7 +69,12 @@ def _rss() -> int | None:
         with open("/proc/self/statm", "rb") as f:
             return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     except Exception:
-        return None
+        try:
+            import psutil
+
+            return psutil.Process().memory_info().rss
+        except Exception:
+            return None
 
 
 class _State:
