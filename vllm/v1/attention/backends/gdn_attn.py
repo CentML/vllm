@@ -9,6 +9,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.gdn import gdn_prefill_census
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -765,6 +766,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_start=shared.non_spec_token_start,
             prefill_checkpoint=prefill_checkpoint,
         )
+        if gdn_prefill_census.ENABLED:
+            # VLLM_GDNP_CENSUS=<dir>: prefill-shape census (diagnostics)
+            gdn_prefill_census.record(
+                self, shared.prefill_query_start_loc_cpu, attn_metadata
+            )
         return attn_metadata
 
     def _build_shared(
