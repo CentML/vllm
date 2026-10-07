@@ -23,9 +23,13 @@ With ``VLLM_MXFP8_TUNE_BUCKETS`` set, this module
    every M that maps to one would fall back to tactic -1.
 
 Only the cute-dsl-only config is replaced; the shared ``_MM_MXFP8_TUNING_CONFIG``
-(CUTLASS / cuDNN / TRT-LLM / auto backends) is untouched. Changing the tactic of
-an M changes the GEMM's accumulation order: outputs at those M are not bitwise
-equal to the default bucketing (the same class of change as a re-tune).
+(CUTLASS / cuDNN / TRT-LLM / auto backends) is untouched.
+
+Numerics: the dense persistent tactics (tile, cluster, swap-AB, prefetch) reduce
+each output element over K in the same order, so a tactic change is bitwise for
+M > 32: on VR all 5,753 (shape, M in 256..512, tactic) runs of the Qwen3.6 MXFP8
+linears matched the bucket-512 tactic exactly. Split-K tactics (offered only for
+M <= 32) change the order: buckets <= 32 can change numerics.
 
 Grammar (comma-separated items, union of all):
   ``N``               one bucket, e.g. ``288``

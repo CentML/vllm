@@ -1914,7 +1914,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hybrid ones (runtime M rounds up to the union), profiled by the kernel
     # warmup before CUDA-graph capture. Comma list of N, LO-HI:STEP or
     # capture[:LO-HI] (CUDA-graph capture sizes), e.g. "272-512:16".
-    # Unset/empty = FlashInfer's buckets. Changes tactics, so not bitwise.
+    # Unset/empty = FlashInfer's buckets. Bitwise for buckets > 32 (only the
+    # split-K tactics, M <= 32, change the K order).
     # See vllm/model_executor/kernels/linear/mxfp8/flashinfer_tune_buckets.py.
     "VLLM_MXFP8_TUNE_BUCKETS": lambda: os.getenv("VLLM_MXFP8_TUNE_BUCKETS") or None,
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
