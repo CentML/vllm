@@ -5,9 +5,11 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import functools
 import os
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,6 +27,10 @@ from vllm.model_executor.warmup.engine_jit_warmup import (
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     write_flashinfer_autotune_cache,
+)
+from vllm.model_executor.warmup.flashinfer_autotune_pin import (
+    run_pinned_autotune,
+    run_record_autotune,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -498,63 +504,13 @@ def _autotune_mxfp8_extra_buckets(runner: "GPUModelRunner") -> None:
     autotune_extra_buckets(runner.scheduler_config.max_num_batched_tokens)
 
 
-def flashinfer_autotune(runner: "GPUModelRunner") -> None:
-    """Autotune FlashInfer operations.
-    FlashInfer have many implementations for the same operation,
-    autotuning runs benchmarks for each implementation and stores
-    the results. The results are cached transparently and
-    future calls to FlashInfer will use the best implementation.
-    Without autotuning, FlashInfer will rely on heuristics, which may
-    be significantly slower.
-
-    Every rank profiles the same tactics. When distributed, per-tactic
-    timings are averaged over the world CPU group so all ranks select the
-    same tactic.
-    """
-    from flashinfer.autotuner import AutoTuner, set_autotune_process_group
+def _run_flashinfer_autotune_passes(
+    runner: "GPUModelRunner", world, autotune_kwargs: dict
+) -> None:
+    """Every tuning pass of the kernel warmup, inside one autotune context."""
+    from flashinfer.autotuner import set_autotune_process_group
 
     import vllm.utils.flashinfer as fi_utils
-    from vllm.distributed.parallel_state import get_world_group
-
-    world = get_world_group()
-    is_leader = world.rank_in_group == 0
-    tuner = AutoTuner.get()
-
-    autotune_kwargs: dict = {}
-    skip_ops = _flashinfer_autotune_skip_ops(runner)
-    if skip_ops:
-        logger.info_once(
-            "Skipping FlashInfer autotuning for ops %s",
-            tuple(sorted(skip_ops)),
-        )
-        autotune_kwargs["skip_ops"] = skip_ops
-
-    cache_path = resolve_flashinfer_autotune_file(runner)
-    if is_leader:
-        logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
-
-    # We skip EPLB here since we don't want to record dummy metrics.
-    # Randomize inputs to avoid every token pick the same experts,
-    # which lead to some EP ranks receiving no tokens and skipping their
-    # MoE kernel entirely, and cause hang due to all-reduce collective
-    # during synchronized autotuning.
-    # Read cached autotune results and broadcast to all ranks.
-    cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    if PINNED_AUTOTUNE_RO:
-        log_read_only_enabled()
-    cached_results = world.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        if PINNED_AUTOTUNE_RO:
-            # Read-only pinned cache: verify the bytes just read instead of
-            # writing them back.
-            verify_pinned_autotune_file(cache_path, cached_results)
-        else:
-            write_flashinfer_autotune_cache(cache_path, cached_results)
-        world.barrier()
-        tuner.load_configs(str(cache_path))
 
     group = world.cpu_group if world.world_size > 1 else None
     set_autotune_process_group(group)
@@ -580,6 +536,114 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
 
     if world.world_size > 1:
         world.barrier()
+
+
+def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+    """Autotune FlashInfer operations.
+    FlashInfer have many implementations for the same operation,
+    autotuning runs benchmarks for each implementation and stores
+    the results. The results are cached transparently and
+    future calls to FlashInfer will use the best implementation.
+    Without autotuning, FlashInfer will rely on heuristics, which may
+    be significantly slower.
+
+    Every rank profiles the same tactics. When distributed, per-tactic
+    timings are averaged over the world CPU group so all ranks select the
+    same tactic.
+
+    With VLLM_FLASHINFER_AUTOTUNE_FILE the pinned table is validated per
+    entry and DP workers sharing the cache dir tune uncovered keys once
+    (flashinfer_autotune_pin.run_pinned_autotune); with
+    VLLM_FLASHINFER_AUTOTUNE_RECORD every key is profiled with repeated
+    timings and recorded for table generation.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    from vllm.distributed.parallel_state import get_world_group
+
+    world = get_world_group()
+    is_leader = world.rank_in_group == 0
+    tuner = AutoTuner.get()
+
+    autotune_kwargs: dict = {}
+    skip_ops = _flashinfer_autotune_skip_ops(runner)
+    if skip_ops:
+        logger.info_once(
+            "Skipping FlashInfer autotuning for ops %s",
+            tuple(sorted(skip_ops)),
+        )
+        autotune_kwargs["skip_ops"] = skip_ops
+
+    cache_path = resolve_flashinfer_autotune_file(runner)
+    if is_leader:
+        logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+    run_passes = functools.partial(
+        _run_flashinfer_autotune_passes, runner, world, autotune_kwargs
+    )
+
+    if envs.VLLM_FLASHINFER_AUTOTUNE_RECORD:
+        if envs.VLLM_FLASHINFER_AUTOTUNE_FILE:
+            logger.warning(
+                "VLLM_FLASHINFER_AUTOTUNE_RECORD is set: the pinned file %s and "
+                "the autotune cache are not used; every key is profiled",
+                envs.VLLM_FLASHINFER_AUTOTUNE_FILE,
+            )
+        run_record_autotune(
+            runner,
+            tuner=tuner,
+            out_dir=Path(envs.VLLM_FLASHINFER_AUTOTUNE_RECORD).expanduser(),
+            rounds=envs.VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS,
+            run_passes=run_passes,
+        )
+        return
+
+    if envs.VLLM_FLASHINFER_AUTOTUNE_FILE:
+        if PINNED_AUTOTUNE_RO:
+            logger.warning(
+                "EWARM_AUTOTUNE_RO is ignored with VLLM_FLASHINFER_AUTOTUNE_FILE "
+                "(use VLLM_FLASHINFER_AUTOTUNE_STRICT=1 to forbid start-up tuning)"
+            )
+        run_pinned_autotune(
+            runner,
+            world=world,
+            tuner=tuner,
+            cache_path=cache_path,
+            pinned_path=Path(envs.VLLM_FLASHINFER_AUTOTUNE_FILE).expanduser(),
+            strict=envs.VLLM_FLASHINFER_AUTOTUNE_STRICT,
+            run_passes=run_passes,
+        )
+        return
+    if envs.VLLM_FLASHINFER_AUTOTUNE_STRICT:
+        logger.warning(
+            "VLLM_FLASHINFER_AUTOTUNE_STRICT has no effect without "
+            "VLLM_FLASHINFER_AUTOTUNE_FILE"
+        )
+
+    # We skip EPLB here since we don't want to record dummy metrics.
+    # Randomize inputs to avoid every token pick the same experts,
+    # which lead to some EP ranks receiving no tokens and skipping their
+    # MoE kernel entirely, and cause hang due to all-reduce collective
+    # during synchronized autotuning.
+    # Read cached autotune results and broadcast to all ranks.
+    cached_results: bytes | None = None
+    if is_leader and cache_path.exists():
+        with open(cache_path, "rb") as f:
+            cached_results = f.read()
+    if PINNED_AUTOTUNE_RO:
+        log_read_only_enabled()
+    cached_results = world.broadcast_object(cached_results, src=0)
+    if cached_results is not None:
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: verify the bytes just read instead of
+            # writing them back.
+            verify_pinned_autotune_file(cache_path, cached_results)
+        else:
+            write_flashinfer_autotune_cache(cache_path, cached_results)
+        world.barrier()
+        tuner.load_configs(str(cache_path))
+
+    run_passes()
+
     if is_leader:
         if PINNED_AUTOTUNE_RO:
             # Read-only pinned cache: do not save; fail if anything had to be

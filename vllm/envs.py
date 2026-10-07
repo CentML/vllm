@@ -221,6 +221,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_FILE: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_STRICT: bool = False
+    VLLM_FLASHINFER_AUTOTUNE_RECORD: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS: int = 15
     VLLM_FLASHINFER_MXFP8_K64: bool = True
     VLLM_FLASHINFER_MXFP8_K64_TACTICS: str = "512,256,256,2;256,256,256,2;256,128,256,2"
     VLLM_FLASHINFER_MXFP8_K64_MIN_M: int = 256
@@ -1783,11 +1786,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),
-    # Pinned FlashInfer autotune file. When set, the autotune cache file that
-    # vLLM resolves (whatever its config-hash directory) is seeded from this
-    # file if it does not exist yet. Shapes missing from it autotune normally.
+    # Pinned FlashInfer autotune table (vllm/model_executor/warmup/
+    # flashinfer_autotune_pin.py). Every entry is checked against this
+    # process's fingerprint (FlashInfer build, GPU, runner source, kernel and
+    # overlay sources, tactic list at the entry's shape, relevant envs) before
+    # use; stale entries are rejected and logged, never applied. Keys it does
+    # not cover autotune at start-up; DP workers sharing a cache dir tune them
+    # once (file lock) and load the same table.
     "VLLM_FLASHINFER_AUTOTUNE_FILE": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_FILE", None
+    ),
+    # With VLLM_FLASHINFER_AUTOTUNE_FILE: fail start-up if any FlashInfer
+    # autotune key is not covered by a valid pinned entry (CI). Default off.
+    "VLLM_FLASHINFER_AUTOTUNE_STRICT": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_STRICT", "0"))
+    ),
+    # Generation mode for pinned tables: profile every FlashInfer autotune key
+    # (pinned file and cache ignored) with repeated measurements and write the
+    # per-tactic samples of this worker to this directory. Merge the records of
+    # several workers with
+    # `python -m vllm.model_executor.warmup.flashinfer_autotune_pin merge`.
+    "VLLM_FLASHINFER_AUTOTUNE_RECORD": lambda: os.getenv(
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD", None
+    ),
+    # Timed CUDA-graph replays per (key, tactic) in generation mode.
+    "VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS", "15")
     ),
     # sm_107 only: add K=64 (Sm107 kernel) tactics to FlashInfer's autotuned
     # CuTe-DSL mm_mxfp8 (vllm/model_executor/layers/quantization/utils/
@@ -2587,6 +2611,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_FILE",
+        "VLLM_FLASHINFER_AUTOTUNE_STRICT",
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD",
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS",
         # Opaque custom-op GEMM tactic sources; not part of traced graphs.
         "VLLM_FLASHINFER_MXFP8_K64",
         "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
