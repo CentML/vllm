@@ -193,22 +193,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             gdn_state_commit.check_num_speculative_tokens(
                 self.num_spec, "GDNAttentionMetadataBuilder"
             )
-        if os.environ.get("VLLM_GDN_CONV_CUDA", "0") == "1":
-            # GB300 stack: build / load F46's CUDA conv extension at engine start, never first inside
-            # the step loop (a mid-run JIT build holds the shared build dir's file lock: GB300 stall root cause)
-            try:
-                from vllm.model_executor.layers.mamba.ops import gdn_conv_cuda
-
-                gdn_conv_cuda.load()
-                import logging
-
-                logging.getLogger(__name__).info(
-                    "gdn_conv_cuda: extension loaded eagerly (GDNAttentionMetadataBuilder)")
-            except Exception as e:  # noqa: BLE001 - never block start-up; first use loads it
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "gdn_conv_cuda: eager load failed (%r); loading at first use", e)
 
     def _build_chunk_metadata(
         self,
