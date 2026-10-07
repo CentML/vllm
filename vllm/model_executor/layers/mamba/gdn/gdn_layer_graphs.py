@@ -809,8 +809,15 @@ def try_replay(
     if not _ARMED[0] or _OFF[0] or _BYPASS[0] or out_q is None or out_scale is None:
         return False
     from vllm.config import CUDAGraphMode
-    from vllm.forward_context import get_forward_context
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
 
+    # The op may run outside a model forward (direct layer calls, e.g. kernel
+    # tests after a runner armed the graphs in the same process): eager.
+    if not is_forward_context_available():
+        return False
     fc = get_forward_context()
     if fc.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
         return False

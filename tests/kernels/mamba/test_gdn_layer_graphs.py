@@ -304,10 +304,7 @@ def _run(layers, md, bufs, use_graphs):
         no_compile_layers={L.prefix: L for L in layers},
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
     )
-    with (
-        patch.object(M, "get_forward_context", return_value=fc),
-        patch("vllm.forward_context.get_forward_context", return_value=fc),
-    ):
+    with patch("vllm.forward_context._forward_context", fc):
         lg._ARMED[0] = use_graphs
         try:
             for L, (qkvz, ba, out, out_q, out_scale) in zip(layers, bufs):
