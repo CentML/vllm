@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -2779,25 +2778,6 @@ def fused_kda_decode(
     return out
 
 
-# Deferred GDN state commit (GDN_STATE_COMMIT=1, not the layout-only control
-# mode): the MTP decode op runs the single-state kernel of
-# vllm/model_executor/layers/mamba/ops/gdn_state_commit (imported on first use).
-_GDN_STATE_COMMIT_DECODE = (
-    os.environ.get("GDN_STATE_COMMIT", "0") == "1"
-    and os.environ.get("GDN_STATE_COMMIT_LAYOUT_ONLY", "0") != "1"
-)
-_gdn_state_commit_mod = None
-
-
-def _gdn_state_commit():
-    global _gdn_state_commit_mod
-    if _gdn_state_commit_mod is None:
-        from vllm.model_executor.layers.mamba.ops import gdn_state_commit
-
-        _gdn_state_commit_mod = gdn_state_commit
-    return _gdn_state_commit_mod
-
-
 def fused_gdn_decode_post_conv_mtp(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -2815,24 +2795,6 @@ def fused_gdn_decode_post_conv_mtp(
     norm_eps: float = 1e-5,
     output_gate_activation: str = "silu",
 ) -> torch.Tensor:
-    if _GDN_STATE_COMMIT_DECODE:
-        return _gdn_state_commit().decode(
-            mixed_qkv,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            state_indices,
-            cu_seqlens,
-            num_accepted_tokens,
-            state,
-            output_gate,
-            norm_weight,
-            out,
-            scale,
-            norm_eps,
-            output_gate_activation,
-        )
     if out is None:
         out = torch.empty_like(output_gate)
     torch.ops._C.fused_gdn_decode_post_conv_mtp(

@@ -16,7 +16,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.mamba.ops import gdn_state_commit
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
@@ -31,13 +30,6 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
-
-# Deferred GDN state commit (GDN_STATE_COMMIT=1, not the layout-only control mode):
-# the align-mode copy kernels below move the GDN conv state only; the GDN ssm state
-# and its in-page token log are committed by gdn_state_commit.materialize.
-_GDN_STATE_COMMIT_DEFERRED = (
-    gdn_state_commit.enabled() and not gdn_state_commit.layout_only()
-)
 
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
@@ -1142,11 +1134,6 @@ class MambaSpecDecodeGPUContext:
                 mamba_state_copy_funcs,
                 block_tables,
             )
-        if _GDN_STATE_COMMIT_DEFERRED and self.is_initialized:
-            # per-layer pointer table for the deferred-commit materialize kernel
-            gdn_state_commit._build_worker_table(
-                self, kv_cache_config, forward_context
-            )
 
     def _populate_metadata(
         self,
@@ -1438,17 +1425,6 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
-        if _GDN_STATE_COMMIT_DEFERRED:
-            # block-boundary checkpoints of the GDN ssm state (+ token log)
-            gdn_state_commit.worker_postprocess(
-                self,
-                num_reqs,
-                num_accepted_tokens_gpu,
-                mamba_state_idx_gpu,
-                num_scheduled_tokens_gpu,
-                num_computed_tokens_gpu,
-                num_draft_tokens_gpu,
-            )
 
     def run_fused_precopy(
         self,
@@ -1505,11 +1481,6 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
-        if _GDN_STATE_COMMIT_DEFERRED:
-            # align-mode block migration of the GDN ssm state (+ token log)
-            gdn_state_commit.worker_precopy(
-                self, num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu, idx_mapping
-            )
 
     def run_fused_postprocess_align(
         self,
@@ -1578,16 +1549,6 @@ class MambaSpecDecodeGPUContext:
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
-        if _GDN_STATE_COMMIT_DEFERRED:
-            # block-boundary checkpoints of the GDN ssm state (+ token log)
-            gdn_state_commit.worker_postprocess_align(
-                self,
-                num_reqs,
-                num_accepted_tokens_gpu,
-                state_idx_gpu,
-                new_num_computed_tokens_gpu,
-                idx_mapping,
-            )
 
 
 @dataclasses.dataclass

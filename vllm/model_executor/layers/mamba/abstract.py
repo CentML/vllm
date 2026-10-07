@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from abc import abstractmethod
 from collections.abc import Iterable
 from math import prod
@@ -14,10 +13,6 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.selector import get_mamba_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
-
-# Deferred GDN state commit (GDN_STATE_COMMIT=1), see
-# vllm/model_executor/layers/mamba/ops/gdn_state_commit.
-_GDN_STATE_COMMIT = os.environ.get("GDN_STATE_COMMIT", "0") == "1"
 
 
 class MambaBase(AttentionLayerBase):
@@ -71,7 +66,7 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
-        spec = MambaSpec(
+        return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
             block_size=mamba_block_size,
@@ -87,13 +82,6 @@ class MambaBase(AttentionLayerBase):
                 else vllm_config.num_speculative_tokens
             ),
         )
-        if _GDN_STATE_COMMIT:
-            # GDN: one state block per running request (no speculative blocks)
-            # and the token-log dtype in the spec.
-            from vllm.model_executor.layers.mamba.ops import gdn_state_commit
-
-            spec = gdn_state_commit.adjust_kv_cache_spec(spec, vllm_config)
-        return spec
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         """Get the attention backend class for this Mamba layer."""
