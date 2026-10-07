@@ -201,15 +201,7 @@ def pruned_forward(
         if isinstance(dec, fib.FlashInferTrtllmAPIDecode)
         else "trtllm-gen"
     )
-    # Same decode entry point as the regular decode path in
-    # FlashInferImpl.forward: the split-KV widening wrapper when
-    # FI_DECODE_SPLITKV is enabled, the stock FlashInfer function otherwise.
-    trtllm_decode = (
-        fib.flashinfer_decode_splitkv.trtllm_batch_decode_with_kv_cache
-        if fib.flashinfer_decode_splitkv.ENABLED
-        else fib.trtllm_batch_decode_with_kv_cache
-    )
-    trtllm_decode(
+    fib.trtllm_batch_decode_with_kv_cache(
         query=q,
         kv_cache=kv_tuple,
         workspace_buffer=fib._get_trtllm_workspace_buffer(),
