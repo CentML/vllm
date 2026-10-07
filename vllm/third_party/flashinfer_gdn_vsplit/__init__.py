@@ -31,7 +31,8 @@ Dispatch (fi_chunk_gated_delta_rule in qwen_gdn_linear_attn.py, non-CP state-poo
                                         "model" picks v_split with a persistent-schedule
                                         cost model from (num_seqs, total tokens, max seq
                                         len); "n<=3" = split iff num_seqs <= 3.
-Steps the rule leaves at v_split=1 run the stock FlashInfer call.
+Steps the rule leaves at v_split=1 run the stock FlashInfer call
+(VLLM_GDN_FI_VSPLIT_V1=1: this package's kernel at v_split=1).
 """
 import os
 

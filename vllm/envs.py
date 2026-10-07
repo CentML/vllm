@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_GDN_PREFILL_CHECKPOINT: bool = False
     VLLM_GDN_VSPLIT_CG0SPLIT: bool = False
     VLLM_GDN_VSPLIT_C1REORDER: bool = False
+    VLLM_GDN_FI_VSPLIT_V1: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1261,6 +1262,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GDN_VSPLIT_C1REORDER": lambda: bool(
         int(os.getenv("VLLM_GDN_VSPLIT_C1REORDER", "0"))
+    ),
+    # Run the non-CP GDN state-pool prefill steps that the V-split rule leaves
+    # at v_split=1 on the vendored V-split kernel instead of FlashInfer's
+    # (bitwise identical output and final state).
+    "VLLM_GDN_FI_VSPLIT_V1": lambda: bool(
+        int(os.getenv("VLLM_GDN_FI_VSPLIT_V1", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
@@ -2522,6 +2529,7 @@ def compile_factors() -> dict[str, object]:
         # Variants of the custom-op GDN prefill kernel; not part of traced graphs.
         "VLLM_GDN_VSPLIT_CG0SPLIT",
         "VLLM_GDN_VSPLIT_C1REORDER",
+        "VLLM_GDN_FI_VSPLIT_V1",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

@@ -177,6 +177,11 @@ GDN_FUSED_CONV_PREP = os.environ.get("VLLM_GDN_FUSED_CONV_PREP", "1") == "1"
 # (choose_vsplit) uses host ints only. The kernel is compiled by the prefill
 # warmup; it stays off in a process whose warmup did not compile it.
 GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "1") == "1"
+# VLLM_GDN_FI_VSPLIT_V1=1: also run the steps the rule leaves at v_split=1 on
+# the vendored kernel (same math, bitwise identical to FlashInfer's non-CP
+# kernel) instead of FlashInfer. FlashInfer's indexed state-pool mode drops the
+# state stride divisibility hint; the vendored adapter keeps it.
+_GDN_FI_VSPLIT_V1 = envs.VLLM_GDN_FI_VSPLIT_V1
 _gdn_vsplit_ready: list = []  # [module] once the warmup compiled the kernel
 _gdn_vsplit_tried: list = []
 # With V-split, the non-CP kernel beats CP for single sequences up to ~8.5k
@@ -242,7 +247,9 @@ def _gdn_vsplit_warmup(
     The stock FlashInfer non-CP kernel still runs the steps choose_vsplit
     leaves at v_split=1 (some 4-6 sequence batches). Without V-split, the
     warmup's dummy batches compile it; with V-split they all take the V-split
-    kernel, so the same pooled variant is compiled here as well.
+    kernel, so the same pooled variant is compiled here as well. With
+    VLLM_GDN_FI_VSPLIT_V1=1 those steps run the vendored kernel at v_split=1,
+    which is compiled here too.
     """
     if _gdn_vsplit_tried:
         return
@@ -271,6 +278,21 @@ def _gdn_vsplit_warmup(
             state_indices=torch.ones(1, device=device, dtype=torch.int32),
             v_split=2,
         )
+        if _GDN_FI_VSPLIT_V1:
+            gdn_vsplit.chunk_gated_delta_rule_vsplit(
+                q,
+                q,
+                v,
+                gate,
+                gate,
+                torch.empty_like(v),
+                torch.tensor([0, T], device=device, dtype=torch.int32),
+                pool,
+                pool,
+                head_dim**-0.5,
+                state_indices=torch.ones(1, device=device, dtype=torch.int32),
+                v_split=1,
+            )
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
         chunk_gated_delta_rule(
@@ -569,7 +591,7 @@ def fi_chunk_gated_delta_rule(
             q.shape[0] if num_seqs == 1 else max_seqlen,
             hv=v.shape[1],
         )
-        if v_split > 1:
+        if v_split > 1 or _GDN_FI_VSPLIT_V1:
             out = torch.empty_like(v) if output is None else output.view(v.shape)
             if cu_seqlens_i32 is None:
                 assert cu_seqlens is not None
