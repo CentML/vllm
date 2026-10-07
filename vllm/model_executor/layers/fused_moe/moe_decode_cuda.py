@@ -760,7 +760,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 E, TOPK, H, INTER = 256, 8, 2048, 512
 MAXT = 32
 _NTEAM = 3
-_SMALL, _XROW, _SLOT = 5120, 2 * H + 64, 64 * INTER
+_SMALL, _XROW, _SLOT = 5120, 2 * H + 64, 64 * INTER + 2048
 
 
 def tuned_source(tune: str) -> str:
