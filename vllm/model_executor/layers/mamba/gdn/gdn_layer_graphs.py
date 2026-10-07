@@ -652,28 +652,6 @@ def capture_model(impl):
         return impl()
     finally:
         _IN_CAPTURE[0] = False
-        _qo_capture_stats()
-
-
-def _qo_capture_stats() -> None:
-    """gb300-fuse engage proof (GLUE_GSC_QO): after vLLM's capture phase, how many GDN decode calls took the fused
-    MXFP8 quant (decode_qo), how many FULL-graph pad-row zeroings were deferred to the decode kernel, skipped (the
-    QO kernel zeroed them) or ran late (QO not taken, e.g. > GLUE_GSC_QO_MAXT rows). Per layer = / 30 GDN layers."""
-    if os.environ.get("GLUE_GSC_QO", "0") != "1":
-        return
-    try:
-        from vllm.model_executor.layers.fusion import norm_quant as _nq
-        from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc as _ga
-        from vllm.model_executor.layers.mamba.ops import gdn_state_commit as _gsc
-
-        logger.info(
-            "[fuse] QO capture stats: gsc decode_calls=%s decode_qo_calls=%s | out_alloc deferred=%s skipped=%s "
-            "late_zero=%s | norm_quant gdn_qo=%s",
-            _gsc.STATS.get("decode_calls"), _gsc.STATS.get("decode_qo_calls", 0), _ga.STATS.get("deferred"),
-            _ga.STATS.get("skipped"), _ga.STATS.get("late_zero"), _nq.STATS.get("gdn_qo", 0),
-        )
-    except Exception as ex:  # noqa: BLE001 (diagnostic only)
-        logger.warning("[fuse] QO capture stats unavailable: %s", ex)
 
 
 def _drop_graphs(reason):
