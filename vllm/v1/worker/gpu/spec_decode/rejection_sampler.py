@@ -17,7 +17,6 @@ from vllm.v1.worker.gpu.input_batch import (
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample import sparse_verify
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -187,13 +186,7 @@ class RejectionSampler:
             draft_sampled,
             expanded_local_pos,
         )
-        # Opt-in: the sparse variant for logits produced by sparse_verify.
-        sample_fn = (
-            sparse_verify.rejection_sample
-            if sparse_verify.ENABLED
-            else rejection_sample
-        )
-        sampled, num_sampled = sample_fn(
+        sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
             draft_sampled,
@@ -308,19 +301,15 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        # Opt-in sparse verify sampling (no-op context unless enabled).
-        with sparse_verify.verify_scope(
-            self, logits, input_batch, draft_logits, chunk_logit_limit, max_num_logprobs
-        ):
-            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-                logits,
-                input_batch,
-                draft_logits,
-                draft_sampled,
-                pos,
-                chunk_logit_limit,
-                max_num_logprobs,
-            )
+        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+            logits,
+            input_batch,
+            draft_logits,
+            draft_sampled,
+            pos,
+            chunk_logit_limit,
+            max_num_logprobs,
+        )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

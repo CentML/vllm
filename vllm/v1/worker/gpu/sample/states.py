@@ -6,7 +6,6 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.sample import sparse_verify
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 import os
@@ -140,20 +139,6 @@ class SamplingStates:
         (+ optional top-p): no logit bias / bad words / thinking budget / min_p and all
         temperatures in {0, 1} (so no temperature scaling is applied before top-k/top-p).
         """
-        if sparse_verify.ENABLED and sparse_verify.in_eligible_verify():
-            # Opt-in sparse processed logits for an eligible verify step.
-            out = sparse_verify.sparse_prep(
-                self,
-                logits,
-                sampler,
-                expanded_idx_mapping,
-                idx_mapping_np,
-                input_ids,
-                expanded_local_pos,
-                bool(_SPLIT_ROW_TOPK and _FUSED_PREP),
-            )
-            if out is not None:
-                return out
         if not (_SPLIT_ROW_TOPK and _FUSED_PREP and logits.is_cuda):
             return None
         if np.any(sampler.logit_bias_state.use_logit_bias[idx_mapping_np]):
