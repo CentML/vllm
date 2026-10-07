@@ -129,7 +129,7 @@ def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
 
 
 @pytest.mark.parametrize(
-    "tune", ["RS=1,LASTN=1,FADD2=1,PF=212", "RS=1,PF=1", "RPT=4,MINB=1,RS=1"]
+    "tune", ["RS=1+LASTN=1+FADD2=1+PF=212", "RS=1,PF=1", "RPT=4+MINB=1+RS=1"]
 )
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("width", [4, 6, 8])

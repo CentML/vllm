@@ -50,19 +50,21 @@ _tried: list = []
 # unchanged. Off (default): the source and launch are the stock ones.
 GDN_MTP_CUDA_PDL = os.environ.get("VLLM_GDN_MTP_CUDA_PDL", "0") == "1"
 
-# VLLM_GDN_MTP_CUDA_TUNE="RPT=4,MINB=1,RS=1": build the kernel with these
-# tuning macros (see the GMR_* block of _SOURCE: rows per thread, min CTAs per
-# SM, reduce-scatter key reductions, early snapshot stores). Every combination
-# computes the same per-element operations and reduction trees, so results are
-# bitwise equal to the stock kernel. Empty (default): the stock kernel.
+# VLLM_GDN_MTP_CUDA_TUNE="RS=1+LASTN=1+FADD2=1+PF=212" (items separated by "+"
+# or ","): build the kernel with these tuning macros (see the GMR_* block of
+# _SOURCE: rows per thread, min CTAs per SM, reduce-scatter key reductions,
+# early snapshot stores, L2 prefetch distance, last-token skip, packed adds).
+# Every combination computes the same per-element operations and reduction
+# trees, so results are bitwise equal to the stock kernel. Empty (default):
+# the stock kernel.
 GDN_MTP_CUDA_TUNE = os.environ.get("VLLM_GDN_MTP_CUDA_TUNE", "")
 
 
 def tuned_source(tune: str, pdl: bool) -> str:
-    """The kernel source with the ``tune`` macros (``"K=V,..."``) prepended."""
+    """The kernel source with the ``tune`` macros (``"K=V+..."``) prepended."""
     source = _pdl_source(_SOURCE) if pdl else _SOURCE
     defines = ""
-    for item in filter(None, (x.strip() for x in tune.split(","))):
+    for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         key, val = item.split("=")
         assert key in ("RPT", "MINB", "RS", "EARLY_ST", "PF", "LASTN", "FADD2"), key
         defines += f"#define GMR_{key} {int(val)}\n"
@@ -123,7 +125,8 @@ def enable() -> bool:
         try:
             load()
             logger.info(
-                "GDN MTP decode: register-resident CUDA kernel built and enabled."
+                "GDN MTP decode: register-resident CUDA kernel built and enabled%s.",
+                f" (tune {GDN_MTP_CUDA_TUNE})" if GDN_MTP_CUDA_TUNE else "",
             )
         except Exception:
             logger.warning(
