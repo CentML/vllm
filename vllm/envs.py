@@ -223,7 +223,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
-    VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int = 16384
+    VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int | None = None
     VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
     VLLM_FI_PERSISTENT_KV_COUNTER_BYTES: int = 1 << 20
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1774,9 +1774,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Upper bound on KV tokens per CTA for FlashInfer trtllm-gen decode
     # attention: raises the split-KV CTA count to ceil(max_seq_len / value)
     # when FlashInfer's one-wave heuristic would split less. 0 keeps
-    # FlashInfer's heuristic.
-    "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: int(
-        os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA", "16384")
+    # FlashInfer's heuristic. Unset: 16384 on SM107, 0 elsewhere.
+    "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: maybe_convert_int(
+        os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA")
     ),
     # Pass one persistent, zero-initialized multi-CTA KV counter buffer per
     # device to the trtllm-gen context kernel instead of letting FlashInfer

@@ -2018,10 +2018,12 @@ class FlashInferImpl(AttentionImpl):
         self.draft_prefill_pruning_layer: str | None = None
         # trtllm-gen decode split-KV policy and the worst-case decode batch
         # that sizes the persistent counter buffer (resolved on first decode,
-        # never regrown after CUDA-graph capture).
-        self.trtllm_decode_max_kv_per_cta = (
-            envs.VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA
-        )
+        # never regrown after CUDA-graph capture). The KV-per-CTA cap is on by
+        # default only on SM107; an explicit setting applies everywhere.
+        max_kv_per_cta = envs.VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA
+        if max_kv_per_cta is None:
+            max_kv_per_cta = 16384 if current_platform.is_device_capability(107) else 0
+        self.trtllm_decode_max_kv_per_cta = max_kv_per_cta
         self._trtllm_decode_max_reqs: int | None = None
         self._trtllm_decode_max_model_len: int | None = None
         if vllm_config is not None and vllm_config.model_config is not None:
