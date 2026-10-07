@@ -686,6 +686,38 @@ def _warm_fi_gdn_prefill_state_pool(runner: "GPUModelRunner") -> None:
     )
 
 
+def _warm_gdn_layer_graphs(
+    runner: "GPUModelRunner", config: _QwenGDNWarmupConfig, x_dtype: torch.dtype
+) -> None:
+    """VLLM_GDN_LAYER_GRAPHS: the Triton variants only the layer graphs launch
+    (pack, padded-bucket spec conv update, ROWS_FROM_PTR norm).
+    """
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
+    # The graphs need out_proj's MXFP8 activation; else they never engage.
+    if not gdn_layer_graphs.ENABLED or not config.gdn_out_mxfp8:
+        return
+    layer = next(
+        (
+            layer
+            for layer in _iter_qwen_gdn_layers(
+                runner.compilation_config.static_forward_context
+            )
+            if _split_qwen_gdn_cache(getattr(layer, "kv_cache", None)) is not None
+        ),
+        None,
+    )
+    if layer is None:
+        return
+    speculative_config = getattr(runner, "speculative_config", None)
+    num_spec = (
+        0
+        if speculative_config is None
+        else int(speculative_config.num_speculative_tokens or 0)
+    )
+    gdn_layer_graphs.warm_triton_kernels(layer, num_spec, x_dtype)
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -727,4 +759,6 @@ def qwen_triton_warmup(
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
     _warm_fi_gdn_prefill_state_pool(runner)
+    if not runner.is_pooling_model:
+        _warm_gdn_layer_graphs(runner, gdn_config, model_config.dtype)
     _synchronize_device(device)

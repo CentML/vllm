@@ -453,6 +453,72 @@ def _kernels(monkeypatch):
     monkeypatch.setattr(lg, "ENABLED", True)
 
 
+@torch.inference_mode()
+def test_warm_triton_kernels_cover_graph_launches(_kernels, monkeypatch):
+    """After ``warm_triton_kernels`` (start-up), capturing and replaying every
+    scenario's layer graphs compiles no further variant of the kernels only
+    the graphs launch with their own arguments (no JIT while serving).
+    """
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_tail_ops
+    from vllm.model_executor.layers.mamba.ops import causal_conv1d
+
+    fake = types.SimpleNamespace(
+        choose_vsplit=lambda *a, **k: 2, chunk_gated_delta_rule_vsplit=_ref_vsplit
+    )
+    monkeypatch.setattr(M, "_gdn_vsplit_ready", [fake])
+    monkeypatch.setattr(lg, "_workspace", lambda *a: None)
+    kernels = (
+        lg._pack_kernel,
+        causal_conv1d._causal_conv1d_update_kernel,
+        qwen_gdn_tail_ops._gdn_gated_norm_mxfp8_kernel,
+    )
+    names = {k.fn.__qualname__ for k in kernels}
+    # Drop the in-memory variants so every compile below reaches the hook.
+    for k in kernels:
+        k.device_caches.clear()
+    compiled: list[str] = []
+    prev = triton.knobs.runtime.jit_cache_hook
+
+    def hook(*, fn, repr, **kw):
+        if fn.name in names:
+            compiled.append(repr)
+        return prev(fn=fn, repr=repr, **kw) if prev else False
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", hook)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    gen_cpu = torch.Generator().manual_seed(11)
+    lg.warm_triton_kernels(
+        _build_layer(LAYERS[0], gen, torch.bfloat16, "silu"), NUM_SPEC, torch.bfloat16
+    )
+    torch.accelerator.synchronize()
+    assert {r.split("[", 1)[0] for r in compiled} == names
+    compiled.clear()
+    hidden = HV * V
+    lg.drop_graphs()
+    lg.STATS.clear()
+    for _, T, steps in _scenarios():
+        layers = [_build_layer(p, gen, torch.bfloat16, "silu") for p in LAYERS]
+        bufs = [
+            (
+                torch.randn(T, CONV_DIM + hidden, device="cuda").to(torch.bfloat16),
+                torch.randn(T, 2 * HV, device="cuda").to(torch.bfloat16),
+                torch.empty(T, HV, V, dtype=torch.bfloat16, device="cuda"),
+                torch.empty(T, hidden, dtype=torch.float8_e4m3fn, device="cuda"),
+                torch.empty(
+                    gdn_mxfp8_scale_numel(T, hidden), dtype=torch.uint8, device="cuda"
+                ),
+            )
+            for _ in LAYERS
+        ]
+        for nr, lens, fresh in steps:
+            _run(layers, _metadata(gen_cpu, nr, lens, fresh), bufs, use_graphs=True)
+    torch.accelerator.synchronize()
+    assert lg.STATS.get("replays", 0) == len(LAYERS) * sum(
+        len(s[2]) for s in _scenarios()
+    ), lg.STATS
+    assert not compiled, compiled
+
+
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize(
     "state_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"]

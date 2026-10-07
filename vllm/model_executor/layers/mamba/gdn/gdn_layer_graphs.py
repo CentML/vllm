@@ -132,8 +132,11 @@ def drop_graphs() -> None:
     _CAP[1] = None
 
 
+# Inputs are the step metadata's tensors (slices at any offset): no alignment
+# specialization, so the warmup's launches compile the serving variants.
 # fmt: off
-@triton.jit(do_not_specialize=["S", "N", "nr", "npf", "lo", "hi", "si_s0", "ns_s0", "ps_s0"])
+@triton.jit(do_not_specialize=["S", "N", "nr", "npf", "lo", "hi", "si_s0", "ns_s0", "ps_s0"],
+            do_not_specialize_on_alignment=["spec_si", "spec_cu", "spec_acc", "p_cu", "ns_si", "ns_hi", "p_si", "p_hi"])
 def _pack_kernel(spec_si, si_s0, spec_cu, spec_acc, p_cu, ns_si, ns_s0, ns_hi, p_si, ps_s0, p_hi,
                  si_out, acc_out, cu_s_out, cu_p_out, ci_conv, hi_conv, ci_chunk, hi_chunk, rows,
                  S, N, nr, npf, lo, hi,
@@ -226,6 +229,154 @@ class _GroupBufs:
         self.ci_chunk.fill_(NULL_BLOCK_ID)
         self.hi_chunk.fill_(True)
         self.rows.zero_()
+
+
+def _launch_pack(
+    gb: _GroupBufs,
+    si_buf: torch.Tensor,
+    si: torch.Tensor | None,
+    spec_cu: torch.Tensor | None,
+    spec_acc: torch.Tensor | None,
+    pcu: torch.Tensor,
+    ns_si: torch.Tensor,
+    ns_hi: torch.Tensor,
+    ps_si: torch.Tensor,
+    ps_hi: torch.Tensor,
+    S: int,
+    N: int,
+    nr: int,
+    npf: int,
+    norm_rows: tuple[int, int],
+) -> None:
+    """One step of one KV-cache group into ``gb`` (spec inputs None: no spec
+    rows).
+    """
+    has_spec = si is not None
+    dummy = gb.cu_s
+    _pack_kernel[(1,)](
+        si if has_spec else dummy,
+        si.stride(0) if has_spec else 0,
+        spec_cu if has_spec else dummy,
+        spec_acc if has_spec else dummy,
+        pcu,
+        ns_si,
+        ns_si.stride(0),
+        ns_hi,
+        ps_si,
+        ps_si.stride(0),
+        ps_hi,
+        si_buf,
+        gb.acc,
+        gb.cu_s,
+        gb.cu_p,
+        gb.ci_conv,
+        gb.hi_conv,
+        gb.ci_chunk,
+        gb.hi_chunk,
+        gb.rows,
+        S,
+        N,
+        nr,
+        npf,
+        norm_rows[0],
+        norm_rows[1],
+        W=si_buf.size(1),
+        NRC=NR,
+        NPC=NP,
+        BLOCK=triton.next_power_of_2(max(NR, NP) + 1),
+        HAS_SPEC=has_spec,
+        num_warps=4,
+    )
+
+
+def warm_triton_kernels(layer, num_spec: int, x_dtype: torch.dtype) -> None:
+    """Compile at start-up the Triton specializations that only the layer
+    graphs launch (else the null warm-up of a variant's first capture compiles
+    them while serving): the pack kernel with and without spec rows, the
+    spec-row ``causal_conv1d_update`` at every padded request bucket on the
+    group buffers, and the ``ROWS_FROM_PTR`` gated-norm MXFP8 kernel in both
+    warp classes, with and without PDL (``T`` below / at 4096). Arguments
+    mirror ``_plan`` / ``graph_core``; nothing live is touched (null slots,
+    zero-length sequences, ``num_valid`` 0 into scratch outputs).
+    """
+    M = _gdn()
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_gated_norm_mxfp8,
+        gdn_mxfp8_scale_numel,
+    )
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+
+    dev = layer.A_log.device
+    i32 = dict(dtype=torch.int32, device=dev)
+    gb = _GroupBufs(dev, torch.int32, torch.int32, torch.int32)
+    pcu = torch.zeros(NP + 1, **i32)
+    slots = torch.full((NP,), NULL_BLOCK_ID, **i32)
+    flags = torch.ones(NP, dtype=torch.bool, device=dev)
+    W = num_spec + 1
+    for has_spec in (False, True) if num_spec > 0 else (False,):
+        width = W if has_spec else 1
+        _launch_pack(
+            gb,
+            gb.si(width),
+            torch.full((NR, width), NULL_BLOCK_ID, **i32) if has_spec else None,
+            torch.zeros(NR + 1, **i32) if has_spec else None,
+            torch.ones(NR, **i32) if has_spec else None,
+            pcu,
+            slots,
+            flags,
+            slots,
+            flags,
+            0,
+            0,
+            0,
+            0,
+            (0, 0),
+        )
+    qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
+    vdim = layer.value_dim // layer.tp_size
+    HV, V = layer.A_log.shape[0], layer.head_v_dim
+    if num_spec > 0:
+        conv_state, conv_w = M._host_layer_views(layer)
+        mixed_qkv = torch.zeros(1, qkv_size + vdim, dtype=x_dtype, device=dev).split(
+            [qkv_size, vdim], dim=-1
+        )[0]
+        si = gb.si(W)
+        for nrb in sorted({_spec_bucket(M, n)[1] for n in range(1, NR + 1)}):
+            causal_conv1d_update(
+                mixed_qkv,
+                conv_state,
+                conv_w,
+                layer.conv1d.bias,
+                layer.activation,
+                conv_state_indices=si[:nrb, 0],
+                num_accepted_tokens=gb.acc[:nrb],
+                query_start_loc=gb.cu_s[: nrb + 1],
+                max_query_len=W,
+                validate_data=False,
+            )
+    for T in sorted({min(T_MAX, 4095), T_MAX}):
+        mixed_qkvz = torch.zeros(T, qkv_size + vdim, dtype=x_dtype, device=dev)
+        gate = mixed_qkvz.split([qkv_size, vdim], dim=-1)[1].reshape(T, -1, V)
+        core_attn_out = torch.zeros(T, HV, V, dtype=x_dtype, device=dev)
+        out_q = torch.empty(T, HV * V, dtype=torch.float8_e4m3fn, device=dev)
+        out_scale = torch.empty(
+            gdn_mxfp8_scale_numel(T, HV * V), dtype=torch.uint8, device=dev
+        )
+        for norm_rows in ((0, 0), (0, 1), (0, T)):
+            gdn_gated_norm_mxfp8(
+                core_attn_out,
+                gate,
+                layer.norm.weight,
+                layer.norm.eps,
+                layer.norm.activation,
+                out_q,
+                out_scale,
+                norm_rows,
+                gb.rows[:1],
+                rows=gb.rows,
+            )
 
 
 @dataclasses.dataclass
@@ -385,41 +536,22 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
     elif gb.dtypes[1:] != dt[1:] or (has_spec and gb.dtypes[0] != dt[0]):
         return "dtype"
     si_buf = gb.si(W)
-    BLOCK = triton.next_power_of_2(max(NR, NP) + 1)
-    dummy = gb.cu_s
-    _pack_kernel[(1,)](
-        si if has_spec else dummy,
-        si.stride(0) if has_spec else 0,
-        md.spec_query_start_loc if has_spec else dummy,
-        md.num_accepted_tokens if has_spec else dummy,
+    _launch_pack(
+        gb,
+        si_buf,
+        si if has_spec else None,
+        md.spec_query_start_loc if has_spec else None,
+        md.num_accepted_tokens if has_spec else None,
         pcu,
         ns_si,
-        ns_si.stride(0),
         ns_hi,
         ps_si,
-        ps_si.stride(0),
         ps_hi,
-        si_buf,
-        gb.acc,
-        gb.cu_s,
-        gb.cu_p,
-        gb.ci_conv,
-        gb.hi_conv,
-        gb.ci_chunk,
-        gb.hi_chunk,
-        gb.rows,
         S,
         N,
         nr,
         npf,
-        norm_rows[0],
-        norm_rows[1],
-        W=W,
-        NRC=NR,
-        NPC=NP,
-        BLOCK=BLOCK,
-        HAS_SPEC=has_spec,
-        num_warps=4,
+        norm_rows,
     )
     variant = (T, spec, W, nrb, npf, vsf, tph, nw, zero)
     return _Step(
