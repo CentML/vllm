@@ -33,6 +33,7 @@ Env (``vllm/envs.py``):
 - ``VLLM_FLASHINFER_MXFP8_K64_MIN_M`` (default 256).
 """
 
+import functools
 import threading
 from typing import Any
 
@@ -76,17 +77,32 @@ def offer_m(m: int, min_m: int) -> bool:
     return m % 32 == 0 and m >= min_m
 
 
+@functools.cache
+def _sm107_kernel_cls():
+    """FlashInfer's sm_107 block-scaled dense GEMM kernel class, or None when
+    this FlashInfer build does not provide it (no K=64 tactics are offered)."""
+    try:
+        from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107 import (
+            Sm107BlockScaledPersistentDenseGemmKernel,
+        )
+    except Exception as e:
+        logger.warning_once(
+            "FlashInfer sm_107 dense block-scaled GEMM kernel unavailable (%r); "
+            "K=64 MXFP8 tactics are disabled.",
+            e,
+        )
+        return None
+    return Sm107BlockScaledPersistentDenseGemmKernel
+
+
 def _adapter_cls():
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     import cutlass.utils as utils
     from cutlass.cute.nvgpu import OperandMajorMode
-    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107 import (
-        Sm107BlockScaledPersistentDenseGemmKernel,
-    )
 
-    class _K64Adapter(Sm107BlockScaledPersistentDenseGemmKernel):
+    class _K64Adapter(_sm107_kernel_cls()):
         @cute.jit
         def launch_mxfp8(
             self,
@@ -127,13 +143,13 @@ def _adapter_cls():
 
 
 def _can_implement(t, m, n, k) -> bool:
-    import cutlass
-    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107 import (
-        Sm107BlockScaledPersistentDenseGemmKernel as K,
-    )
-
+    K = _sm107_kernel_cls()
+    if K is None:
+        return False
     tile, inst, cl = tactic_shapes(t)
     try:
+        import cutlass
+
         return bool(
             K._can_implement_impl(
                 (m, n, k, 1),
@@ -156,6 +172,10 @@ def _can_implement(t, m, n, k) -> bool:
 
 
 def _get_compiled(dev, n, k, t, out_dtype):
+    if _sm107_kernel_cls() is None:
+        # A K=64 tactic can still arrive from a seeded or pinned
+        # autotune cache; the caller falls back to the stock tactic.
+        return None
     import torch
 
     key = (dev, n, k, t, out_dtype)

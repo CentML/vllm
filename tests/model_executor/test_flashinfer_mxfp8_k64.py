@@ -121,6 +121,26 @@ def test_factory_gating_and_tactics(monkeypatch):
     assert r.forward(_inputs(512), tactic=0) == ("base", 0)
 
 
+def test_missing_sm107_kernel_offers_no_tactics(monkeypatch):
+    # A None entry makes the kernel-module import raise ImportError.
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.gemm.kernels.dense_blockscaled_gemm_sm107", None
+    )
+    k64._sm107_kernel_cls.cache_clear()
+    try:
+        assert k64._sm107_kernel_cls() is None
+        assert not k64._can_implement((107, 256, 256, 256, 2), 512, 4096, 2048)
+        gb = _fake_gb()
+        k64.install(gb, k64.parse_tactics(DEFAULT_TACTICS), 256)
+        r = gb._cute_dsl_gemm_mxfp8_runner(10, 7, True, torch.bfloat16)
+        assert r.get_valid_tactics(_inputs(512), None) == [-1, 0]
+        # A K=64 tactic from a seeded autotune cache runs the stock one.
+        k64_tactic = [107, 256, 256, 256, 2]
+        assert r.forward(_inputs(512), tactic=k64_tactic) == ("base", -1)
+    finally:
+        k64._sm107_kernel_cls.cache_clear()
+
+
 def test_maybe_install_gating(monkeypatch):
     from vllm.platforms import current_platform
 
