@@ -224,6 +224,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int = 16384
+    VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
+    VLLM_FI_PERSISTENT_KV_COUNTER_BYTES: int = 1 << 20
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1775,6 +1777,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FlashInfer's heuristic.
     "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: int(
         os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA", "16384")
+    ),
+    # Pass one persistent, zero-initialized multi-CTA KV counter buffer per
+    # device to the trtllm-gen context kernel instead of letting FlashInfer
+    # allocate and zero a fresh one on every eager call (the kernel resets its
+    # semaphores at the end of every launch). Never created during graph capture.
+    "VLLM_FI_PERSISTENT_KV_COUNTER": lambda: bool(
+        int(os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER", "0"))
+    ),
+    # Size in bytes of that buffer; launches needing more keep FlashInfer's own.
+    "VLLM_FI_PERSISTENT_KV_COUNTER_BYTES": lambda: int(
+        os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for

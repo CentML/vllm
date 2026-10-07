@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -208,6 +207,40 @@ def _get_trtllm_gen_decode_counter_buffer(
             num_bytes, dtype=torch.uint8, device=device
         )
     return trtllm_gen_decode_counter_buffer
+
+
+trtllm_ctx_counter_buffers: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_trtllm_ctx_counter_buffer(
+    device: torch.device, num_bytes: int
+) -> torch.Tensor | None:
+    """VLLM_FI_PERSISTENT_KV_COUNTER: persistent zeroed multi-CTA KV semaphore
+    buffer for the trtllm-gen context kernel, one per device and separate from
+    the decode / generation-kernel prefill buffers (those launches may overlap
+    the context launch under PDL).
+
+    Without it, ``trtllm_batch_context_with_kv_cache`` allocates and zero-fills
+    a fresh buffer on every call; the kernel resets its semaphores after every
+    launch, so one zeroing at allocation suffices. Returns None when the
+    launch needs more than ``VLLM_FI_PERSISTENT_KV_COUNTER_BYTES`` or the
+    buffer does not exist yet during graph capture (it would live in the
+    graph's private pool); FlashInfer then allocates its own.
+    """
+    buf = trtllm_ctx_counter_buffers.get(device)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(
+            envs.VLLM_FI_PERSISTENT_KV_COUNTER_BYTES, dtype=torch.uint8, device=device
+        )
+        trtllm_ctx_counter_buffers[device] = buf
+        logger.info(
+            "Persistent trtllm-gen context KV counter on: device=%s bytes=%d",
+            device,
+            buf.numel(),
+        )
+    return buf if num_bytes <= buf.numel() else None
 
 
 def _pack_draft_block_bool_mask(
@@ -1900,55 +1933,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
-# GB300 study (fix-host): opt-in persistent trtllm-gen multi-CTA KV counter buffer.
-# FlashInfer allocates (torch.zeros) a fresh semaphore buffer on every eager
-# trtllm_batch_{context,decode}_with_kv_cache call when none is passed; the
-# kernels reset the semaphores to zero at the end of every launch, so one
-# zero-initialized buffer per device can be reused (FlashInfer's own wrappers do
-# the same). Saves an allocation + memset launch per eager attention call
-# (mixed / piecewise steps). Default off: VLLM_FI_PERSISTENT_KV_COUNTER=1.
-_FI_KV_COUNTER_ENABLED = os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER", "0") == "1"
-_FI_KV_COUNTER_BYTES = int(
-    os.environ.get("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
-)
-# One buffer per (device, kernel kind): the context and generation kernels of a
-# layer run back to back and may overlap under PDL, so they never share one.
-_FI_KV_COUNTER_BUFS: dict[tuple[torch.device, str], torch.Tensor] = {}
-
-
-def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | None:
-    if not _FI_KV_COUNTER_ENABLED:
-        return None
-    buf = _FI_KV_COUNTER_BUFS.get((device, kind))
-    if buf is None:
-        if torch.cuda.is_current_stream_capturing():
-            # Never create the persistent buffer inside a graph capture (it
-            # would live in the graph's private pool); FlashInfer allocates.
-            return None
-        buf = torch.zeros(_FI_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
-        _FI_KV_COUNTER_BUFS[(device, kind)] = buf
-        logger.info(
-            "FI persistent KV counter on: kind=%s device=%s bytes=%d",
-            kind,
-            device,
-            _FI_KV_COUNTER_BYTES,
-        )
-    return buf
-
-
-def _fi_kv_counter_kwargs(
-    device: torch.device, batch_size: int, num_qo_heads: int, kind: str
-) -> dict:
-    buf = _fi_kv_counter_buffer(device, kind)
-    if buf is None:
-        return {}
-    # FlashInfer needs round_up(max(batch * heads, sm_count), 8) int32 semaphores.
-    need = (max(batch_size * num_qo_heads, 1024) + 7) // 8 * 8 * 4
-    if need > buf.numel():
-        return {}
-    return {"multi_ctas_kv_counter_buffer": buf}
-
-
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -2047,6 +2031,7 @@ class FlashInferImpl(AttentionImpl):
             )
             self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
         self._device_sm_count: int | None = None
+        self._persistent_ctx_kv_counter = envs.VLLM_FI_PERSISTENT_KV_COUNTER
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -2125,6 +2110,23 @@ class FlashInferImpl(AttentionImpl):
         if needed > counter_buffer.numel():
             return sm_count, None
         return sm_count, counter_buffer
+
+    def _ctx_kv_counter_buffer(
+        self, query: torch.Tensor, batch_size: int
+    ) -> torch.Tensor | None:
+        """Multi-CTA KV counter buffer for one trtllm-gen context launch, or
+        None to let FlashInfer allocate one (see _get_trtllm_ctx_counter_buffer).
+        """
+        if not self._persistent_ctx_kv_counter:
+            return None
+        if self._device_sm_count is None:
+            self._device_sm_count = flashinfer_decode.get_device_sm_count(query.device)
+        return _get_trtllm_ctx_counter_buffer(
+            query.device,
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch_size, query.size(1), self._device_sm_count
+            ),
+        )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         if quant_key == kNvfp4Dynamic and self.is_kvcache_nvfp4:
@@ -2608,11 +2610,8 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     kv_cache_sf=prefill_kv_block_scales,
-                    **_fi_kv_counter_kwargs(
-                        prefill_query.device,
-                        attn_metadata.num_prefills,
-                        prefill_query.shape[1],
-                        "ctx",
+                    multi_ctas_kv_counter_buffer=self._ctx_kv_counter_buffer(
+                        prefill_query, attn_metadata.num_prefills
                     ),
                 )
 
