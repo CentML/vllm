@@ -65,6 +65,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -327,7 +328,15 @@ def maybe_install() -> None:
     source (``GS2_ROUTE``) and / or the routing-never-PDL launcher
     (``VLLM_MOE_PDL_FC=1``). No-op unless one of them is enabled; idempotent.
     """
-    global _installed
+    global _installed, PDL_FC
+    if PDL_FC and envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0:
+        # Both control FlashInfer's _device_support_moe_pdl: per call for
+        # VLLM_FI_SM107_MOE_PDL_MAX_TOKENS, globally here.
+        logger.warning(
+            "[moe-pdl-fc] VLLM_MOE_PDL_FC ignored: "
+            "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0 selects the per-call MoE PDL"
+        )
+        PDL_FC = False
     if not (ENABLED or PDL_FC) or _installed:
         return
     from flashinfer.fused_moe import core
