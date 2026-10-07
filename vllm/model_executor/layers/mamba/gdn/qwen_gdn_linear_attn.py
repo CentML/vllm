@@ -145,30 +145,22 @@ def _gdn_vsplit_call(q, k, v, g_exp, beta, out, ssm_state, slots, cu_seqlens, at
 
             st["mod"] = gdn_vsplit
             st["calls"] = 0
+            logger.info("gdn_vsplit: V-split GDN prefill enabled (rule=%s)", gdn_vsplit.VSPLIT_RULE)
         mod = st["mod"]
         n = cu_seqlens.numel() - 1
         vsf = mod.choose_vsplit(n, q.size(0), int(getattr(attn_metadata, "prefill_max_seqlen", 0)),
                                 hv=v.size(1))
         if vsf == 1:
             return False
-        if ssm_state.dtype not in (torch.float32, torch.bfloat16):
-            if not st.get("warned_dtype"):
-                st["warned_dtype"] = True
-                logger.warning("gdn_vsplit: V-split ineligible: ssm state dtype %s (fp32/bf16 only); using FlashInfer",
-                               ssm_state.dtype)
-            return False
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and out.is_contiguous()
                 and g_exp.is_contiguous() and beta.is_contiguous() and q.size(2) == 128
-                and ssm_state.stride(3) == 1):
-            if not st.get("warned_layout"):
-                st["warned_layout"] = True
-                logger.warning("gdn_vsplit: V-split ineligible: non-contiguous inputs; using FlashInfer")
+                and ssm_state.dtype == torch.float32 and ssm_state.stride(3) == 1):
             return False
         if _GDN_FI_VSPLIT_CHECK:
             # debug: run stock FlashInfer on copies and compare bitwise (slow; diagnostics only)
             from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi
 
-            ref_pool = ssm_state.clone()  # debug only: clones the whole pool (can OOM on a full server)
+            ref_pool = ssm_state.clone()
             ref_out = out.clone()
             _fi(q=q, k=k, v=v, g=g_exp, beta=beta, initial_state=ref_pool, output_final_state=True,
                 cu_seqlens=cu_seqlens, output=ref_out, output_state=ref_pool, use_cp=False, state_indices=slots)
@@ -188,9 +180,6 @@ def _gdn_vsplit_call(q, k, v, g_exp, beta, out, ssm_state, slots, cu_seqlens, at
                                out.stride(), g_exp.stride(), beta.stride(), tuple(ssm_state.shape), ssm_state.stride(),
                                slots.tolist()[:8])
         st["calls"] += 1
-        if st["calls"] == 1:
-            logger.info("gdn_vsplit: V-split GDN prefill active: first call took the V-split path (rule=%s, state=%s, "
-                        "v_split=%d, n=%d)", mod.VSPLIT_RULE, str(ssm_state.dtype).replace("torch.", ""), vsf, n)
         return True
     except Exception as e:  # never break serving: fall back to FlashInfer
         st["disabled"] = True
