@@ -3,8 +3,8 @@
 """Opt-in CUDA graphs for the spec-decode verify sampler of decode steps.
 
 On GB300 at low concurrency the decode step is host-bound: after the FULL-graph
-forward, ``GPUModelRunner.sample`` (target lm_head, sampling params / sparse
-verify sampling, rejection sampling, accepted counts) launches ~30 eager ops
+forward, ``GPUModelRunner.sample`` (target lm_head, sampling params, rejection
+sampling, accepted counts) launches ~30 eager ops
 whose Python + launch time is ~1 ms per step on Grace. This module captures
 that call once per batch shape and sampling-parameter signature and replays it.
 
@@ -25,7 +25,7 @@ Randomness: the V2 sampler and rejection sampler draw with Triton
 draw exactly what the eager path draws. Batches with explicitly seeded requests
 still run eagerly (conservative).
 
-Host decisions inside the captured call (sparse-verify eligibility, top-k max,
+Host decisions inside the captured call (top-k max,
 penalty / logit-bias / bad-words / thinking-budget / logprobs branches, chunking)
 are functions of the batch's per-request sampling parameters; the graph key holds
 the set of distinct per-request parameter tuples plus the batch shape, so a
@@ -168,15 +168,16 @@ class SamplerGraphs:
     def _scratch_ptrs() -> tuple:
         """Addresses of the module-level scratch buffers the sampling kernels
         cache and REALLOCATE when a larger batch arrives (e.g. an eager step with
-        more logits rows): a graph must never replay against a freed buffer."""
+        more logits rows): a graph must never replay against a freed buffer.
+        Modules that are not imported (or lack the cache) contribute nothing."""
         import sys
 
         out = []
         for modname, attr in (
-            ("vllm.v1.worker.gpu.sample.sparse_verify_kernels", "_BUF"),
-            ("vllm.v1.worker.gpu.sample.sparse_verify_kernels", "_BITS"),
-            ("vllm.v1.worker.gpu.sample.states", "_BUF_CACHE"),
-            ("vllm.v1.worker.gpu.sample.topk_topp_subchunk", "_BUF"),
+            ("vllm.v1.worker.gpu.sample.spec_topk_topp", "_SCRATCH"),
+            ("vllm.v1.sample.ops.topk_topp_triton", "_TRITON_BUFFER_CACHE"),
+            ("vllm.v1.sample.ops.topk_topp_triton", "_TRITON_SPLIT_CACHE"),
+            ("vllm.v1.sample.ops.topk_topp_triton", "_TRITON_TABLE_CACHE"),
         ):
             mod = sys.modules.get(modname)
             d = getattr(mod, attr, None) if mod is not None else None
@@ -184,7 +185,12 @@ class SamplerGraphs:
                 continue
             for k in sorted(d, key=repr):
                 v = d[k]
-                vals = v.values() if isinstance(v, dict) else (v,)
+                if isinstance(v, dict):
+                    vals = v.values()
+                elif isinstance(v, (tuple, list)):
+                    vals = v
+                else:
+                    vals = (v,)
                 for t in vals:
                     if isinstance(t, torch.Tensor):
                         out.append(t.data_ptr())
