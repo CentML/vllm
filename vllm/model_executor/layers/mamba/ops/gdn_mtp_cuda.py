@@ -43,6 +43,25 @@ logger = init_logger(__name__)
 _ext: list = []  # [module] once load() built or loaded it
 _tried: list = []
 
+# VLLM_GDN_MTP_CUDA_TUNE="RS=1+LASTN=1+FADD2=1+PF=212" (items separated by "+"
+# or ","): build the kernel with these tuning macros (see the GMR_* block of
+# _SOURCE: rows per thread, min CTAs per SM, reduce-scatter key reductions,
+# early snapshot stores, L2 prefetch distance, last-token skip, packed adds).
+# Every combination computes the same per-element operations and reduction
+# trees, so results are bitwise equal to the stock kernel. Empty (default):
+# the stock kernel.
+GDN_MTP_CUDA_TUNE = os.environ.get("VLLM_GDN_MTP_CUDA_TUNE", "")
+
+
+def tuned_source(tune: str) -> str:
+    """The kernel source with the ``tune`` macros (``"K=V+..."``) prepended."""
+    defines = ""
+    for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
+        key, val = item.split("=")
+        assert key in ("RPT", "MINB", "RS", "EARLY_ST", "PF", "LASTN", "FADD2"), key
+        defines += f"#define GMR_{key} {int(val)}\n"
+    return defines + _SOURCE
+
 
 def build_dir(arch: str) -> str:
     return os.path.join(envs.VLLM_CACHE_ROOT, "gdn_mtp_cuda", f"sm{arch}")
@@ -52,36 +71,41 @@ def load():
     """Build (or load the cached build of) the extension for the current device."""
     if _ext:
         return _ext[0]
+    ext = build(tuned_source(GDN_MTP_CUDA_TUNE))
+    _ext.append(ext)
+    return ext
+
+
+def build(source: str):
+    """Build (or load the cached build of) ``source`` for the current device."""
     major, minor = torch.cuda.get_device_capability()
     import torch.utils.cpp_extension as cpp
 
     arch = f"{major}{minor}{'a' if major >= 9 else ''}"
-    build = build_dir(arch)
-    os.makedirs(build, exist_ok=True)
-    digest = hashlib.sha256(_SOURCE.encode()).hexdigest()[:16]
-    src = os.path.join(build, f"gdn_mtp_cuda_{digest}.cu")
+    bdir = build_dir(arch)
+    os.makedirs(bdir, exist_ok=True)
+    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+    src = os.path.join(bdir, f"gdn_mtp_cuda_{digest}.cu")
     if not os.path.exists(src):
         tmp = f"{src}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            f.write(_SOURCE)
+            f.write(source)
         os.replace(tmp, src)
     orig = cpp._get_cuda_arch_flags
     cpp._get_cuda_arch_flags = lambda cflags=None: [
         f"-gencode=arch=compute_{arch},code=sm_{arch}"
     ]
     try:
-        ext = cpp.load(
+        return cpp.load(
             name=f"_gdn_mtp_cuda_{digest}",
             sources=[src],
             extra_cuda_cflags=["-O3", "-std=c++20", "-lineinfo"],
             extra_cflags=["-O3", "-std=c++20"],
-            build_directory=build,
+            build_directory=bdir,
             verbose=False,
         )
     finally:
         cpp._get_cuda_arch_flags = orig
-    _ext.append(ext)
-    return ext
 
 
 def enable() -> bool:
@@ -93,7 +117,8 @@ def enable() -> bool:
         try:
             load()
             logger.info(
-                "GDN MTP decode: register-resident CUDA kernel built and enabled."
+                "GDN MTP decode: register-resident CUDA kernel built and enabled%s.",
+                f" (tune {GDN_MTP_CUDA_TUNE})" if GDN_MTP_CUDA_TUNE else "",
             )
         except Exception:
             logger.warning(
@@ -155,18 +180,48 @@ _SOURCE = r"""
 
 namespace gmr {
 
+// Tuning macros (prepended by tuned_source(); defaults = the stock kernel):
+// GMR_RPT value rows per thread (8: 256 threads, 4: 512 threads), GMR_MINB
+// min CTAs per SM for __launch_bounds__, GMR_RS 1: per-token key reductions as
+// a reduce-scatter (same operands and add tree per row as the xor butterfly,
+// so bitwise equal; fewer shuffles) with S_t k_{t+1} shared through smem,
+// GMR_EARLY_ST 1: issue the snapshot stores before the reductions, GMR_PF N > 0:
+// L2-prefetch the source state of the CTA N blocks ahead, GMR_LASTN 1: skip
+// S_t k_{t+1} on the last token (unused), GMR_FADD2 1: packed adds in sum4.
+#ifndef GMR_RPT
+#define GMR_RPT 8
+#endif
+#ifndef GMR_MINB
+#define GMR_MINB 2
+#endif
+#ifndef GMR_RS
+#define GMR_RS 0
+#endif
+#ifndef GMR_PF
+#define GMR_PF 0
+#endif
+#ifndef GMR_LASTN
+#define GMR_LASTN 0
+#endif
+#ifndef GMR_FADD2
+#define GMR_FADD2 0
+#endif
+#ifndef GMR_EARLY_ST
+#define GMR_EARLY_ST 0
+#endif
+
 constexpr int kK = 128;
 constexpr int kV = 128;
 constexpr int kMaxT = 8;
 constexpr int kKPT = 8;              // key columns per thread
-constexpr int kRPT = 8;              // value rows per thread
+constexpr int kRPT = GMR_RPT;        // value rows per thread
 constexpr int kTPR = kK / kKPT;      // threads per row (16)
 constexpr int kNRG = kV / kRPT;      // row groups (16)
 constexpr int kNT = kNRG * kTPR;     // threads (256)
 constexpr int kNW = kNT / 32;        // warps (8): one per token in the prologue/epilogue
 constexpr int kNI = kKPT / 4;        // float4 chunks per row slice (2)
 constexpr int kGI = kMaxT * kV / kNT;  // gate elements per thread (4)
-static_assert(kNW == kMaxT, "one warp per token");
+static_assert(kNW >= kMaxT, "one warp per token");
 
 struct Params {
   const __nv_bfloat16* qkv;
@@ -241,11 +296,45 @@ __device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
 }
 
 __device__ __forceinline__ float sum4(const float2 (&x)[2]) {
+#if GMR_FADD2 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+  // same two pair sums as below, as one packed add
+  const float2 s = __fadd2_rn(make_float2(x[0].x, x[1].x), make_float2(x[0].y, x[1].y));
+  return s.x + s.y;
+#else
   return (x[0].x + x[0].y) + (x[1].x + x[1].y);
+#endif
 }
 
+// Sum of the R row partials x over the 16 lanes of a row group, as a
+// reduce-scatter: at each xor level (off 8, 4, 2, 1) a lane keeps half of its
+// rows (chosen by bit `off` of j) and adds the partner's partial of the same
+// row, so every row is summed with exactly the operands and order of the xor
+// butterfly. Returns the sum of local row `rho` (accumulated into rho).
+template <int R, int OFF>
+struct RowSum {
+  static __device__ __forceinline__ float run(float* x, int j, int& rho) {
+    if constexpr (R > 1) {
+      constexpr int h = R / 2;
+      const bool hi = (j & OFF) != 0;
+#pragma unroll
+      for (int k = 0; k < h; ++k) {
+        const float send = hi ? x[k] : x[k + h];
+        const float keep = hi ? x[k + h] : x[k];
+        x[k] = keep + __shfl_xor_sync(0xffffffffu, send, OFF);
+      }
+      rho += hi ? h : 0;
+      return RowSum<h, OFF / 2>::run(x, j, rho);
+    } else if constexpr (OFF > 0) {
+      x[0] += __shfl_xor_sync(0xffffffffu, x[0], OFF);
+      return RowSum<1, OFF / 2>::run(x, j, rho);
+    } else {
+      return x[0];
+    }
+  }
+};
+
 template <typename S>
-__global__ void __launch_bounds__(kNT, 2) mtp_kernel(const Params p) {
+__global__ void __launch_bounds__(kNT, GMR_MINB) mtp_kernel(const Params p) {
   __shared__ __align__(16) float s_q[kMaxT][kK];
   __shared__ __align__(16) float s_k[kMaxT][kK];
   __shared__ float s_v[kMaxT][kV];
@@ -253,6 +342,9 @@ __global__ void __launch_bounds__(kNT, 2) mtp_kernel(const Params p) {
   __shared__ float s_g[kMaxT][kV];  // norm weight x activated output gate
   __shared__ float s_dec[kMaxT];
   __shared__ float s_beta[kMaxT];
+#if GMR_RS
+  __shared__ __align__(16) float s_n[2][kNRG][kRPT];  // S_t k_{t+1} rows, by token parity
+#endif
 
   const int req = blockIdx.x;
   const int hv = blockIdx.y;
@@ -296,6 +388,27 @@ __global__ void __launch_bounds__(kNT, 2) mtp_kernel(const Params p) {
       h[r][i][1] = make_float2(x.z, x.w);
     }
   }
+#if GMR_PF
+  // L2 prefetch of the source state of the CTA GMR_PF blocks ahead in launch
+  // order (a hint only; no effect on results), by the last warp.
+  if (warp == kNW - 1) {
+    const int f = blockIdx.x + blockIdx.y * gridDim.x + GMR_PF;
+    if (f < static_cast<int>(gridDim.x * gridDim.y)) {
+      const int freq = f % gridDim.x;
+      const int fhv = f / gridDim.x;
+      const int facc = __ldg(p.acc + freq);
+      const int fsrc = facc >= 1 && facc <= p.si_width ? __ldg(p.si + freq * p.si_width + facc - 1) : 0;
+      if (fsrc > 0) {
+        constexpr int kBytes = kV * kK * static_cast<int>(sizeof(S));
+        const char* fp = reinterpret_cast<const char*>(static_cast<const S*>(p.state) +
+                                                       static_cast<int64_t>(fsrc) * p.s_slot +
+                                                       static_cast<int64_t>(fhv) * kV * kK) +
+                         lane * (kBytes / 32);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fp), "r"(kBytes / 32) : "memory");
+      }
+    }
+  }
+#endif
 
   // Every other global load is issued before any is used, so their latencies
   // overlap the state loads: q/k/v/a/b of token `warp`, dt bias, A_log, and the
@@ -388,16 +501,37 @@ __global__ void __launch_bounds__(kNT, 2) mtp_kernel(const Params p) {
         for (int c = 0; c < 2; ++c) a[r][i & 1] = fma2(h[r][i][c], kc[c], a[r][i & 1]);
       }
     }
+#if GMR_RS
+    // same tree as below, via RowSum; buffer 1 (token 0 writes buffer 0)
+    float nv[kRPT];
+#pragma unroll
+    for (int r = 0; r < kRPT; ++r) nv[r] = sum4(a[r]);
+    int rho_n = 0;
+    const float n = RowSum<kRPT, kTPR / 2>::run(nv, j, rho_n);
+    if ((j & (kTPR / kRPT - 1)) == 0) s_n[1][rg][rho_n] = n;
+    __syncwarp();
+#pragma unroll
+    for (int r = 0; r < kRPT; r += 4) {
+      const float4 n4 = *reinterpret_cast<const float4*>(&s_n[1][rg][r]);
+      hkr[r] = n4.x;
+      hkr[r + 1] = n4.y;
+      hkr[r + 2] = n4.z;
+      hkr[r + 3] = n4.w;
+    }
+#else
 #pragma unroll
     for (int r = 0; r < kRPT; ++r) {
       hkr[r] = sum4(a[r]);
 #pragma unroll
       for (int off = kTPR / 2; off > 0; off >>= 1) hkr[r] += __shfl_xor_sync(0xffffffffu, hkr[r], off);
     }
+#endif
   }
 
   S* const state = static_cast<S*>(p.state);
-  for (int t = 0; t < T; ++t) {
+  // One token; kNext: also compute S_t k_{t+1} (hkr for the next token).
+  const auto token = [&](const int t, auto next) {
+    constexpr bool kNext = decltype(next)::value;
     const float d = s_dec[t];
     const float2 d2 = make_float2(d, d);
     const float bt = s_beta[t];
@@ -417,44 +551,93 @@ __global__ void __launch_bounds__(kNT, 2) mtp_kernel(const Params p) {
     for (int i = 0; i < kNI; ++i) {
       const float4 k4 = *reinterpret_cast<const float4*>(kt + i * 4 * kTPR + 4 * j);
       const float4 q4 = *reinterpret_cast<const float4*>(qt + i * 4 * kTPR + 4 * j);
-      const float4 n4 = *reinterpret_cast<const float4*>(kn + i * 4 * kTPR + 4 * j);
       const float2 kc[2] = {make_float2(k4.x, k4.y), make_float2(k4.z, k4.w)};
       const float2 qc[2] = {make_float2(q4.x, q4.y), make_float2(q4.z, q4.w)};
-      const float2 nc[2] = {make_float2(n4.x, n4.y), make_float2(n4.z, n4.w)};
+      float2 nc[2];
+      if constexpr (kNext) {
+        const float4 n4 = *reinterpret_cast<const float4*>(kn + i * 4 * kTPR + 4 * j);
+        nc[0] = make_float2(n4.x, n4.y);
+        nc[1] = make_float2(n4.z, n4.w);
+      }
 #pragma unroll
       for (int r = 0; r < kRPT; ++r) {
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
           h[r][i][c] = fma2(kc[c], dl[r], mul2(h[r][i][c], d2));
           aq[r][i & 1] = fma2(h[r][i][c], qc[c], aq[r][i & 1]);
-          ak[r][i & 1] = fma2(h[r][i][c], nc[c], ak[r][i & 1]);
+          if constexpr (kNext) ak[r][i & 1] = fma2(h[r][i][c], nc[c], ak[r][i & 1]);
         }
       }
     }
+    const auto store = [&]() {
+      const int dst = __ldg(si_row + t);
+      if (dst > 0) {
+        S* dp = state + static_cast<int64_t>(dst) * p.s_slot + head;
+#pragma unroll
+        for (int r = 0; r < kRPT; ++r) {
+#pragma unroll
+          for (int i = 0; i < kNI; ++i) {
+            Io<S>::st(dp + (rg + r * kNRG) * kK + i * 4 * kTPR + 4 * j,
+                      make_float4(h[r][i][0].x, h[r][i][0].y, h[r][i][1].x, h[r][i][1].y));
+          }
+        }
+      }
+    };
+#if GMR_EARLY_ST
+    store();
+#endif
+#if GMR_RS
+    {
+      float ov[kRPT], nv[kRPT];
+#pragma unroll
+      for (int r = 0; r < kRPT; ++r) {
+        ov[r] = sum4(aq[r]);
+        if constexpr (kNext) nv[r] = sum4(ak[r]);
+      }
+      int rho = 0;
+      const float o = RowSum<kRPT, kTPR / 2>::run(ov, j, rho);
+      if ((j & (kTPR / kRPT - 1)) == 0) s_o[t][rg + rho * kNRG] = __bfloat162float(__float2bfloat16(o));
+      if constexpr (kNext) {
+        int rho_n = 0;
+        const float n = RowSum<kRPT, kTPR / 2>::run(nv, j, rho_n);
+        if ((j & (kTPR / kRPT - 1)) == 0) s_n[t & 1][rg][rho_n] = n;
+        __syncwarp();
+#pragma unroll
+        for (int r = 0; r < kRPT; r += 4) {
+          const float4 n4 = *reinterpret_cast<const float4*>(&s_n[t & 1][rg][r]);
+          hkr[r] = n4.x;
+          hkr[r + 1] = n4.y;
+          hkr[r + 2] = n4.z;
+          hkr[r + 3] = n4.w;
+        }
+      }
+    }
+#else
 #pragma unroll
     for (int r = 0; r < kRPT; ++r) {
       float o = sum4(aq[r]);
-      float n = sum4(ak[r]);
+      float n = 0.0f;
+      if constexpr (kNext) n = sum4(ak[r]);
 #pragma unroll
       for (int off = kTPR / 2; off > 0; off >>= 1) {
         o += __shfl_xor_sync(0xffffffffu, o, off);
-        n += __shfl_xor_sync(0xffffffffu, n, off);
+        if constexpr (kNext) n += __shfl_xor_sync(0xffffffffu, n, off);
       }
-      hkr[r] = n;
+      if constexpr (kNext) hkr[r] = n;
       if (j == 0) s_o[t][rg + r * kNRG] = __bfloat162float(__float2bfloat16(o));
     }
-    const int dst = __ldg(si_row + t);
-    if (dst > 0) {
-      S* dp = state + static_cast<int64_t>(dst) * p.s_slot + head;
-#pragma unroll
-      for (int r = 0; r < kRPT; ++r) {
-#pragma unroll
-        for (int i = 0; i < kNI; ++i) {
-          Io<S>::st(dp + (rg + r * kNRG) * kK + i * 4 * kTPR + 4 * j,
-                    make_float4(h[r][i][0].x, h[r][i][0].y, h[r][i][1].x, h[r][i][1].y));
-        }
-      }
-    }
+#endif
+#if !GMR_EARLY_ST
+    store();
+#endif
+  };
+  for (int t = 0; t < T; ++t) {
+#if GMR_LASTN
+    if (t + 1 < T) token(t, std::true_type{});
+    else token(t, std::false_type{});
+#else
+    token(t, std::true_type{});
+#endif
   }
   __syncthreads();
 
