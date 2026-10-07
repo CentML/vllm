@@ -26,7 +26,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.triton_utils import tldevice as _ld
-from vllm.lcd_pdl.triton_switch import lcd_pdl_triton_on as _lcd_pdl_on  # noqa: E402
 
 # ruff: noqa: E501
 # Kernel sources are kept verbatim (Triton cache keys hash the source).
@@ -43,10 +42,7 @@ def _sigmoid_bf16_exact(g):
 
 @triton.jit
 def _seg_scale_kernel(out_ptr, g_ptr, M, stride_om, stride_g,
-                      N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, launch_pdl: tl.constexpr = False):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+                      N: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BM + tl.arange(0, BM)
     rmask = rows < M
@@ -63,10 +59,7 @@ def _seg_scale_kernel(out_ptr, g_ptr, M, stride_om, stride_g,
 @triton.jit
 def _seg_gemv_scale_kernel(x_ptr, w_ptr, out_ptr, M, stride_xm, stride_om,
                            K: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
-                           BN: tl.constexpr, launch_pdl: tl.constexpr = False):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+                           BN: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BM + tl.arange(0, BM)
     rmask = rows < M
@@ -101,7 +94,7 @@ def seg_scale_(out: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     assert out.stride(1) == 1 and out.dtype == torch.bfloat16
     BM, BN = _cfg(M, N)
     _seg_scale_kernel[(triton.cdiv(M, BM),)](out, g, M, out.stride(0), g.stride(0), N=N, BM=BM, BN=BN,
-                                            num_warps=4, launch_pdl=_lcd_pdl_on())
+                                            num_warps=4)
     return out
 
 
@@ -114,16 +107,13 @@ def seg_gemv_scale_(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> torc
     assert x.stride(1) == 1 and out.stride(1) == 1 and w.is_contiguous()
     BM, BN = _cfg(M, N)
     _seg_gemv_scale_kernel[(triton.cdiv(M, BM),)](x, w, out, M, x.stride(0), out.stride(0), K=K, N=N, BM=BM,
-                                                 BK=min(K, 2048), BN=BN, num_warps=4, launch_pdl=_lcd_pdl_on())
+                                                 BK=min(K, 2048), BN=BN, num_warps=4)
     return out
 
 
 @triton.jit
 def _route_fold_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
-                       E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr, launch_pdl: tl.constexpr = False):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+                       E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr):
     pid = tl.program_id(0)
     rows = pid * BT + tl.arange(0, BT)
     rmask = rows < M
@@ -156,10 +146,7 @@ def _route_fold_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
 
 @triton.jit
 def _route_fold_packed_kernel(lg_ptr, ids_ptr, w_ptr, M, stride_l,
-                              E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr, launch_pdl: tl.constexpr = False):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
+                              E: tl.constexpr, K: tl.constexpr, KP: tl.constexpr, BT: tl.constexpr):
     # bf16 logits only: fp32(bf16) has 16 zero low bits, so (order-preserving int32 key | (E-1-idx)) is a unique
     # sortable key -> one max-reduction per top-k round (ties -> lowest expert index), value recovered from the key.
     pid = tl.program_id(0)
@@ -208,9 +195,9 @@ def seg_route_fold(logits: torch.Tensor, E: int = 256, K: int = 8, w_dtype: torc
         if logits.dtype == torch.bfloat16 and E <= 65536 and not _ROUTE_PLAIN:
             BT = 8 if M >= 4096 else 4
             _route_fold_packed_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
-                                                            KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4, launch_pdl=_lcd_pdl_on())
+                                                            KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4)
         else:
             BT = 4
             _route_fold_kernel[(triton.cdiv(M, BT),)](logits, ids, w, M, logits.stride(0), E=E, K=K,
-                                                     KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4, launch_pdl=_lcd_pdl_on())
+                                                     KP=triton.next_power_of_2(K + 1), BT=BT, num_warps=4)
     return ids, w
