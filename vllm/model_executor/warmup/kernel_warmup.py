@@ -483,6 +483,21 @@ def _run_flashinfer_autotune_dummy_runs(
             )
 
 
+def _autotune_mxfp8_extra_buckets(runner: "GPUModelRunner") -> None:
+    """VLLM_MXFP8_TUNE_BUCKETS: profile the MXFP8 linears at the extra M
+    buckets. The dummy runs above override the bucket list with the hybrid
+    one, so they never reach these; without this pass every M mapped to an
+    extra bucket would run FlashInfer's fallback tactic.
+    """
+    if not envs.VLLM_MXFP8_TUNE_BUCKETS:
+        return
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer_tune_buckets import (
+        autotune_extra_buckets,
+    )
+
+    autotune_extra_buckets(runner.scheduler_config.max_num_batched_tokens)
+
+
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
@@ -556,6 +571,7 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
             _run_flashinfer_autotune_dummy_runs(runner, skip_attn=hisparse_enabled)
+            _autotune_mxfp8_extra_buckets(runner)
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
             _autotune_mxfp8_draft_head(runner)

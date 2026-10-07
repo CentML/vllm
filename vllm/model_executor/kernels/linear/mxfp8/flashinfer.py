@@ -158,6 +158,14 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
             weight_scale_swizzled.contiguous(), requires_grad=False
         )
 
+        # VLLM_MXFP8_TUNE_BUCKETS: extra mm_mxfp8 autotune buckets (no-op unset).
+        from .flashinfer_tune_buckets import maybe_install
+
+        out_dtype = getattr(layer, "params_dtype", torch.bfloat16)
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            out_dtype = torch.bfloat16
+        maybe_install(layer, out_dtype)
+
     def apply_weights(
         self,
         layer: torch.nn.Module,

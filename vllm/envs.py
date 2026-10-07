@@ -243,6 +243,7 @@ if TYPE_CHECKING:
     VLLM_KF_DECODE_ATTN_QLENS: str = ""
     VLLM_KF_DECODE_ATTN_CHECK: int = 0
     VLLM_KF_DECODE_ATTN_LOG_EVERY: int = 0
+    VLLM_MXFP8_TUNE_BUCKETS: str | None = None
     VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
     VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1909,6 +1910,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KF_DECODE_ATTN_LOG_EVERY": lambda: int(
         os.getenv("VLLM_KF_DECODE_ATTN_LOG_EVERY", "0")
     ),
+    # Extra FlashInfer cute-dsl mm_mxfp8 autotune M buckets, joined to the
+    # hybrid ones (runtime M rounds up to the union), profiled by the kernel
+    # warmup before CUDA-graph capture. Comma list of N, LO-HI:STEP or
+    # capture[:LO-HI] (CUDA-graph capture sizes), e.g. "272-512:16".
+    # Unset/empty = FlashInfer's buckets. Changes tactics, so not bitwise.
+    # See vllm/model_executor/kernels/linear/mxfp8/flashinfer_tune_buckets.py.
+    "VLLM_MXFP8_TUNE_BUCKETS": lambda: os.getenv("VLLM_MXFP8_TUNE_BUCKETS") or None,
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
     # layer only for the row each prefill request samples (the speculator's
     # last_token_indices); the other rows' outputs are discarded.
