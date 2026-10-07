@@ -585,13 +585,6 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
 
-    # 3. opt-in model rewrites that change the traced graph without changing
-    #    any config field (the key does not include the traced sources).
-    if os.environ.get("SEG_FOLD", "0") == "1":
-        # MoE runners whose shared expert was folded into the routed experts
-        # call torch.ops.seg.fold_moe (see fused_moe/shared_expert_fold.py).
-        factors.append("seg-fold-v1")
-
     return factors
 
 

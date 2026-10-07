@@ -91,14 +91,6 @@ class BaseModelLoader(ABC):
 
             process_weights_after_loading(model, model_config, target_device)
 
-            # Opt-in (SEG_FOLD=1): fold the sigmoid-gated shared expert of
-            # Qwen3-Next / Qwen3.5 MoE blocks into the routed experts, once
-            # all layers are in kernel format.
-            from vllm.model_executor.layers.fused_moe import shared_expert_fold
-
-            if shared_expert_fold.SEG_FOLD:
-                shared_expert_fold.fold_model(model)
-
         return model.eval()
 
 

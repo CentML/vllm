@@ -25,7 +25,6 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
-import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -42,10 +41,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
-from vllm.model_executor.layers.fused_moe.shared_expert_kernels import (
-    seg_gemv_scale_,
-    seg_scale_,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -73,50 +68,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-# Fused sigmoid gating of the shared expert output (Qwen2MoeMLP with an
-# expert_gate, e.g. the Qwen3-Next / Qwen3.5 MoE shared expert).
-# VLLM_SEG_MODE:
-#   "scale"  one Triton kernel computes out *= bf16(sigmoid(g)) in place;
-#            bit-identical to F.sigmoid(g) * out (replaces the sigmoid and
-#            the [M, 1]-broadcast mul kernels).
-#   "gemv"   additionally computes g = x @ w_gate^T inside the same kernel
-#            (fp32 accumulation, bf16 rounding); g may differ from the cuBLAS
-#            GEMM by about one bf16 ulp (summation order), so not bit-exact.
-#   unset / "off" / "0"  stock path (default).
-_SEG_MODE = os.environ.get("VLLM_SEG_MODE", "off").lower()
-if _SEG_MODE in ("", "0", "off", "none", "false"):
-    _SEG_MODE = ""
-if _SEG_MODE:
-    logger.info(
-        "shared expert gate fusion enabled (VLLM_SEG_MODE=%s)",
-        "gemv" if _SEG_MODE == "gemv" else "scale",
-    )
-
-
-def _seg_ok(x: torch.Tensor, out: torch.Tensor, gate: nn.Module) -> bool:
-    """Whether the fused gating kernel supports this call; otherwise the
-    stock expression runs. Not used while tracing (torch.compile)."""
-    if not _SEG_MODE or torch.compiler.is_compiling():
-        return False
-    w = getattr(gate, "weight", None)
-    return (
-        out.dim() == 2
-        and x.dim() == 2
-        and out.is_cuda
-        and out.dtype == torch.bfloat16
-        and x.dtype == torch.bfloat16
-        and out.stride(1) == 1
-        and x.stride(1) == 1
-        and x.shape[0] == out.shape[0]
-        and getattr(gate, "bias", None) is None
-        and w is not None
-        and w.dtype == torch.bfloat16
-        and tuple(w.shape) == (1, x.shape[1])
-        and w.is_contiguous()
-        and (x.shape[1] & (x.shape[1] - 1)) == 0
-        and out.shape[1] % 256 == 0
-    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -164,16 +115,7 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            if _seg_ok(x, out, self.expert_gate):
-                if _SEG_MODE == "gemv":
-                    # One kernel: g = x @ w_gate^T (fp32 accumulation, bf16
-                    # rounding), then out *= sigmoid(g) in place.
-                    seg_gemv_scale_(x, self.expert_gate.weight, out)
-                else:
-                    # Bit-identical to F.sigmoid(g) * out.
-                    seg_scale_(out, self.expert_gate(x)[0])
-            else:
-                out = F.sigmoid(self.expert_gate(x)[0]) * out
+            out = F.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
 
