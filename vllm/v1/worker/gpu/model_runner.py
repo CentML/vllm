@@ -692,22 +692,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
         )
-        # rx-cascade: exact "front" grouping of shared-prefix decode requests (PREFIX_SPREAD=1; default off).
-        self._prefix_front_gid = None
+        # Shared-prefix decode ordering (VLLM_PREFIX_SPREAD=1; default off).
+        self._prefix_front = False
         if prefix_front.ENABLED:
+            attn_gid = None
             for gi, group in enumerate(kv_cache_config.kv_cache_groups):
                 spec = group.kv_cache_spec
                 layer_spec = (
-                    spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+                    spec.first_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else spec
                 )
                 if not isinstance(layer_spec, MambaSpec):
-                    self._prefix_front_gid = gi
+                    attn_gid = gi
                     break
-            if self._prefix_front_gid is not None:
-                self.block_tables.enable_first_block_tracking(prefix_front.DEPTH)
+            if attn_gid is not None:
+                self.block_tables.enable_key_tracking(
+                    attn_gid, max_num_blocks_per_group[attn_gid]
+                )
+                self._prefix_front = True
             prefix_front.log_engage(
-                self._prefix_front_gid,
-                [type(g.kv_cache_spec).__name__ for g in kv_cache_config.kv_cache_groups],
+                attn_gid,
+                [
+                    type(g.kv_cache_spec).__name__
+                    for g in kv_cache_config.kv_cache_groups
+                ],
             )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
@@ -1303,14 +1312,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = sort_batch_req_ids(
             num_tokens_per_req, draft_tokens, self.decode_query_len
         )
-        if getattr(self, "_prefix_front_gid", None) is not None:
+        if getattr(self, "_prefix_front", False):
             req_ids = prefix_front.reorder(
                 req_ids,
                 num_tokens_per_req,
                 draft_tokens,
                 self.decode_query_len,
                 self.req_states.req_id_to_index,
-                self.block_tables.first_block_np[self._prefix_front_gid],
+                self.block_tables.key_rows_np,
+                self.block_tables.key_nblk_np,
             )
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)

@@ -3,6 +3,7 @@
 import os
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -53,10 +54,12 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
-        # Prefix-group key per (group, request index): the table entry of KV block `_key_depth` (prefix-cache chain
-        # hashing makes equal entries imply equal ancestors); -1 = shorter / unknown. Only with PREFIX_SPREAD=1.
-        self.first_block_np = None
-        self._key_depth = 0
+        # Host mirror of one KV group's block ids per request (KV-cache block ids,
+        # unexpanded; -1 = none); only kept with VLLM_PREFIX_SPREAD=1
+        # (prefix_front.py).
+        self.key_gid: int | None = None
+        self.key_rows_np = np.empty((0, 0), dtype=np.int32)
+        self.key_nblk_np = np.empty(0, dtype=np.int64)
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -144,21 +147,23 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
-            if self.first_block_np is not None:
-                pos = self._key_depth * bpk
-                if start == 0:
-                    self.first_block_np[i, req_index] = -1
-                if start <= pos < end:
-                    self.first_block_np[i, req_index] = block_ids[pos - start]
+            if i == self.key_gid:
+                kids = new_block_ids[i]
+                old_len = int(self.key_nblk_np[req_index])
+                kstart = 0 if overwrite else old_len
+                klen = kstart + len(kids)
+                if overwrite and old_len > klen:
+                    self.key_rows_np[req_index, klen:old_len] = -1
+                self.key_rows_np[req_index, kstart:klen] = kids
+                self.key_nblk_np[req_index] = klen
         self._lowc2_nb_dirty = True
 
-    def enable_first_block_tracking(self, depth_blocks: int = 0) -> None:
-        import numpy as np
-
-        self._key_depth = max(0, int(depth_blocks))
-        self.first_block_np = np.full(
-            (self.num_kv_cache_groups, self.max_num_reqs), -1, dtype=np.int64
+    def enable_key_tracking(self, gid: int, max_num_blocks: int) -> None:
+        self.key_gid = gid
+        self.key_rows_np = np.full(
+            (self.max_num_reqs, max_num_blocks), -1, dtype=np.int32
         )
+        self.key_nblk_np = np.zeros(self.max_num_reqs, dtype=np.int64)
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:

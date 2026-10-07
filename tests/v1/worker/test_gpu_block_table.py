@@ -275,3 +275,28 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+def test_prefix_spread_key_rows_follow_appends_and_overwrites():
+    """The VLLM_PREFIX_SPREAD host mirror holds the tracked group's unexpanded KV
+    block ids; an overwrite with a shorter row clears the stale tail.
+    """
+    block_tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=3,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[8, 8],
+        device=torch.device("cuda"),
+        kernel_block_sizes=[16, 16],
+    )
+    block_tables.enable_key_tracking(1, 8)
+    block_tables.append_block_ids(1, ([1, 2], [10, 11, 12]), overwrite=True)
+    block_tables.append_block_ids(1, ([3], [13]), overwrite=False)
+    assert block_tables.key_rows_np[1].tolist() == [10, 11, 12, 13, -1, -1, -1, -1]
+    assert block_tables.key_nblk_np[1] == 4
+    block_tables.append_block_ids(1, ([4], [20, 21]), overwrite=True)
+    assert block_tables.key_rows_np[1].tolist() == [20, 21, -1, -1, -1, -1, -1, -1]
+    assert block_tables.key_nblk_np[1] == 2
+    # Other request rows untouched.
+    assert (block_tables.key_rows_np[[0, 2]] == -1).all()
+    assert block_tables.key_nblk_np[[0, 2]].tolist() == [0, 0]

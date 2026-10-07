@@ -1,28 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact decode-batch order for shared-prefix decode attention (rx-cascade "front" grouping). Default OFF.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Shared-prefix decode-batch order (rx-cascade "front" grouping, CentML/vllm #142).
+Default OFF.
 
-PREFIX_SPREAD=1 enables it. Inside the uniform decode/verify segment that sort_batch_req_ids puts first, decode requests
-whose full-attention KV block at depth PREFIX_SPREAD_DEPTH (default 8, i.e. the 9th block; prefix-cache chain hashing
-makes an equal block imply equal ancestors) is shared with at least one other decode request of the step (prefix-cache
-groups, e.g. a common system prompt) are placed contiguously at the head of the segment: largest group first, stock
-order inside a group, then the other requests in stock order. Keying on a deep block (not block 0) keeps groups that
-share only a short common head (e.g. the Qwen3.6 tool list rendered before the salted system prompt: 4 blocks shared by
-every Workato repeat) from being merged into one interleaved group. PREFIX_SPREAD_K>0 instead cuts the members into same-group clusters of K
-and spreads the clusters evenly between the other requests (measured slower than front on Rubin; kept for study).
+VLLM_PREFIX_SPREAD=1 enables it. Inside the uniform decode/verify segment that
+sort_batch_req_ids puts first, decode requests are ordered by their full-attention KV
+block-id row (prefix-cache block ids), i.e. in prefix-trie order. Prefix caching gives
+requests that share a prefix the same block ids (chain hashing: an equal block implies
+equal ancestors), so after the sort every set of decode requests sharing a prefix of
+any depth is contiguous, and adjacent requests share the longest prefix that any pair
+in the batch shares. The key is the whole block row: no depth constant, group size or
+other parameter derived from a dataset's prompt layout. (This replaces #142's key on
+the block at a fixed depth, PREFIX_SPREAD_DEPTH=8, and its spread-clusters mode.)
 
-Why: the split-KV decode attention kernel dispatches CTAs request-major, so adjacent members read the shared prefix pages
-from L2 instead of HBM (rx-cascade rxc-mb1, Rubin r1024 window: -0.31 ms/step of decode attention, bitwise equal).
+Why: the split-KV decode/verify attention kernels launch CTAs request-major, so adjacent
+requests read the shared prefix pages close in time and hit L2 instead of DRAM.
 
-Exactness: a pure permutation of independent rows inside the uniform decode segment. Batch size, padding, CUDA-graph keys,
-the verification-first invariant (split_decodes_and_prefills, adaptive verification) and the extend/prefill tail are
-unchanged; with no sharing the stock order is returned as is. Host-only: not a compile-hash factor.
+Exactness: a pure permutation of the independent rows of the uniform decode segment. The
+permutation is applied to req_ids before the batch is built, so every per-request tensor
+(idx_mapping, input ids, positions, block tables, seq lens, spec-decode metadata, GDN
+state indices, sampling state, output order) follows it. Batch size, padding, CUDA-graph
+keys, the verification-first invariant and the extend/prefill tail are unchanged;
+with no shared first block the stock order is returned as is. Host-only: not a
+compile-hash factor.
 
 Env:
-  PREFIX_SPREAD=1              enable (default 0)
-  PREFIX_SPREAD_K=0            0 = front (default); K > 0 = spread clusters of K
-  PREFIX_SPREAD_DEPTH=8        group key = the KV block at this index (requests with fewer blocks are not grouped)
-  PREFIX_SPREAD_LOG_EVERY=2000 log group / host-time statistics every N decode steps (0 = off)
+  VLLM_PREFIX_SPREAD=1               enable (default 0)
+  VLLM_PREFIX_SPREAD_LOG_EVERY=2000  log statistics every N steps (0 = off)
+  VLLM_PREFIX_SPREAD_FORCE=1         gate/debug only: apply the trie order even when no
+                                     two decode requests share a block (exercises a
+                                     non-trivial permutation in correctness gates)
 """
+
 import os
 import time
 
@@ -32,78 +41,69 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ENABLED = os.environ.get("PREFIX_SPREAD", "0").strip() == "1"
-K = int(os.environ.get("PREFIX_SPREAD_K", "0") or 0)
-DEPTH = int(os.environ.get("PREFIX_SPREAD_DEPTH", "8") or 0)
-LOG_EVERY = int(os.environ.get("PREFIX_SPREAD_LOG_EVERY", "2000") or 0)
-STATS = {"steps": 0, "reordered_steps": 0, "groups": 0, "grouped_reqs": 0, "decodes": 0, "host_ns": 0}
+ENABLED = os.environ.get("VLLM_PREFIX_SPREAD", "0").strip() == "1"
+LOG_EVERY = int(os.environ.get("VLLM_PREFIX_SPREAD_LOG_EVERY", "2000") or 0)
+FORCE = os.environ.get("VLLM_PREFIX_SPREAD_FORCE", "0").strip() == "1"
+# Adjacent-share statistics are sampled every this many steps (host cost).
+_STAT_SAMPLE = 8
+
+STATS = {
+    "steps": 0,
+    "reordered": 0,
+    "moved": 0,
+    "decodes": 0,
+    "host_ns": 0,
+    "sampled": 0,
+    "blocks": 0,
+    "shared_blocks": 0,
+    "adj_before": 0,
+    "adj_after": 0,
+}
 _ENGAGED = [False]
 
 
-def log_engage(attn_gid, group_names) -> None:
+def log_engage(attn_gid: int | None, group_names: list[str]) -> None:
     logger.info(
-        "prefix-front: shared-prefix decode grouping ON (PREFIX_SPREAD=1, K=%d, %s, key depth %d blocks); "
-        "full-attention KV group %s of %s", K, "front" if K <= 0 else "spread", DEPTH, attn_gid, group_names)
+        "prefix-front: shared-prefix decode ordering ON (VLLM_PREFIX_SPREAD=1, "
+        "key = full-attention block row); KV group %s of %s",
+        attn_gid,
+        group_names,
+    )
 
 
-def spread_segment(seg, first_block, k):
-    """seg: decode request ids in stock order; first_block: req_id -> first block id (or None).
-    Returns (permuted seg, number of groups, number of grouped requests)."""
-    counts = {}
-    for r in seg:
-        fb = first_block(r)
-        if fb is not None:
-            counts[fb] = counts.get(fb, 0) + 1
-    shared = {fb for fb, c in counts.items() if c >= 2}
-    if not shared:
-        return seg, 0, 0
-    groups, gorder, non = {}, [], []
-    for r in seg:
-        fb = first_block(r)
-        if fb in shared:
-            if fb not in groups:
-                groups[fb] = []
-                gorder.append(fb)
-            groups[fb].append(r)
-        else:
-            non.append(r)
-    first_seen = {fb: i for i, fb in enumerate(gorder)}
-    gl = [r for fb in sorted(gorder, key=lambda f: (-len(groups[f]), first_seen[f])) for r in groups[fb]]
-    if k <= 0 or not non:
-        return gl + non, len(groups), len(gl)
-    clusters = [gl[j:j + k] for j in range(0, len(gl), k)]
-    slots = {}
-    for c, cl in enumerate(clusters):
-        slots.setdefault(min(len(non), int((c + 0.5) * len(non) / len(clusters))), []).append(cl)
-    out = []
-    for j in range(len(non) + 1):
-        for cl in slots.get(j, []):
-            out.extend(cl)
-        if j < len(non):
-            out.append(non[j])
-    return out, len(groups), len(gl)
+def _adjacent_lcp(rows: np.ndarray) -> np.ndarray:
+    """Common-prefix length (blocks) of each adjacent row pair; rows padded with -1."""
+    eq = (rows[1:] == rows[:-1]) & (rows[1:] >= 0)
+    # argmin finds the first mismatch; an all-equal pair has lcp = width.
+    lcp = np.argmin(eq, axis=1)
+    lcp[eq.all(axis=1)] = rows.shape[1]
+    return lcp
 
 
-def _front_numpy(seg, fb):
-    """Front policy, vectorised: fb[i] = first block of seg[i] (-1 = unknown). Returns (perm or None, groups, members)."""
-    n = len(seg)
-    uniq, inv, cnt = np.unique(fb, return_inverse=True, return_counts=True)
-    member = (fb >= 0) & (cnt[inv] >= 2)
-    if not member.any():
-        return None, 0, 0
-    first_pos = np.full(len(uniq), n, dtype=np.int64)
-    np.minimum.at(first_pos, inv, np.arange(n))
-    gorder = np.lexsort((first_pos, -cnt))          # largest group first, ties by first appearance
-    grank = np.empty(len(uniq), dtype=np.int64)
-    grank[gorder] = np.arange(len(uniq))
-    key = np.where(member, grank[inv], len(uniq))   # non-members after every group
-    perm = np.argsort(key, kind="stable")           # stable: stock order inside a group and among non-members
-    ng = int(np.count_nonzero(np.bincount(inv[member], minlength=len(uniq))))
-    return perm, ng, int(member.sum())
+def trie_order(rows: np.ndarray) -> np.ndarray:
+    """rows: [n, D] int32 block-id rows (-1 padded). Returns a stable permutation
+    that sorts the rows lexicographically by bytes, which makes every set of rows
+    sharing a leading prefix contiguous.
+    """
+    rows = np.ascontiguousarray(rows)
+    keys = rows.view(np.dtype((np.void, rows.dtype.itemsize * rows.shape[1]))).ravel()
+    return np.argsort(keys, kind="stable")
 
 
-def reorder(req_ids, num_tokens_per_req, draft_tokens, decode_query_len, req_id_to_index, first_block_np):
-    """req_ids: sort_batch_req_ids output. Only the leading uniform decode/verify run is permuted."""
+def reorder(
+    req_ids: list[str],
+    num_tokens_per_req: dict[str, int],
+    draft_tokens: dict[str, list[int]],
+    decode_query_len: int,
+    req_id_to_index: dict[str, int],
+    block_rows: np.ndarray,
+    num_blocks: np.ndarray,
+) -> list[str]:
+    """req_ids: sort_batch_req_ids output. Only the leading uniform decode/verify
+    run is permuted. block_rows: [max_num_reqs, max_blocks] host mirror of the
+    full-attention KV block ids (-1 = none); num_blocks: [max_num_reqs] valid
+    length of each row.
+    """
     t0 = time.perf_counter_ns()
     n = 0
     for r in req_ids:
@@ -112,34 +112,63 @@ def reorder(req_ids, num_tokens_per_req, draft_tokens, decode_query_len, req_id_
         else:
             break
     out = req_ids
-    ng = nr = 0
+    sample = False
     if n > 1:
-        seg = req_ids[:n]
-        fb = first_block_np[np.fromiter(map(req_id_to_index.__getitem__, seg), dtype=np.intp, count=n)]
-        if K <= 0:
-            perm, ng, nr = _front_numpy(seg, fb)
-            if perm is not None:
-                out = [seg[i] for i in perm] + list(req_ids[n:])
-        else:
-            fbd = {r: (int(v) if v >= 0 else None) for r, v in zip(seg, fb)}
-            pseg, ng, nr = spread_segment(seg, fbd.get, K)
-            if ng:
-                out = list(pseg) + list(req_ids[n:])
-        if ng and not _ENGAGED[0]:
-            _ENGAGED[0] = True
-            logger.info("prefix-front: first reordered decode batch (%d decodes, %d groups, %d grouped requests)",
-                        n, ng, nr)
+        idx = np.fromiter(
+            map(req_id_to_index.__getitem__, req_ids[:n]), dtype=np.intp, count=n
+        )
+        first = block_rows[idx, 0]
+        # Any decode request sharing its first block with another one?
+        u, cnt = np.unique(first[first >= 0], return_counts=True)
+        if FORCE or (u.size and cnt.max() >= 2):
+            width = max(int(num_blocks[idx].max()), 1)
+            rows = block_rows[idx, :width]
+            perm = trie_order(rows)
+            out = [req_ids[i] for i in perm.tolist()] + req_ids[n:]
+            STATS["reordered"] += 1
+            if (perm != np.arange(n)).any():
+                STATS["moved"] += 1
+            sample = LOG_EVERY > 0 and STATS["steps"] % _STAT_SAMPLE == 0
+            if sample:
+                before = _adjacent_lcp(rows)
+                srows = rows[perm]
+                after = _adjacent_lcp(srows)
+                # Deepest share of each row = max(lcp with predecessor, successor).
+                deep = np.zeros(n, dtype=np.int64)
+                deep[1:] = after
+                deep[:-1] = np.maximum(deep[:-1], after)
+                STATS["sampled"] += 1
+                STATS["blocks"] += int(num_blocks[idx].sum())
+                STATS["shared_blocks"] += int(deep.sum())
+                STATS["adj_before"] += int(before.sum())
+                STATS["adj_after"] += int(after.sum())
+            if not _ENGAGED[0]:
+                _ENGAGED[0] = True
+                logger.info(
+                    "prefix-front: first reordered decode batch "
+                    "(%d decodes, %d distinct first blocks)",
+                    n,
+                    u.size,
+                )
     STATS["steps"] += 1
     STATS["decodes"] += n
-    if ng:
-        STATS["reordered_steps"] += 1
-        STATS["groups"] += ng
-        STATS["grouped_reqs"] += nr
     STATS["host_ns"] += time.perf_counter_ns() - t0
     if LOG_EVERY and STATS["steps"] % LOG_EVERY == 0:
         s = STATS["steps"]
+        m = max(STATS["sampled"], 1)
+        blocks = max(STATS["blocks"], 1)
         logger.info(
-            "prefix-front stats: %d steps, %d reordered, mean decodes %.1f, groups/step %.2f, grouped reqs/step %.1f, "
-            "host %.1f us/step", s, STATS["reordered_steps"], STATS["decodes"] / s, STATS["groups"] / s,
-            STATS["grouped_reqs"] / s, STATS["host_ns"] / s / 1e3)
+            "prefix-front stats: %d steps, %d reordered (%d moved), mean decodes %.1f, "
+            "shared KV blocks %.1f%% (blocks/step %.0f), adjacent common prefix "
+            "blocks/step before %.0f after %.0f, host %.1f us/step",
+            s,
+            STATS["reordered"],
+            STATS["moved"],
+            STATS["decodes"] / s,
+            100.0 * STATS["shared_blocks"] / blocks,
+            STATS["blocks"] / m,
+            STATS["adj_before"] / m,
+            STATS["adj_after"] / m,
+            STATS["host_ns"] / s / 1e3,
+        )
     return out
