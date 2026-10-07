@@ -42,6 +42,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
     StatePoolGroup,
@@ -3156,6 +3157,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if gdn_layer_graphs.ENABLED and gdn_layer_graphs.try_replay(
+            self, attn_metadata, mixed_qkvz, ba, core_attn_out, out_q, out_scale
+        ):
+            # VLLM_GDN_LAYER_GRAPHS=1: this layer's core was replayed from its
+            # CUDA graph (mixed / prefill-only PIECEWISE step).
+            return
         mixed_qkv, output_gate_flat = mixed_qkvz.split(
             [qkv_size, self.value_dim // self.tp_size], dim=-1
         )

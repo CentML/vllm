@@ -43,6 +43,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1123,6 +1124,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Lock workspace to prevent resizing during execution. A resize after
             # capture frees the static cuda graph buffer.
             lock_workspace()
+            # VLLM_GDN_LAYER_GRAPHS: GDN layer graphs are captured only from
+            # here on (final KV cache and piecewise-graph buffers).
+            gdn_layer_graphs.arm()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
