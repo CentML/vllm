@@ -94,10 +94,14 @@ def chunk_gated_delta_rule_vsplit(
     scale: float,
     state_indices: Optional[torch.Tensor] = None,
     v_split: int = 2,
+    workspace: Optional[torch.Tensor] = None,
 ) -> None:
     """Same contract as flashinfer chunk_gated_delta_rule_sm100 (no checkpoints).
     q/k: [T, HQ, 128] bf16, v/output: [T, HV, 128], gate (=exp(g)) / beta: [T, HV] fp32,
-    cu_seqlens int32 [B+1], states [N, HV, 128(V), 128(K)] fp32 or bf16 (pool if state_indices)."""
+    cu_seqlens int32 [B+1], states [N, HV, 128(V), 128(K)] fp32 or bf16 (pool if state_indices).
+    ``workspace``: caller-owned int8 scratch of at least ``get_workspace_size`` bytes (the
+    persistent kernel's size depends only on the SM count), used instead of one allocated
+    here; CUDA-graph captures pass one allocated outside the capture."""
     HQ, HV, DK = q.size(1), v.size(1), q.size(2)
     assert DK == 128 and v.size(2) == 128
     assert cu_seqlens.dtype == torch.int32
@@ -122,7 +126,10 @@ def chunk_gated_delta_rule_vsplit(
         compiled = _fast_compiled.get(fkey)
         if compiled is not None:
             handle = torch._C._cuda_getCurrentRawStream(dev)
-            ws_stream = _fast_ws.get(handle)
+            if workspace is not None:
+                ws_stream = (workspace, cuda.CUstream(handle))
+            else:
+                ws_stream = _fast_ws.get(handle)
             if ws_stream is None:
                 ws = torch.empty(
                     GatedDeltaNetChunkedKernel.get_workspace_size(
@@ -182,8 +189,9 @@ def chunk_gated_delta_rule_vsplit(
         c["compiled"] = cute.compile(
             gdn, qc, kc, vc, gc, bc, oc, cuc, sic, soc, sidx, None, None, 0, scale, wsc, stream,
             options="--enable-tvm-ffi --opt-level 3")
-    ws = torch.empty(GatedDeltaNetChunkedKernel.get_workspace_size(num_sm, B, HQ, HV, True),
-                     dtype=torch.int8, device=q.device)
+    ws = workspace if workspace is not None else torch.empty(
+        GatedDeltaNetChunkedKernel.get_workspace_size(num_sm, B, HQ, HV, True),
+        dtype=torch.int8, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     c["compiled"](q, k, v, gate, beta, output, cu_seqlens,
                   initial_state if use_init else None, output_state if store_final else None,
