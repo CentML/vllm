@@ -40,17 +40,6 @@ Env:
       (default 1).
   VLLM_NORM_QUANT_FUSION_OUT_PROJ=0 disables the o_proj / GDN out_proj input
       fusions (default 1).
-  QGF_FIN=1 (default off): MoE finalize fold. A deferred MoE runner whose
-      shared expert is folded into the routed experts (SEG_FOLD=1) runs the
-      trtllm MoE without its finalize kernel and returns a placeholder; the
-      next pre_norm gathers and weights the expert outputs inside its fused
-      kernel (bit-identical to finalize + pre_norm).
-      VLLM_MOE_FINALIZE_FOLD_MAX_M (default 1024): above this many tokens the
-      standalone finalize + pre_norm is used instead of the fused kernel.
-      VLLM_MOE_FINALIZE_FOLD_FMA (default 1): finalize accumulates with FMA
-      like the trtllm kernel.
-  QGF_GDNM=1 (default off): in mixed steps, quantize all GDN out_proj input
-      rows not written by the fused gated norm in one launch (bit-identical).
 Numerics: bit-exact vs Inductor norm + FlashInfer mxfp8_quantize, as long
 as the Inductor reduction config matches norm_quant_kernels.CONFIG.
 """
@@ -70,30 +59,6 @@ _SILU_ENV = os.environ.get("VLLM_NORM_QUANT_FUSION_SILU", "1")
 _OUT_PROJ_ENV = os.environ.get("VLLM_NORM_QUANT_FUSION_OUT_PROJ", "1")
 _H_OK = (2048,)
 STATS = {"hit_swz": 0, "hit_lin": 0, "miss": 0, "pre": 0, "post": 0}
-
-QGF_GDNM = EMIT and os.environ.get("QGF_GDNM", "0") == "1"
-QGF_FIN_MAXM = int(os.environ.get("VLLM_MOE_FINALIZE_FOLD_MAX_M", "1024"))
-QGF_FIN = EMIT and os.environ.get("QGF_FIN", "0") == "1"
-# handle data_ptr -> (handle, gemm2_out, weights, expanded_idx_to_permuted_idx)
-_FIN: dict = {}
-
-
-def fin_produce(handle, g2, wts, idx):
-    """Register the unfinalized MoE output behind the placeholder `handle`
-    (called by the folded MoE op when QGF_FIN=1)."""
-    _FIN[handle.data_ptr()] = (handle, g2, wts, idx)
-    STATS["fin_prod"] = STATS.get("fin_prod", 0) + 1
-    if len(_FIN) > 8:  # never expected: a produced handle was not consumed
-        STATS["fin_orphan"] = STATS.get("fin_orphan", 0) + 1
-        _FIN.pop(next(iter(_FIN)))
-
-
-def fin_take(t):
-    e = _FIN.get(t.data_ptr()) if isinstance(t, torch.Tensor) else None
-    if e is None or e[0].shape != t.shape:
-        return None
-    del _FIN[t.data_ptr()]
-    return e
 
 # --------------------------------------------------------------------- stash
 _STASH: dict = {"key": None, "src": None, "q": None, "swz": None, "lin": None}
@@ -168,23 +133,6 @@ def _pre_norm(
     eps: float,
     emit: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    e = fin_take(s) if QGF_FIN else None
-    if e is not None:
-        # s is a deferred-finalize placeholder of the folded MoE: gather and
-        # weight the expert outputs here (== trtllm finalize, then pre_norm).
-        g2, wts, idx = e[1], e[2], e[3].view(-1)
-        if s.shape[0] <= QGF_FIN_MAXM:
-            out, res, q, swz = K.fin_norm_quant(g2, wts, idx, f, a, r, w, eps)
-            STATS["fin_fused"] = STATS.get("fin_fused", 0) + 1
-        else:  # large M: finalize + pre_norm is faster than the fused kernel
-            s_m = K.finalize(g2, wts, idx, s.shape[0], s.shape[1])
-            out, res, q, swz, _ = K.norm_quant(
-                a, r, w, eps, s=s_m, f=f, emit_q=True, emit_swz=True, emit_lin=False
-            )
-            STATS["fin_split"] = STATS.get("fin_split", 0) + 1
-        _stash_set(out, q, swz, None)
-        STATS["pre"] += 1
-        return out, res
     out, res, q, swz, _ = K.norm_quant(
         a, r, w, eps, s=s, f=f, emit_q=emit, emit_swz=True, emit_lin=False
     )
@@ -232,21 +180,6 @@ def _gate_mul_mxfp8_fake(a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(a)
 
 
-def _fin_mat(t: torch.Tensor) -> torch.Tensor:
-    """Deferred (unfinalized) MoE output -> the exact bf16 tensor the trtllm
-    finalize would have produced (a copy of t if t is not a placeholder)."""
-    e = fin_take(t)
-    if e is None:
-        STATS["fin_mat_passthru"] = STATS.get("fin_mat_passthru", 0) + 1
-        return t.clone()
-    STATS["fin_mat"] = STATS.get("fin_mat", 0) + 1
-    return K.finalize(e[1], e[2], e[3].view(-1), t.shape[0], t.shape[1])
-
-
-def _fin_mat_fake(t: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(t)
-
-
 _LIB = None
 
 
@@ -287,14 +220,6 @@ def register_ops() -> None:
         _silu_mul_mxfp8,
         mutates_args=[],
         fake_impl=_silu_mul_mxfp8_fake,
-        target_lib=_LIB,
-        dispatch_key="CUDA",
-    )
-    direct_register_custom_op(
-        "fin_mat",
-        _fin_mat,
-        mutates_args=[],
-        fake_impl=_fin_mat_fake,
         target_lib=_LIB,
         dispatch_key="CUDA",
     )
@@ -560,24 +485,7 @@ def gdn_forward_core_fused_norm_packed(
         _GDN_TGT[0] = None
     x2 = core_attn_out.view(T, K_)
     pm = (T + 127) // 128 * 128
-    if QGF_GDNM and t["covered"]:
-        # one launch for every row the fused gated norm did not write (real
-        # uncovered rows, padding, scale padding)
-        unc, lo = [], 0
-        for a, b in sorted(t["covered"]):
-            if a > lo:
-                unc.append((lo, a))
-            lo = max(lo, b)
-        if lo < T:
-            unc.append((lo, T))
-        while len(unc) > 4:  # never expected; extra ranges via the row quant
-            a, b = unc.pop()
-            K.quant_rows(x2, q, sf, a, b, T, psc)
-        K.gdn_fixup(x2, q, sf, None, T, pm, psc, unc)
-        STATS["gdn_unc_rows"] = STATS.get("gdn_unc_rows", 0) + sum(
-            b - a for a, b in unc
-        )
-    elif not t["covered"]:
+    if not t["covered"]:
         # decode-only / warmup: exactly the stock FlashInfer kernel, into the
         # static buffers
         K.fi_quant_into(x2, q[:T], sf[: pm * psc])
@@ -593,21 +501,12 @@ def gdn_forward_core_fused_norm_packed(
 
 
 # ------------------------------------------------------------ compile cache
-def compile_hash_factors() -> list[str]:
-    """AOT compile-cache salts: the key does not include the traced sources,
+def compile_hash_factor() -> str:
+    """AOT compile-cache salt: the key does not include the traced sources,
     so a cache from the unfused graph would silently bypass these rewrites."""
-    return [
-        f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}",
-        f"qgf-v3-m{int(QGF_GDNM)}-f{int(QGF_FIN)}-{QGF_FIN_MAXM}-c0",
-    ]
+    return f"nqf-v1-emit{int(EMIT)}-silu{_SILU_ENV}"
 
 
 if NQF:
     register_ops()
     logger.info("norm_quant_fusion enabled (emit=%s)", EMIT)
-    if QGF_FIN:
-        logger.info("norm_quant_fusion: MoE finalize fold enabled (QGF_FIN)")
-    if QGF_GDNM:
-        logger.info(
-            "norm_quant_fusion: GDN single-launch row quant in mixed steps (QGF_GDNM)"
-        )

@@ -773,19 +773,12 @@ class MoERunner(MoERunnerInterface):
             # Shared expert folded into the routed experts (SEG_FOLD=1, see
             # shared_expert_fold): router GEMM, fused routing and the routed
             # MoE (whose finalize adds the gated shared expert) in one op.
+            out = torch.ops.seg.fold_moe(hidden_states, self._encode_layer_name())
             if getattr(self, "_nqf_defer", False):
                 # The consumer takes the (shared, routed) pair; the shared
                 # part is already in `out`, so pass zeros (x + 0 is exact).
-                # QGF_FIN: the consumer also does the MoE finalize.
-                op = (
-                    torch.ops.seg.fold_moe_nf
-                    if norm_quant.QGF_FIN
-                    else torch.ops.seg.fold_moe
-                )
-                out = op(hidden_states, self._encode_layer_name())
                 zeros = self._seg_zeros[: hidden_states.shape[0]]
                 return (out, zeros)  # type: ignore[return-value]
-            out = torch.ops.seg.fold_moe(hidden_states, self._encode_layer_name())
             return out
 
         if (

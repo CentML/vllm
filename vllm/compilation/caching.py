@@ -596,7 +596,7 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
         # model_executor/layers/fusion/norm_quant.py).
         from vllm.model_executor.layers.fusion import norm_quant
 
-        factors.extend(norm_quant.compile_hash_factors())
+        factors.append(norm_quant.compile_hash_factor())
 
     return factors
 
