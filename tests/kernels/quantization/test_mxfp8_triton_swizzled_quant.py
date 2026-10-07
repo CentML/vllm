@@ -4,6 +4,8 @@
 scales must be bit-identical to FlashInfer's cute-dsl kernel (values and the
 whole scale buffer, padding rows included)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -47,3 +49,41 @@ def test_triton_swizzled_quant_matches_flashinfer(k, m, kind):
     q, s = mu.mxfp8_quantize_swizzled_triton(x)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert s.shape == s_ref.shape and torch.equal(s, s_ref)
+
+
+@pytest.mark.parametrize("d", [256, 2304])
+@pytest.mark.parametrize("m", [1, 130, 2304])
+@pytest.mark.parametrize("limit", [10.0, None])
+def test_fused_silu_clamp_mxfp8_quant_matches_unfused(d, m, limit):
+    """VLLM_MXFP8_FUSED_SWIGLU_QUANT: the one-kernel SwiGLU(+clamp) + MXFP8 quant
+    equals the fp32 single-rounding activation (forward_native as torch.compile
+    emits it) followed by mxfp8_quantize_swizzled_triton, bitwise."""
+    from vllm.model_executor.layers.fusion import fused_act_quant
+    from vllm.model_executor.layers.fusion.silu_clamp_mxfp8_quant import (
+        silu_and_mul_clamp_mxfp8_quant,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    # ~N(0, 4): a few percent of the gate / up values exceed the clamp.
+    x = (torch.randn(m, 2 * d, device="cuda", generator=g) * 4.0).bfloat16()
+    gate, up = x[:, :d].float(), x[:, d:].float()
+    if limit is not None:
+        gate = gate.clamp(max=limit)
+        up = up.clamp(-limit, limit)
+    act = (gate * torch.sigmoid(gate) * up).bfloat16()
+    q_ref, s_ref = mu.mxfp8_quantize_swizzled_triton(act)
+
+    q, s = silu_and_mul_clamp_mxfp8_quant(x, limit)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert s.shape == s_ref.shape and torch.equal(s, s_ref)
+
+    if limit is not None:
+        # The registered producer reads the SiluAndMulWithClamp parameters.
+        act_fn = SimpleNamespace(swiglu_limit=limit, alpha=1.0, beta=0.0)
+        out = fused_act_quant._silu_and_mul_clamp_mxfp8_dynamic(act_fn, x, None)
+        assert out.quant_key == kMxfp8Dynamic and out.orig_shape == (m, d)
+        assert torch.equal(out.data.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(out.scale, s_ref)

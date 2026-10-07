@@ -13,11 +13,16 @@ fires here, the activation and quantization are already consumed, so a compiler
 pass cannot fuse the same boundary again.
 """
 
+import os
 from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.activation import ReLUSquaredActivation, SiluAndMul
+from vllm.model_executor.layers.activation import (
+    ReLUSquaredActivation,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     get_input_quant_key,
@@ -30,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -193,6 +199,58 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "silu_and_mul_nvfp4_quan
     _FUSED_ACT_QUANT[(SiluAndMul, kNvfp4Dynamic)] = _silu_and_mul_nvfp4_dynamic
 
 
+def _silu_and_mul_clamp_mxfp8_dynamic(
+    act_fn: SiluAndMulWithClamp, x: torch.Tensor, linear: LinearBase
+) -> QuantizedActivation:
+    """SiluAndMulWithClamp + MXFP8 dynamic quantization (F8_128x4 swizzled ue8m0
+    scales, the FlashInfer cute-dsl / Rubin MXFP8 linear input layout)."""
+    from vllm.model_executor.layers.fusion.silu_clamp_mxfp8_quant import (
+        silu_and_mul_clamp_mxfp8_quant,
+    )
+
+    d = x.shape[-1] // 2
+    out_shape = x.shape[:-1] + (d,)
+    xq, scales = silu_and_mul_clamp_mxfp8_quant(
+        x, act_fn.swiglu_limit, act_fn.alpha, act_fn.beta
+    )
+    return QuantizedActivation(
+        data=xq,
+        scale=scales,
+        orig_dtype=x.dtype,
+        orig_shape=out_shape,
+        quant_key=kMxfp8Dynamic,
+    )
+
+
+def _silu_and_mul_clamp_mxfp8_supported(
+    act_fn: torch.nn.Module, x: torch.Tensor, linear: LinearBase
+) -> bool:
+    return (
+        x.is_cuda
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
+        and x.stride(-1) == 1
+        and (x.shape[-1] // 2) % 128 == 0
+    )
+
+
+# Producers that need the activation module's parameters (clamp limit, alpha,
+# beta): called as producer(act_fn, x, linear). Opt-in (numerics: the fp32
+# single-rounding activation of forward_native, then the exact MXFP8 quant).
+# VLLM_MXFP8_FUSED_SWIGLU_QUANT=1 (read once at import, like the other Rubin
+# MXFP8 knobs VLLM_MXFP8_TRITON_QUANT / VLLM_MXFP8_FI_LARGE_M_BACKEND):
+# SiluAndMulWithClamp feeding an MXFP8 linear (the DeepSeek-V4.1 shared
+# expert's down_proj) runs silu_clamp_mxfp8_quant.py's one Triton kernel.
+_FUSED_ACT_QUANT_WITH_ACT: dict[tuple[type, QuantKey], tuple[Callable, Callable]] = {}
+if current_platform.is_cuda() and os.environ.get(
+    "VLLM_MXFP8_FUSED_SWIGLU_QUANT", "0"
+) == "1":
+    _FUSED_ACT_QUANT_WITH_ACT[(SiluAndMulWithClamp, kMxfp8Dynamic)] = (
+        _silu_and_mul_clamp_mxfp8_dynamic,
+        _silu_and_mul_clamp_mxfp8_supported,
+    )
+
+
 def maybe_fused_act_quant(
     act_fn: torch.nn.Module,
     x: torch.Tensor,
@@ -206,6 +264,9 @@ def maybe_fused_act_quant(
     key = get_input_quant_key(linear)
     if key is not None:
         registry_key = (type(act_fn), key)
+        with_act = _FUSED_ACT_QUANT_WITH_ACT.get(registry_key)
+        if with_act is not None and with_act[1](act_fn, x, linear):
+            return with_act[0](act_fn, x, linear)
         producer = _FUSED_ACT_QUANT.get(registry_key)
         support = _FUSED_ACT_QUANT_SUPPORT.get(registry_key)
         if producer is not None and (support is None or support(act_fn, x, linear)):
