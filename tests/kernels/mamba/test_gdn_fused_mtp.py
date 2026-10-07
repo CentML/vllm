@@ -24,7 +24,11 @@ from tests.v1.attention.utils import (  # noqa: E402
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig, set_current_vllm_config  # noqa: E402
+from vllm.config import (  # noqa: E402
+    CUDAGraphMode,
+    SpeculativeConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
     ChunkGatedDeltaRule,
@@ -831,3 +835,76 @@ def test_mixed_fork_matches_serial(
     assert torch.equal(out, ref_out)
     assert torch.equal(layer.kv_cache[0], ref_layer.kv_cache[0])
     assert torch.equal(layer.kv_cache[1], ref_layer.kv_cache[1])
+
+
+@pytest.mark.parametrize("late_capture", [False, True])
+@torch.inference_mode()
+def test_ba_late_join_in_full_graph_capture(late_capture: bool) -> None:
+    """VLLM_GDN_BA_LATE_JOIN defers the aux-stream BA join in a FULL-graph
+    capture, including the V2 runner's (runtime mode NONE while capturing),
+    but not in a PIECEWISE capture or eagerly. With VLLM_GDN_BA_LATE_CAPTURE
+    the GEMM is issued at the join; either way a replay with a new input
+    writes the eager ``x @ W.T`` into ``ba``.
+    """
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    hidden, rows = 256, 40
+    weight = 0.1 * torch.randn(2 * HV, hidden, dtype=torch.bfloat16, device=device)
+    layer = types.SimpleNamespace(
+        in_proj_ba=types.SimpleNamespace(weight=weight),
+        _ba_stream=torch.cuda.Stream(),
+        _ba_events=(torch.cuda.Event(), torch.cuda.Event()),
+        _ba_stream_max_tokens=1 << 20,
+        _ba_pending=False,
+        _ba_late=None,
+        enable_fused_gdn_decode=True,
+        norm=types.SimpleNamespace(weight=torch.ones(V, device=device)),
+    )
+    for name in (
+        "_in_proj_ba_gemm",
+        "_in_proj_ba_fork",
+        "_in_proj_ba_launch",
+        "_in_proj_ba_join",
+        "_uses_fused_gdn_decode",
+        "_ba_join_deferred",
+    ):
+        setattr(
+            layer,
+            name,
+            types.MethodType(getattr(QwenGatedDeltaNetAttention, name), layer),
+        )
+    layer._full_graph_capture = QwenGatedDeltaNetAttention._full_graph_capture
+    context = types.SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE)
+    x = torch.randn(rows, hidden, dtype=torch.bfloat16, device=device)
+    ba = torch.empty(rows, 2 * HV, dtype=torch.bfloat16, device=device)
+    out = torch.empty_like(ba)
+    deferred: list[bool] = []
+
+    def body() -> None:
+        layer._in_proj_ba_fork(x, ba)
+        deferred.append(layer._ba_join_deferred(ba))
+        layer._in_proj_ba_join()
+        torch.add(ba, 1.0, out=out)
+
+    with (
+        patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=context),
+        patch.object(qwen_gdn_linear_attn, "GDN_BA_LATE_JOIN", True),
+        patch.object(qwen_gdn_linear_attn, "GDN_BA_LATE_CAPTURE", late_capture),
+    ):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            body()  # eager: not a capture
+            for mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE):
+                context.cudagraph_runtime_mode = mode
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    body()
+                assert layer._ba_late is None and not layer._ba_pending
+        assert deferred == [False, False, True]
+        x.copy_(torch.randn_like(x))
+        graph.replay()
+        torch.accelerator.synchronize()
+    ref = torch.mm(x, weight.t())
+    assert torch.equal(ba, ref)
+    assert torch.equal(out, ref + 1.0)
