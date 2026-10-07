@@ -478,12 +478,19 @@ def gdn_mtp_fused_decode_launch_config(
     the in_proj/out_proj MXFP8 GEMMs at H=16, HV=32, K=V=128 (job 675792):
     4 tokens/request: 16/4 at 1-3 requests, 32/4 at 4, 64/4 at 5-6;
     5 tokens/request: 16/4 at 1-2 and 4 requests, 32/4 at 3 (also used at
-    6 and 7 tokens/request).
+    6 tokens/request).
+    7 tokens/request (core only, bf16 state, 30 layers per graph, job 708057;
+    us per layer vs the three-kernel chain): 8/4 at 1 request (10.3 vs 12.3),
+    16/2 at 2-3 (12.8 vs 13.7, 13.0 vs 14.3), 64/4 at 4 (16.1, chain 15.3).
     """
     if tokens_per_request <= 4:
         if num_requests <= 3:
             return 16, 4
         return (32, 4) if num_requests == 4 else (64, 4)
+    if tokens_per_request >= 7:
+        if num_requests == 1:
+            return 8, 4
+        return (16, 2) if num_requests <= 3 else (64, 4)
     return (32, 4) if num_requests == 3 else (16, 4)
 
 
