@@ -22,6 +22,7 @@ from vllm.forward_context import (
     is_forward_context_available,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import routing_capture
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -1330,6 +1331,10 @@ class MoERunner(MoERunnerInterface):
                 shared_quantized_input=shared_q,
                 routed_quantized_input=routed_q,
             )
+            if routing_capture.ENABLED:
+                routing_capture.CAPTURE.record_call(
+                    self.layer_name, router_logits, self.moe_config.num_experts
+                )
 
             result = self._maybe_combine(
                 shared_output,

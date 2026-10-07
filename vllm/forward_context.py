@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -24,6 +25,8 @@ last_logging_time: float = 0
 forward_start_time: float = 0
 batchsize_logging_interval: float = envs.VLLM_LOG_BATCHSIZE_INTERVAL
 batchsize_forward_time: defaultdict = defaultdict(list)
+# Env-gated routing capture (instrument): see fused_moe/routing_capture.py.
+_ROUTING_CAPTURE: bool = bool(os.environ.get("VLLM_ROUTING_CAPTURE_DIR"))
 
 
 @dataclass(frozen=True)
@@ -347,9 +350,15 @@ def set_forward_context(
         is_padding=is_padding,
     )
 
+    if _ROUTING_CAPTURE:
+        from vllm.model_executor.layers.fused_moe.routing_capture import CAPTURE
+
+        CAPTURE.forward_begin(forward_context, num_tokens)
     try:
         with override_forward_context(forward_context):
             yield
+        if _ROUTING_CAPTURE:
+            CAPTURE.forward_end()
     finally:
         global last_logging_time, batchsize_logging_interval
         if need_to_track_batchsize:
