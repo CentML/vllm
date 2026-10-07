@@ -24,11 +24,7 @@ class _T:
 
 class _BaseRunner:
     def get_valid_tactics(self, inputs, profile):
-        return [
-            ((128, 64), (1, 1), True, False, 1),
-            ((256, 64), (2, 1), False, False, 1),
-            ((256, 192), (4, 2), False, False, 1),
-        ]
+        return [((128, 64), (1, 1), True, False, 1), ((256, 64), (2, 1), False, False, 1)]
 
     def forward(self, inputs, tactic=None, do_preparation=False, **kw):
         return ("base", tactic)
@@ -38,7 +34,7 @@ def _inputs(m, k=4096, n=2048, out_contiguous=True):
     return [_T(m, k), _T(k, n), None, None, None, _T(m, n, contiguous=out_contiguous), None]
 
 
-def _install(monkeypatch, tactics, max_m=2048, cap=0, cap_min_m=513):
+def _install(monkeypatch, tactics, max_m=2048):
     monkeypatch.setattr(sk, "_max_active_clusters", lambda s: {2: 106, 4: 46}[s])
     gb = types.SimpleNamespace(
         _cute_dsl_gemm_mxfp8_runner=lambda *a: _BaseRunner(), run_calls=[]
@@ -46,7 +42,7 @@ def _install(monkeypatch, tactics, max_m=2048, cap=0, cap_min_m=513):
     monkeypatch.setattr(
         sk, "run", lambda gb_, inputs, tn, s, pdl: gb.run_calls.append((tn, s, pdl))
     )
-    sk.install(gb, tactics, max_m, cap, cap_min_m)
+    sk.install(gb, tactics, max_m)
     return gb, gb._cute_dsl_gemm_mxfp8_runner(10, 7, True, torch.bfloat16)
 
 
@@ -82,13 +78,6 @@ def test_runner_keeps_class_name_and_dispatches(monkeypatch):
     r.forward(_inputs(128), tactic=(1072, 128, 4))
     assert gb.run_calls == [(128, 4, True)]
     assert r.forward(_inputs(128), tactic=7) == ("base", 7)
-
-
-def test_cluster_cap(monkeypatch):
-    _, r = _install(monkeypatch, [], cap=2, cap_min_m=513)
-    assert len(r.get_valid_tactics(_inputs(512), None)) == 3
-    t = r.get_valid_tactics(_inputs(1024), None)
-    assert ((256, 192), (4, 2), False, False, 1) not in t and len(t) == 2
 
 
 def _sm10x_cute_dsl():

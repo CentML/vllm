@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Mid-M split-K tactics (and a cluster-size cap) for FlashInfer's CuTe-DSL mm_mxfp8.
+"""Mid-M split-K tactics for FlashInfer's CuTe-DSL mm_mxfp8 (MXFP8 dense GEMM).
 
 FlashInfer 0.6.18.post1 offers its split-K MXFP8 kernel
 (``Sm100BlockScaledSplitKGemmKernel``: swap-AB, a (1, 1, s) K-cluster per
@@ -35,11 +35,6 @@ wave. The wrapped runner keeps the base runner's class name, so autotune file
 keys do not change; a file that contains a ``1072`` tactic needs this module
 enabled.
 
-``VLLM_MXFP8_MAX_CLUSTER_CTAS`` (setting experiment for the mixed-batch grids
-capped at 176/184 CTAs by 8/4-CTA clusters): when > 0, stock persistent
-tactics whose cluster has more CTAs are dropped at
-M >= ``VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M``.
-
 Installed explicitly by :func:`maybe_install` from the FlashInfer CuTe-DSL
 MXFP8 linear kernels' ``process_weights_after_loading`` (after the K=64
 tactics); importing this module has no side effects.
@@ -61,7 +56,7 @@ SUPPORTED_TILE_N = (64, 128)
 SUPPORTED_SPLIT_K = (2, 4)
 _LOCK = threading.Lock()
 _KERNEL_CACHE: dict = {}
-STATS = {"calls": 0, "tactic_offers": 0, "cluster_dropped": 0}
+STATS = {"calls": 0, "tactic_offers": 0}
 _STATE: dict[str, Any] = {"installed": False}
 
 
@@ -107,17 +102,6 @@ def offer(m: int, n: int, k: int, tile_n: int, split_k: int, max_m: int) -> bool
         return False
     clusters = -(-n // TILE_M) * -(-m // tile_n)
     return clusters <= _max_active_clusters(split_k)
-
-
-def cluster_ctas(tactic: Any) -> int:
-    """CTAs per cluster of a stock persistent tactic (1 if not one)."""
-    if (
-        isinstance(tactic, (tuple, list))
-        and len(tactic) == 5
-        and isinstance(tactic[1], (tuple, list))
-    ):
-        return int(tactic[1][0]) * int(tactic[1][1])
-    return 1
 
 
 @functools.cache
@@ -194,13 +178,7 @@ def run(gb, inputs, tile_n: int, split_k: int, enable_pdl: bool):
     return out
 
 
-def install(
-    gb,
-    tactics: list[tuple[int, int]],
-    max_m: int,
-    max_cluster_ctas: int = 0,
-    cluster_min_m: int = 513,
-) -> None:
+def install(gb, tactics: list[tuple[int, int]], max_m: int) -> None:
     """Wrap ``gb._cute_dsl_gemm_mxfp8_runner`` (``flashinfer.gemm.gemm_base``)."""
     import torch
 
@@ -221,11 +199,6 @@ def install(
                 out = list(Base.get_valid_tactics(self, inputs, profile))
                 a, b = inputs[0], inputs[1]
                 m, k, n = a.shape[0], a.shape[1], b.shape[1]
-                if max_cluster_ctas > 0 and m >= cluster_min_m:
-                    kept = [t for t in out if cluster_ctas(t) <= max_cluster_ctas]
-                    if kept:
-                        STATS["cluster_dropped"] += len(out) - len(kept)
-                        out = kept
                 if inputs[5].is_contiguous():
                     for tile_n, s in tactics:
                         if offer(m, n, k, tile_n, s, max_m):
@@ -252,17 +225,15 @@ def install(
 
 
 def maybe_install() -> bool:
-    """Install the mid-M split-K tactics / cluster cap once per process.
+    """Install the mid-M split-K tactics once per process.
 
-    Only on CUDA SM10x when ``VLLM_MXFP8_SPLITK_MIDM`` is on or
-    ``VLLM_MXFP8_MAX_CLUSTER_CTAS`` > 0. Returns whether installed. Never
-    raises: any failure is logged and the stock tactics stay in use.
+    Only on CUDA SM10x when ``VLLM_MXFP8_SPLITK_MIDM`` is on. Returns whether
+    installed. Never raises: any failure is logged and the stock tactics stay
+    in use.
     """
     if _STATE["installed"]:
         return True
-    midm = envs.VLLM_MXFP8_SPLITK_MIDM
-    max_cluster_ctas = int(envs.VLLM_MXFP8_MAX_CLUSTER_CTAS)
-    if not midm and max_cluster_ctas <= 0:
+    if not envs.VLLM_MXFP8_SPLITK_MIDM:
         return False
     from vllm.platforms import current_platform
 
@@ -274,20 +245,16 @@ def maybe_install() -> bool:
         try:
             import flashinfer.gemm.gemm_base as gb
 
-            tactics = parse_tactics(envs.VLLM_MXFP8_SPLITK_MIDM_TACTICS) if midm else []
+            tactics = parse_tactics(envs.VLLM_MXFP8_SPLITK_MIDM_TACTICS)
             max_m = int(envs.VLLM_MXFP8_SPLITK_MIDM_MAX_M)
-            cluster_min_m = int(envs.VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M)
-            install(gb, tactics, max_m, max_cluster_ctas, cluster_min_m)
+            install(gb, tactics, max_m)
         except Exception as e:
             logger.warning("FlashInfer mid-M split-K MXFP8 tactics not installed: %r", e)
             return False
         _STATE["installed"] = True
     logger.info(
-        "FlashInfer CuTe-DSL MXFP8: mid-M split-K tactics %s (32 < M <= %d); "
-        "max cluster CTAs %s at M >= %d",
+        "FlashInfer CuTe-DSL MXFP8: mid-M split-K tactics %s (32 < M <= %d)",
         tactics,
         max_m,
-        max_cluster_ctas or "unlimited",
-        cluster_min_m,
     )
     return True
