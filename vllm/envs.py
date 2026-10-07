@@ -252,6 +252,8 @@ if TYPE_CHECKING:
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+    VLLM_SAMPLER_SPLIT_ROW_TOPK: bool = True
+    VLLM_DRAFT_SPLIT_ROW_ARGMAX: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1832,6 +1834,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
     ),
+    # Model Runner V2: exact top-k/top-p kernel for batches whose every row
+    # has 1 <= top_k <= 64. 0 falls back to the generic (Qrita) top-k/top-p.
+    "VLLM_SAMPLER_SPLIT_ROW_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SAMPLER_SPLIT_ROW_TOPK", "1"))
+    ),
+    # Model Runner V2: greedy draft tokens via the vocab-split argmax kernel.
+    # 0 falls back to torch.argmax.
+    "VLLM_DRAFT_SPLIT_ROW_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DRAFT_SPLIT_ROW_ARGMAX", "1"))
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
@@ -2294,6 +2306,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        # Model Runner V2 sampler / drafter kernel choices, made outside
+        # the compiled model; not part of traced graphs.
+        "VLLM_SAMPLER_SPLIT_ROW_TOPK",
+        "VLLM_DRAFT_SPLIT_ROW_ARGMAX",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

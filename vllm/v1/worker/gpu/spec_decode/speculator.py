@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.eplb.eplb_state import EplbState
@@ -135,6 +136,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.use_local_argmax_reduction = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self.use_split_row_argmax = envs.VLLM_DRAFT_SPLIT_ROW_ARGMAX
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -455,7 +457,10 @@ class DraftModelSpeculator(BaseSpeculator):
         else:
             logits = self.model.compute_logits(hidden_states)
             # Bitwise equal to logits.argmax(dim=-1), split across the vocab.
-            sampled = split_argmax(logits)
+            if self.use_split_row_argmax:
+                sampled = split_argmax(logits)
+            else:
+                sampled = logits.argmax(dim=-1)
         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
         return sampled
 

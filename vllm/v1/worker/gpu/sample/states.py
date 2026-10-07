@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
@@ -21,6 +22,7 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 class SamplingStates:
     def __init__(self, max_num_reqs: int, vocab_size: int):
         self.max_num_reqs = max_num_reqs
+        self.use_split_row_top_k = envs.VLLM_SAMPLER_SPLIT_ROW_TOPK
         self.vocab_size = vocab_size
 
         self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
@@ -114,7 +116,7 @@ class SamplingStates:
         # Full-GPU exact path when every row has 1 <= top_k <= MAX_TOP_K
         # (disabled top-k is stored as vocab_size); otherwise Qrita below.
         max_top_k = int(top_k_np.max()) if top_k_np.size else 0
-        if 0 < max_top_k <= MAX_TOP_K:
+        if self.use_split_row_top_k and 0 < max_top_k <= MAX_TOP_K:
             use_top_p = bool(np.any(self.top_p.np[idx_mapping_np] != 1.0))
             return apply_spec_top_k_top_p(
                 logits,
