@@ -227,6 +227,11 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_MXFP8_K64: bool = True
     VLLM_FLASHINFER_MXFP8_K64_TACTICS: str = "512,256,256,2;256,256,256,2;256,128,256,2"
     VLLM_FLASHINFER_MXFP8_K64_MIN_M: int = 256
+    VLLM_MXFP8_SPLITK_MIDM: bool = False
+    VLLM_MXFP8_SPLITK_MIDM_TACTICS: str = "32,2;32,4;64,2;64,4;128,2"
+    VLLM_MXFP8_SPLITK_MIDM_MAX_M: int = 2048
+    VLLM_MXFP8_MAX_CLUSTER_CTAS: int = 0
+    VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M: int = 513
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -1830,6 +1835,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_MXFP8_K64_MIN_M": lambda: int(
         os.getenv("VLLM_FLASHINFER_MXFP8_K64_MIN_M", "256")
     ),
+    # Add split-K tactics with tile N 32/64/128 for 32 < M <= MAX_M to
+    # FlashInfer's autotuned CuTe-DSL mm_mxfp8 (vllm/model_executor/layers/
+    # quantization/utils/flashinfer_mxfp8_splitk.py). Default off.
+    "VLLM_MXFP8_SPLITK_MIDM": lambda: os.getenv("VLLM_MXFP8_SPLITK_MIDM", "0")
+    in ("1", "true", "on"),
+    # ";"-separated "tile_n,split_k" mid-M split-K tactics.
+    "VLLM_MXFP8_SPLITK_MIDM_TACTICS": lambda: os.getenv(
+        "VLLM_MXFP8_SPLITK_MIDM_TACTICS", "32,2;32,4;64,2;64,4;128,2"
+    ),
+    # Largest M (rows) for which mid-M split-K tactics are offered.
+    "VLLM_MXFP8_SPLITK_MIDM_MAX_M": lambda: int(
+        os.getenv("VLLM_MXFP8_SPLITK_MIDM_MAX_M", "2048")
+    ),
+    # >0: drop stock CuTe-DSL mm_mxfp8 tactics whose cluster has more CTAs
+    # than this at M >= VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M (0 = off).
+    "VLLM_MXFP8_MAX_CLUSTER_CTAS": lambda: int(
+        os.getenv("VLLM_MXFP8_MAX_CLUSTER_CTAS", "0")
+    ),
+    "VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M": lambda: int(
+        os.getenv("VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M", "513")
+    ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
     # CuTe-DSL NVFP4 linear kernel is selected. Empty: skip nothing.
@@ -2618,6 +2644,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_MXFP8_K64",
         "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
         "VLLM_FLASHINFER_MXFP8_K64_MIN_M",
+        "VLLM_MXFP8_SPLITK_MIDM",
+        "VLLM_MXFP8_SPLITK_MIDM_TACTICS",
+        "VLLM_MXFP8_SPLITK_MIDM_MAX_M",
+        "VLLM_MXFP8_MAX_CLUSTER_CTAS",
+        "VLLM_MXFP8_MAX_CLUSTER_CTAS_MIN_M",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         # Launch choice inside the low-M GEMM custom op.
         "VLLM_LOWM_BF16_GEMM_PDL",
