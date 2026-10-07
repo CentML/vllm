@@ -12,7 +12,6 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
-from vllm.model_executor.layers.fusion import norm_quant
 
 logger = init_logger(__name__)
 
@@ -155,43 +154,6 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if norm_quant.NQF:
-            # Fused residual-add + norm + MXFP8 quant (NQF=1, see
-            # fusion/norm_quant.py). The residual stream of a flagged layer is
-            # carried as deferred (a, b) pairs.
-            role = getattr(self, "_nqf_role", None)
-            if (
-                role == "pre"
-                and isinstance(x, tuple)
-                and isinstance(residual, tuple)
-                and all(norm_quant.is_fusable(t) for t in (*x, *residual))
-            ):
-                return torch.ops.nqf.pre_norm(
-                    x[0],
-                    x[1],
-                    residual[0],
-                    residual[1],
-                    self.weight,
-                    self.variance_epsilon,
-                    norm_quant.EMIT,
-                )
-            if (
-                role == "post"
-                and norm_quant.is_fusable(x)
-                and norm_quant.is_fusable(residual)
-            ):
-                out = torch.ops.nqf.post_norm(
-                    x, residual, self.weight, self.variance_epsilon, norm_quant.EMIT
-                )
-                return out, (x, residual)
-            # Unflagged norms (e.g. the final norm) may still receive deferred
-            # pairs: materialize them with the ops of the unfused graph.
-            if isinstance(x, tuple):
-                x = x[0] + x[1]
-            if isinstance(residual, tuple):
-                residual = (
-                    residual[0].to(torch.float32) + residual[1].to(torch.float32)
-                ).to(residual[0].dtype)
         weight = self.weight.float() + 1.0
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)

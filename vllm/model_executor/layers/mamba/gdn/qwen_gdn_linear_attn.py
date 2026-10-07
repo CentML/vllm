@@ -24,7 +24,6 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
-from vllm.model_executor.layers.fusion import norm_quant
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -717,12 +716,6 @@ def gdn_gated_rmsnorm_(
     eps: float,
     activation: str,
 ) -> None:
-    if norm_quant.NQF and norm_quant.gdn_gated_rmsnorm_into_target(
-        x, z, weight, eps, activation
-    ):
-        # NQF=1: rows of the layer inside the fused packed core were normed
-        # with the out_proj MXFP8 quant epilogue (see norm_quant).
-        return
     T, HV, D = x.shape
     if T == 0:
         return
@@ -1025,10 +1018,6 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-    # Set per layer by norm_quant.configure_decoder_layer (NQF=1) when out_proj
-    # takes the MXFP8 input produced by _forward_core_fused_norm_packed.
-    _nqf_gdn: bool = False
-
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -2463,26 +2452,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def _forward_core_fused_norm_packed(
-        self,
-        mixed_qkvz: torch.Tensor,
-        ba: torch.Tensor,
-        core_attn_out: torch.Tensor,
-    ) -> None:
-        if norm_quant.NQF and norm_quant.gdn_packed_enabled(self, core_attn_out):
-            # NQF=1: run the core with the gated RMSNorm writing out_proj's
-            # MXFP8 input into static buffers, quantize the remaining rows and
-            # stash the result for out_proj.
-            norm_quant.gdn_forward_core_fused_norm_packed(
-                self,
-                self._forward_core_fused_norm_packed_impl,
-                mixed_qkvz,
-                ba,
-                core_attn_out,
-            )
-            return
-        self._forward_core_fused_norm_packed_impl(mixed_qkvz, ba, core_attn_out)
-
-    def _forward_core_fused_norm_packed_impl(
         self,
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,

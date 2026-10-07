@@ -38,7 +38,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
-from vllm.model_executor.layers.fusion import norm_quant
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -203,11 +202,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
-
-        if norm_quant.NQF:
-            # Fused residual-add + norm + MXFP8 quant: flag the norms, the MoE
-            # runner and the attention of an eligible layer.
-            norm_quant.configure_decoder_layer(self, vllm_config)
 
 
 @support_torch_compile(
