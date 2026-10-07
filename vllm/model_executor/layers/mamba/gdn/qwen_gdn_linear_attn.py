@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import dataclasses
+import enum
 import os
 from typing import Literal
 
@@ -457,6 +458,18 @@ def _to(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 def _rows(t: torch.Tensor, n: int) -> torch.Tensor:
     """``t[:n]``; ``t`` itself if it has at most ``n`` rows (same view)."""
     return t if t.size(0) <= n else t[:n]
+
+
+class SpecCoreOut(enum.IntEnum):
+    """What the spec-decode core wrote; falsy when the gated norm is left to
+    the caller.
+    """
+
+    RAW = 0  # the pre-norm core output (Triton recurrence)
+    NORMED = 1  # the gated-RMSNorm bf16 output (CUDA MTP kernels)
+    # out_proj's MXFP8 activation of every row, the bf16 output unwritten
+    # (VLLM_GDN_MTP_FUSED_QUANT)
+    QUANTIZED = 2
 
 
 def _host_spec_args(m: GDNAttentionMetadata) -> tuple:
@@ -2735,10 +2748,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
-    ) -> bool:
-        """Conv + recurrence of the spec-decode rows into ``core_attn_out``.
-        Returns whether the gated norm was applied too (CUDA MTP kernel); the
-        Triton recurrence leaves it to the caller's norm launch.
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
+    ) -> SpecCoreOut:
+        """Conv + recurrence of the spec-decode rows into ``core_attn_out``,
+        plus the gated norm in the CUDA MTP kernels (the Triton recurrence
+        leaves it to the caller's norm launch). ``out_q``/``out_scale``: try
+        the fused out_proj MXFP8 quant (``_post_conv_fused_norm``).
         """
         num_requests = attn_metadata.num_spec_decodes
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -2769,6 +2785,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_gate=_rows(output_gate, n),
                 core_attn_out=_rows(core_attn_out, n),
                 attn_metadata=attn_metadata,
+                out_q=out_q,
+                out_scale=out_scale,
             )
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
@@ -2804,6 +2822,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_gate=output_gate[:num_actual_tokens],
             core_attn_out=core_attn_out[:num_actual_tokens],
             attn_metadata=attn_metadata,
+            out_q=out_q,
+            out_scale=out_scale,
         )
 
     def _forward_core_decode_spec_post_conv_fused_norm(
@@ -2814,9 +2834,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
-    ) -> bool:
-        """Spec-decode recurrence; returns whether the gated norm was applied
-        (CUDA MTP kernel) or is left to the caller (Triton recurrence).
+        out_q: torch.Tensor | None = None,
+        out_scale: torch.Tensor | None = None,
+    ) -> SpecCoreOut:
+        """Spec-decode recurrence; the gated norm is applied (CUDA MTP kernels)
+        or left to the caller (Triton recurrence). With ``out_q``/``out_scale``
+        (out_proj's whole MXFP8 activation and scales, VLLM_GDN_MTP_FUSED_QUANT)
+        the register-resident CUDA kernel writes them instead of
+        ``core_attn_out``, padding rows included, when it runs and takes them.
         """
         # VLLM_GDN_BA_LATE_JOIN: the deferred aux-stream join (no-op otherwise);
         # the recurrence is the first reader of b/a.
@@ -2848,7 +2873,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out,
                 scale=self.head_k_dim**-0.5,
             )
-            return False
+            return SpecCoreOut.RAW
         args = (
             mixed_qkv,
             a,
@@ -2866,10 +2891,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.layer_norm_epsilon,
             self.norm.activation,
         )
-        if gdn_mtp_cuda.ready() and gdn_mtp_cuda.gdn_mtp_cuda(*args):
-            return True
+        if gdn_mtp_cuda.ready():
+            if out_q is not None and gdn_mtp_cuda.gdn_mtp_cuda(
+                *args, out_q=out_q, out_scale=out_scale
+            ):
+                return SpecCoreOut.QUANTIZED
+            if gdn_mtp_cuda.gdn_mtp_cuda(*args):
+                return SpecCoreOut.NORMED
         ops.fused_gdn_decode_post_conv_mtp(*args)
-        return True
+        return SpecCoreOut.NORMED
 
     def _forward_core_decode_spec_one_launch(
         self,
@@ -3150,14 +3180,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if not quantize:
                 # The MTP kernels skip FULL-graph padding requests.
                 core_attn_out.zero_()
-            normalized = self._forward_core_decode_spec_fused_norm(
+            # VLLM_GDN_MTP_FUSED_QUANT: the CUDA MTP kernel may write out_proj's
+            # MXFP8 activation itself (every row), instead of the separate
+            # quant launch below.
+            fold_quant = quantize and gdn_mtp_cuda.GDN_MTP_FUSED_QUANT
+            written = self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
                 a=a,
                 output_gate=output_gate,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
+                out_q=out_q if fold_quant else None,
+                out_scale=out_scale if fold_quant else None,
             )
+            if written == SpecCoreOut.QUANTIZED:
+                return
             if quantize:
                 # Only the MTP rows of real requests are valid; their count is
                 # on the device (FULL-graph replay pads the requests).
@@ -3168,12 +3206,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     output_gate,
                     out_q,  # type: ignore[arg-type]
                     out_scale,  # type: ignore[arg-type]
-                    norm_rows=(0, 0 if normalized else core_attn_out.shape[0]),
+                    norm_rows=(0, 0 if written else core_attn_out.shape[0]),
                     num_valid=attn_metadata.spec_query_start_loc[
                         num_spec : num_spec + 1
                     ],
                 )
-            elif not normalized:
+            elif not written:
                 self._rms_norm_gated_strided_gate_cuda(core_attn_out, output_gate)
             return
 
@@ -3207,7 +3245,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 spec_start, spec_start + attn_metadata.num_spec_decode_tokens
             )
 
-            def spec_half() -> bool:
+            def spec_half() -> SpecCoreOut:
                 return self._forward_core_decode_spec_fused_norm(
                     mixed_qkv=mixed_qkv[spec_rows],
                     b=b[spec_rows],
