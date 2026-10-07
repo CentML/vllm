@@ -99,56 +99,6 @@ LAZY_IDX_CHECK = [int(os.environ.get("VLLM_GDN_STEP_PLAN_LAZY_IDX_CHECK", "0"))]
 MDREUSE_PTR_KEY = os.environ.get("VLLM_GDN_STEP_PLAN_MDREUSE_PTR_KEY", "0") == "1"
 LOG = os.environ.get("VLLM_GDN_STEP_PLAN_LOG", "1") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_GDN_STEP_PLAN_LOG_EVERY", "2000"))
-# Host-side hoists of run_plan (exact: same kernels, same arguments; default off,
-# one gate each so they can be attributed separately; never used during a CUDA
-# graph capture, which keeps the stock path):
-#   VLLM_GDN_PLAN_HOIST_STATIC=1  per-layer constants (conv-state / conv-weight
-#       views, layout flag, scalar casts) built once per layer and reused while
-#       the layer's KV-cache tensors and conv weight are the same objects;
-#   VLLM_GDN_PLAN_HOIST_CONV=1    the spec-row causal_conv1d_update launch with
-#       its scalar / constexpr arguments computed once per step plan and checked
-#       per layer (dtype, strides, shapes, bias, activation), falling back to
-#       the stock wrapper on any difference.
-HOIST_STATIC = ENABLED and os.environ.get("VLLM_GDN_PLAN_HOIST_STATIC", "0") == "1"
-HOIST_CONV = ENABLED and os.environ.get("VLLM_GDN_PLAN_HOIST_CONV", "0") == "1"
-# Spec || prefill overlap of one planned mixed GDN layer (rubin-gdnpf; exact by
-# construction, default off; host-side only: the GDN core is a splitting op, so
-# this changes no traced / compiled code and is not a compile-hash factor):
-#   VLLM_GDN_SPEC_OVERLAP=1  run the spec-row branch (causal_conv1d_update + the
-#       deferred-commit decode, rows [0, S)) concurrently with the prefill chunk
-#       kernel + gated RMSNorm (rows [S, N)). The two branches touch disjoint
-#       rows of mixed_qkv / core_attn_out and disjoint conv / SSM state slots;
-#       the CUDA conv + post-conv of the prefill rows runs first, the fork is
-#       recorded after it, and the join is enqueued on the caller's stream
-#       before run_plan returns (before any reader of either branch).
-#       Same kernels, same arguments, same per-buffer order.
-#   VLLM_GDN_SPEC_OVERLAP_MODE=side (default): spec branch on a side stream,
-#       chunk + norm on the caller's stream, enqueued first (GB300 gdnp mode 2;
-#       the side stream's event wake gives the chunk's full-SM CTAs a head start);
-#       =hp: chunk + norm on a high-priority stream, spec branch on the caller's
-#       stream (measured ~1.5-2.5 us/layer slower on VR200: the chunk then waits
-#       for the cross-stream wake itself).
-#   VLLM_GDN_SPEC_OVERLAP_MIN_S (192): only steps with >= this many spec tokens
-#       (host cost ~4 stream ops per layer; low C is host-bound).
-#   VLLM_GDN_SPEC_OVERLAP_MAX_NS (0 = no limit): only steps with <= this many
-#       prefill sequences (the chunk grid fills the GPU from 4 sequences on).
-#   Never during a CUDA graph capture (the GDN layer graphs keep their own path).
-OVL = ENABLED and os.environ.get("VLLM_GDN_SPEC_OVERLAP", "0") == "1"
-OVL_MODE = os.environ.get("VLLM_GDN_SPEC_OVERLAP_MODE", "side").strip().lower()
-OVL_MIN_S = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MIN_S", "192"))
-OVL_MAX_NS = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MAX_NS", "0"))
-#   VLLM_GDN_SPEC_OVERLAP_FAST=1 (mode side only; default off): the same fork /
-#       join with ~1/3 of the host cost: two stream switches instead of four,
-#       torch's C entry points (current-stream tuple, set-stream, event record /
-#       wait) instead of the Python wrappers, the caller's Stream object cached by
-#       its (id, device, type) key, and the capture check shared with the hoists.
-#       Same stream operations in the same order -> same GPU dependency graph.
-#   VLLM_GDN_SPEC_OVERLAP_MODE=sideearly: as side, but the fork is recorded BEFORE
-#       the prefill conv, so the spec branch's conv update also runs beside
-#       conv_post (works with and without FAST).
-OVL_FAST = os.environ.get("VLLM_GDN_SPEC_OVERLAP_FAST", "0") == "1"
-_OVL_RES: dict = {}
-_OVL_FAST_RES: dict = {}
 
 HOST_TRIMS = os.environ.get("GGM_OG2", "0") == "1"
 GROUP_MATERIALIZE = (
@@ -222,12 +172,6 @@ def check_config(state_commit: bool, norm_quant_fusion: bool) -> None:
             int(LAZY),
             int(VSDIRECT),
             int(MDREUSE),
-        )
-    if HOIST_STATIC or HOIST_CONV:
-        logger.info(
-            "GDN step plan host hoists enabled: static=%d conv=%d",
-            int(HOIST_STATIC),
-            int(HOIST_CONV),
         )
     if GROUP_MATERIALIZE and state_commit:
         logger.info("GDN state materialize: one launch per KV group enabled")
@@ -438,7 +382,6 @@ class _Plan:
         "scale",
         "names",
         "vs_direct",
-        "conv_pre",
     )
 
 
@@ -469,29 +412,8 @@ def _vs_direct(p, q, v, st):
         tuple(st.stride()[1:]),
         int(p.vsf),
     )
-    if hasattr(ad, "_cg0_split"):
-        # The gdnchunk adapter (CG0 split / C1 reorder) appends its two layout
-        # flags to the cache key (use_init is True here). Without them this
-        # lookup never hits, and every layer falls back to the full adapter
-        # call plus a fresh _vs_direct attempt (host time only; same kernel).
-        key = key + (ad._cg0_split(int(p.vsf), True), bool(ad._C1_REORDER))
-    # Guard: _vs_direct runs right after an adapter call with the same inputs, so
-    # the adapter's last key must equal this rebuilt key (length, field order and
-    # values). A future adapter-key change would otherwise silently disable the
-    # direct launch (every layer falling back to the full adapter call).
-    lk = getattr(ad, "_LAST_KEY", None)
-    if lk is not None and lk[0] is not None and lk[0] != key:
-        STATS["vs_direct_key_mismatch"] = STATS.get("vs_direct_key_mismatch", 0) + 1
-        logger.warning_once(
-            "GDN step plan: VSDIRECT key mismatch vs the V-split adapter "
-            "(adapter key %d fields, plan key %d fields): direct launch disabled",
-            len(lk[0]),
-            len(key),
-        )
-        return None
     c = ad._cache(*key)
     if "compiled" not in c:
-        STATS["vs_direct_miss"] = STATS.get("vs_direct_miss", 0) + 1
         return None
     B = p.cu_p_i32.size(0) - 1
     ws = torch.empty(
@@ -501,9 +423,6 @@ def _vs_direct(p, q, v, st):
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     STATS["vs_direct"] = STATS.get("vs_direct", 0) + 1
-    logger.info_once(
-        "GDN step plan: VSDIRECT direct launch engaged (adapter key %d fields)", len(key)
-    )
     return (c["compiled"], ws, stream, tuple(st.stride()))
 
 
@@ -640,7 +559,6 @@ def build_plan(layer, md, raw):
     p.vsf = 1
     p.vsmod = None
     p.vs_direct = None
-    p.conv_pre = None
     if mod._GDN_FI_VSPLIT and not p.want_cp:
         st = mod._GDN_VSPLIT_STATE
         if mod._GDN_FI_VSPLIT_CHECK:
@@ -734,184 +652,26 @@ def build_plan(layer, md, raw):
     return p
 
 
-_CC: list = []
-
-
-def _cc():
-    """The causal_conv1d ops module (imported lazily, like _gdn / _gsc)."""
-    if not _CC:
-        from vllm.model_executor.layers.mamba.ops import causal_conv1d as m
-
-        _CC.append(m)
-    return _CC[0]
-
-
-_CONV_DIM_FIRST: list = []
-
-
-def _layer_static(layer, mod, kv0, kv1, w):
-    """VLLM_GDN_PLAN_HOIST_STATIC: the per-layer values run_plan rebuilds on
-    every call, computed exactly as run_plan does. Valid while kv0 / kv1 / w are
-    the same tensor objects (their metadata cannot change in place)."""
-    if not _CONV_DIM_FIRST:
-        _CONV_DIM_FIRST.append(bool(mod.is_conv_state_dim_first()))
-    conv_state = kv0 if _CONV_DIM_FIRST[0] else kv0.transpose(-1, -2)
-    conv_weights = w.view(w.size(0), w.size(2))
-    STATS["hoist_static_build"] = STATS.get("hoist_static_build", 0) + 1
-    return (
-        kv0,
-        kv1,
-        w,
-        conv_state,
-        conv_weights,
-        float(layer.head_k_dim**-0.5),
-        float(layer.layer_norm_epsilon),
-        layer.norm.activation == "sigmoid",
-        int(layer.num_k_heads // layer.tp_size),
+def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
+    """One layer of a planned mixed step: the kernels of the zero-copy mixed
+    path, in its order, with its arguments.
+    """
+    mod = _gdn()
+    gsc = _gsc()
+    S, N = p.S, p.N
+    ssm_state = layer.kv_cache[1]
+    conv_state = (
+        layer.kv_cache[0]
+        if mod.is_conv_state_dim_first()
+        else layer.kv_cache[0].transpose(-1, -2)
     )
-
-
-class _ConvPre:
-    """VLLM_GDN_PLAN_HOIST_CONV: the arguments causal_conv1d_update passes to
-    _causal_conv1d_update_kernel for this step's spec rows (varlen + spec
-    decoding, out = x, default null_block_id), computed once per plan from the
-    first layer and valid for every layer with the same checked properties."""
-
-    __slots__ = ("chk", "grid", "scal", "kw")
-
-
-def _conv_pre(p, x, conv_state, weight, bias, activation):
-    cc = _cc()
-    if isinstance(activation, bool):
-        act = "silu" if activation is True else None
-    else:
-        act = activation
-    if act is not None and act not in ("silu", "swish"):
-        return None
-    if p.nacc is None or p.cu_s is None or p.conv_si is None:
-        return None  # not the varlen spec-decoding form this path mirrors
-    batch = p.conv_si.size(0)
-    dim = x.size(1)
-    seqlen = p.mql
-    _, width = weight.shape
-    num_cache_lines, _, _ = conv_state.size()
-    stride_w_dim, stride_w_width = weight.stride()
-    stride_x_token, stride_x_dim = x.stride()
-    s_seq, s_dim, s_tok = conv_state.stride()
-    state_len = width - 1 + (seqlen - 1)  # num_accepted_tokens is not None
-    c = _ConvPre()
-    c.chk = (
-        x.dtype,
-        x.stride(),
-        dim,
-        conv_state.dtype,
-        tuple(conv_state.shape),
-        conv_state.stride(),
-        tuple(weight.shape),
-        weight.stride(),
-        bias is None,
-        activation,
+    conv_weights = layer.conv1d.weight.view(
+        layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
     )
-    c.grid = (batch, triton.cdiv(dim, 256))
-    c.scal = (
-        batch,
-        dim,
-        seqlen,
-        state_len,
-        num_cache_lines,
-        0,
-        stride_x_dim,
-        stride_x_token,
-        stride_w_dim,
-        stride_w_width,
-        s_seq,
-        s_dim,
-        s_tok,
-        p.conv_si.stride(0),
-        0,
-        stride_x_dim,
-        stride_x_token,
-        cc.NULL_BLOCK_ID,
-    )
-    c.kw = dict(
-        HAS_BIAS=bias is not None,
-        KERNEL_WIDTH=width,
-        SILU_ACTIVATION=act in ["silu", "swish"],
-        IS_VARLEN=True,
-        IS_APC_ENABLED=False,
-        IS_SPEC_DECODING=True,
-        NP2_STATELEN=triton.next_power_of_2(state_len),
-        HAS_NULL_BLOCK=cc.NULL_BLOCK_ID is not None,
-        BLOCK_N=256,
-        launch_pdl=cc.current_platform.is_arch_support_pdl(),
-    )
-    return c
-
-
-def conv_update_spec(p, x, conv_state, weight, bias, activation):
-    """causal_conv1d_update(x, conv_state, weight, bias, activation,
-    conv_state_indices=p.conv_si, num_accepted_tokens=p.nacc,
-    query_start_loc=p.cu_s, max_query_len=p.mql, validate_data=False) with the
-    per-step arguments hoisted (VLLM_GDN_PLAN_HOIST_CONV). Same kernel object,
-    same arguments; launched on the current stream. Returns x (the wrapper's
-    result when x.dtype == conv_state.dtype)."""
-    c = p.conv_pre
-    if c is None:  # first spec-row layer of this plan; False = not applicable
-        c = _conv_pre(p, x, conv_state, weight, bias, activation)
-        p.conv_pre = c if c is not None else False
-    if c and c.chk == (
-        x.dtype,
-        x.stride(),
-        x.size(1),
-        conv_state.dtype,
-        tuple(conv_state.shape),
-        conv_state.stride(),
-        tuple(weight.shape),
-        weight.stride(),
-        bias is None,
-        activation,
-    ) and x.dtype == conv_state.dtype and x.dim() == 2:
-        _cc()._causal_conv1d_update_kernel[c.grid](
-            x,
-            weight,
-            bias,
-            conv_state,
-            p.conv_si,
-            p.nacc,
-            p.cu_s,
-            None,
-            None,
-            x,
-            *c.scal,
-            **c.kw,
-        )
-        STATS["hoist_conv"] = STATS.get("hoist_conv", 0) + 1
-        return x
-    STATS["hoist_conv_fallback"] = STATS.get("hoist_conv_fallback", 0) + 1
-    return _gdn().causal_conv1d_update(
-        x,
-        conv_state,
-        weight,
-        bias,
-        activation,
-        conv_state_indices=p.conv_si,
-        num_accepted_tokens=p.nacc,
-        query_start_loc=p.cu_s,
-        max_query_len=p.mql,
-        validate_data=False,
-    )
-
-
-def _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
-              ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig) -> None:
-    """Spec rows [0, S) of a planned mixed layer: causal_conv1d_update + the
-    deferred-commit MTP decode (unchanged kernels and arguments)."""
-    S = p.S
-    if hoist and HOIST_CONV:
-        mixed_qkv_spec = conv_update_spec(
-            p, mixed_qkv[:S], conv_state, conv_weights, layer.conv1d.bias, layer.activation
-        )
-    else:
+    if not MAT:
+        gsc._layer_check(layer)
+        gsc.materialize_non_spec(layer, md)
+    if S > 0:
         mixed_qkv_spec = mod.causal_conv1d_update(
             mixed_qkv[:S],
             conv_state,
@@ -924,53 +684,101 @@ def _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn
             max_query_len=p.mql,
             validate_data=False,
         )
-    if p.dec_direct:
-        gsc.STATS["decode_calls"] += 1
-        gsc.load().decode(
-            mixed_qkv_spec,
-            a[:S],
-            b[:S],
+        if p.dec_direct:
+            gsc.STATS["decode_calls"] += 1
+            gsc.load().decode(
+                mixed_qkv_spec,
+                a[:S],
+                b[:S],
+                layer.A_log,
+                layer.dt_bias,
+                p.dec_si,
+                p.cu_s,
+                p.nacc,
+                ssm_state,
+                output_gate[:S],
+                layer.norm.weight,
+                core_attn_out[:S],
+                float(layer.head_k_dim**-0.5),
+                float(layer.layer_norm_epsilon),
+                layer.norm.activation == "sigmoid",
+            )
+        else:
+            mod.ops.fused_gdn_decode_post_conv_mtp(
+                mixed_qkv=mixed_qkv_spec,
+                a=a[:S],
+                b=b[:S],
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                state_indices=p.dec_si,
+                cu_seqlens=p.cu_s,
+                num_accepted_tokens=p.nacc,
+                state=ssm_state,
+                output_gate=output_gate[:S],
+                norm_weight=layer.norm.weight,
+                out=core_attn_out[:S],
+                scale=layer.head_k_dim**-0.5,
+                norm_eps=layer.layer_norm_epsilon,
+                output_gate_activation=layer.norm.activation,
+            )
+    # ---- prefill conv + post-conv (CUDA) ----
+    if p.bufs is not None:
+        q, k, v, g, beta = p.bufs
+    else:
+        P = p.P
+        H, HV = layer.num_k_heads // layer.tp_size, layer.A_log.shape[0]
+        x = mixed_qkv
+        q = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
+        k = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
+        v = torch.empty(P, HV, 128, dtype=x.dtype, device=x.device)
+        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+    ok = p.gext.run(
+        mixed_qkv[S:N],
+        conv_weights,
+        conv_state,
+        p.ci,
+        p.hi,
+        p.cu_ns,
+        p.ns,
+        a[S:N],
+        b[S:N],
+        layer.A_log,
+        layer.dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        int(layer.num_k_heads // layer.tp_size),
+        int(p.tph),
+        int(p.rv),
+    )
+    gcc = mod._GDN_CONV_CUDA_MOD[0]
+    if ok:
+        gcc.STATS["calls"] += 1
+    else:
+        # as in the unplanned path: the CUDA kernel refused (no launch) -> Triton kernel
+        gcc.STATS["fallbacks"] += 1
+        STATS["conv_fallback"] += 1
+        q, k, v, g, beta = mod.gdn_fused_conv_post_conv(
+            mixed_qkv[S:N],
+            conv_weights,
+            conv_state,
+            p.ci,
+            p.hi,
+            p.cu_ns,
+            p.ns,
+            a[S:N],
+            b[S:N],
             layer.A_log,
             layer.dt_bias,
-            p.dec_si,
-            p.cu_s,
-            p.nacc,
-            ssm_state,
-            output_gate[:S],
-            layer.norm.weight,
-            core_attn_out[:S],
-            k_scale,
-            n_eps,
-            n_sig,
+            layer.num_k_heads // layer.tp_size,
+            layer.head_k_dim,
+            layer.head_v_dim,
+            use_cuda=False,
         )
-    else:
-        mod.ops.fused_gdn_decode_post_conv_mtp(
-            mixed_qkv=mixed_qkv_spec,
-            a=a[:S],
-            b=b[:S],
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            state_indices=p.dec_si,
-            cu_seqlens=p.cu_s,
-            num_accepted_tokens=p.nacc,
-            state=ssm_state,
-            output_gate=output_gate[:S],
-            norm_weight=layer.norm.weight,
-            out=core_attn_out[:S],
-            scale=layer.head_k_dim**-0.5,
-            norm_eps=layer.layer_norm_epsilon,
-            output_gate_activation=layer.norm.activation,
-        )
-
-
-def _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state,
-                    cu_stream=None, main=None) -> None:
-    """Prefill rows [S, N) of a planned mixed layer after the CUDA conv: fresh-slot
-    zeroing, the chunked GDN kernel (state pool in place) and the gated RMSNorm
-    (unchanged kernels and arguments). cu_stream: explicit CUstream for the
-    V-split direct launch (overlap mode hp); main: the caller's stream (overlap).
-    """
-    S, N = p.S, p.N
+    out = core_attn_out[S:N]
     # ---- chunked GDN (state pool in place) ----
     if not p.zero_done:
         mod.gdn_zero_state_slots(ssm_state, p.slots, p.has_init)
@@ -1005,7 +813,7 @@ def _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state
                     0,
                     p.scale,
                     d[1],
-                    d[2] if cu_stream is None else cu_stream,
+                    d[2],
                 )
             else:
                 p.vsmod.chunk_gated_delta_rule_vsplit(
@@ -1023,16 +831,7 @@ def _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state
                     v_split=p.vsf,
                 )
                 if VSDIRECT:
-                    if main is None:
-                        p.vs_direct = _vs_direct(p, q, v, ssm_state)
-                    else:
-                        # overlap: cache the caller's stream + allocate the workspace on it
-                        cur = torch.cuda.current_stream()
-                        torch.cuda.set_stream(main)
-                        try:
-                            p.vs_direct = _vs_direct(p, q, v, ssm_state)
-                        finally:
-                            torch.cuda.set_stream(cur)
+                    p.vs_direct = _vs_direct(p, q, v, ssm_state)
             st["calls"] = st.get("calls", 0) + 1
             done = True
     if not done:
@@ -1062,297 +861,7 @@ def _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state
         layer.layer_norm_epsilon,
         layer.norm.activation,
     )
-
-
-def _ovl_res(dev):
-    """(stream, CUstream, fork event, join event) of the overlap on this device."""
-    r = _OVL_RES.get(dev)
-    if r is None:
-        import cuda.bindings.driver as cuda
-
-        hp = OVL_MODE == "hp"
-        st = torch.cuda.Stream(device=dev, priority=-1 if hp else 0)
-        r = _OVL_RES[dev] = (
-            st,
-            cuda.CUstream(st.cuda_stream),
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-        )
-        logger.info(
-            "GDN step plan: spec||prefill overlap stream created (mode=%s, stream "
-            "priority %d, caller stream priority %d, min S %d, max ns %d)",
-            OVL_MODE,
-            st.priority,
-            torch.cuda.current_stream(dev).priority,
-            OVL_MIN_S,
-            OVL_MAX_NS,
-        )
-    return r
-
-
-def _ovl_fast_res(dev_idx):
-    """[side stream, its (id, device, type) key, fork event, join event, caller key, caller Stream]."""
-    r = _OVL_FAST_RES.get(dev_idx)
-    if r is None:
-        st = torch.cuda.Stream(device=dev_idx, priority=0)
-        r = _OVL_FAST_RES[dev_idx] = [
-            st,
-            (st.stream_id, st.device_index, st.device_type),
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-            None,
-            None,
-        ]
-        logger.info(
-            "GDN step plan: spec||prefill overlap stream created (mode=side-fast, stream "
-            "priority %d, caller stream priority %d, min S %d, max ns %d)",
-            st.priority,
-            torch.cuda.current_stream(dev_idx).priority,
-            OVL_MIN_S,
-            OVL_MAX_NS,
-        )
-    return r
-
-
-def _ovl_ok(p, mixed_qkv, conv_state, not_capturing=False) -> bool:
-    if OVL_MAX_NS and p.ns > OVL_MAX_NS:
-        STATS["ovl_off_ns"] = STATS.get("ovl_off_ns", 0) + 1
-        return False
-    if (
-        p.N <= p.S
-        or mixed_qkv.dtype != conv_state.dtype
-        or (not not_capturing and torch.cuda.is_current_stream_capturing())
-    ):
-        STATS["ovl_off_other"] = STATS.get("ovl_off_other", 0) + 1
-        return False
-    return True
-
-
-def _ovl_begin(fast):
-    """Record the overlap fork on the caller's stream (mode sideearly).
-    Returns (caller Stream, side Stream, fork event, join event, caller key, side key)."""
-    if fast:
-        C = torch._C
-        dev_idx = C._cuda_getDevice()
-        r = _OVL_FAST_RES.get(dev_idx) or _ovl_fast_res(dev_idx)
-        key = C._cuda_getCurrentStream(dev_idx)
-        if r[4] != key:
-            r[4] = key
-            r[5] = torch.cuda.Stream(stream_id=key[0], device_index=key[1], device_type=key[2])
-        C._CudaEventBase.record(r[2], r[5])
-        return (r[5], r[0], r[2], r[3], key, r[1])
-    main = torch.cuda.current_stream()
-    st, _, ev_fork, ev_join = _ovl_res(main.device)
-    ev_fork.record(main)
-    return (main, st, ev_fork, ev_join, None, None)
-
-
-def _ovl_spec_join(ctx, fast, spec_args) -> None:
-    """Spec branch on the side stream after the fork, then the join on the caller's stream."""
-    main, st, ev_fork, ev_join, key, stkey = ctx
-    if fast:
-        C = torch._C
-        EB = C._CudaEventBase
-        EB.wait(ev_fork, st)
-        C._cuda_setStream(*stkey)
-        try:
-            _run_spec(*spec_args)
-        finally:
-            C._cuda_setStream(*key)
-        EB.record(ev_join, st)
-        EB.wait(ev_join, main)
-    else:
-        st.wait_event(ev_fork)
-        torch.cuda.set_stream(st)
-        try:
-            _run_spec(*spec_args)
-        finally:
-            torch.cuda.set_stream(main)
-        ev_join.record(st)
-        main.wait_event(ev_join)
-
-
-def run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out) -> None:
-    """One layer of a planned mixed step: the kernels of the zero-copy mixed
-    path, in its order, with its arguments.
-    """
-    mod = _gdn()
-    gsc = _gsc()
-    S, N = p.S, p.N
-    hoist = (HOIST_STATIC or HOIST_CONV) and not torch.cuda.is_current_stream_capturing()
-    if hoist and HOIST_STATIC:
-        kvc = layer.kv_cache
-        kv0, kv1, w = kvc[0], kvc[1], layer.conv1d.weight
-        ls = layer.__dict__.get("_gdn_plan_static")
-        if ls is None or ls[0] is not kv0 or ls[1] is not kv1 or ls[2] is not w:
-            ls = layer.__dict__["_gdn_plan_static"] = _layer_static(layer, mod, kv0, kv1, w)
-        ssm_state, conv_state, conv_weights = kv1, ls[3], ls[4]
-        k_scale, n_eps, n_sig, n_kh = ls[5], ls[6], ls[7], ls[8]
-    else:
-        ssm_state = layer.kv_cache[1]
-        conv_state = (
-            layer.kv_cache[0]
-            if mod.is_conv_state_dim_first()
-            else layer.kv_cache[0].transpose(-1, -2)
-        )
-        conv_weights = layer.conv1d.weight.view(
-            layer.conv1d.weight.size(0), layer.conv1d.weight.size(2)
-        )
-        k_scale = float(layer.head_k_dim**-0.5)
-        n_eps = float(layer.layer_norm_epsilon)
-        n_sig = layer.norm.activation == "sigmoid"
-        n_kh = int(layer.num_k_heads // layer.tp_size)
-    if not MAT:
-        gsc._layer_check(layer)
-        gsc.materialize_non_spec(layer, md)
-    # FAST: hoist is computed with the capture check, so hoist=True means "not capturing"
-    ovl = OVL and S >= OVL_MIN_S and _ovl_ok(p, mixed_qkv, conv_state, OVL_FAST and hoist)
-    early = ovl and OVL_MODE == "sideearly"
-    if early:
-        # fork before the prefill conv: the spec branch's conv update runs beside conv_post
-        ectx = _ovl_begin(OVL_FAST)
-    if S > 0 and not ovl:
-        _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
-                  ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
-    # ---- prefill conv + post-conv (CUDA) ----
-    if p.bufs is not None:
-        q, k, v, g, beta = p.bufs
-    else:
-        P = p.P
-        H, HV = layer.num_k_heads // layer.tp_size, layer.A_log.shape[0]
-        x = mixed_qkv
-        q = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
-        k = torch.empty(P, H, 128, dtype=x.dtype, device=x.device)
-        v = torch.empty(P, HV, 128, dtype=x.dtype, device=x.device)
-        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
-        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
-    ok = p.gext.run(
-        mixed_qkv[S:N],
-        conv_weights,
-        conv_state,
-        p.ci,
-        p.hi,
-        p.cu_ns,
-        p.ns,
-        a[S:N],
-        b[S:N],
-        layer.A_log,
-        layer.dt_bias,
-        q,
-        k,
-        v,
-        g,
-        beta,
-        n_kh,
-        int(p.tph),
-        int(p.rv),
-    )
-    gcc = mod._GDN_CONV_CUDA_MOD[0]
-    if ok:
-        gcc.STATS["calls"] += 1
-    else:
-        # as in the unplanned path: the CUDA kernel refused (no launch) -> Triton kernel
-        gcc.STATS["fallbacks"] += 1
-        STATS["conv_fallback"] += 1
-        q, k, v, g, beta = mod.gdn_fused_conv_post_conv(
-            mixed_qkv[S:N],
-            conv_weights,
-            conv_state,
-            p.ci,
-            p.hi,
-            p.cu_ns,
-            p.ns,
-            a[S:N],
-            b[S:N],
-            layer.A_log,
-            layer.dt_bias,
-            layer.num_k_heads // layer.tp_size,
-            layer.head_k_dim,
-            layer.head_v_dim,
-            use_cuda=False,
-        )
-    out = core_attn_out[S:N]
-    if not ovl:
-        _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
-        STATS["layers_fast"] += 1
-        return
-    if early:
-        # chunk + norm (host order first) on the caller's stream, then the spec branch + join
-        _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
-        _ovl_spec_join(ectx, OVL_FAST, (layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate,
-                                        core_attn_out, ssm_state, conv_state, conv_weights, k_scale,
-                                        n_eps, n_sig))
-        STATS["layers_fast"] += 1
-        n_ovl = STATS["ovl_layers"] = STATS.get("ovl_layers", 0) + 1
-        if n_ovl == 1:
-            logger.info(
-                "GDN step plan: spec||prefill overlap engaged (mode=sideearly%s, S=%d, P=%d, ns=%d, vsf=%d)",
-                "-fast" if OVL_FAST else "", S, p.P, p.ns, p.vsf,
-            )
-        return
-    # ---- spec || prefill overlap: fork after the prefill conv, join before return ----
-    if OVL_FAST and OVL_MODE == "side":
-        C = torch._C
-        dev_idx = C._cuda_getDevice()
-        r = _OVL_FAST_RES.get(dev_idx) or _ovl_fast_res(dev_idx)
-        key = C._cuda_getCurrentStream(dev_idx)
-        if r[4] != key:
-            r[4] = key
-            r[5] = torch.cuda.Stream(stream_id=key[0], device_index=key[1], device_type=key[2])
-        main, st, ev_fork, ev_join = r[5], r[0], r[2], r[3]
-        EB = C._CudaEventBase
-        EB.record(ev_fork, main)
-        # chunk + norm first (host order), on the caller's stream
-        _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
-        EB.wait(ev_fork, st)
-        C._cuda_setStream(*r[1])
-        try:
-            _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
-                      ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
-        finally:
-            C._cuda_setStream(*key)
-        EB.record(ev_join, st)
-        EB.wait(ev_join, main)
-        STATS["layers_fast"] += 1
-        n_ovl = STATS["ovl_layers"] = STATS.get("ovl_layers", 0) + 1
-        if n_ovl == 1:
-            logger.info(
-                "GDN step plan: spec||prefill overlap engaged (mode=side-fast, S=%d, P=%d, ns=%d, vsf=%d)",
-                S, p.P, p.ns, p.vsf,
-            )
-        return
-    main = torch.cuda.current_stream()
-    st, cu_st, ev_fork, ev_join = _ovl_res(main.device)
-    ev_fork.record(main)
-    st.wait_event(ev_fork)
-    torch.cuda.set_stream(st)
-    try:
-        if OVL_MODE == "hp":
-            # chunk + norm first, on the high-priority stream (explicit CUstream for
-            # the cached direct launch, whose own stream is the caller's)
-            _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state,
-                            cu_stream=cu_st, main=main)
-        else:
-            torch.cuda.set_stream(main)
-            # chunk + norm first (host order), on the caller's stream
-            _run_chunk_norm(layer, p, mod, q, k, v, g, beta, out, output_gate, ssm_state)
-            torch.cuda.set_stream(st)
-            _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
-                      ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
-    finally:
-        torch.cuda.set_stream(main)
-    ev_join.record(st)
-    if OVL_MODE == "hp":
-        _run_spec(layer, p, mod, gsc, hoist, mixed_qkv, b, a, output_gate, core_attn_out,
-                  ssm_state, conv_state, conv_weights, k_scale, n_eps, n_sig)
-    main.wait_event(ev_join)
     STATS["layers_fast"] += 1
-    STATS["ovl_layers"] = STATS.get("ovl_layers", 0) + 1
-    if STATS["ovl_layers"] == 1:
-        logger.info(
-            "GDN step plan: spec||prefill overlap engaged (mode=%s, S=%d, P=%d, ns=%d, vsf=%d)",
-            OVL_MODE, S, p.P, p.ns, p.vsf,
-        )
 
 
 def forward_core_fused_norm(
