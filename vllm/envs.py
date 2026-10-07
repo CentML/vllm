@@ -308,6 +308,19 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_DSV41_MEGAMOE_SM107: bool = False
     VLLM_DSV41_MEGAMOE_PERDIE: str = "0"
+    VLLM_FI_MEGA_MOE_KNOBS: Literal["cache", "config"] = "cache"
+    VLLM_FI_MEGA_MOE_CAPACITIES: str = "auto"
+    VLLM_FI_MEGA_MOE_NVFP4_INPUT_SCALE: Literal["calibrated", "dynamic"] = (
+        "calibrated"
+    )
+    VLLM_FI_MEGA_MOE_NVFP4_FC2_INPUT_SCALE: Literal["layer_max", "per_expert"] = (
+        "layer_max"
+    )
+    VLLM_FI_MEGA_MOE_SM107_VARIANT: Literal["inference"] = "inference"
+    VLLM_FI_MEGA_MOE_SHARED: Literal["separate", "overlap"] = "separate"
+    VLLM_FI_MEGA_MOE_MAX_SM_COUNT: str = "auto"
+    VLLM_FI_MEGA_MOE_DEBUG_DIR: str = ""
+    VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE: bool = True
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2123,6 +2136,86 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights, "routed" per-die queues + die-local routed weights only (no extra memory for the shared experts).
     # Incompatible with EPLB (the localized weights are not (E, ...) tensors).
     "VLLM_DSV41_MEGAMOE_PERDIE": lambda: os.getenv("VLLM_DSV41_MEGAMOE_PERDIE", "0"),
+    # flashinfer moe_ep SM107 (Rubin) MegaMoE, moe_backend
+    # flashinfer_moe_ep_mega_cutedsl (vllm/models/deepseek_v4/nvidia/fi_moe.py).
+    # Knob policy: "cache" = flashinfer's offline knob cache
+    # (FLASHINFER_MOE_EP_KNOB_CACHE) with flashinfer's per-capacity heuristic
+    # as fallback; "config" = the config dataclass defaults (debug only).
+    "VLLM_FI_MEGA_MOE_KNOBS": env_with_choices(
+        "VLLM_FI_MEGA_MOE_KNOBS", "cache", ["cache", "config"]
+    ),
+    # Workspace capacity profiles (tokens per rank), capped at the per-rank
+    # maximum cap = ceil(max_num_batched_tokens / sequence-parallel size).
+    # "auto" = powers of two from 128 below cap, plus cap; "max" = one cap
+    # workspace; or a comma-separated list of capacities (values >= cap are
+    # dropped, cap is always added). Every EP rank selects the same profile
+    # per step (DP token counts come from the forward context); knobs are
+    # tuned per capacity, so decode steps no longer run prefill-sized tiles.
+    "VLLM_FI_MEGA_MOE_CAPACITIES": lambda: os.getenv(
+        "VLLM_FI_MEGA_MOE_CAPACITIES", "auto"
+    ),
+    # SM107 NVFP4 checkpoint: global scale of the in-kernel bf16 -> NVFP4
+    # activation quantization. "calibrated" = 1 / max(w13.input_scale) over
+    # all experts (max-reduced across the EP group; the grid every other
+    # vLLM NVFP4 MoE backend uses); "dynamic" = 1.0 (raw per-16 amax/6
+    # E4M3 block scales).
+    "VLLM_FI_MEGA_MOE_NVFP4_INPUT_SCALE": env_with_choices(
+        "VLLM_FI_MEGA_MOE_NVFP4_INPUT_SCALE",
+        "calibrated",
+        ["calibrated", "dynamic"],
+    ),
+    # SM107 NVFP4 checkpoint: FC2-input (FC1-output requant) scale, i.e.
+    # fc1_norm_const = 1 / scale and fc2_alpha = w2.weight_scale_2 * scale.
+    # "layer_max" = max(w2.input_scale) over the layer's experts (EP
+    # all-reduce; the grid of vLLM's FusedMoE NVFP4 backends);
+    # "per_expert" = each expert's calibrated w2.input_scale (TensorRT-LLM
+    # MegaMoE convention; clips activations beyond an expert's calibration).
+    "VLLM_FI_MEGA_MOE_NVFP4_FC2_INPUT_SCALE": env_with_choices(
+        "VLLM_FI_MEGA_MOE_NVFP4_FC2_INPUT_SCALE",
+        "layer_max",
+        ["layer_max", "per_expert"],
+    ),
+    # SM107 kernel variant: "inference" (RubinInferenceMegaMoE, every capacity
+    # profile; a key of FlashInfer's tuned knob cache). The only variant wired
+    # in FlashInfer claude/rubin-moe-ports (GenPhase, slower at every DSv4.1
+    # shape, is not).
+    "VLLM_FI_MEGA_MOE_SM107_VARIANT": env_with_choices(
+        "VLLM_FI_MEGA_MOE_SM107_VARIANT", "inference", ["inference"]
+    ),
+    # DeepSeek-V4 shared expert next to the FlashInfer SM107 MegaMoE
+    # (flashinfer_moe_ep_mega_cutedsl; the megakernel has no FP8 shared phase):
+    # "separate" (default): vLLM's FP8 shared MLP after the megakernel, same
+    # stream. "overlap": the shared MLP on a side stream, concurrent with the
+    # megakernel (fork after the input staging; eager, FULL and PIECEWISE
+    # breakable graphs alike; runs as "separate" when the shared MLP is
+    # TP-sharded, i.e. no SP and TP > 1; the low-load cross-rank hang seen at
+    # DP4 + EP4 is a phase-interleave scheduler race in the megakernel that hits
+    # both modes: fixed in flashinfer's SM107 scheduler (n1024 k1), worked
+    # around in older builds by flashinfer's SM107 safe schedule, p3mega).
+    "VLLM_FI_MEGA_MOE_SHARED": env_with_choices(
+        "VLLM_FI_MEGA_MOE_SHARED", "separate", ["separate", "overlap"]
+    ),
+    # SM budget of the SM107 megakernel (uniform cluster launch), leaving the
+    # rest to the concurrent shared MLP of VLLM_FI_MEGA_MOE_SHARED=overlap:
+    # "auto" (default): a measured per-capacity budget in overlap mode, none
+    # otherwise; "0": all SMs; "<n>": n SMs for every capacity profile;
+    # "<cap>:<n>,<cap>:<n>,...": per capacity profile (first cap >= profile).
+    "VLLM_FI_MEGA_MOE_MAX_SM_COUNT": lambda: os.getenv(
+        "VLLM_FI_MEGA_MOE_MAX_SM_COUNT", "auto"
+    ),
+    # Debug only: hang forensics for the SM107 MegaMoE (fi_mega_debug.py). A
+    # per-process device trace of every megakernel call (graph-captured) plus
+    # the kernel's synchronization state, written to this directory whenever
+    # <dir>/dump.req is touched. "" (default): off.
+    "VLLM_FI_MEGA_MOE_DEBUG_DIR": lambda: os.getenv("VLLM_FI_MEGA_MOE_DEBUG_DIR", ""),
+    # SM107 MegaMoE: never let an EP rank stage an all-padding (zero-route)
+    # batch (DP dummy batches, empty SP shards): the first row keeps its gate
+    # routes. Works around an intermittent cross-rank deadlock of the SM107
+    # megakernel when one rank has no routes (p3mega). "0" restores masking
+    # every padding row.
+    "VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE", "1"))
+    ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)

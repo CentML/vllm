@@ -1055,7 +1055,8 @@ class DeepseekV4MoE(nn.Module):
         # shared MLP. Sequence parallel replicates those weights while sharding
         # tokens. TP=1 is also naturally replicated. With PP+TP the shared MLP
         # remains tensor-sharded, so retain the serial path. The FlashInfer
-        # megakernel has no shared-expert fusion, so it keeps the serial path.
+        # megakernel has no shared-expert fusion: its shared MLP runs separately
+        # (serial, or overlapped on a side stream with VLLM_FI_MEGA_MOE_SHARED).
         fuse_shared_experts = bool(
             self.shared_experts is not None
             and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
@@ -1156,6 +1157,38 @@ class DeepseekV4MoE(nn.Module):
             return self._forward_fused_moe(hidden_states, input_ids)
 
         org_shape = hidden_states.shape
+        overlap_shared = self.shared_experts is not None and getattr(
+            self.experts, "overlaps_shared_experts", False
+        )
+        final_hidden_states = self._forward_mega_routed(
+            hidden_states,
+            input_ids,
+            mega_gate_metadata,
+            # FlashInfer SM107 + VLLM_FI_MEGA_MOE_SHARED=overlap: the experts run
+            # the shared MLP on a side stream next to the megakernel and
+            # return routed + shared.
+            shared_experts=self.shared_experts if overlap_shared else None,
+        )
+        if (
+            self.shared_experts is not None
+            and not overlap_shared
+            and not self.experts.has_fused_shared_experts
+        ):
+            shared_output = self.shared_experts(hidden_states)
+            final_hidden_states += shared_output
+
+        return final_hidden_states.view(org_shape)
+
+    def _forward_mega_routed(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+        shared_experts: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Gate + routed MegaMoE experts (+ the shared expert when fused, or
+        overlapped when ``shared_experts`` is given)."""
+        bias_vl = getattr(self.gate, "bias_vl", None)
         # Small local padded batches favor GateLinear; 128-expert gates cross earlier.
         gate_threshold = 1 if self.gate.weight.shape[0] == 128 else 16
         if hidden_states.shape[0] <= gate_threshold:
@@ -1214,21 +1247,20 @@ class DeepseekV4MoE(nn.Module):
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
+        if shared_experts is not None:
+            return self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+                shared_experts=shared_experts,
+            )
+        return self.experts(
             hidden_states,
             topk_weights,
             topk_ids,
             activation_clamp=activation_clamp,
         )
-
-        if (
-            self.shared_experts is not None
-            and not self.experts.has_fused_shared_experts
-        ):
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
-
-        return final_hidden_states.view(org_shape)
 
     def _forward_fused_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None

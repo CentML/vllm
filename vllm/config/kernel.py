@@ -170,12 +170,17 @@ SparseIndexerTopkBackend = Literal[
 ]
 
 # Architectures whose model code wires up the flashinfer moe_ep experts. MTP
-# and DSpark draft variants inherit the setting from these target models.
+# and DSpark draft variants inherit the setting from these target models; the
+# DSpark drafts (DSparkDeepseekV4ForCausalLM, built on the DeepSeek-V4 MoE
+# layers) are listed because the draft VllmConfig is re-validated with the
+# target's kernel_config before any speculative moe_backend override applies.
 FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
         "DeepSeekV4MTPModel",
         "DeepseekV41ForCausalLM",
+        "DSparkDraftModel",
+        "DSparkV41DraftModel",
     }
 )
 
@@ -264,7 +269,13 @@ class KernelConfig:
     - "flashinfer_moe_ep_mega_cutedsl": Same, with the CuteDSL megakernel
       (additionally requires NVSHMEM). The checkpoint selects the weight path:
       an NVFP4 checkpoint is consumed prequantized, MXFP4 weights are
-      requantized at load
+      requantized at load. On SM107 (Rubin) it runs flashinfer's
+      RubinInferenceMegaMoE port, nvfp4 x nvfp4 on the NVFP4 expert
+      checkpoint only (per-expert fc1_norm_const = 1/w2.input_scale; MXFP4
+      experts, e.g. a DSpark draft, use deep_gemm_mega_moe). Needs a
+      flashinfer build with the sm107 moe_ep kernels; tuning via
+      VLLM_FI_MEGA_MOE_{KNOBS,CAPACITIES,SM107_VARIANT,MAX_SM_COUNT}, shared
+      expert via VLLM_FI_MEGA_MOE_SHARED (separate|overlap)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
