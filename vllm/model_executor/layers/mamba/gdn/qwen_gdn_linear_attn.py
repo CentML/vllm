@@ -177,6 +177,16 @@ GDN_MTP_CUDA_JIT = os.environ.get("VLLM_GDN_MTP_JIT", "1") == "1"
 # receives the GEMM's input to keep it alive until the join. Every other batch
 # (PIECEWISE pieces must join inside the captured piece) joins as before.
 GDN_BA_LATE_JOIN = os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1"
+# VLLM_GDN_BA_LATE_CAPTURE=1: in FULL-graph captures of the fused decode path,
+# the aux-stream in_proj_ba GEMM is captured where the main stream joins it
+# (after the conv1d update with VLLM_GDN_BA_LATE_JOIN, else after in_proj_qkvz)
+# instead of before in_proj_qkvz. It still depends only on the fork point (the
+# layer input), so the graph is the same DAG; but the graph executor runs a
+# join node on the stream of its first-captured dependency, so the b/a reader
+# (the MTP recurrence, or the one-launch fused decode kernel) stays on the
+# in_proj_qkvz / conv1d stream as their PDL consumer instead of moving behind
+# the BA GEMM onto the aux stream.
+GDN_BA_LATE_CAPTURE = os.environ.get("VLLM_GDN_BA_LATE_CAPTURE", "0") == "1"
 # FlashInfer GDN prefill: a single sequence of at most this many tokens runs
 # the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
 # single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
@@ -1051,6 +1061,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._ba_stream: torch.cuda.Stream | None = None
         self._ba_stream_max_tokens = envs.VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD
         self._ba_pending = False
+        # VLLM_GDN_BA_LATE_CAPTURE: (input, output) of a GEMM not yet issued.
+        self._ba_late: tuple[torch.Tensor, torch.Tensor] | None = None
         if (
             current_platform.is_cuda()
             and self._ba_stream_max_tokens > 0
@@ -1325,16 +1337,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._in_proj_ba_gemm(hidden_states, ba)
             return
         main_stream = torch.cuda.current_stream()
+        self._ba_events[0].record(main_stream)
+        self._ba_pending = True
+        if (
+            GDN_BA_LATE_CAPTURE
+            and self._uses_fused_gdn_decode(ba.dtype)
+            and self._full_graph_capture()
+        ):
+            # _in_proj_ba_join issues the GEMM (still after fork_event only).
+            self._ba_late = (hidden_states, ba)
+            return
+        self._in_proj_ba_launch(hidden_states, ba)
+
+    def _in_proj_ba_launch(self, hidden_states: torch.Tensor, ba: torch.Tensor) -> None:
+        stream = self._ba_stream
+        assert stream is not None
         fork_event, join_event = self._ba_events
-        fork_event.record(main_stream)
         with torch.cuda.stream(stream):
             fork_event.wait(stream)
             self._in_proj_ba_gemm(hidden_states, ba)
             join_event.record(stream)
-        self._ba_pending = True
 
     def _in_proj_ba_join(self) -> None:
         if self._ba_pending:
+            if self._ba_late is not None:
+                self._in_proj_ba_launch(*self._ba_late)
+                self._ba_late = None
             self._ba_events[1].wait(torch.cuda.current_stream())
             self._ba_pending = False
 
@@ -1346,23 +1374,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
 
+    @staticmethod
+    def _full_graph_capture() -> bool:
+        """Whether this forward is being captured into a FULL CUDA graph. The
+        V2 model runner captures FULL graphs with runtime mode NONE, so a
+        capturing stream under mode NONE is a FULL-graph capture too.
+        """
+        mode = get_forward_context().cudagraph_runtime_mode
+        return mode == CUDAGraphMode.FULL or (
+            mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+        )
+
     def _ba_join_deferred(self, ba: torch.Tensor) -> bool:
         """VLLM_GDN_BA_LATE_JOIN: leave the join to the fused core op, which
         waits right before its first read of b/a. Only inside FULL graphs: a
         PIECEWISE piece must join the aux stream before the core op (a
-        splitting op) ends the captured piece. The V2 model runner captures
-        FULL graphs with runtime mode NONE, so a capturing stream under mode
-        NONE is a FULL-graph capture too.
+        splitting op) ends the captured piece.
         """
-        if not (
+        return (
             GDN_BA_LATE_JOIN
             and self._ba_pending
             and self._uses_fused_gdn_decode(ba.dtype)
-        ):
-            return False
-        mode = get_forward_context().cudagraph_runtime_mode
-        return mode == CUDAGraphMode.FULL or (
-            mode == CUDAGraphMode.NONE and torch.cuda.is_current_stream_capturing()
+            and self._full_graph_capture()
         )
 
     def fix_query_key_value_ordering(
