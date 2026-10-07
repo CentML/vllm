@@ -79,7 +79,7 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops import attn_pd_overlap, flashinfer_decode_splitkv
+from vllm.v1.attention.ops import flashinfer_decode_splitkv
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -612,16 +612,6 @@ class TRTLLMPrefill:
 
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
-
-    ctx_tiles: int = 0
-    """Sum over prefill requests of ceil(q_len / 128): the trtllm-gen context
-    FMHA launches ctx_tiles * num_q_heads CTAs (attn-pdo wave gate); -1 when
-    the launch takes the FMHA_GEN generation-kernel route instead."""
-
-    pd_ctas: int = 0
-    """attn-pdo wave gate with VLLM_ATTN_PD_WAVE_MODEL=gen: the fmha-sol gen
-    route's predicted CTA count (attn_pd_overlap.PERSISTENT for a Persistent
-    launch); 0 = no prediction (the ctx model is used)."""
 
 
 @dataclass
@@ -1597,35 +1587,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     cum_seq_lens_kv=paged_kv_indptr_prefill_gpu,
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
-                    ctx_tiles=(
-                        (
-                            -1
-                            if attn_pd_overlap.would_route_gen(
-                                int(qo_indptr_prefill_cpu[-1].item()),
-                                num_prefills,
-                                max_q_len_prefill,
-                            )
-                            else int(
-                                ((query_lens_prefill_cpu + 127) // 128).sum().item()
-                            )
-                        )
-                        if attn_pd_overlap.WAVE_GATE
-                        and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
-                        else 0
-                    ),
-                    pd_ctas=(
-                        _pd_gen_ctas(
-                            int(query_lens_prefill_cpu.sum().item()),
-                            num_prefills,
-                            max_q_len_prefill,
-                            max_seq_len,
-                            self.num_kv_heads,
-                        )
-                        if attn_pd_overlap.WAVE_GATE
-                        and attn_pd_overlap.WAVE_MODEL == "gen"
-                        and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
-                        else 0
-                    ),
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -1865,17 +1826,6 @@ _FI_KV_COUNTER_BYTES = int(
 _FI_KV_COUNTER_BUFS: dict[tuple[torch.device, str], torch.Tensor] = {}
 
 
-def _pd_gen_ctas(T: int, B: int, max_q: int, max_kv: int, hkv: int) -> int:
-    """attn-pdo wave gate (WAVE_MODEL=gen): predicted CTAs of the fmha-sol gen
-    route, PERSISTENT for a Persistent launch, 0 if the launch is not gen-routed."""
-    from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as _gr
-
-    pred = _gr.predict_launch(T, B, max_q, max_kv, hkv)
-    if pred is None:
-        return 0
-    return attn_pd_overlap.PERSISTENT if pred[1] else pred[0]
-
-
 def _fi_kv_counter_buffer(device: torch.device, kind: str) -> torch.Tensor | None:
     if not _FI_KV_COUNTER_ENABLED:
         return None
@@ -2013,13 +1963,6 @@ class FlashInferImpl(AttentionImpl):
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
-
-        # attn-pdo: create the side stream + private workspace now, before the
-        # KV-cache memory profiling, so the extra workspace is accounted for.
-        if attn_pd_overlap.ENABLED:
-            attn_pd_overlap.preallocate(
-                torch.device("cuda", torch.cuda.current_device())
-            )
 
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
@@ -2297,37 +2240,9 @@ class FlashInferImpl(AttentionImpl):
             assert self.o_sf_scale is None
             assert output.dtype != FP4_DTYPE
 
-        # Opt-in (VLLM_ATTN_PD_OVERLAP): run the prefill and the decode kernels
-        # of this mixed step on two streams (attn_pd_overlap.py); None = serial.
-        _pdo = (
-            attn_pd_overlap.plan(
-                num_prefill_tokens,
-                num_decode_tokens,
-                query.device,
-                ctx_ctas=(
-                    attn_metadata.prefill.pd_ctas
-                    or attn_metadata.prefill.ctx_tiles * self.num_heads
-                )
-                if attn_pd_overlap.WAVE_GATE and num_prefill_tokens > 0
-                else None,
-            )
-            if attn_pd_overlap.ENABLED
-            # cheap pre-check: below the decode-row minimum the hook is skipped
-            # entirely (no plan() call), so gated-off points pay ~no host time
-            and num_decode_tokens >= attn_pd_overlap.MIN_DEC_ROWS
-            and prefill_use_trtllm
-            and decode_with_trtllm_gen
-            and not use_dcp
-            and not self.is_kvcache_nvfp4
-            and output.dtype != FP4_DTYPE
-            else None
-        )
-
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
-            if _pdo is not None:
-                _pdo.enter("p")
             prefill_query = query[num_decode_tokens:]
             assert prefill_query.shape[0] == num_prefill_tokens
 
@@ -2435,8 +2350,6 @@ class FlashInferImpl(AttentionImpl):
                 prefill_query = prefill_query.contiguous()
                 prefill_query = canonicalize_singleton_dim_strides(prefill_query)
                 workspace_buffer = _get_trtllm_workspace_buffer()
-                if _pdo is not None:
-                    workspace_buffer = _pdo.workspace("p", workspace_buffer)
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
 
@@ -2551,11 +2464,7 @@ class FlashInferImpl(AttentionImpl):
                         num_decode_tokens : num_decode_tokens + num_prefill_tokens
                     ].copy_(out[:num_prefill_tokens])
 
-        if _pdo is not None:
-            _pdo.leave("p")
         if num_decode_tokens > 0:
-            if _pdo is not None:
-                _pdo.enter("d")
             decode_query_tokens = num_decode_tokens
             if decode_with_xqa:
                 assert isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode)
@@ -2643,8 +2552,6 @@ class FlashInferImpl(AttentionImpl):
                 decode_query = decode_query.contiguous()
                 decode_query = canonicalize_singleton_dim_strides(decode_query)
                 workspace_buffer = _get_trtllm_workspace_buffer()
-                if _pdo is not None:
-                    workspace_buffer = _pdo.workspace("d", workspace_buffer)
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
 
@@ -2781,17 +2688,12 @@ class FlashInferImpl(AttentionImpl):
                     ),
                     lse=lse,
                     return_lse=self.need_to_return_lse_for_decode,
-                    # F's persistent "gen" counter, overridden by attn-pdo's
-                    # private one when the decode runs on the side stream (dly).
-                    **{
-                        **_fi_kv_counter_kwargs(
-                            decode_query.device,
-                            decode_query.shape[0],
-                            decode_query.shape[1],
-                            "gen",
-                        ),
-                        **(_pdo.decode_kwargs() if _pdo is not None else {}),
-                    },
+                    **_fi_kv_counter_kwargs(
+                        decode_query.device,
+                        decode_query.shape[0],
+                        decode_query.shape[1],
+                        "gen",
+                    ),
                 )
 
                 if use_dcp:
@@ -2806,30 +2708,6 @@ class FlashInferImpl(AttentionImpl):
                     )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
-        if _pdo is not None:
-            _pdo.leave("d")
-            _pdo.join()
-            if attn_pd_overlap.check_due():
-                # Re-run this call serially on the same inputs and compare the
-                # output rows bitwise (the first VLLM_ATTN_PD_CHECK forks).
-                fork_out = output_padded[:num_actual_tokens].clone()
-                with attn_pd_overlap.serial_scope():
-                    self.forward(
-                        layer,
-                        query_padded,
-                        key,
-                        value,
-                        kv_cache,
-                        attn_metadata,
-                        output_padded,
-                        output_scale,
-                        output_block_scale,
-                    )
-                attn_pd_overlap.check_result(
-                    fork_out,
-                    output_padded[:num_actual_tokens],
-                    getattr(layer, "layer_name", "?"),
-                )
         return output_padded
 
     def do_kv_cache_update(
