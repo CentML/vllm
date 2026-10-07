@@ -29,11 +29,24 @@ after their own wait, but the GEMMs only start streaming weights after
   every PDL consumer of the GEMM output waits before touching it and writes
   nothing before its wait (audited for vLLM's current consumers; soak before
   adopting).
+* weights into shared memory before the wait (``LCD_FI_PREWAIT=1``
+  persistent, ``LCD_FI_PREWAITS=1`` split-K): the TMA warp arms the first
+  ``min(stages, k-blocks)`` pipeline stages of the CTA's first tile and issues
+  their weight copies (B + B-scale, or A + A-scale under swap-AB) before
+  ``griddepcontrol_wait``; TMEM is allocated before it; only the TMA warp
+  waits, then adds the activation copies of the armed stages. Weights are never
+  written by a predecessor, the MMA/epilogue warps follow the wait through the
+  stage mbarriers, so results are bit-identical;
+* trigger placement (``LCD_FI_TRIG`` persistent / ``LCD_FI_TRIGS`` split-K):
+  ``0`` stock (last instruction), ``1`` after the CTA's mainloop (MMA warp),
+  ``2`` after the last C store is issued (epilogue warps). Same consumer
+  requirement as the early trigger.
 
 Env (read when the overlay modules are imported; baked into the kernels):
   LCD_FI_OVERLAY=1  install the overlays (``vllm/__init__.py``). Default off.
   PFW, PFW_KB (0 = all k-blocks), PFW_TILES (first tiles per CTA), PFW_TRIG
   PFWS, PFWS_TRIG
+  LCD_FI_PREWAIT, LCD_FI_TRIG, LCD_FI_PREWAITS, LCD_FI_TRIGS (default 0)
   LCD_FI_OVERLAY_BASE_CHECK=0  skip the base-file sha256 guard (do not).
 
 A FlashInfer module is replaced only if the file it would have loaded is the
@@ -108,10 +121,13 @@ class _OverlayFinder(importlib.abc.MetaPathFinder):
             SKIPPED.append(fullname)
             return None
         LOADED.append(fullname)
+        e = os.environ.get
         _log(
             f"FlashInfer overlay {fullname} <- vllm/lcd_pdl/{f} "
-            f"(PFW={os.environ.get('PFW', '0')}/{os.environ.get('PFW_TRIG', '0')} "
-            f"PFWS={os.environ.get('PFWS', '0')}/{os.environ.get('PFWS_TRIG', '0')}, "
+            f"(PFW={e('PFW', '0')}/{e('PFW_TRIG', '0')} "
+            f"PFWS={e('PFWS', '0')}/{e('PFWS_TRIG', '0')} "
+            f"PREWAIT={e('LCD_FI_PREWAIT', '0')}/{e('LCD_FI_TRIG', '0')} "
+            f"PREWAITS={e('LCD_FI_PREWAITS', '0')}/{e('LCD_FI_TRIGS', '0')}, "
             f"pid {os.getpid()})"
         )
         return importlib.util.spec_from_file_location(fullname, os.path.join(_DIR, f))

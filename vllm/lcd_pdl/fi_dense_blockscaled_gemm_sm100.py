@@ -51,10 +51,23 @@ import os as _os
 # scales are only touched after the wait. Math is unchanged (bitwise). Env (read at import, baked at compile):
 #   PFW=1 enable; PFW_KB=<k-blocks to prefetch per tile, 0=all>; PFW_TILES=<first tiles per CTA>; PFW_TRIG=1 early
 #   launch_dependents right after the wait (consumers must griddepcontrol_wait before reading C).
+# [gemmpdl] LCD_FI_PREWAIT=1: before griddepcontrol_wait, the TMA warp acquires the first min(stages, k-blocks) stages
+# of the CTA's first tile and issues only their WEIGHT copies (B+SFB, or A+SFA under swap_ab) into shared memory, and
+# epilogue warp 0 allocates TMEM. Only the TMA warp executes griddepcontrol_wait; it then issues the activation copies
+# of the pre-armed stages (same mbarriers: the stage's tx-count covers both halves) and continues the stock loop. The
+# MMA/epilogue warps are causally after the wait through the stage mbarriers (no global read; C is stored after the
+# MMAs). With PFW=1 the L2 prefetch then covers the k-blocks after the staged ones. Same math, same tactic (bitwise).
+# LCD_FI_TRIG=<0|1|2>: griddepcontrol_launch_dependents placement. 0 = stock (last instruction). 1 = MMA warp after
+# the CTA's last mainloop. 2 = epilogue warps after the last C TMA store is issued (before the store drain and TMEM
+# dealloc). PDL consumers still wait for this grid's completion before reading C.
 _PFW = _os.environ.get("PFW", "0") == "1"
 _PFW_KB = int(_os.environ.get("PFW_KB", "0"))
 _PFW_TILES = int(_os.environ.get("PFW_TILES", "1"))
 _PFW_TRIG = _os.environ.get("PFW_TRIG", "0") == "1"
+_PREWAIT = _os.environ.get("LCD_FI_PREWAIT", "0") == "1"
+_TRIG = int(_os.environ.get("LCD_FI_TRIG", "0"))
+if _TRIG not in (0, 1, 2):
+    raise ValueError(f"LCD_FI_TRIG must be 0, 1 or 2, got {_TRIG}")
 
 
 
@@ -130,6 +143,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         self.pfw_tiles = _PFW_TILES
         self.pfw_trig = _PFW_TRIG
         self.pfw_weight_a = False
+        self.prewait = _PREWAIT
+        self.trig = _TRIG
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -796,8 +811,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         #
         # [gemm-smallm] PFW: weight L2 prefetch ahead of griddepcontrol_wait (weights only).
+        # With PREWAIT the prefetch is issued by the TMA warp after the staged weight copies (below).
         #
-        if cutlass.const_expr(self.pfw):
+        pf_kend = k_block_cnt
+        if cutlass.const_expr(self.pfw_kb > 0):
+            pf_kend = min(cutlass.Int32(self.pfw_kb), k_block_cnt)
+        if cutlass.const_expr(self.pfw and not self.prewait):
             if warp_idx == self.tma_warp_id:
                 pf_sched = utils.StaticPersistentTileScheduler.create(
                     tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -810,7 +829,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         if cutlass.const_expr(self.pfw_weight_a):
                             pf_a = tAgA[(None, pf_m, None, pf_coord[2])]
                             pf_sfa = tAgSFA[(None, pf_m, None, pf_coord[2])]
-                            for pf_k in cutlass.range(0, k_block_cnt, unroll=1):
+                            for pf_k in cutlass.range(0, pf_kend, unroll=1):
                                 cute.prefetch(tma_atom_a, pf_a[(None, pf_k)])
                                 cute.prefetch(tma_atom_sfa, pf_sfa[(None, pf_k)])
                         else:
@@ -820,7 +839,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                 pf_sn = pf_coord[1] // 2
                             pf_b = tBgB[(None, pf_n, None, pf_coord[2])]
                             pf_sfb = tBgSFB[(None, pf_sn, None, pf_coord[2])]
-                            for pf_k in cutlass.range(0, k_block_cnt, unroll=1):
+                            for pf_k in cutlass.range(0, pf_kend, unroll=1):
                                 cute.prefetch(tma_atom_b, pf_b[(None, pf_k)])
                                 cute.prefetch(tma_atom_sfb, pf_sfb[(None, pf_k)])
                         pf_sched.advance_to_next_work()
@@ -840,14 +859,89 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # behavior is controlled by use_pdl= in .launch(). The griddepcontrol
         # instructions are effectively no-ops when PDL is not enabled at
         # the driver level.
-        griddepcontrol_wait()
-        if cutlass.const_expr(self.pfw_trig):
-            griddepcontrol_launch_dependents()
+        # [gemmpdl] PREWAIT: only the TMA warp waits (inside its role branch below).
+        if cutlass.const_expr(not self.prewait):
+            griddepcontrol_wait()
+            if cutlass.const_expr(self.pfw_trig):
+                griddepcontrol_launch_dependents()
 
         #
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            #
+            # [gemmpdl] PREWAIT: arm the first stages of this CTA's first tile and
+            # issue their weight copies before griddepcontrol_wait. Weights (and
+            # their scale factors) are never written by a PDL predecessor.
+            #
+            pre_left = cutlass.Int32(0)
+            if cutlass.const_expr(self.prewait):
+                pre_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                pre_work = pre_sched.initial_work_tile_info()
+                if pre_work.is_valid_tile:
+                    pre_coord = pre_work.tile_idx
+                    pre_m = pre_coord[0] // cute.size(tiled_mma.thr_id.shape)
+                    pre_left = min(cutlass.Int32(self.num_ab_stage), k_block_cnt)
+                    pre_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, self.num_ab_stage
+                    )
+                    if cutlass.const_expr(self.pfw_weight_a):
+                        pre_a = tAgA[(None, pre_m, None, pre_coord[2])]
+                        pre_sfa = tAgSFA[(None, pre_m, None, pre_coord[2])]
+                        for _pre_k in cutlass.range(0, pre_left, 1, unroll=1):
+                            # First pass over the stages: the empty wait passes at once;
+                            # the leader arms the full barrier with the whole stage tx.
+                            ab_pipeline.producer_acquire(pre_state)
+                            cute.copy(
+                                tma_atom_a,
+                                pre_a[(None, pre_state.count)],
+                                tAsA[(None, pre_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfa,
+                                pre_sfa[(None, pre_state.count)],
+                                tAsSFA[(None, pre_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
+                            pre_state.advance()
+                        if cutlass.const_expr(self.pfw):
+                            for pf_k in cutlass.range(pre_left, pf_kend, unroll=1):
+                                cute.prefetch(tma_atom_a, pre_a[(None, pf_k)])
+                                cute.prefetch(tma_atom_sfa, pre_sfa[(None, pf_k)])
+                    else:
+                        pre_sn = pre_coord[1]
+                        if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                            pre_sn = pre_coord[1] // 2
+                        pre_b = tBgB[(None, pre_coord[1], None, pre_coord[2])]
+                        pre_sfb = tBgSFB[(None, pre_sn, None, pre_coord[2])]
+                        for _pre_k in cutlass.range(0, pre_left, 1, unroll=1):
+                            ab_pipeline.producer_acquire(pre_state)
+                            cute.copy(
+                                tma_atom_b,
+                                pre_b[(None, pre_state.count)],
+                                tBsB[(None, pre_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfb,
+                                pre_sfb[(None, pre_state.count)],
+                                tBsSFB[(None, pre_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                            pre_state.advance()
+                        if cutlass.const_expr(self.pfw):
+                            for pf_k in cutlass.range(pre_left, pf_kend, unroll=1):
+                                cute.prefetch(tma_atom_b, pre_b[(None, pf_k)])
+                                cute.prefetch(tma_atom_sfb, pre_sfb[(None, pf_k)])
+                griddepcontrol_wait()
+
             #
             # Persistent tile scheduling loop
             #
@@ -915,6 +1009,52 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
+                k_start = 0
+                if cutlass.const_expr(self.prewait):
+                    # [gemmpdl] PREWAIT: these stages were acquired (tx armed) and
+                    # their weight copies issued before the wait; add the activation.
+                    for _pre_k in cutlass.range(0, pre_left, 1, unroll=1):
+                        if cutlass.const_expr(self.pfw_weight_a):
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_slice[(None, ab_producer_state.count)],
+                                tBsB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=b_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_slice[(None, ab_producer_state.count)],
+                                tBsSFB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=sfb_full_mcast_mask,
+                            )
+                        else:
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_slice[(None, ab_producer_state.count)],
+                                tAsA[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                            cute.copy(
+                                tma_atom_sfa,
+                                tAgSFA_slice[(None, ab_producer_state.count)],
+                                tAsSFA[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
+                        ab_producer_state.advance()
+                    k_start = pre_left
+                    pre_left = cutlass.Int32(0)
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_block_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
@@ -923,7 +1063,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):
+                for k_block in cutlass.range(k_start, k_block_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -1232,6 +1372,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            # [gemmpdl] LCD_FI_TRIG=1: trigger dependents once this CTA's last
+            # mainloop is issued (any thread's trigger counts for the CTA).
+            if cutlass.const_expr(self.trig == 1):
+                griddepcontrol_launch_dependents()
+
             #
             # Wait for accumulator buffer empty
             #
@@ -1448,6 +1593,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+
+            # [gemmpdl] LCD_FI_TRIG=2: trigger dependents once the last C store is
+            # issued, before the TMEM dealloc and the store drain.
+            if cutlass.const_expr(self.trig == 2):
+                griddepcontrol_launch_dependents()
 
             #
             # Dealloc the tensor memory buffer
