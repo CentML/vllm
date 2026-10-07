@@ -65,12 +65,7 @@ def _reference(qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w, scale, ac
     return out, state
 
 
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("H,HV", [(2, 4), (1, 4), (4, 4)])
-@pytest.mark.parametrize("width", [4, 8])
-@pytest.mark.parametrize("act", ["silu", "sigmoid"])
-def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
-    torch.manual_seed(width + HV // H)
+def _inputs(state_dtype, H, HV, width):
     device = torch.device("cuda")
     n = 9
     # Varlen requests (1..width tokens); request 2 has an invalid source
@@ -94,7 +89,18 @@ def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
     gate = torch.randn(L, HV, V, device=device).to(torch.bfloat16)
     w = (1 + 0.1 * torch.randn(V, device=device)).to(torch.bfloat16)
     si, cu, acc = si.to(device), cu.to(device), acc.to(device)
-    out = torch.full((L, HV, V), 7.0, dtype=torch.bfloat16, device=device)
+    return n, lens, slots, L, (qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("H,HV", [(2, 4), (1, 4), (4, 4)])
+@pytest.mark.parametrize("width", [4, 8])
+@pytest.mark.parametrize("act", ["silu", "sigmoid"])
+def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
+    torch.manual_seed(width + HV // H)
+    n, lens, slots, L, args = _inputs(state_dtype, H, HV, width)
+    qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w = args
+    out = torch.full((L, HV, V), 7.0, dtype=torch.bfloat16, device=qkv.device)
     scale = K**-0.5
 
     ref_out, ref_state = _reference(
@@ -107,7 +113,7 @@ def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
 
     # The output is bf16-rounded twice (before and after the norm).
     torch.testing.assert_close(out.double(), ref_out, atol=3e-2, rtol=3e-2)
-    written = torch.zeros(slots, dtype=torch.bool, device=device)
+    written = torch.zeros(slots, dtype=torch.bool, device=qkv.device)
     for r in range(n):
         n_acc = int(acc[r])
         if 0 < n_acc <= width and int(si[r, n_acc - 1]) > 0:
@@ -120,6 +126,33 @@ def test_gdn_mtp_cuda_matches_reference(state_dtype, H, HV, width, act):
     )
     # Slots that no destination names keep their bytes.
     assert torch.equal(new_state[~written], state[~written])
+
+
+@pytest.mark.parametrize(
+    "tune", ["RS=1,LASTN=1,FADD2=1,PF=212", "RS=1,PF=1", "RPT=4,MINB=1,RS=1"]
+)
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("width", [4, 6, 8])
+def test_gdn_mtp_cuda_tuned_bitwise(tune, state_dtype, width):
+    """VLLM_GDN_MTP_CUDA_TUNE builds: same state and output bits as the stock
+    kernel (same per-element operations and reduction trees).
+    """
+    torch.manual_seed(width)
+    _, _, _, L, args = _inputs(state_dtype, 2, 4, width)
+    state = args[8]
+    res = []
+    for ext in (
+        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source("", pdl=False)),
+        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source(tune, pdl=True)),
+    ):
+        st = state.clone()
+        out = torch.full((L, 4, V), 7.0, dtype=torch.bfloat16, device=state.device)
+        run_args = list(args)
+        run_args[8] = st
+        assert ext.run(*run_args, out, K**-0.5, EPS, False)
+        res.append((st, out))
+    assert torch.equal(res[0][0], res[1][0])
+    assert torch.equal(res[0][1], res[1][1])
 
 
 def test_gdn_mtp_cuda_rejects_unsupported_layout():
