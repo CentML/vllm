@@ -114,11 +114,14 @@ class Sampler:
 
     def apply_staged_writes(self) -> None:
         if _STATE_DIRTY_GATE:
-            # Every UVA-backed / staged sampler state is written only from
+            # Every sampler state below (the DeviceParam sampling / penalty
+            # tables, the UVA-backed logit-bias, bad-words, logprob-token-ids,
+            # thinking-budget and trace-replay tensors, and their staged
+            # writes and pending reset lists) is written on the host only from
             # add_request (above), so a step without a new request has nothing
-            # to stage: skip re-copying ~15 unchanged host arrays into the next
-            # pool slot (exact: the current slot already holds this content,
-            # and pool rotation still happens on every write).
+            # to stage: skip re-copying the unchanged host arrays into the next
+            # pool slot (exact: the current slot already holds this content).
+            # A new per-step host writer must set self._lowc2_dirty.
             if not self._lowc2_dirty:
                 return
             self._lowc2_dirty = False
