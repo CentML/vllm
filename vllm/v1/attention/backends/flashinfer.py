@@ -85,6 +85,12 @@ from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
 )
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    ENABLED as PREFILL_GEN_ROUTING_ENABLED,
+)
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    trtllm_batch_context_with_kv_cache as routed_trtllm_batch_context_with_kv_cache,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -2157,6 +2163,13 @@ class FlashInferImpl(AttentionImpl):
             )
             self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
         self._device_sm_count: int | None = None
+        # Opt-in routing of eligible FP8 context launches to the trtllm-gen
+        # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
+        # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
+        self._prefill_gen_routing = (
+            PREFILL_GEN_ROUTING_ENABLED
+            and not current_platform.is_device_capability(107)
+        )
         self._persistent_ctx_kv_counter = envs.VLLM_FI_PERSISTENT_KV_COUNTER
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
@@ -2743,7 +2756,12 @@ class FlashInferImpl(AttentionImpl):
                             ),
                         )
                 else:
-                    trtllm_batch_context_with_kv_cache(
+                    trtllm_prefill = (
+                        routed_trtllm_batch_context_with_kv_cache
+                        if self._prefill_gen_routing
+                        else trtllm_batch_context_with_kv_cache
+                    )
+                    trtllm_prefill(
                         query=prefill_query,
                         kv_cache=mock_kv_cache,
                         workspace_buffer=workspace_buffer,

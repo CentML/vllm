@@ -6,7 +6,7 @@ FlashInfer runs its trtllm-gen context kernel persistent with multi-CTA KV
 disabled, so a short prefill chunk over a long cached prefix launches few CTAs
 and gets no KV parallelism. Eligible launches of
 ``flashinfer.prefill.trtllm_batch_context_with_kv_cache`` (FP8 e4m3 Q/KV,
-BF16 O, head_dim 256, page size 32, causal) can instead go to one of:
+BF16 O, head_dim 256, page size 32, causal) can instead go to:
 
 ``gen``
     The trtllm-gen GENERATION kernels through
@@ -23,29 +23,20 @@ BF16 O, head_dim 256, page size 32, causal) can instead go to one of:
         )
 
     so the route hands it a virtual SM count (see :func:`gen_vsm`).
-``f107``
-    A dedicated SM107 CuTe-DSL prefill kernel. It is not part of this module;
-    when it is not available in the build, an ``f107`` route fails and falls
-    back to the stock kernel (logged for the first failures).
 ``stock``
     The trtllm-gen context kernel (FlashInfer default).
 
 Routing uses host-known values only (T = total q tokens, B, max_q_len; never
 a device sync). With ``FMHA_GEN=1`` a launch goes to ``gen`` when
-``T <= FMHA_GEN_MAX_T`` or ``B > FMHA107_MAX_B``; otherwise to ``f107`` when
-``FMHA107_F107=1``, ``T >= FMHA107_MIN_TOKENS``,
-``max_kv >= FMHA107_MIN_KV`` and ``FMHA107_MIN_B <= B <= FMHA107_MAX_B``
-(and ``T <= FMHA107_MAX_TOKENS``, ``max_kv <= FMHA107_MAX_KV``); else stock.
-Unsupported launches, CUDA-graph capture, a too small workspace and any
-exception fall back to the stock kernel.
+``T <= FMHA_GEN_MAX_T`` or ``B > FMHA107_MAX_B``, and ``FMHA_GEN_RULE``
+accepts it; otherwise to stock. Unsupported launches, CUDA-graph capture, a
+too small workspace and any exception fall back to the stock kernel.
 
 Environment (read at import):
 
 * ``FMHA107=1`` enables the routing (default ``0``: stock path only).
 * ``FMHA107_LOG=1`` logs the route of each new (T, B) class.
-* ``FMHA107_F107`` (1), ``FMHA107_MIN_TOKENS`` (2048), ``FMHA107_MIN_KV``
-  (4096), ``FMHA107_MIN_B`` (1), ``FMHA107_MAX_B`` (1000000),
-  ``FMHA107_MAX_TOKENS`` (1e9), ``FMHA107_MAX_KV`` (1e9).
+* ``FMHA107_MAX_B`` (1000000).
 * ``FMHA_GEN=1`` enables the ``gen`` route (default 0), ``FMHA_GEN_MAX_T``
   (default: all), ``FMHA_GEN_TARGET`` (768), ``FMHA_GEN_MAX_S`` (8),
   ``FMHA_GEN_MAX_VSM`` (default: 8x the device SM count; bounds the
@@ -91,14 +82,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("FMHA107", "0") == "1"
-_F107 = os.environ.get("FMHA107_F107", "1") == "1"
-_MIN_TOKENS = int(os.environ.get("FMHA107_MIN_TOKENS", "2048"))
-_MIN_KV = int(os.environ.get("FMHA107_MIN_KV", "4096"))
 _LOG = os.environ.get("FMHA107_LOG", "0") == "1"
-_MIN_B = int(os.environ.get("FMHA107_MIN_B", "1"))
 _MAX_B = int(os.environ.get("FMHA107_MAX_B", "1000000"))
-_MAX_T = int(os.environ.get("FMHA107_MAX_TOKENS", "1000000000"))
-_MAX_KV = int(os.environ.get("FMHA107_MAX_KV", "1000000000"))
 _GEN = os.environ.get("FMHA_GEN", "0") == "1"
 _GEN_MAX_T = int(os.environ.get("FMHA_GEN_MAX_T", "1000000000"))
 _GEN_RULE = os.environ.get("FMHA_GEN_RULE", "rubin").strip().lower()
@@ -119,11 +104,9 @@ _GEN_REAL_B1_MAXQ = int(os.environ.get("FMHA_GEN_REAL_B1_MAXQ", "512"))
 _GEN_PDL = os.environ.get("FMHA_GEN_PDL", "0") == "1"
 
 _state: dict[str, Any] = {
-    "fwd": None,
     "logged": set(),
     "fail": 0,
     "calls": 0,
-    "routed": 0,
     "gen": 0,
     "gen_fn": None,
     "counter": None,
@@ -134,23 +117,14 @@ _state: dict[str, Any] = {
 if ENABLED:
     logger.info(
         "trtllm-gen prefill routing enabled (gen=%s rule=%s gen_max_t=%s "
-        "gen_target=%s max_vsm=%s, f107=%s min_tokens=%s max_b=%s)",
+        "gen_target=%s max_vsm=%s max_b=%s)",
         _GEN,
         _GEN_RULE,
         _GEN_MAX_T,
         _GEN_TARGET,
         _GEN_MAX_VSM if _GEN_MAX_VSM is not None else "8x SMs",
-        _F107,
-        _MIN_TOKENS,
         _MAX_B,
     )
-
-
-def _get_fwd():
-    """Forward entry point of the dedicated SM107 prefill kernel."""
-    if _state["fwd"] is None:
-        raise ImportError("the SM107 prefill kernel is not available in this build")
-    return _state["fwd"]
 
 
 def _supported(
@@ -348,19 +322,13 @@ def trtllm_batch_context_with_kv_cache(
     )
     T, B = int(query.shape[0]), int(batch_size)
     route = "stock"
-    if sup:
-        if _GEN and (T <= _GEN_MAX_T or B > _MAX_B):
-            if gen_rule_accepts(T, B, int(max_q_len)):
-                route = "gen"
-        elif (
-            _F107
-            and T >= _MIN_TOKENS
-            and int(max_kv_len) >= _MIN_KV
-            and _MIN_B <= B <= _MAX_B
-            and T <= _MAX_T
-            and int(max_kv_len) <= _MAX_KV
-        ):
-            route = "f107"
+    if (
+        sup
+        and _GEN
+        and (T <= _GEN_MAX_T or B > _MAX_B)
+        and gen_rule_accepts(T, B, int(max_q_len))
+    ):
+        route = "gen"
     if _LOG:
         key = (T // 128 if T < 1024 else 8 + T // 1024, min(B, 16), route)
         if key not in _state["logged"] and len(_state["logged"]) < 200:
@@ -374,38 +342,20 @@ def trtllm_batch_context_with_kv_cache(
                 route,
             )
     try:
-        if route == "gen":
-            if _gen(
-                query,
-                kv_cache,
-                workspace_buffer,
-                block_tables,
-                seq_lens,
-                max_q_len,
-                max_kv_len,
-                bmm1_scale,
-                batch_size,
-                cum_seq_lens_q,
-                out,
-            ):
-                _state["gen"] += 1
-                return out
-        elif route == "f107":
-            k, v = kv_cache
-            _get_fwd()(
-                query,
-                k.permute(0, 2, 1, 3),
-                v.permute(0, 2, 1, 3),
-                cu_seqlens_q=cum_seq_lens_q,
-                seqused_k=seq_lens,
-                max_seqlen_q=int(max_q_len),
-                max_seqlen_k=int(block_tables.shape[1]) * 32,
-                page_table=block_tables,
-                softmax_scale=float(bmm1_scale),
-                causal=True,
-                out=out,
-            )
-            _state["routed"] += 1
+        if route == "gen" and _gen(
+            query,
+            kv_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            batch_size,
+            cum_seq_lens_q,
+            out,
+        ):
+            _state["gen"] += 1
             return out
     except Exception as e:  # never break serving: fall back to the stock kernel
         _state["fail"] += 1
