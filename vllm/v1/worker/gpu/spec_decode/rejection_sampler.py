@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
@@ -125,6 +126,7 @@ class RejectionSampler:
     ):
         self.sampler = sampler
         self.watermark_key = watermark_key
+        self.use_fused = envs.VLLM_FUSED_REJECTION_SAMPLER
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -357,7 +359,8 @@ class RejectionSampler:
         temperature and bounded top-k/top-p as logits processing.
         """
         if (
-            draft_logits is not None
+            not self.use_fused
+            or draft_logits is not None
             or self.synthetic_conditional_rates is not None
             or self.use_block_verification
             or self.watermark_key is not None

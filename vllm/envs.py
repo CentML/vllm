@@ -258,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
     VLLM_SAMPLER_SPLIT_ROW_TOPK: bool = True
     VLLM_DRAFT_SPLIT_ROW_ARGMAX: bool = True
+    VLLM_FUSED_REJECTION_SAMPLER: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -1871,6 +1872,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DRAFT_SPLIT_ROW_ARGMAX": lambda: bool(
         int(os.getenv("VLLM_DRAFT_SPLIT_ROW_ARGMAX", "1"))
     ),
+    # Model Runner V2: single fused kernel for spec-decode verification of
+    # one-hot drafts with only penalties/temperature/bounded top-k/top-p.
+    # 0 uses the unfused sampling + rejection path.
+    "VLLM_FUSED_REJECTION_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_FUSED_REJECTION_SAMPLER", "1"))
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
@@ -2337,6 +2344,7 @@ def compile_factors() -> dict[str, object]:
         # the compiled model; not part of traced graphs.
         "VLLM_SAMPLER_SPLIT_ROW_TOPK",
         "VLLM_DRAFT_SPLIT_ROW_ARGMAX",
+        "VLLM_FUSED_REJECTION_SAMPLER",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives
