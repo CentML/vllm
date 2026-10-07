@@ -39,15 +39,6 @@ kernels with the same arguments in the same order. Also:
       Reuse is keyed on the identity of the step's input objects.
       GGM_MDCHECK=N: also run the full build for the first N derived builds and
       compare every field (mismatch -> warning, the full build is used).
-      VLLM_GDN_STEP_PLAN_MDREUSE_PTR_KEY=1: key the reuse on the (pointer, shape,
-      stride, device) of the accepted / draft-count tensors instead of object
-      identity (per-group slices of inference tensors are distinct objects, so
-      the identity key does not match on the V2 model runner).
-  VLLM_GDN_STEP_PLAN_LAZY_IDX=1 (with GGM_LAZY): the spec / non-spec token
-      permutation of mixed batches (repeat_interleave + argsort), read only by
-      the fallback paths, is deferred as well and computed by fill_lazy().
-      VLLM_GDN_STEP_PLAN_LAZY_IDX_CHECK=N: for the first N deferred builds also
-      compute the permutation eagerly and compare (mismatch -> eager values).
   VLLM_GDN_STEP_PLAN_LOG=1 (default) / VLLM_GDN_STEP_PLAN_LOG_EVERY=2000:
       log the plan counters every N fast-path plans.
 Whatever the plan cannot prove identical (verify mode, gather/scatter CP path,
@@ -94,9 +85,6 @@ VSDIRECT = os.environ.get("GGM_VSDIRECT", "0") == "1"
 LAZY = ENABLED and os.environ.get("GGM_LAZY", "0") == "1"
 MDREUSE = ENABLED and os.environ.get("GGM_MDREUSE", "0") == "1"
 MDCHECK = [int(os.environ.get("GGM_MDCHECK", "0"))]
-LAZY_IDX = LAZY and os.environ.get("VLLM_GDN_STEP_PLAN_LAZY_IDX", "0") == "1"
-LAZY_IDX_CHECK = [int(os.environ.get("VLLM_GDN_STEP_PLAN_LAZY_IDX_CHECK", "0"))]
-MDREUSE_PTR_KEY = os.environ.get("VLLM_GDN_STEP_PLAN_MDREUSE_PTR_KEY", "0") == "1"
 LOG = os.environ.get("VLLM_GDN_STEP_PLAN_LOG", "1") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_GDN_STEP_PLAN_LOG_EVERY", "2000"))
 
@@ -261,17 +249,6 @@ def group_materialize_non_spec(layer, md, per_layer) -> None:
         )
     # identical to gdn_state_commit.materialize_non_spec, once for the group
     items = min(items, slots.size(0))
-    from vllm.v1.attention.backends import gdn_fused_metadata
-
-    views = gdn_fused_metadata.mat_inputs(md, items)
-    if views is not None:
-        # VLLM_GDN_FUSED_MD_MAT: views of the fused metadata, same values as the
-        # zeros + slice copies below
-        gsc.materialize(
-            0, items, gt.gsc_table, gt.H, slots[:items], views[0], has_init=views[1]
-        )
-        STATS["mat_launches"] += 1
-        return
     n_src = getattr(md, "gsc_non_spec_num_accepted", None)
     n = torch.zeros(items, dtype=torch.int32, device=slots.device)
     if n_src is not None and n_src.numel() > 0:
@@ -456,17 +433,6 @@ def _materialize_rows(md, layers, gt):
     if slots is None or items <= 0:
         return
     items = min(items, slots.size(0))
-    from vllm.v1.attention.backends import gdn_fused_metadata
-
-    views = gdn_fused_metadata.mat_inputs(md, items)
-    if views is not None:
-        # VLLM_GDN_FUSED_MD_MAT: views of the fused metadata, same values as the
-        # zeros + slice copies below
-        gsc.materialize(
-            0, items, gt.gsc_table, gt.H, slots[:items], views[0], has_init=views[1]
-        )
-        STATS["mat_launches"] += 1
-        return
     n_src = getattr(md, "gsc_non_spec_num_accepted", None)
     n = torch.zeros(items, dtype=torch.int32, device=slots.device)
     if n_src is not None and n_src.numel() > 0:
@@ -612,9 +578,7 @@ def build_plan(layer, md, raw):
             gt = _TABLES[key] = _GroupTable(layers, gsc)
         if MAT:
             _materialize_rows(md, layers, gt)
-        if md.__dict__.get("_step_plan_zeroed"):
-            p.zero_done = True  # done by the GDN layer-graph builder step
-        elif ZERO and p.slots.numel() > 0:
+        if ZERO and p.slots.numel() > 0:
             _gdn_zero_state_slots_layers_kernel[(p.slots.numel(), gt.hv, gt.n)](
                 gt.ptrs,
                 p.slots,
@@ -892,70 +856,10 @@ def defer_metadata(md, pending) -> None:
     STATS["lazy_deferred"] = STATS.get("lazy_deferred", 0) + 1
 
 
-class LazyT:
-    """Deferred tensor op (VLLM_GDN_STEP_PLAN_LAZY_IDX): fn(*args, **kwargs), or
-    parent[key] for a slice of a deferred value.
-    """
-
-    __slots__ = ("fn", "args", "kwargs", "parent", "key")
-
-    def __init__(self, fn=None, args=(), kwargs=None, parent=None, key=None):
-        self.fn, self.args, self.kwargs, self.parent, self.key = (
-            fn,
-            args,
-            kwargs or {},
-            parent,
-            key,
-        )
-
-    def __getitem__(self, key):
-        return LazyT(parent=self, key=key)
-
-    def materialize(self):
-        if self.parent is not None:
-            return self.parent.materialize()[self.key]
-        args = tuple(a.materialize() if isinstance(a, LazyT) else a for a in self.args)
-        return self.fn(*args, **self.kwargs)
-
-
-_IDX_FIELDS = ("spec_token_indx", "non_spec_token_indx")
-
-
-def _fill_idx(md) -> None:
-    for f in _IDX_FIELDS:
-        v = md.__dict__.get(f)
-        if isinstance(v, LazyT):
-            md.__dict__[f] = v.materialize()
-            STATS["lazy_idx_filled"] = STATS.get("lazy_idx_filled", 0) + 1
-
-
-def check_lazy_indices(md, eager_build) -> None:
-    """VLLM_GDN_STEP_PLAN_LAZY_IDX_CHECK: compare the deferred token permutation
-    of md with an eager full build (eager_build()); use the eager one on
-    mismatch.
-    """
-    if LAZY_IDX_CHECK[0] > 0 and isinstance(md.__dict__.get("spec_token_indx"), LazyT):
-        LAZY_IDX_CHECK[0] -= 1
-        full = eager_build()
-        ok = all(
-            torch.equal(md.__dict__[f].materialize(), getattr(full, f))
-            for f in _IDX_FIELDS
-        )
-        STATS["lazy_idx_checked"] = STATS.get("lazy_idx_checked", 0) + 1
-        if not ok:
-            STATS["lazy_idx_check_fail"] = STATS.get("lazy_idx_check_fail", 0) + 1
-            logger.warning("GDN lazy token-index check mismatch; using eager indices")
-            md.spec_token_indx, md.non_spec_token_indx = (
-                full.spec_token_indx,
-                full.non_spec_token_indx,
-            )
-
-
 def fill_lazy(md) -> None:
     """Compute the deferred metadata of md (no-op if none is pending)."""
     if md is None:
         return
-    _fill_idx(md)
     lz = md.__dict__.pop("_step_plan_lazy", None)
     if not lz:
         return
@@ -971,20 +875,13 @@ def fill_lazy(md) -> None:
 # GGM_MDREUSE: GDN metadata of the other KV-cache groups derived from the first
 # ----------------------------------------------------------------------------
 _MDTPL: list = [None]
-_FLAG_KEYS = ("_step_plan", "_gsc_done", "_step_plan_graph", "_step_plan_zeroed")
+_FLAG_KEYS = ("_step_plan", "_gsc_done")
 
 
 def _base(t):
     if t is None:
         return None
-    if MDREUSE_PTR_KEY:
-        # identity of the storage region a (possibly re-sliced) tensor views
-        return (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.device.type)
     return t._base if t._base is not None else t
-
-
-def _same(a, b) -> bool:
-    return a == b if MDREUSE_PTR_KEY else a is b
 
 
 def _md_equal(a, b):
@@ -993,9 +890,6 @@ def _md_equal(a, b):
         if k.startswith("_step_plan") or k.startswith("_gsc"):
             continue
         x, y = a.__dict__.get(k), b.__dict__.get(k)
-        if isinstance(x, LazyT) or isinstance(y, LazyT):
-            x = x.materialize() if isinstance(x, LazyT) else x
-            y = y.materialize() if isinstance(y, LazyT) else y
         if isinstance(x, torch.Tensor) or isinstance(y, torch.Tensor):
             if (
                 not (isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor))
@@ -1066,8 +960,8 @@ def mdreuse_build(
             ("qsl_cpu", t["qsl_cpu"] is m.query_start_loc_cpu),
             ("qsl", t["qsl"] is m.query_start_loc),
             ("seq_lens", t["seq_lens"] is m.seq_lens),
-            ("nacc", _same(t["nacc"], _base(num_accepted_tokens))),
-            ("ndd", _same(t["ndd"], _base(num_decode_draft_tokens_cpu))),
+            ("nacc", t["nacc"] is _base(num_accepted_tokens)),
+            ("ndd", t["ndd"] is _base(num_decode_draft_tokens_cpu)),
             ("nreq", t["nreq"] == m.num_reqs),
             ("nat", t["nat"] == m.num_actual_tokens),
             ("num_spec", t["num_spec"] == builder.num_spec),
