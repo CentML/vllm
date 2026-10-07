@@ -133,12 +133,6 @@ _GDN_FI_HAS_MAXLEN = []
 # 64-row V slice), M=64 tcgen05 state GEMMs). Output and final state are bitwise identical to
 # FlashInfer's non-CP kernel.
 _GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "0") == "1"
-# VLLM_GDN_FI_VSPLIT_V1=1: also run the steps the rule leaves at v_split=1 on the
-# vendored kernel (same math, bitwise identical to FlashInfer's non-CP kernel)
-# instead of FlashInfer. FlashInfer's indexed state-pool mode drops the state
-# stride divisibility hint; the vendored adapter keeps it (SM103: 1-9% faster on
-# every measured v_split=1 step). Default 0 = FlashInfer for v_split=1.
-_GDN_FI_VSPLIT_V1 = os.environ.get("VLLM_GDN_FI_VSPLIT_V1", "0") == "1"
 _GDN_VSPLIT_STATE: dict = {}
 _GDN_FI_VSPLIT_CHECK = os.environ.get("VLLM_GDN_FI_VSPLIT_CHECK", "0") == "1"
 
@@ -157,7 +151,7 @@ def _gdn_vsplit_call(q, k, v, g_exp, beta, out, ssm_state, slots, cu_seqlens, at
         n = cu_seqlens.numel() - 1
         vsf = mod.choose_vsplit(n, q.size(0), int(getattr(attn_metadata, "prefill_max_seqlen", 0)),
                                 hv=v.size(1))
-        if vsf == 1 and not _GDN_FI_VSPLIT_V1:
+        if vsf == 1:
             return False
         if ssm_state.dtype not in (torch.float32, torch.bfloat16):
             if not st.get("warned_dtype"):
