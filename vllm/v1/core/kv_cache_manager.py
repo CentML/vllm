@@ -15,7 +15,6 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.sched import mamba_inline_ckpt
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -194,25 +193,6 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.fine_grained_prefix_cache = True
-        # [F122] in-step Mamba prefill checkpoints (VLLM_MAMBA_TAIL_CKPT=1): the
-        # scheduler's merge decisions, req -> (start, end, block boundary b or 0,
-        # partial-tail boundary T or 0), shared with every Mamba manager. Supported when every Mamba group is
-        # a GDN align-mode group with prefix caching (worker: gdn_inline_ckpt).
-        self.mamba_inline_tail_pending: dict[str, tuple[int, int, int, int]] = {}
-        mamba_mgrs = [
-            m
-            for m in self.coordinator.single_type_managers
-            if isinstance(m, MambaManager)
-        ]
-        self.mamba_inline_ckpt = (
-            mamba_inline_ckpt.ENABLED
-            and self.enable_caching
-            and bool(mamba_mgrs)
-            and all(m.supports_inline_ckpt for m in mamba_mgrs)
-        )
-        for m in mamba_mgrs:
-            m.inline_tail_pending = self.mamba_inline_tail_pending
-            m.inline_ckpt = self.mamba_inline_ckpt
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -916,49 +896,7 @@ class KVCacheManager:
             for source_block, cow_block in pending_copies
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
-        if self.mamba_inline_ckpt:
-            # [F122] checkpoint blocks: page copy (state at the chunk start) after
-            # the CoW copies; the allocation ref is released once the step that
-            # writes them has run
-            for mgr in self.coordinator.single_type_managers:
-                if isinstance(mgr, MambaManager):
-                    copies.extend(
-                        KVCacheBlockCopy(src_block_id=s.block_id, dst_block_id=d.block_id)
-                        for s, d in mgr.take_inline_copies()
-                    )
-                    retained_blocks.extend(mgr.take_inline_retained())
         return copies, retained_blocks
-
-    def take_mamba_inline_ckpts(
-        self,
-    ) -> dict[str, tuple[int, int, tuple[tuple[int, int, bool, dict[int, int]], ...]]]:
-        """[F122] Drain this step's in-step Mamba checkpoints for the worker:
-        ``{req_id: (start, end, ((position, kind, zero_init, {group_id: block_id}),
-        ...))}``, positions ascending. Every Mamba group must report the same
-        checkpoints for a request (same chunk, same rule).
-        """
-        merged: dict[str, tuple[int, int, dict[tuple[int, int, bool], dict[int, int]]]] = {}
-        for mgr in self.coordinator.single_type_managers:
-            if not isinstance(mgr, MambaManager):
-                continue
-            for req_id, (start, end, ckpts) in mgr.take_inline_ckpt_step().items():
-                ent = merged.setdefault(req_id, (start, end, {}))
-                assert ent[0] == start and ent[1] == end, (req_id, ent[:2], start, end)
-                for pos, kind, zero_init, block_id in ckpts:
-                    ent[2].setdefault((pos, kind, zero_init), {})[
-                        mgr.kv_cache_group_id
-                    ] = block_id
-        out = {}
-        num_groups = sum(
-            isinstance(m, MambaManager) for m in self.coordinator.single_type_managers
-        )
-        for req_id, (start, end, by_ckpt) in merged.items():
-            ckpts = []
-            for (pos, kind, zero_init), blocks in sorted(by_ckpt.items()):
-                assert len(blocks) == num_groups, (req_id, pos, kind, blocks)
-                ckpts.append((pos, kind, zero_init, blocks))
-            out[req_id] = (start, end, tuple(ckpts))
-        return out
 
     def take_boundary_state_offloads(
         self,

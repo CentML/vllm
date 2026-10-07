@@ -43,7 +43,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_inline_ckpt, gdn_layer_graphs
+from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1142,10 +1142,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
-        if not profile_only and gdn_inline_ckpt.ENABLED:
-            # [F122] compile the in-step checkpoint kernels before serving (0 runtime JIT)
-            with torch.inference_mode():
-                gdn_inline_ckpt.warmup(self)
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
@@ -1821,11 +1817,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
-            if gdn_inline_ckpt.ENABLED:
-                # [F122] this step's in-step GDN prefill checkpoints -> token rows
-                gdn_inline_ckpt.begin_step(
-                    scheduler_output, input_batch, self.kv_cache_config, self.device
-                )
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1837,8 +1828,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
-            if gdn_inline_ckpt.ENABLED:
-                gdn_inline_ckpt.end_step()
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,

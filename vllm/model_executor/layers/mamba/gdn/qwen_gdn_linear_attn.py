@@ -36,7 +36,6 @@ from vllm.model_executor.layers.mamba.gdn import (
     gdn_out_alloc,
     gdn_step_plan,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_inline_ckpt
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -2504,9 +2503,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self, mixed_qkvz, ba, core_attn_out
         ):
             # VLLM_GDN_LAYER_GRAPHS=1: served by this layer's CUDA graph
-            self._f122_graph = True  # [F122] its conv outputs are in the shared buffers
             return
-        self._f122_graph = False
         if norm_quant.NQF and norm_quant.gdn_packed_enabled(self, core_attn_out):
             # NQF=1: run the core with the gated RMSNorm writing out_proj's
             # MXFP8 input into static buffers, quantize the remaining rows and
@@ -3078,9 +3075,6 @@ def qwen_gdn_attention_core(
             a=a_or_z_out,
             core_attn_out=core_attn_out,
         )
-        if gdn_inline_ckpt.ENABLED:
-            # [F122] in-step prefill checkpoints of this layer
-            gdn_inline_ckpt.after_core(self, qkv_or_qkvz, b_or_ba, a_or_z_out)
 
 
 direct_register_custom_op(
@@ -3105,12 +3099,6 @@ def qwen_gdn_attention_core_fused_norm_packed(
         ba=ba,
         core_attn_out=core_attn_out,
     )
-    if gdn_inline_ckpt.ENABLED:
-        # [F122] in-step prefill checkpoints of this layer (any core path: layer
-        # graph, step plan, eager)
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-        b, a = self.split_ba(ba)
-        gdn_inline_ckpt.after_core(self, mixed_qkvz[:, :qkv_size], b, a, raw=(mixed_qkvz, ba))
 
 
 direct_register_custom_op(

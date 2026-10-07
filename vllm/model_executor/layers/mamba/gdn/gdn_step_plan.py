@@ -149,15 +149,6 @@ OVL_MAX_NS = int(os.environ.get("VLLM_GDN_SPEC_OVERLAP_MAX_NS", "0"))
 OVL_FAST = os.environ.get("VLLM_GDN_SPEC_OVERLAP_FAST", "0") == "1"
 _OVL_RES: dict = {}
 _OVL_FAST_RES: dict = {}
-# [F122] shared conv-output buffers (exact: same kernels; only the output buffers of the
-# prefill CUDA conv, which are the input buffers of the chunk kernel, move). On steps with
-# in-step GDN checkpoints (VLLM_MAMBA_TAIL_CKPT=1) the per-step buffers
-# (VLLM_GDN_STEP_PLAN_BUFS) are views of the GDN layer graphs' static T_MAX conv-output
-# buffers at ABSOLUTE token rows [S, S + P), so gdn_inline_ckpt's checkpoint replay graphs
-# (keyed on static addresses) also serve step-plan layers.
-# VLLM_GDN_STEP_PLAN_SHARED_BUFS=1 forces the shared buffers on every planned step
-# (det proof of exactness vs the per-step buffers; default 0).
-SHARED_BUFS_ALL = os.environ.get("VLLM_GDN_STEP_PLAN_SHARED_BUFS", "0") == "1"
 
 HOST_TRIMS = os.environ.get("GGM_OG2", "0") == "1"
 GROUP_MATERIALIZE = (
@@ -448,33 +439,7 @@ class _Plan:
         "names",
         "vs_direct",
         "conv_pre",
-        "f122",
     )
-
-
-def _f122_shared_bufs(dev, dt, H, HV, rows):
-    """[F122] The GDN layer graphs' static conv-output buffers (q, k, v, g, beta; T_MAX
-    rows) when this step's plan should write into them, else None: steps with in-step
-    GDN checkpoints (gdn_inline_ckpt has replay jobs) or VLLM_GDN_STEP_PLAN_SHARED_BUFS=1.
-    Never during a CUDA graph capture (the layer graphs own those steps)."""
-    if not SHARED_BUFS_ALL:
-        from vllm.model_executor.layers.mamba.gdn import gdn_inline_ckpt as _ic
-
-        if not (_ic.ENABLED and _ic.step_has_jobs()):
-            return None
-    if dt != torch.bfloat16 or torch.cuda.is_current_stream_capturing():
-        return None
-    try:
-        from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs as _lg
-    except ImportError:
-        # [F122] adapt: the shared buffers live in the GDN layer-graphs module
-        # (row 14 / #88-family); without it there are no static buffers to share.
-        return None
-
-    if rows > _lg.T_MAX:
-        STATS["shared_bufs_too_big"] = STATS.get("shared_bufs_too_big", 0) + 1
-        return None
-    return _lg._shared(dev, H, HV)
 
 
 def _vs_direct(p, q, v, st):
@@ -699,24 +664,16 @@ def build_plan(layer, md, raw):
     p.scale = 1.0 / math.sqrt(K)
     # ---- per-step buffers ----
     p.bufs = None
-    p.f122 = False
     if BUFS:
         HV = layer.num_v_heads // layer.tp_size
         dev, dt = conv_w.device, conv_w.dtype
-        sh = _f122_shared_bufs(dev, dt, H, HV, S + P)
-        if sh is not None:
-            # [F122] conv outputs at absolute token rows of the static shared buffers
-            p.bufs = tuple(t[S : S + P] for t in sh)
-            p.f122 = True
-            STATS["shared_bufs_plans"] = STATS.get("shared_bufs_plans", 0) + 1
-        else:
-            p.bufs = (
-                torch.empty(P, H, K, dtype=dt, device=dev),
-                torch.empty(P, H, K, dtype=dt, device=dev),
-                torch.empty(P, HV, V, dtype=dt, device=dev),
-                torch.empty(P, HV, dtype=torch.float32, device=dev),
-                torch.empty(P, HV, dtype=torch.float32, device=dev),
-            )
+        p.bufs = (
+            torch.empty(P, H, K, dtype=dt, device=dev),
+            torch.empty(P, H, K, dtype=dt, device=dev),
+            torch.empty(P, HV, V, dtype=dt, device=dev),
+            torch.empty(P, HV, dtype=torch.float32, device=dev),
+            torch.empty(P, HV, dtype=torch.float32, device=dev),
+        )
     # ---- group (all layers sharing this metadata object) ----
     p.zero_done = False
     if MAT or ZERO:
@@ -1414,9 +1371,6 @@ def forward_core_fused_norm(
             fill_lazy(md)
         return False
     run_plan(layer, p, md, mixed_qkv, b, a, output_gate, core_attn_out)
-    # [F122] this layer's prefill conv outputs are at absolute rows of the shared buffers
-    # (gdn_inline_ckpt replays the checkpoints from them); read by after_core
-    layer._f122_graph = "plan" if p.f122 else False
     return True
 
 

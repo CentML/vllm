@@ -19,7 +19,6 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
-from vllm.v1.core.sched import mamba_inline_ckpt
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -1496,19 +1495,6 @@ class MambaManager(SingleTypeKVCacheManager):
         # blocks in place. Other modes retain positional identity.
         return self.mamba_cache_mode != "align"
 
-    @property
-    def supports_inline_ckpt(self) -> bool:
-        """[F122] In-step prefill checkpoints are implemented for GDN align-mode
-        groups with one state block per request (deferred state commit layout)."""
-        spec = self.kv_cache_spec
-        return (
-            self.mamba_cache_mode == "align"
-            and self.enable_caching
-            and getattr(spec.mamba_type, "name", str(spec.mamba_type)) == "GDN_ATTN"
-            and spec.num_speculative_blocks == 0
-            and spec.num_prefill_checkpoint_blocks == 0
-        )
-
     def __init__(
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
@@ -1541,26 +1527,6 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
-        # [F122] in-step prefill checkpoints (VLLM_MAMBA_TAIL_CKPT=1; set up by
-        # KVCacheManager: the scheduler's shared tail decisions and the gate).
-        self.inline_tail_pending: dict[str, tuple[int, int, int, int]] = {}
-        self.inline_ckpt = False
-        # req -> (start, end) of the allocation being sized (get_num_blocks_to_allocate)
-        self._inline_alloc: dict[str, tuple[int, int]] = {}
-        # req -> (start, end, b, X, T, D, zero_init) between allocation and cache_blocks
-        self._inline_plan: dict[
-            str,
-            tuple[int, int, int, KVCacheBlock | None, int, KVCacheBlock | None, bool],
-        ] = {}
-        # this step's checkpoints for the worker:
-        # req -> (start, end, [(position, kind, zero_init, block_id), ...])
-        self._inline_step: dict[str, tuple[int, int, list[tuple[int, int, bool, int]]]] = {}
-        # checkpoint blocks retained until the step ran; their pre-copies
-        self._inline_retained: list[KVCacheBlock] = []
-        self._inline_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        self.num_inline_block_ckpts = 0
-        self.num_inline_block_skipped = 0
-        self.num_inline_tail_ckpts = 0
         # Opt-in superseded-checkpoint dropping (see the comment on
         # _MAMBA_DROP_SUPERSEDED_STATE_ENV at the top of this module).
         self.drop_superseded_state = (
@@ -2115,204 +2081,9 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            inline_blocks = 0
-            if self.inline_ckpt and not apply_admission_cap:
-                inline_blocks = self._size_inline_ckpt(
-                    request_id, total_computed_tokens, num_tokens
-                )
-            return num_new_blocks + num_evictable_computed_blocks + inline_blocks
-
-    # ------------------------------------------------------------------
-    # [F122] in-step prefill checkpoints
-    # ------------------------------------------------------------------
-    def _inline_ckpts_for(self, request_id: str, start: int, end: int) -> tuple[int, int]:
-        """The scheduler's merge decision for the prompt chunk [start, end),
-        re-validated against the chunk actually allocated: (b or 0, T or 0)."""
-        pend = self.inline_tail_pending.get(request_id)
-        if pend is None or pend[0] != start:
-            return 0, 0
-        _, p_end, b, t = pend
-        b = b if (b and start < b < end) else 0
-        t = t if (t and end == p_end and start < t < end) else 0
-        return b, t
-
-    def _size_inline_ckpt(self, request_id: str, start: int, end: int) -> int:
-        """Remember the chunk [start, end) of this allocation; returns the number
-        of extra blocks (0 or 1: the partial-tail checkpoint block) it needs."""
-        self._inline_alloc[request_id] = (start, end)
-        return int(self._inline_ckpts_for(request_id, start, end)[1] > 0)
-
-    def _plan_inline_ckpt(
-        self,
-        request_id: str,
-        partial_hit_source: KVCacheBlock | None,
-    ) -> None:
-        """After the regular align-mode allocation of [start, end): the
-        block-boundary checkpoint (column start // B, written in place by the
-        worker) and the partial-tail checkpoint block (reserved here, pre-filled
-        with the state at start by a queued page copy, keyed at T in
-        cache_blocks)."""
-        alloc = self._inline_alloc.pop(request_id, None)
-        if alloc is None:
-            return
-        start, end = alloc
-        req_blocks = self.req_to_blocks[request_id]
-        # (the shared decision dict is cleared by the scheduler after the step's
-        # allocations: every Mamba group reads it)
-        b, t = self._inline_ckpts_for(request_id, start, end)
-        x_block = None
-        if b:
-            # the column that held the chunk's initial state; the split flow
-            # leaves the state at b there
-            assert b == mamba_inline_ckpt.block_ckpt_position(
-                start, end, self.block_size
-            ), (request_id, start, end, b)
-            x_block = req_blocks[start // self.block_size]
-            assert not x_block.is_null, (request_id, start, end, b)
-        d_block = None
-        zero_init = False
-        if t:
-            assert t % self.block_size != 0, (request_id, start, end, t)
-            if partial_hit_source is not None:
-                src = partial_hit_source
-            elif start > 0:
-                src = req_blocks[(start - 1) // self.block_size]
-            else:
-                src = None
-            d_block = self.block_pool.get_new_blocks(1)[0]
-            # D's allocation ref is released once the step has run (the
-            # PIN / prefix cache keep it afterwards)
-            self._inline_retained.append(d_block)
-            if src is None or src.is_null:
-                zero_init = True  # fresh state (cold prompt): the worker zero-fills D
-            else:
-                # page copy src -> D before the forward (with the CoW copies).
-                # src takes no extra ref: it is the request's own block, or the
-                # CoW source, whose hit ref is retained until the step has run;
-                # so the superseded-checkpoint logic sees the split flow's refs.
-                self._inline_copies.append((src, d_block))
-        if b or d_block is not None:
-            self._inline_plan[request_id] = (start, end, b, x_block, t, d_block, zero_init)
-
-    def _cache_inline_ckpt(
-        self, request: Request, num_tokens: int
-    ) -> tuple[BlockHashWithGroupId | None, KVCacheBlock | None]:
-        """cache_blocks part: key the partial-tail checkpoint block at T and hand
-        this step's checkpoints to the worker."""
-        plan = self._inline_plan.pop(request.request_id, None)
-        if plan is None:
-            return None, None
-        start, end, b, x_block, t, d_block, zero_init = plan
-        assert num_tokens == end, (request.request_id, num_tokens, end)
-        ckpts: list[tuple[int, int, bool, int]] = []
-        if b:
-            assert x_block is not None
-            # Only a cached state must be right: with sparse retention the full
-            # block ending at b is usually not kept (no hash), and X is released
-            # once the request runs on its next column, so it needs no state.
-            if x_block.block_hash is not None:
-                assert x_block.block_hash_num_tokens == b, (
-                    request.request_id, b, x_block.block_hash_num_tokens)
-                ckpts.append(
-                    (b, mamba_inline_ckpt.KIND_BLOCK, False, x_block.block_id)
-                )
-                self.num_inline_block_ckpts += 1
-            else:
-                # not cached: X needs no state, but the worker still splits the
-                # tail checkpoint's replay at b like the split flow's chunks
-                ckpts.append(
-                    (b, mamba_inline_ckpt.KIND_SPLIT, False, x_block.block_id)
-                )
-                self.num_inline_block_skipped += 1
-        tail_hash = None
-        if d_block is not None:
-            tail_hash = self.block_pool.cache_partial_block(
-                request=request,
-                block=d_block,
-                num_tokens=t,
-                kv_cache_group_id=self.kv_cache_group_id,
-                block_size=self.block_size,
-            )
-            if tail_hash is not None:
-                self.cached_blocks_this_step.add(tail_hash)
-                ckpts.append(
-                    (t, mamba_inline_ckpt.KIND_TAIL, zero_init, d_block.block_id)
-                )
-                self.num_inline_tail_ckpts += 1
-            else:
-                d_block = None
-        if any(c[1] != mamba_inline_ckpt.KIND_SPLIT for c in ckpts):
-            # the running block (state at end): only read by the worker's VERIFY
-            run_block = self.req_to_blocks[request.request_id][
-                (end - 1) // self.block_size
-            ]
-            ckpts.append((end, mamba_inline_ckpt.KIND_RUN, False, run_block.block_id))
-            self._inline_step[request.request_id] = (start, end, ckpts)
-        return tail_hash, d_block
-
-    def take_inline_retained(self) -> list[KVCacheBlock]:
-        blocks = self._inline_retained
-        self._inline_retained = []
-        return blocks
-
-    def take_inline_copies(self) -> list[tuple[KVCacheBlock, KVCacheBlock]]:
-        copies = self._inline_copies
-        self._inline_copies = []
-        return copies
-
-    def take_inline_ckpt_step(
-        self,
-    ) -> dict[str, tuple[int, int, list[tuple[int, int, bool, int]]]]:
-        step = self._inline_step
-        self._inline_step = {}
-        return step
-
-    def _drop_inline_ckpt(self, request_id: str) -> None:
-        """The request is freed before the worker ran this step's checkpoints
-        (e.g. preempted after it was scheduled): forget their cache entries, the
-        blocks would not hold the promised states."""
-        self._inline_alloc.pop(request_id, None)
-        self.inline_tail_pending.pop(request_id, None)
-        plan = self._inline_plan.pop(request_id, None)
-        step = self._inline_step.pop(request_id, None)
-        blocks: list[KVCacheBlock] = []
-        if plan is not None:
-            blocks += [blk for blk in (plan[3], plan[5]) if blk is not None]
-        if step is not None:
-            ids = {
-                c[3]
-                for c in step[2]
-                if c[1] in (mamba_inline_ckpt.KIND_BLOCK, mamba_inline_ckpt.KIND_TAIL)
-            }
-            blocks += [
-                blk
-                for blk in self.req_to_blocks.get(request_id, ())
-                if not blk.is_null and blk.block_id in ids
-            ]
-            pinned = self._own_pin.get(request_id)
-            if pinned is not None and pinned.block_id in ids:
-                blocks.append(pinned)
-        for blk in blocks:
-            self.block_pool._maybe_evict_cached_block(blk)
+            return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
-    ) -> list[KVCacheBlock]:
-        if not (self.inline_ckpt and request_id in self._inline_alloc):
-            return self._allocate_new_blocks_impl(
-                request_id, num_tokens, num_tokens_main_model
-            )
-        # [F122] the CoW source (if any) holds the state at the chunk start
-        partial_hit = self._partial_hit_reqs.get(request_id)
-        new_blocks = self._allocate_new_blocks_impl(
-            request_id, num_tokens, num_tokens_main_model
-        )
-        self._plan_inline_ckpt(
-            request_id, partial_hit[1] if partial_hit is not None else None
-        )
-        return new_blocks
-
-    def _allocate_new_blocks_impl(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
@@ -2472,8 +2243,6 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
-            if self.inline_ckpt:
-                self._drop_inline_ckpt(request_id)
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
@@ -2527,20 +2296,12 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         partial_hash = None
-        inline_tail_block = None
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(
                 request, num_tokens, retention_interval=retention_interval
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
-            if self._inline_plan:
-                # [F122] partial-tail checkpoint written inside this step
-                inline_hash, inline_tail_block = self._cache_inline_ckpt(
-                    request, num_tokens
-                )
-                if partial_hash is None:
-                    partial_hash = inline_hash
         if self.drop_superseded_state:
             self._after_cache_blocks(
                 request, num_cached_blocks_before, num_cached_blocks_after, partial_hash
@@ -2554,8 +2315,6 @@ class MambaManager(SingleTypeKVCacheManager):
                 tail = self._partial_hit_reqs.get(request.request_id)
                 if tail is not None:
                     self._pin_own_checkpoint(request, tail[1])
-            if inline_tail_block is not None:
-                self._pin_own_checkpoint(request, inline_tail_block)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2583,10 +2342,6 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
-        if self.inline_ckpt:
-            # [F122] sizing / plan state never outlives one scheduling step
-            self._inline_alloc.clear()
-            self._inline_plan.clear()
 
     def _cache_partial_tail_block(
         self,

@@ -4195,12 +4195,6 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-        if getattr(scheduler_output, "mamba_inline_ckpts", None):
-            # [F122] the in-step GDN checkpoints are wired into the V2 runner only
-            raise RuntimeError(
-                "VLLM_MAMBA_TAIL_CKPT=1 requires the V2 model runner "
-                "(VLLM_USE_V2_MODEL_RUNNER=1)"
-            )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.

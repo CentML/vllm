@@ -294,19 +294,6 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
-    # [F122] In-step Mamba prefill checkpoints (VLLM_MAMBA_TAIL_CKPT=1):
-    # req_id -> (chunk start, chunk end,
-    #            ((position, kind, zero_init, {kv_cache_group_id: block id}), ...)).
-    # The worker writes the recurrent state at `position` into the block during
-    # this step's forward (kind 0: block-boundary state into the block-table
-    # column that held the chunk's initial state; kind 1: partial-tail state into
-    # a reserved checkpoint block, pre-filled with the state at the chunk start
-    # by kv_cache_block_copies unless zero_init).
-    mamba_inline_ckpts: (
-        dict[str, tuple[int, int, tuple[tuple[int, int, bool, dict[int, int]], ...]]]
-        | None
-    ) = None
-
     # Complete block-table rows that replace incrementally appended block IDs.
     block_table_updates: dict[str, tuple[list[int], ...]] | None = None
 
