@@ -36,6 +36,15 @@ Environment:
 * ``GS2_ROUTE_TAG`` (default ``exact_routing``): suffix of the module name.
 * ``GS2_ROUTE_PREBUILT``: path of the patched module's ``.so`` built from the
   same FlashInfer install (e.g. once per image); loaded instead of JIT-building.
+* ``VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE``: optional persistent directory
+  for the JIT-built module (ignored with ``GS2_ROUTE_PREBUILT``). FlashInfer
+  builds JIT modules inside its workspace, which serving launchers often make
+  fresh per process (minutes of nvcc per start for this module). With this
+  set, the built ``.so`` is copied to ``<dir>/<module>-<input hash>/<module>.so``
+  and later processes whose inputs hash the same (source bytes, compiler/linker
+  flags, include dirs, FlashInfer version, device capability) load it instead
+  of rebuilding. Start-up only: the loaded code is the code the build would
+  produce.
 * Read by the patched C++: ``GS2_ROUTE_MAXN`` (max ``numTokens * topK``,
   default 8192 = 1024 tokens at top-8, capped at 32768; above
   that the single CTA was slower than the cooperative kernel on VR), ``GS2_ROUTE_MINTOK`` (default 17),
@@ -60,6 +69,7 @@ from pathlib import Path
 
 import regex as re
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -243,6 +253,92 @@ def patched_sources(stock_sources: list[Path], out_dir: Path) -> dict[Path, Path
     return result
 
 
+def _module_cache_key(spec) -> str:
+    import flashinfer
+    import torch
+    from flashinfer.jit import env as jit_env
+
+    # Paths inside the (per-process) FlashInfer workspace are normalised, so the
+    # key does not depend on where the workspace lives; the generated headers
+    # there are a function of the FlashInfer version and the module flags.
+    ws = str(jit_env.FLASHINFER_WORKSPACE_DIR)
+    h = hashlib.sha256()
+    cap = torch.cuda.get_device_capability()
+    h.update(f"{spec.name}|{flashinfer.__version__}|{cap}".encode())
+    for p in spec.sources:
+        h.update(Path(p).name.encode())
+        h.update(Path(p).read_bytes())
+    groups = (
+        "extra_cflags",
+        "extra_cuda_cflags",
+        "extra_ldflags",
+        "extra_include_dirs",
+    )
+    for group in groups:
+        for item in getattr(spec, group, None) or []:
+            h.update(f"{group}={str(item).replace(ws, '<ws>')}".encode())
+    return h.hexdigest()[:16]
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=dst.name + ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(src.read_bytes())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _with_module_cache(spec):
+    """Return ``spec`` whose build output is shared through
+    ``VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE`` (see the module docstring).
+    """
+    cache_dir = envs.VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE
+    if not cache_dir:
+        return spec
+    cached = (
+        Path(cache_dir) / f"{spec.name}-{_module_cache_key(spec)}" / f"{spec.name}.so"
+    )
+
+    class _CachedSpec(type(spec)):
+        def try_load(self):
+            if cached.is_file():
+                try:
+                    # Materialise the cached build at the module's JIT path:
+                    # FlashInfer also opens that path directly (cubin loader).
+                    dst = Path(self.jit_library_path)
+                    _copy_atomic(cached, dst)
+                    module = self.load(dst)
+                    logger.info(
+                        "exact MoE routing: loaded %s from %s", self.name, cached
+                    )
+                    return module
+                except Exception as e:  # corrupt / incompatible copy: rebuild
+                    logger.warning(
+                        "exact MoE routing: cannot load %s (%r); rebuilding", cached, e
+                    )
+            return super().try_load()
+
+        def build(self, *args, **kwargs):
+            super().build(*args, **kwargs)
+            try:
+                _copy_atomic(Path(self.jit_library_path), cached)
+                logger.info("exact MoE routing: cached %s at %s", self.name, cached)
+            except Exception as e:  # the module still loads from the workspace
+                logger.warning(
+                    "exact MoE routing: could not cache %s (%r)", self.name, e
+                )
+
+    out = object.__new__(_CachedSpec)
+    out.__dict__.update(spec.__dict__)
+    return out
+
+
 def maybe_install() -> None:
     """Build (or load the prebuilt) FlashInfer trtllm fused-MoE module from the
     patched routing sources (no-op unless ``GS2_ROUTE`` enables it; idempotent).
@@ -254,6 +350,11 @@ def maybe_install() -> None:
     from flashinfer.jit import env as jit_env
 
     prebuilt = Path(PREBUILT) if PREBUILT else None
+    if prebuilt is not None and envs.VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE:
+        logger.warning(
+            "exact MoE routing: GS2_ROUTE_PREBUILT is set; ignoring "
+            "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE"
+        )
     if prebuilt is not None and not prebuilt.is_file():
         raise FileNotFoundError(prebuilt)
     orig = core.gen_trtllm_gen_fused_moe_sm100_module
@@ -274,6 +375,10 @@ def maybe_install() -> None:
                 ),
                 prebuilt=prebuilt,
             )
+        else:
+            # The persistent cache would load before the prebuilt module and
+            # shadow it, so it only applies to JIT builds.
+            new = _with_module_cache(new)
         logger.info(
             "exact MoE routing: module %s -> %s (%s), patched sources %s",
             spec.name,

@@ -310,6 +310,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
     VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
+    VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2127,6 +2128,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not cover keep PDL off.
     "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")
+    ),
+    # Persistent directory for the JIT-built exact-routing FlashInfer MoE module
+    # (GS2_ROUTE, flashinfer_exact_routing), keyed by a hash of its build
+    # inputs; ignored with GS2_ROUTE_PREBUILT. Empty = no cache.
+    "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE": lambda: os.getenv(
+        "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE", ""
     ),
     # SM107 only: run the small unquantized BF16 decode projections (MoE router,
     # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.
