@@ -188,14 +188,8 @@ def load(minb=None):
     c3p = int(os.environ.get("GDN_STATE_COMMIT_CK3_PF", "0"))  # CK=3: L2 prefetch distance (blocks)
     c3o = int(os.environ.get("GDN_STATE_COMMIT_CK3_ORDER", "0"))  # CK=3: token loads before state
     c3ps = int(os.environ.get("GDN_STATE_COMMIT_CK3_PFS", "1"))  # CK=3: prefetch includes the state
-    # [rubin-ck] CK=3: commit lane remap (k of the lane's chunk in registers; bitwise equal to CK=3)
-    c3r = int(os.environ.get("GDN_STATE_COMMIT_CK3_REMAP", "0"))
     tag = f"b{minb}_nc{nc}_f{f2}_p{ps}_r{pr}_x{fx}_e{ea}_ck{ck}_pdl{pdl}" + (f"_u{upd}" if upd != 1 else "") + (
-        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}" + (f"r{c3r}" if c3r else "") + "_v3" if ck == 3 else "_v4") + ("_mc2")
-    # compact materialize CTAs/SM bound for fp32 state (default 3 = Rubin rubin-ck build; GB300 [gx-alignc] uses 4)
-    matc_f32 = int(os.environ.get("GDN_STATE_COMMIT_MATC_MINB_F32", "3"))
-    if matc_f32 != 3:
-        tag += f"_matc{matc_f32}"
+        f"_c3f{c3f2}m{c3m}s{c3s}p{c3p}o{c3o}ps{c3ps}_v3" if ck == 3 else "_v4")
     build = os.path.join(build, f"sm{arch}_{tag}")
     os.makedirs(build, exist_ok=True)
     orig = cpp._get_cuda_arch_flags
@@ -206,7 +200,7 @@ def load(minb=None):
             name=f"_gdn_state_commit_{tag}",
             sources=[os.path.join(_HERE, "gdn_state_commit.cu")],
             # --use_fast_math: same as vLLM's build of fused_gdn_decode_kernel.cu (bit-exactness)
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}", f"-DGSC_CK3_REMAP={c3r}", f"-DGSC_MATC_MINB_F32={matc_f32}"],
+            extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20", "-lineinfo", f"-DGSC_MINB={minb}", f"-DGSC_NC={nc}", f"-DGSC_F2={f2}", f"-DGSC_PERSIST={ps}", f"-DGSC_PROBE={pr}", f"-DGSC_FAST={fx}", f"-DGSC_EARLY={ea}", f"-DGSC_CK={ck}", f"-DGSC_PDL={pdl}", f"-DGSC_CK2_UPD={upd}", f"-DGSC_CK3_F2={c3f2}", f"-DGSC_CK3_MAP={c3m}", f"-DGSC_CK3_STORE={c3s}", f"-DGSC_CK3_PF={c3p}", f"-DGSC_CK3_ORDER={c3o}", f"-DGSC_CK3_PFS={c3ps}"],
             extra_cflags=["-O3", "-std=c++20"],
             build_directory=build,
             verbose=False,
@@ -268,24 +262,15 @@ class LayerTable:
 
 
 def materialize(mode, num_items, table: LayerTable, H, a0, a1=None, a2=None, a3=None, a4=None,
-                has_init=None, bt_ptrs=None, bt_stride=0, block_size=0, idx_map=None, compact=0):
-    """compact > 0 ([rubin-ck], modes 1-3): grid (compact, H, layers) over only the items that pass the per-item
-    decision instead of (num_items, H, layers) mostly-empty CTAs. Same bytes written (bitwise)."""
+                has_init=None, bt_ptrs=None, bt_stride=0, block_size=0, idx_map=None):
     if num_items <= 0:
         return
     STATS["materialize_calls"] += 1
     i32 = lambda t: None if t is None else t.to(torch.int32).contiguous()  # noqa: E731
-    args = (int(mode), int(num_items), int(table.n), i32(a0), i32(a1), i32(a2), i32(a3),
-            i32(a4), None if has_init is None else has_init.to(torch.bool).contiguous(),
-            i32(idx_map), bt_ptrs, int(bt_stride), int(block_size), table.state, table.alog, table.dtb,
-            table.group, int(table.slot_stride), int(H), int(table.HV), int(table.dt_type), int(table.state_bf16))
-    ext = load()
-    if compact and int(mode) != 0 and hasattr(ext, "materialize_compact"):
-        logger.info_once("gdn_state_commit: compact align materialize active (VLLM_MAMBA_ALIGN_COMPACT=%d)",
-                         int(compact))
-        ext.materialize_compact(int(compact), *args)
-    else:
-        ext.materialize(*args)
+    load().materialize(int(mode), int(num_items), int(table.n), i32(a0), i32(a1), i32(a2), i32(a3),
+                       i32(a4), None if has_init is None else has_init.to(torch.bool).contiguous(),
+                       i32(idx_map), bt_ptrs, int(bt_stride), int(block_size), table.state, table.alog, table.dtb,
+                       table.group, int(table.slot_stride), int(H), int(table.HV), int(table.dt_type), int(table.state_bf16))
     _dbg(f"materialize mode={mode} items={num_items} layers={table.n}")
 
 
@@ -427,14 +412,6 @@ def forward_core_prologue(layer, md) -> None:
 # ----------------------------------------------------------------------------------------------
 # worker align-mode copies (v1/worker/mamba_utils.py MambaSpecDecodeGPUContext)
 # ----------------------------------------------------------------------------------------------
-def align_compact() -> int:
-    """[rubin-ck] VLLM_MAMBA_ALIGN_COMPACT=G (default 0 = off): the align-mode precopy / postprocess state copies
-    (stock conv copies in v1/worker/mamba_utils.py and the GDN ssm materialize here) run a grid of G CTAs per
-    (state, tile) / (key head, layer) over only the requests whose copy decision is taken, instead of one CTA per
-    request. Exact: the same bytes are written."""
-    return int(os.environ.get("VLLM_MAMBA_ALIGN_COMPACT", "0"))
-
-
 class _WorkerTables:
     table = None
     H = None
@@ -466,7 +443,7 @@ def worker_precopy(ctx, num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu, id
     STATS["precopy_calls"] += 1
     materialize(1, num_reqs, t, _WorkerTables.H, src_col_gpu, state_idx_gpu, token_bias_gpu,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size, idx_map=idx_mapping, compact=align_compact())
+                block_size=ctx.block_size, idx_map=idx_mapping)
 
 
 def worker_postprocess(ctx, num_reqs, num_accepted_tokens_gpu, mamba_state_idx_gpu,
@@ -480,7 +457,7 @@ def worker_postprocess(ctx, num_reqs, num_accepted_tokens_gpu, mamba_state_idx_g
     materialize(2, num_reqs, t, _WorkerTables.H, num_accepted_tokens_gpu, mamba_state_idx_gpu,
                 num_scheduled_tokens_gpu, num_computed_tokens_gpu, num_draft_tokens_gpu,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size, compact=align_compact())
+                block_size=ctx.block_size)
 
 
 def worker_postprocess_align(ctx, num_reqs, num_accepted_tokens_gpu, state_idx_gpu,
@@ -495,4 +472,4 @@ def worker_postprocess_align(ctx, num_reqs, num_accepted_tokens_gpu, state_idx_g
     materialize(3, num_reqs, t, _WorkerTables.H, ctx.num_accepted_tokens_out, state_idx_gpu,
                 None, new_num_computed_tokens_gpu, None,
                 bt_ptrs=ctx.block_table_ptrs, bt_stride=ctx.block_table_stride_req,
-                block_size=ctx.block_size, idx_map=idx_mapping, compact=align_compact())
+                block_size=ctx.block_size, idx_map=idx_mapping)

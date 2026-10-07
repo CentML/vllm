@@ -29,7 +29,6 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <algorithm>
 #include <cstdint>
 
 namespace gsc {
@@ -1375,15 +1374,6 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void deferred_decode_kernel(
 #ifndef GSC_CK3_F2
 #define GSC_CK3_F2 1  // 1: packed f32x2 commit; 0: scalar (same bits)
 #endif
-#ifndef GSC_CK3_REMAP
-#define GSC_CK3_REMAP 0  // [rubin-ck] 1 (row loop unrolled x2) / 2 (not unrolled): commit lane map chunk c = lane >> 1, row half hh = lane & 1, 8 rows per lane.
-                         // k_j of the lane's chunk is loaded once into registers (2 LDS.128 per j instead of 16) and
-                         // each row's c_j comes from a per-warp smem table written by the row-solve lanes. Same
-                         // per-element op sequence (fmul(s, G_R) then fma(c_j, k_j, .) for j < R ascending, RN bf16).
-#endif
-#if GSC_CK3_REMAP && !GSC_CK3_F2
-#error "GSC_CK3_REMAP needs GSC_CK3_F2=1"
-#endif
 __device__ __forceinline__ float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
 __device__ __forceinline__ uint32_t pack_rn(float a, float b) {
@@ -1541,11 +1531,6 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
   __shared__ CkRep s_rep;
   __shared__ CkNew s_new;
   __shared__ int s_last;
-#if GSC_CK3_REMAP
-  // [rubin-ck] per-warp c_j table, entry hh * 9 + r for warp row hh * 8 + r (padding puts rows r and 8 + r on
-  // different banks)
-  __shared__ __align__(16) float s_cc[kWarps][17][kMaxT];
-#endif
   __nv_bfloat16* vrep = svec;
   __nv_bfloat16* vnew = svec + 3 * kSplitRep;
 
@@ -1765,69 +1750,6 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
       }
     }
     const float GR = crep.GR;
-#if GSC_CK3_REMAP
-    // [rubin-ck] commit, lane = (chunk c = lane >> 1, row half hh = lane & 1), rows hh * 8 + r (r < 8) of this warp.
-    // Per element (row, col) the op sequence is unchanged: u = fmul(s, G_R) (f32x2 .ftz), then for j < R in
-    // ascending order u = fma(c_j[row], k_j[col], u) (f32x2 .ftz), then RN to bf16 -> bitwise equal to the CK3 map.
-    if (half == 0)
-      *reinterpret_cast<float4*>(&s_cc[warp][(rr >> 3) * 9 + (rr & 7)][0]) = make_float4(cc[0], cc[1], cc[2], cc[3]);
-    __syncwarp();
-    {
-      const int c = lane >> 1, hh = lane & 1;
-      unsigned long long kp[kMaxT][4];
-#pragma unroll
-      for (int j = 0; j < kMaxT; ++j) {
-        if (j < R) {
-          const float4 k0 = *reinterpret_cast<const float4*>(&sk[j][c * 8]);
-          const float4 k1 = *reinterpret_cast<const float4*>(&sk[j][c * 8 + 4]);
-          kp[j][0] = f2_pk(k0.x, k0.y);
-          kp[j][1] = f2_pk(k0.z, k0.w);
-          kp[j][2] = f2_pk(k1.x, k1.y);
-          kp[j][3] = f2_pk(k1.z, k1.w);
-        }
-      }
-      const unsigned long long gr2 = f2_pk(GR, GR);
-      const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(st)) + (warp * 16 + hh * 8) * (kDimK * 2);
-      __nv_bfloat16* gdst0 = head_state + (warp * 16 + hh * 8) * kDimK + c * 8;
-#if GSC_CK3_REMAP == 2
-#pragma unroll 1
-#else
-#pragma unroll 2
-#endif
-      for (int r = 0; r < 8; ++r) {
-        const uint32_t addr = sbase0 + r * (kDimK * 2) + ((c ^ r) << 4);  // row & 7 == r
-        uint4 sv4;
-        asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(sv4.x), "=r"(sv4.y), "=r"(sv4.z), "=r"(sv4.w)
-                     : "r"(addr));
-        const float4 cr = *reinterpret_cast<const float4*>(&s_cc[warp][hh * 9 + r][0]);
-        const float ccr[kMaxT] = {cr.x, cr.y, cr.z, cr.w};
-        const uint32_t w[4] = {sv4.x, sv4.y, sv4.z, sv4.w};
-        unsigned long long u[4];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) u[e] = f2_mul(f2_pk(bf_lo(w[e]), bf_hi(w[e])), gr2);
-#pragma unroll
-        for (int j = 0; j < kMaxT; ++j) {
-          if (j < R) {
-            const unsigned long long c2 = f2_pk(ccr[j], ccr[j]);
-#pragma unroll
-            for (int e = 0; e < 4; ++e) u[e] = f2_fma(c2, kp[j][e], u[e]);
-          }
-        }
-        uint32_t o[4];
-#pragma unroll
-        for (int e = 0; e < 4; ++e) o[e] = pack_rn(f2_lo(u[e]), f2_hi(u[e]));
-        asm volatile("st.shared.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(addr), "r"(o[0]), "r"(o[1]), "r"(o[2]), "r"(o[3])
-                     : "memory");
-#if GSC_CK3_STORE == 0
-        *reinterpret_cast<uint4*>(gdst0 + r * kDimK) = make_uint4(o[0], o[1], o[2], o[3]);
-#endif
-      }
-    }
-    __syncwarp();
-#if GSC_CK3_STORE == 1
-    mm_store_rows(head_state, st, warp, lane);
-#endif
-#else
     // commit: 8 chunks (8 cols each) of this lane's row half
     const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(st)) + row * (kDimK * 2);
     __nv_bfloat16* gdst = head_state + row * kDimK;
@@ -1888,7 +1810,6 @@ __global__ __launch_bounds__(kThreads, GSC_MINB) void ck3_decode_kernel(
     (void)gdst;
     mm_store_rows(head_state, st, warp, lane);
 #endif
-#endif  // GSC_CK3_REMAP
   }
   // ---- new tokens: outputs only
   mm_dots3(acc, st, vnew, kSplitNew, warp, lane);
@@ -2191,94 +2112,11 @@ struct MatArgs {
   int64_t slot_stride_floats;
   int H, HV, dt_bias_type;
   int state_bf16;
-  int num_items;  // [rubin-ck] items of the call (compact mode scans them)
-  int compact;    // [rubin-ck] > 0: grid (compact, H, layers) loops over the items that pass the per-item decision
 };
-
-// [rubin-ck] compact mode: the item list holds at most kMatMaxItems items (the host falls back above that).
-constexpr int kMatMaxItems = 1024;
-
-// [rubin-ck] the layer- and head-independent part of mat_item's per-item decision (modes 1-3): false exactly when
-// mat_item returns before any memory write for every (key head, layer). mat_item re-evaluates all of it.
-__device__ __forceinline__ bool mat_active(const MatArgs& args, int item) {
-  int r = item;
-  if (args.idx_map) {
-    r = args.idx_map[item];
-    if (r < 0) return false;
-  }
-  if (args.mode == 0) return true;
-  if (args.mode == 1) {
-    const int src_col = args.a0[r];
-    const int dst_col = args.a1[r];
-    return !(src_col < 0 || src_col == dst_col);
-  }
-  const int acc = args.a0[r];
-  const int running = args.mode == 2 ? args.a3[r] + args.a2[r] - args.a4[r] : args.a3[r] - acc + 1;
-  const int new_computed = running + acc - 1;
-  const int aligned = (new_computed / args.block_size) * args.block_size;
-  return !(aligned < running);
-}
-
-template <typename S, int VPK>
-__device__ __forceinline__ void mat_item(const MatArgs& args, const int item, const int key_head, const int layer);
 
 template <typename S, int VPK>
 __global__ __launch_bounds__(kThreads, 2) void materialize_kernel(MatArgs args) {
-  mat_item<S, VPK>(args, blockIdx.x, blockIdx.y, blockIdx.z);
-}
-
-// [gx-alignc] CTAs/SM bound of the compact kernel: fp32 state 4 (the default fp32 build is 64 regs / 4 CTAs/SM, and
-// 152 SMs x 4 = 608 >= the 480 (key head, layer) CTAs of one active item -> one wave), bf16 3 (rubin-ck's 80-reg build).
-// Default 3 for both state types = rubin-ck as shipped (the Rubin reference build); the GB300 fp32 value 4 is selected
-// with GDN_STATE_COMMIT_MATC_MINB_F32=4 (passed as -DGSC_MATC_MINB_F32 by load()).
-#ifndef GSC_MATC_MINB_F32
-#define GSC_MATC_MINB_F32 3
-#endif
-#ifndef GSC_MATC_MINB_BF16
-#define GSC_MATC_MINB_BF16 3
-#endif
-
-// [rubin-ck] compact mode (separate kernel so the default kernel's code and occupancy are unchanged): every CTA
-// builds the same ascending list of active items (one load round per item, spread over the CTA), then CTA x handles
-// list entries x, x + gridDim.x, ... for its (key head, layer). Per-item work is the unchanged mat_item -> the same
-// bytes are written as in the full (items, H, layers) grid.
-template <typename S, int VPK>
-__global__ __launch_bounds__(kThreads, sizeof(S) == 4 ? GSC_MATC_MINB_F32 : GSC_MATC_MINB_BF16)
-void materialize_compact_kernel(MatArgs args) {
-  __shared__ int s_list[kMatMaxItems];
-  __shared__ int s_wsum[kWarps];
-  __shared__ int s_cnt;
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  if (tid == 0) s_cnt = 0;
-  __syncthreads();
-  for (int base = 0; base < args.num_items; base += kThreads) {
-    const int it = base + tid;
-    const bool act = it < args.num_items && mat_active(args, it);
-    const unsigned bal = __ballot_sync(0xffffffffu, act);
-    if (lane == 0) s_wsum[warp] = __popc(bal);
-    __syncthreads();
-    if (act) {
-      int pos = s_cnt + __popc(bal & ((1u << lane) - 1u));
-      for (int w = 0; w < warp; ++w) pos += s_wsum[w];
-      s_list[pos] = it;
-    }
-    __syncthreads();
-    if (tid == 0) {
-      int t = 0;
-      for (int w = 0; w < kWarps; ++w) t += s_wsum[w];
-      s_cnt += t;
-    }
-    __syncthreads();
-  }
-  const int cnt = s_cnt;
-  for (int k = blockIdx.x; k < cnt; k += gridDim.x) {
-    __syncthreads();  // smem of the previous item is no longer read
-    mat_item<S, VPK>(args, s_list[k], blockIdx.y, blockIdx.z);
-  }
-}
-
-template <typename S, int VPK>
-__device__ __forceinline__ void mat_item(const MatArgs& args, const int item, const int key_head, const int layer) {
+  const int item = blockIdx.x, key_head = blockIdx.y, layer = blockIdx.z;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   int src = 0, dst = 0, n = 0;
   bool init = true;
@@ -2587,8 +2425,7 @@ void decode(torch::Tensor mixed_qkv, torch::Tensor a, torch::Tensor b, torch::Te
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-static void materialize_impl(int64_t compact, int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0,
-                 c10::optional<torch::Tensor> a1,
+void materialize(int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0, c10::optional<torch::Tensor> a1,
                  c10::optional<torch::Tensor> a2, c10::optional<torch::Tensor> a3, c10::optional<torch::Tensor> a4,
                  c10::optional<torch::Tensor> has_init, c10::optional<torch::Tensor> idx_map,
                  c10::optional<torch::Tensor> bt_ptrs, int64_t bt_stride,
@@ -2621,10 +2458,7 @@ static void materialize_impl(int64_t compact, int64_t mode, int64_t num_items, i
   m.slot_stride_floats = slot_stride_floats;
   m.H = static_cast<int>(H); m.HV = static_cast<int>(HV); m.dt_bias_type = static_cast<int>(dt_bias_type);
   m.state_bf16 = static_cast<int>(state_bf16);
-  m.num_items = static_cast<int>(num_items);
-  // [rubin-ck] compact mode only for the per-request copy modes (1-3) and item counts that fit the smem list
-  m.compact = (compact > 0 && mode != 0 && num_items <= kMatMaxItems) ? static_cast<int>(compact) : 0;
-  const dim3 grid(m.compact ? std::min<int64_t>(m.compact, num_items) : num_items, H, num_layers);
+  const dim3 grid(num_items, H, num_layers);
   auto stream = c10::cuda::getCurrentCUDAStream();
   if (m.state_bf16) {
     const int dyn = GSC_CK >= 2 ? kDimV * kDimK * 2 : 0;
@@ -2632,63 +2466,15 @@ static void materialize_impl(int64_t compact, int64_t mode, int64_t num_items, i
     if (dyn > 0 && !mat_attr) {  // static + dynamic > 48 KB needs the opt-in
       C10_CUDA_CHECK(cudaFuncSetAttribute(materialize_kernel<__nv_bfloat16, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
       C10_CUDA_CHECK(cudaFuncSetAttribute(materialize_kernel<__nv_bfloat16, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
-      C10_CUDA_CHECK(cudaFuncSetAttribute(materialize_compact_kernel<__nv_bfloat16, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
-      C10_CUDA_CHECK(cudaFuncSetAttribute(materialize_compact_kernel<__nv_bfloat16, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
       mat_attr = true;
     }
-    if (m.compact) {
-      if (HV / H == 2) materialize_compact_kernel<__nv_bfloat16, 2><<<grid, kThreads, dyn, stream>>>(m);
-      else materialize_compact_kernel<__nv_bfloat16, 1><<<grid, kThreads, dyn, stream>>>(m);
-    } else {
-      if (HV / H == 2) materialize_kernel<__nv_bfloat16, 2><<<grid, kThreads, dyn, stream>>>(m);
-      else materialize_kernel<__nv_bfloat16, 1><<<grid, kThreads, dyn, stream>>>(m);
-    }
-  } else if (m.compact) {
-    if (HV / H == 2) materialize_compact_kernel<float, 2><<<grid, kThreads, 0, stream>>>(m);
-    else materialize_compact_kernel<float, 1><<<grid, kThreads, 0, stream>>>(m);
+    if (HV / H == 2) materialize_kernel<__nv_bfloat16, 2><<<grid, kThreads, dyn, stream>>>(m);
+    else materialize_kernel<__nv_bfloat16, 1><<<grid, kThreads, dyn, stream>>>(m);
   } else {
     if (HV / H == 2) materialize_kernel<float, 2><<<grid, kThreads, 0, stream>>>(m);
     else materialize_kernel<float, 1><<<grid, kThreads, 0, stream>>>(m);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void materialize(int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0, c10::optional<torch::Tensor> a1,
-                 c10::optional<torch::Tensor> a2, c10::optional<torch::Tensor> a3, c10::optional<torch::Tensor> a4,
-                 c10::optional<torch::Tensor> has_init, c10::optional<torch::Tensor> idx_map,
-                 c10::optional<torch::Tensor> bt_ptrs, int64_t bt_stride,
-                 int64_t block_size, torch::Tensor layer_state, torch::Tensor layer_alog, torch::Tensor layer_dtb,
-                 torch::Tensor layer_group, int64_t slot_stride_floats, int64_t H, int64_t HV, int64_t dt_bias_type,
-                 int64_t state_bf16) {
-  materialize_impl(0, mode, num_items, num_layers, a0, a1, a2, a3, a4, has_init, idx_map, bt_ptrs, bt_stride, block_size,
-                   layer_state, layer_alog, layer_dtb, layer_group, slot_stride_floats, H, HV, dt_bias_type, state_bf16);
-}
-
-// [rubin-ck] same as materialize, with the item-compacting grid (compact = CTAs along x per (key head, layer)).
-void materialize_compact(int64_t compact, int64_t mode, int64_t num_items, int64_t num_layers, torch::Tensor a0,
-                         c10::optional<torch::Tensor> a1, c10::optional<torch::Tensor> a2,
-                         c10::optional<torch::Tensor> a3, c10::optional<torch::Tensor> a4,
-                         c10::optional<torch::Tensor> has_init, c10::optional<torch::Tensor> idx_map,
-                         c10::optional<torch::Tensor> bt_ptrs, int64_t bt_stride, int64_t block_size,
-                         torch::Tensor layer_state, torch::Tensor layer_alog, torch::Tensor layer_dtb,
-                         torch::Tensor layer_group, int64_t slot_stride_floats, int64_t H, int64_t HV,
-                         int64_t dt_bias_type, int64_t state_bf16) {
-  materialize_impl(compact, mode, num_items, num_layers, a0, a1, a2, a3, a4, has_init, idx_map, bt_ptrs, bt_stride,
-                   block_size, layer_state, layer_alog, layer_dtb, layer_group, slot_stride_floats, H, HV,
-                   dt_bias_type, state_bf16);
-}
-
-// [rubin-ck] materialize kernel (bf16 state, VPK 2; compact != 0 -> the compact kernel):
-// blocks/SM * 1e6 + regs * 1e3 + static smem KB (+ local * 1e9)
-int64_t occupancy_mat(int64_t compact) {
-  constexpr int kDyn = kDimV * kDimK * 2;
-  auto fn = compact ? materialize_compact_kernel<__nv_bfloat16, 2> : materialize_kernel<__nv_bfloat16, 2>;
-  C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kDyn));
-  int n = 0;
-  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, kThreads, kDyn));
-  cudaFuncAttributes fa;
-  C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, fn));
-  return static_cast<int64_t>(fa.localSizeBytes) * 1000000000LL + n * 1000000 + fa.numRegs * 1000 + fa.sharedSizeBytes / 1024;
 }
 
 int64_t occupancy() {
@@ -2738,8 +2524,6 @@ int64_t log_bytes(int64_t H, int64_t HV) { return log_layout(static_cast<int>(H)
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode", &gsc::decode);
   m.def("materialize", &gsc::materialize);
-  m.def("materialize_compact", &gsc::materialize_compact);
-  m.def("occupancy_mat", &gsc::occupancy_mat);
   m.def("log_bytes", &gsc::log_bytes);
   m.def("occupancy", &gsc::occupancy);
   m.def("occupancy_bf16", &gsc::occupancy_bf16);
