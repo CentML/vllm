@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -828,6 +829,77 @@ def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
 # KV storage, so a released KV cache is freed.
 _cow_copy_plans: dict[tuple, tuple[torch.Tensor, int, int] | None] = {}
 
+# VLLM_KV_COW_LAYOUT_CACHE=1: the copy plan (or None: per-storage path) of a
+# kv_caches list, keyed on num_blocks and each cache's memory layout (data
+# pointer, storage offset, shape, strides, dtype, CUDA or not). The layout walk
+# reads nothing else except the storages' sizes, which only change with the
+# allocation (and so the data pointer). Skips the walk and the plan-key build
+# on every copy call after the first one.
+KV_COW_LAYOUT_CACHE = os.environ.get("VLLM_KV_COW_LAYOUT_CACHE", "0") == "1"
+_COW_LAYOUT_CACHE_MAX = 64
+# Values: (device, plan) or None; like _cow_copy_plans, addresses only (the
+# anchor storage is kv_caches[0]'s, taken from the caches on every call).
+_cow_layout_plans: dict[
+    tuple, tuple[torch.device, tuple[torch.Tensor, int, int]] | None
+] = {}
+
+
+def _cow_layout_key(kv_caches: list[torch.Tensor], num_blocks: int) -> tuple:
+    return (
+        num_blocks,
+        tuple(
+            (
+                c.data_ptr(),
+                c.storage_offset(),
+                c.shape,
+                c.stride(),
+                c.dtype,
+                c.is_cuda,
+            )
+            for c in kv_caches
+        ),
+    )
+
+
+def _cow_copy_plan(
+    kv_caches: list[torch.Tensor], num_blocks: int
+) -> tuple[torch.device, torch.UntypedStorage, tuple[torch.Tensor, int, int]] | None:
+    """(device, anchor storage, one-launch copy plan) of ``kv_caches``, or
+    None (per-storage path).
+    """
+    layout = _cow_copy_rows(kv_caches, num_blocks)
+    if layout is None:
+        return None
+    device, anchor_storage, rows = layout
+    key = (device, anchor_storage.data_ptr(), num_blocks, rows)
+    if key not in _cow_copy_plans:
+        _cow_copy_plans[key] = _make_cow_copy_plan(
+            device, anchor_storage, rows, num_blocks
+        )
+    plan = _cow_copy_plans[key]
+    return None if plan is None else (device, anchor_storage, plan)
+
+
+def _cow_copy_plan_cached(
+    kv_caches: list[torch.Tensor], num_blocks: int
+) -> tuple[torch.device, torch.UntypedStorage, tuple[torch.Tensor, int, int]] | None:
+    """``_cow_copy_plan`` memoized on the caches' layout
+    (VLLM_KV_COW_LAYOUT_CACHE). The anchor is kv_caches[0]'s storage, as in
+    ``_cow_copy_rows``; its address is part of the key.
+    """
+    key = _cow_layout_key(kv_caches, num_blocks)
+    try:
+        entry = _cow_layout_plans[key]
+    except KeyError:
+        if len(_cow_layout_plans) >= _COW_LAYOUT_CACHE_MAX:
+            _cow_layout_plans.clear()
+        full = _cow_copy_plan(kv_caches, num_blocks)
+        _cow_layout_plans[key] = None if full is None else (full[0], full[2])
+        return full
+    if entry is None:
+        return None
+    return entry[0], kv_caches[0].untyped_storage(), entry[1]
+
 
 def _cow_copy_rows(kv_caches: Iterable[torch.Tensor], num_blocks: int) -> tuple | None:
     """Scheduler-block rows exactly as the per-storage path copies them: one
@@ -929,26 +1001,29 @@ def copy_kv_cache_blocks_inplace(
     plan = None
     # Direct row copies equal gather-then-scatter only when destinations are
     # unique and no block is both a source and a destination.
-    direct_copy_safe = (
-        len(np.unique(dst_np)) == len(dst_np)
-        and not np.intersect1d(src_np, dst_np).size
-    )
+    if KV_COW_LAYOUT_CACHE:
+        # Same predicate on the (few) host pairs, without numpy.
+        dsts = {copy[1] for copy in kv_cache_block_copies}
+        direct_copy_safe = len(dsts) == len(kv_cache_block_copies) and dsts.isdisjoint(
+            copy[0] for copy in kv_cache_block_copies
+        )
+    else:
+        direct_copy_safe = (
+            len(np.unique(dst_np)) == len(dst_np)
+            and not np.intersect1d(src_np, dst_np).size
+        )
     if envs.VLLM_KV_COW_ONE_LAUNCH and direct_copy_safe:
-        layout = _cow_copy_rows(kv_caches, num_blocks)
-        if layout is not None:
-            device, anchor_storage, rows = layout
-            key = (device, anchor_storage.data_ptr(), num_blocks, rows)
-            if key not in _cow_copy_plans:
-                _cow_copy_plans[key] = _make_cow_copy_plan(
-                    device, anchor_storage, rows, num_blocks
-                )
-            plan = _cow_copy_plans[key]
+        plan = (
+            _cow_copy_plan_cached(kv_caches, num_blocks)
+            if KV_COW_LAYOUT_CACHE
+            else _cow_copy_plan(kv_caches, num_blocks)
+        )
     if plan is None:
         _copy_kv_cache_blocks_inplace_per_storage(
             kv_caches, num_blocks, indices_np, direct_copy_safe=direct_copy_safe
         )
         return
-    table, num_entries, max_len16 = plan
+    device, anchor_storage, (table, num_entries, max_len16) = plan
     anchor = torch.empty(0, dtype=torch.int32, device=device)
     anchor.set_(anchor_storage, 0, (anchor_storage.nbytes() // 4,))
     indices = async_tensor_h2d(np.concatenate([src_np, dst_np]), device=device)

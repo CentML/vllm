@@ -26,6 +26,14 @@ def _enable_copy_paths(monkeypatch):
     monkeypatch.setenv("VLLM_FUSED_KV_BLOCK_COPY", "1")
 
 
+@pytest.fixture(autouse=True, params=[False, True], ids=["walk", "layout_cache"])
+def layout_cache(request, monkeypatch):
+    """Every test with and without VLLM_KV_COW_LAYOUT_CACHE."""
+    monkeypatch.setattr(worker_utils, "KV_COW_LAYOUT_CACHE", request.param)
+    worker_utils._cow_layout_plans.clear()
+    return request.param
+
+
 def _hybrid_views(
     raw, layout, attn_dtype, block_size, kernel_block_size, ssm_dtype=torch.float32
 ):
@@ -86,6 +94,7 @@ def _run(
     )
     worker_utils._cow_copy_plans.clear()
     ref_raw = raw.clone()
+    worker_utils._cow_layout_plans.clear()
     worker_utils.copy_kv_cache_blocks_inplace(make_caches(raw), NUM_BLOCKS, copies)
     _gather_copy(make_caches(ref_raw), copies)
     torch.accelerator.synchronize()
@@ -294,3 +303,63 @@ def test_supported_hybrid_layouts_copy_exactly(layout):
         return _hybrid_views(raw, layout, torch.bfloat16, 128, None)
 
     _run(make, _copies(5))
+
+
+def test_layout_cache_walks_once_per_layout(layout_cache, monkeypatch):
+    """With the cache, the caches are walked once per layout; a new
+    allocation or another view layout is walked again and copied correctly,
+    and an unsupported layout's per-storage fallback is remembered too.
+    """
+    if not layout_cache:
+        pytest.skip("cache only")
+    monkeypatch.setenv("VLLM_KV_COW_ONE_LAUNCH", "1")
+    walks: list[int] = []
+    real = worker_utils._cow_copy_rows
+
+    def _counted_walk(*args):
+        walks.append(1)
+        return real(*args)
+
+    monkeypatch.setattr(worker_utils, "_cow_copy_rows", _counted_walk)
+
+    def lbhnc(raw):
+        return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None)
+
+    def split(raw):
+        return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, 64)
+
+    def head_split(raw):
+        return _hybrid_views(raw, KVCacheLayout.LHBNC, torch.bfloat16, 128, None)
+
+    raw = torch.randint(
+        -128, 127, (_raw_bytes(torch.bfloat16),), dtype=torch.int8, device="cuda"
+    )
+
+    def copy_and_check(make, raw, copies):
+        ref_raw = raw.clone()
+        worker_utils.copy_kv_cache_blocks_inplace(make(raw), NUM_BLOCKS, copies)
+        worker_utils._copy_kv_cache_blocks_inplace_per_storage(
+            make(ref_raw), NUM_BLOCKS, np.array(copies, dtype=np.int64)
+        )
+        torch.accelerator.synchronize()
+        assert torch.equal(raw, ref_raw)
+
+    # Fresh view objects of the same tensors each call (as a runner may hand
+    # over): one walk.
+    for seed in range(3):
+        copy_and_check(lbhnc, raw, _copies(4, seed=seed))
+    assert len(walks) == 1
+    # Same bytes, other view layout (kernel blocks of 64): a new key.
+    copy_and_check(split, raw, _copies(4, seed=5))
+    assert len(walks) == 2
+    # A new allocation (the cache tensors changed): walked again.
+    raw2 = raw.clone()
+    copy_and_check(lbhnc, raw2, _copies(6, seed=6))
+    assert len(walks) == 3
+    copy_and_check(lbhnc, raw2, _copies(2, seed=7))
+    assert len(walks) == 3
+    # Unsupported layout: the per-storage path, also from the cache.
+    copy_and_check(head_split, raw, _copies(3, seed=8))
+    copy_and_check(head_split, raw, _copies(3, seed=9))
+    assert len(walks) == 4
+    assert any(plan is None for plan in worker_utils._cow_layout_plans.values())
