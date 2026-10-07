@@ -1819,8 +1819,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
     ),
     # MTP draft prefill: compute the FlashInfer prefill attention of the draft
-    # layer only for each prefill request's last (sampled) row; the other rows'
-    # outputs are discarded by the speculator.
+    # layer only for the row each prefill request samples (the speculator's
+    # last_token_indices); the other rows' outputs are discarded.
     "VLLM_MTP_DRAFT_PREFILL_PRUNE": lambda: bool(
         int(os.getenv("VLLM_MTP_DRAFT_PREFILL_PRUNE", "0"))
     ),

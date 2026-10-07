@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
 from vllm import envs
@@ -39,7 +40,13 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "compact_topk_indices")
         )
         if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
-            _enable_draft_prefill_prune(draft_model)
+            # Under prefill context parallelism the draft prefill is re-laid
+            # out, so last_token_indices does not index the attention's rows.
+            # The PCP manager is attached after model load; read the config.
+            pcp = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+            _enable_draft_prefill_prune(
+                draft_model, None if pcp else self.last_token_indices
+            )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -66,22 +73,34 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             self.model.model.set_skip_topk(False)
 
 
-def _enable_draft_prefill_prune(draft_model: nn.Module) -> None:
+def _enable_draft_prefill_prune(
+    draft_model: nn.Module, last_token_indices: torch.Tensor | None
+) -> None:
     """Let the draft attention layer compute prefill attention only for each
-    prefill request's last row (FlashInferImpl._draft_prefill_last_rows).
+    prefill request's sampled row (FlashInferImpl._draft_prefill_last_rows).
 
-    The draft prefill samples only that row, and with a single attention layer
-    the draft KV comes from the layer input, not from attention outputs. A
-    deeper draft would feed every row's attention output into the next layer's
-    KV, so pruning stays off there (and for non-FlashInfer layers).
+    ``last_token_indices`` is the speculator's persistent buffer of those rows,
+    written before every draft prefill; None keeps pruning off. The draft
+    prefill samples only those rows, and with a single attention layer the
+    draft KV comes from the layer input, not from attention outputs. A deeper
+    draft would feed every row's attention output into the next layer's KV, so
+    pruning stays off there (and for non-FlashInfer layers).
     """
+    if last_token_indices is None:
+        logger.warning(
+            "MTP draft prefill attention pruning off: not supported with prefill "
+            "context parallelism"
+        )
+        return
     layers = [m for m in draft_model.modules() if isinstance(m, Attention)]
-    if len(layers) != 1 or not hasattr(layers[0].impl, "draft_prefill_prune"):
+    if len(layers) != 1 or not hasattr(
+        layers[0].impl, "draft_prefill_last_token_indices"
+    ):
         logger.warning(
             "MTP draft prefill attention pruning off: needs exactly one FlashInfer "
             "draft attention layer, got %s",
             [(m.layer_name, type(m.impl).__name__) for m in layers],
         )
         return
-    layers[0].impl.draft_prefill_prune = True
+    layers[0].impl.draft_prefill_last_token_indices = last_token_indices
     logger.info("MTP draft prefill attention pruning on for %s", layers[0].layer_name)

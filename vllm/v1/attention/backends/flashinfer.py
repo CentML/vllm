@@ -348,6 +348,37 @@ def _get_trtllm_ctx_counter_buffer(
     return buf if num_bytes <= buf.numel() else None
 
 
+def draft_prefill_rows(
+    cum_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_decodes: int,
+    num_decode_tokens: int,
+    num_prefills: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefill-bucket rows an MTP draft prefill samples and their KV lengths.
+
+    ``last_token_indices`` is the speculator's per-request index of the last
+    accepted row into the whole batch's tokens; prefill request ``i`` is batch
+    request ``num_decodes + i`` (decodes are ordered first) and its rows start
+    at ``num_decode_tokens + cum_q[i]``. Each row is clamped into its request's
+    span of the prefill query (``cum_q``, prefill-local), which keeps CUDA-graph
+    capture and dummy runs (zero-filled indices) in bounds without a host sync.
+    The causal KV length of a row is the request's sequence length minus the
+    rows after it (e.g. rejected draft tokens).
+
+    Returns ``(rows, kv_lens)``: int64 row indices into the prefill query and
+    int32 KV lengths, one per prefill request.
+    """
+    cum_q = cum_q[: num_prefills + 1].long()
+    lo = cum_q[:-1]
+    hi = cum_q[1:] - 1
+    rows = last_token_indices[num_decodes : num_decodes + num_prefills].long()
+    rows = (rows - num_decode_tokens).clamp(lo, hi)
+    kv_lens = (seq_lens[:num_prefills].long() - (hi - rows)).to(torch.int32)
+    return rows, kv_lens
+
+
 def _pack_draft_block_bool_mask(
     bool_mask: torch.Tensor, num_packed: int
 ) -> torch.Tensor:
@@ -2180,9 +2211,10 @@ class FlashInferImpl(AttentionImpl):
             )
             self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
         self._device_sm_count: int | None = None
-        # Set by the MTP speculator on its draft attention layers when
-        # VLLM_MTP_DRAFT_PREFILL_PRUNE=1 (see _draft_prefill_last_rows).
-        self.draft_prefill_prune = False
+        # Set by the MTP speculator on its draft attention layer when
+        # VLLM_MTP_DRAFT_PREFILL_PRUNE=1: its last_token_indices buffer, the rows
+        # the draft prefill samples (see _draft_prefill_last_rows). None: off.
+        self.draft_prefill_last_token_indices: torch.Tensor | None = None
         self._draft_prefill_prune_checks_left = envs.VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK
         # Opt-in routing of eligible FP8 context launches to the trtllm-gen
         # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
@@ -2294,52 +2326,65 @@ class FlashInferImpl(AttentionImpl):
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         workspace_buffer: torch.Tensor,
         prefill: "TRTLLMPrefill",
+        last_token_indices: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
         num_prefills: int,
         out: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill attention of an MTP draft layer, last row of each request only.
+        """Prefill attention of an MTP draft layer, sampled row of each request
+        only.
 
-        The draft prefill samples one row per request (the speculator's
-        ``last_token_indices``); for a prefill request that is the last token of
-        its chunk, whose causal KV is the whole sequence. The draft model has a
-        single layer whose KV comes from its input, not from attention outputs,
-        and the other rows' outputs are discarded, so only those rows need
-        attention. They run as one q_len 1 trtllm-gen decode launch with the
-        decode split-KV policy (_trtllm_gen_decode_launch_config); the other
+        The draft prefill samples one row per request, the speculator's
+        ``last_token_indices`` (the last accepted row: the chunk's last row, or
+        an earlier one when draft tokens were rejected); see
+        ``draft_prefill_rows``. The draft model has a single layer whose KV comes
+        from its input, not from attention outputs, and the other rows' outputs
+        are discarded, so only those rows need attention. They run as one
+        q_len 1 trtllm-gen decode launch over each row's causal KV length with
+        the decode split-KV policy (_trtllm_gen_decode_launch_config); the other
         prefill rows are zero-filled. Decode rows are not touched. Returns the
-        last-row indices into ``out``.
+        sampled-row indices into ``out``.
         """
-        last_rows = (prefill.cum_seq_lens_q[1:] - 1).long()
-        query_last = prefill_query.index_select(0, last_rows)
-        out_last = torch.empty(
+        rows, kv_lens = draft_prefill_rows(
+            prefill.cum_seq_lens_q,
+            prefill.seq_lens,
+            last_token_indices,
+            num_decodes,
+            num_decode_tokens,
+            num_prefills,
+        )
+        query_rows = prefill_query.index_select(0, rows)
+        out_rows = torch.empty(
             (num_prefills, self.num_heads, self.head_size),
             dtype=out.dtype,
             device=out.device,
         )
+        # max_seq_len stays an upper bound of kv_lens.
         sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
-            num_prefills, 1, prefill.max_seq_len, query_last, workspace_buffer
+            num_prefills, 1, prefill.max_seq_len, query_rows, workspace_buffer
         )
         with _flashinfer_decode_sm_count(sm_count):
             trtllm_batch_decode_with_kv_cache(
-                query=query_last,
+                query=query_rows,
                 kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
                 block_tables=prefill.block_tables,
-                seq_lens=prefill.seq_lens,
+                seq_lens=kv_lens,
                 max_seq_len=prefill.max_seq_len,
                 bmm1_scale=self.bmm1_scale,
                 bmm2_scale=self.bmm2_scale,
                 window_left=self.window_left,
                 sinks=self.sinks,
-                out=out_last,
+                out=out_rows,
                 kv_layout="HND",
                 backend="trtllm-gen",
                 q_len_per_req=1,
                 multi_ctas_kv_counter_buffer=counter_buffer,
             )
         out.zero_()
-        out.index_copy_(0, last_rows, out_last)
-        return last_rows
+        out.index_copy_(0, rows, out_rows)
+        return rows
 
     def _check_draft_prefill_last_rows(
         self,
@@ -2350,10 +2395,10 @@ class FlashInferImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: "FlashInferMetadata",
         out: torch.Tensor,
-        last_rows: torch.Tensor,
+        rows: torch.Tensor,
     ) -> None:
-        """VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: compare the pruned rows with the
-        regular prefill attention (debug only; syncs).
+        """VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: compare the pruned (sampled) rows
+        with the regular prefill attention (debug only; syncs).
         """
         self._draft_prefill_prune_checks_left -= 1
         ref = torch.empty(
@@ -2361,16 +2406,17 @@ class FlashInferImpl(AttentionImpl):
             dtype=out.dtype,
             device=out.device,
         )
-        self.draft_prefill_prune = False
+        last_token_indices = self.draft_prefill_last_token_indices
+        self.draft_prefill_last_token_indices = None
         try:
             self.forward(layer, query, key, value, kv_cache, attn_metadata, ref)
         finally:
-            self.draft_prefill_prune = True
+            self.draft_prefill_last_token_indices = last_token_indices
         prefill = attn_metadata.prefill
         assert isinstance(prefill, TRTLLMPrefill)
         start = attn_metadata.num_decode_tokens
-        ref_last = ref[start : start + attn_metadata.num_prefill_tokens][last_rows]
-        diff = (ref_last.float() - out[last_rows].float()).abs()
+        ref_rows = ref[start : start + attn_metadata.num_prefill_tokens][rows]
+        diff = (ref_rows.float() - out[rows].float()).abs()
         row_max = diff.amax(dim=(1, 2))
         logger.info(
             "draft prefill pruning check: num_prefills=%d num_decodes=%d "
@@ -2384,7 +2430,7 @@ class FlashInferImpl(AttentionImpl):
             int((row_max == 0).sum()),
             row_max.numel(),
             float(diff.max()),
-            float(ref_last.float().abs().max()),
+            float(ref_rows.float().abs().max()),
         )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
@@ -2825,18 +2871,21 @@ class FlashInferImpl(AttentionImpl):
 
                 gen_sm_count = attn_metadata.prefill.gen_sm_count
                 if (
-                    self.draft_prefill_prune
+                    self.draft_prefill_last_token_indices is not None
                     and isinstance(out, torch.Tensor)
                     and out.dtype == torch.bfloat16
                     and mock_kv_cache is kv_cache_tuple
                 ):
-                    # MTP draft layer: only each prefill request's last row is
-                    # sampled (see _draft_prefill_last_rows).
-                    last_rows = self._draft_prefill_last_rows(
+                    # MTP draft layer: only each prefill request's sampled row
+                    # needs attention (see _draft_prefill_last_rows).
+                    rows = self._draft_prefill_last_rows(
                         prefill_query,
                         kv_cache_tuple,
                         workspace_buffer,
                         attn_metadata.prefill,
+                        self.draft_prefill_last_token_indices,
+                        attn_metadata.num_decodes,
+                        attn_metadata.num_decode_tokens,
                         attn_metadata.num_prefills,
                         out,
                     )
@@ -2849,7 +2898,7 @@ class FlashInferImpl(AttentionImpl):
                             kv_cache,
                             attn_metadata,
                             out,
-                            last_rows,
+                            rows,
                         )
                 elif (
                     gen_sm_count is not None
