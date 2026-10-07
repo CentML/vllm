@@ -2746,7 +2746,8 @@ class FlashInferImpl(AttentionImpl):
                     max_seq_len=attn_metadata.decode.max_seq_len,
                     bmm1_scale=self.bmm1_scale,
                     bmm2_scale=self.bmm2_scale,
-                    window_left=self.window_left,
+                    # [gdn-opt] VLLM_MTP_DRAFT_WINDOW: MTP draft layers attend to the last W tokens (SWA cubin)
+                    window_left=getattr(self, "draft_window_left", self.window_left),
                     sinks=self.sinks,
                     o_sf_scale=self.o_sf_scale,
                     out=out,

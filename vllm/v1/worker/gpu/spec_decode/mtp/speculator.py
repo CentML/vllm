@@ -36,6 +36,7 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         )
         if draft_prefill_pruning.ENABLED:
             draft_prefill_pruning.install(draft_model)
+        draft_prefill_pruning.install_window(draft_model)  # [gdn-opt] VLLM_MTP_DRAFT_WINDOW
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:

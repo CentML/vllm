@@ -84,6 +84,29 @@ def install(draft_model: nn.Module) -> None:
     logger.info("draft attention layers: %d (draft prefill pruning=%s)", n, ENABLED)
 
 
+# [gdn-opt] VLLM_MTP_DRAFT_WINDOW=W (tokens, default 0 = off): the MTP draft layer's decode attention (and the pruned
+# draft-prefill rows) attend to the last W tokens only (trtllm-gen SlidingOrChunkedCausal cubin, window_left = W - 1),
+# so each draft pass reads ~W instead of L tokens of KV. Drafts only: the target model's verify attention is unchanged
+# and drafts are accepted by rejection sampling, so outputs keep the target distribution; acceptance may drop.
+DRAFT_WINDOW = int(os.environ.get("VLLM_MTP_DRAFT_WINDOW", "0") or 0)
+
+
+def install_window(draft_model: nn.Module) -> None:
+    """Set the draft decode window on every attention layer of a loaded MTP draft model (VLLM_MTP_DRAFT_WINDOW)."""
+    if DRAFT_WINDOW <= 0:
+        return
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    for name, m in draft_model.named_modules():
+        if isinstance(m, Attention):
+            wl = getattr(m.impl, "window_left", -1)
+            if wl is not None and 0 <= wl < DRAFT_WINDOW - 1:
+                continue  # the layer already has a narrower sliding window
+            m.impl.draft_window_left = DRAFT_WINDOW - 1
+            logger.info("MTP draft attention window %d tokens on %s (%s)", DRAFT_WINDOW,
+                        getattr(m, "layer_name", name), type(m.impl).__name__)
+
+
 def mark_ready() -> None:
     """Called when the speculator finished CUDA graph capture."""
     CTX.ready = True
@@ -218,7 +241,7 @@ def pruned_forward(
         max_seq_len=int(sp.draft_max_seq_len),
         bmm1_scale=impl.bmm1_scale,
         bmm2_scale=impl.bmm2_scale,
-        window_left=impl.window_left,
+        window_left=getattr(impl, "draft_window_left", impl.window_left),  # [gdn-opt] draft window
         sinks=impl.sinks,
         o_sf_scale=impl.o_sf_scale,
         out=out,
