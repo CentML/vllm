@@ -1851,6 +1851,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
+        if GDN_HOST_TRIM3:
+            # BUFS holds one set of conv-prep outputs from the first GDN layer
+            # to the end of a serving step. Hold the set of this (profile)
+            # token count across the dummy forward too, so memory profiling
+            # counts it at the peak of the other layers' activations.
+            step_conv_bufs(
+                get_forward_context(),
+                qkv_or_qkvz.shape[0],
+                self.num_k_heads // self.tp_size,
+                self.head_k_dim,
+                self.A_log.shape[0],
+                self.head_v_dim,
+                qkv_or_qkvz.dtype,
+                qkv_or_qkvz.device,
+            )
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
