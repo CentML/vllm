@@ -98,65 +98,6 @@ def log_bytes(H: int, HV: int) -> int:
     return MAX_T * H * 128 * 2 + MAX_T * HV * 128 * 2 + MAX_T * HV * 2 * 2 + HV * 4 + H * 4
 
 
-# ------------------------------------------------------------------------------
-# load-time guard: tokens per spec-decode row (1 + num_speculative_tokens) <= MAX_T
-# ------------------------------------------------------------------------------
-# The decode kernels log at most kMaxT (= MAX_T, asserted against the compiled
-# kernel in load()) tokens per spec-decode row; a longer row takes an early-exit
-# branch that writes zeros as the GDN output without any error. So with
-# GDN_STATE_COMMIT=1 the engine refuses to start when num_speculative_tokens + 1
-# > MAX_T: in EngineCore.__init__ (before the model loads) and in
-# GDNAttentionMetadataBuilder.__init__ (on the width the metadata post-step and
-# the kernel see). The layout-only control mode runs the stock kernels and is not
-# limited. GDN_STATE_COMMIT_GUARD=0 disables the check (default 1).
-_GUARD_SEEN: set = set()
-
-
-def guard_enabled() -> bool:
-    return enabled() and os.environ.get("GDN_STATE_COMMIT_GUARD", "1") != "0"
-
-
-def check_num_speculative_tokens(num_spec, site: str) -> int:
-    """Raise RuntimeError if 1 + num_spec tokens per spec-decode row exceed MAX_T.
-
-    Returns the row width. Logs the accepted width once per (site, width).
-    """
-    k = int(num_spec or 0)
-    t = k + 1
-    if layout_only():
-        if (site, "layout_only") not in _GUARD_SEEN:
-            _GUARD_SEEN.add((site, "layout_only"))
-            logger.info(
-                "gdn_state_commit guard: OK (%s): GDN_STATE_COMMIT_LAYOUT_ONLY=1 "
-                "(stock kernels), num_speculative_tokens=%d not limited",
-                site,
-                k,
-            )
-        return t
-    if t > MAX_T:
-        msg = (
-            f"refusing to start ({site}): num_speculative_tokens={k} -> {t} "
-            f"tokens per spec row > gdn_state_commit MAX_T={MAX_T}. With "
-            "GDN_STATE_COMMIT=1 the deferred-commit decode kernel would write "
-            "zero GDN output for such rows. Use num_speculative_tokens <= "
-            f"{MAX_T - 1}, disable GDN_STATE_COMMIT, or use a kernel build with "
-            f"MAX_T >= {t}."
-        )
-        logger.error("gdn_state_commit guard: %s", msg)
-        raise RuntimeError("gdn_state_commit guard: " + msg)
-    if (site, t) not in _GUARD_SEEN:
-        _GUARD_SEEN.add((site, t))
-        logger.info(
-            "gdn_state_commit guard: OK (%s): num_speculative_tokens=%d -> %d "
-            "tokens/row <= MAX_T=%d",
-            site,
-            k,
-            t,
-            MAX_T,
-        )
-    return t
-
-
 def load(minb=None):
     """minb: CTAs/SM launch bound of the decode kernel (env GDN_STATE_COMMIT_MINB, default 2)."""
     global _ext
