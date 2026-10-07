@@ -32,7 +32,9 @@ GDN_HOST_TRIM = os.environ.get("VLLM_GDN_HOST_TRIM", "0") == "1"
 # - the GDN metadata builders compute the state-slot gather indices once per
 #   step instead of once per KV-cache group (they depend on seq_lens only);
 # - the causal_conv1d_fn metadata (H2D copies + fills) is built on first use,
-#   i.e. never when every layer takes the fused conv-prep path.
+#   i.e. never when every layer takes the fused conv-prep path;
+# - the int64 copy of the prefill state indices (gather path only) is not
+#   built when the chunk kernel updates the SSM pool in place.
 GDN_HOST_TRIM2 = os.environ.get("VLLM_GDN_HOST_TRIM2", "0") == "1"
 
 _pdl: list[bool] = []

@@ -14,6 +14,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
     GDN_HOST_TRIM2,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -315,6 +316,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
+        # VLLM_GDN_HOST_TRIM2: the int64 prefill state indices only feed the
+        # gather path of the chunk kernel (the forward falls back to the int32
+        # ones otherwise); none are built when the prefill updates the pool in
+        # place (ChunkGatedDeltaRule.updates_state_in_place).
+        self._skip_state_indices_i64 = (
+            GDN_HOST_TRIM2
+            and self.gdn_prefill_backend == "flashinfer"
+            and current_platform.is_device_capability_family(100)
+            and kv_cache_spec.dtypes[-1] in (torch.float32, torch.bfloat16)
+        )
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -807,7 +818,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prefill_state_indices = prefill_state_indices[
                     shared.prefill_row_start :
                 ]
-            prefill_state_indices_i64 = prefill_state_indices.to(torch.int64)
+            if not self._skip_state_indices_i64:
+                prefill_state_indices_i64 = prefill_state_indices.to(torch.int64)
 
         spec_sequence_masks = shared.spec_sequence_masks
         spec_token_indx = shared.spec_token_indx
