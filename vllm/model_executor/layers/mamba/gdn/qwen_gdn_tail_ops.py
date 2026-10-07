@@ -58,6 +58,7 @@ def _gdn_gated_norm_mxfp8_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
     VALID_FROM_PTR: tl.constexpr,
+    ROWS_FROM_PTR: tl.constexpr,
     ACTIVATION: tl.constexpr,
     LAUNCH_PDL: tl.constexpr,
     EARLY_TRIGGER: tl.constexpr,
@@ -74,12 +75,20 @@ def _gdn_gated_norm_mxfp8_kernel(
     cols = tl.arange(0, HEAD_DIM)
     offs = heads[:, None] * HEAD_DIM + cols[None, :]
     n_valid = tl.load(valid_ptr).to(tl.int64) if VALID_FROM_PTR else num_valid
+    if ROWS_FROM_PTR:
+        # valid_ptr = [num_valid, norm_lo, norm_hi] on the device (replay of
+        # the GDN layer graphs, whose row ranges change per step).
+        lo = tl.load(valid_ptr + 1).to(tl.int64)
+        hi = tl.load(valid_ptr + 2).to(tl.int64)
+    else:
+        lo = norm_lo
+        hi = norm_hi
     flat = tl.arange(0, BLOCK)
     sf = tl.zeros((BLOCK // 32,), dtype=tl.uint32)
     if (row < num_rows) & (row < n_valid):
         # x and z are loaded up front and the norm-or-not choice is a select,
         # so both loads are in flight together.
-        normed = (row >= norm_lo) & (row < norm_hi)
+        normed = (row >= lo) & (row < hi)
         mask = heads[:, None] < HEADS
         x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0)
         x = x.to(tl.float32)
@@ -153,6 +162,7 @@ def gdn_gated_norm_mxfp8(
     out_scale: torch.Tensor,
     norm_rows: tuple[int, int],
     num_valid: int | torch.Tensor,
+    rows: torch.Tensor | None = None,
 ) -> None:
     """Gated RMSNorm (per head, norm before gate) + swizzled MXFP8 of the output.
 
@@ -164,7 +174,11 @@ def gdn_gated_norm_mxfp8(
     normalized first and the others are taken as already normalized. Rows
     ``>= num_valid`` get zero values and scales and are not read. ``num_valid``
     may be a 1-element int tensor on the device (FULL-graph replay, where the
-    real row count is only known there).
+    real row count is only known there). ``rows``: an int32 ``[3]`` device
+    tensor ``[num_valid, norm_lo, norm_hi]`` read by the kernel instead of
+    ``num_valid`` and ``norm_rows`` (replay of the GDN layer graphs);
+    ``norm_rows`` then only picks the launch config (``num_warps``), so it must
+    be a row range of the same regime.
     """
     num_rows, heads, head_dim = x.shape
     hidden = heads * head_dim
@@ -180,7 +194,8 @@ def gdn_gated_norm_mxfp8(
         assert out_q.dtype == torch.float8_e4m3fn
         scale_numel = gdn_mxfp8_scale_numel(num_rows, hidden)
         assert out_scale.numel() == scale_numel and out_scale.dtype == torch.uint8
-    valid_from_ptr = isinstance(num_valid, torch.Tensor)
+    valid_from_ptr = rows is not None or isinstance(num_valid, torch.Tensor)
+    valid_ptr = rows if rows is not None else num_valid
     if num_rows == 0:
         return
     padded_rows = triton.cdiv(num_rows, 128) * 128
@@ -198,7 +213,7 @@ def gdn_gated_norm_mxfp8(
         weight,
         out_q,
         out_scale,
-        num_valid if valid_from_ptr else out_scale,
+        valid_ptr if valid_from_ptr else out_scale,
         num_rows,
         norm_rows[0],
         norm_rows[1],
@@ -210,6 +225,7 @@ def gdn_gated_norm_mxfp8(
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
         VALID_FROM_PTR=valid_from_ptr,
+        ROWS_FROM_PTR=rows is not None,
         ACTIVATION=activation,
         LAUNCH_PDL=launch_pdl,
         EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
