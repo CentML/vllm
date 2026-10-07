@@ -605,14 +605,6 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
         from vllm.model_executor.layers.fusion import norm_quant
 
         factors.extend(norm_quant.compile_hash_factors())
-    if (
-        os.environ.get("LCD2_BF16", "0") == "tiny"
-        and os.environ.get("LCD2_BA", "1") == "1"
-    ):
-        # TinyGEMM2 in_proj_ba (model_executor/layers/lcd2_bf16.py): the GDN
-        # forward calls torch.ops.vllm.lcd2_bf16_linear with the _lcd2_ba_b
-        # buffer instead of self.in_proj_ba.
-        factors.append("lcd2-ba-v1")
 
     return factors
 

@@ -93,9 +93,6 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
-# LCD2_BF16=tiny (+ LCD2_BA=1, default): decode-size in_proj_ba through FlashInfer's
-# TinyGEMM2 (one kernel instead of cuBLAS GEMM + splitKreduce); see vllm/model_executor/layers/lcd2_bf16.py
-from vllm.model_executor.layers import lcd2_bf16 as _lcd2  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1119,16 +1116,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
-        self._lcd2_ba = False
-        _w_ba = getattr(self.in_proj_ba, "weight", None)
-        if _w_ba is not None and _lcd2.ba_eligible(_w_ba) and _lcd2.available():
-            # zero bias: TinyGEMM2's sm100 variants run with a bias tensor
-            self.register_buffer(
-                "_lcd2_ba_b",
-                torch.zeros(_w_ba.shape[0], dtype=_w_ba.dtype, device=_w_ba.device),
-                persistent=False,
-            )
-            self._lcd2_ba = True
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -1590,13 +1577,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        if self._lcd2_ba:
-            # LCD2_BA: TinyGEMM2 for decode-size M, F.linear above LCD2_MAXM
-            ba = torch.ops.vllm.lcd2_bf16_linear(
-                hidden_states, self.in_proj_ba.weight, self._lcd2_ba_b
-            )
-        else:
-            ba, _ = self.in_proj_ba(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
