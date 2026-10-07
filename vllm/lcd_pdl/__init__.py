@@ -47,6 +47,8 @@ Env (read when the overlay modules are imported; baked into the kernels):
   PFW, PFW_KB (0 = all k-blocks), PFW_TILES (first tiles per CTA), PFW_TRIG
   PFWS, PFWS_TRIG
   LCD_FI_PREWAIT, LCD_FI_TRIG, LCD_FI_PREWAITS, LCD_FI_TRIGS (default 0)
+  LCD_FI_PREWAIT_STAGES (max armed stages, 0 = all), LCD_FI_PREWAIT_WAITALL
+  (MMA/epilogue warps also sleep in griddepcontrol.wait after their setup)
   LCD_FI_OVERLAY_BASE_CHECK=0  skip the base-file sha256 guard (do not).
 
 A FlashInfer module is replaced only if the file it would have loaded is the
@@ -127,7 +129,9 @@ class _OverlayFinder(importlib.abc.MetaPathFinder):
             f"(PFW={e('PFW', '0')}/{e('PFW_TRIG', '0')} "
             f"PFWS={e('PFWS', '0')}/{e('PFWS_TRIG', '0')} "
             f"PREWAIT={e('LCD_FI_PREWAIT', '0')}/{e('LCD_FI_TRIG', '0')} "
-            f"PREWAITS={e('LCD_FI_PREWAITS', '0')}/{e('LCD_FI_TRIGS', '0')}, "
+            f"PREWAITS={e('LCD_FI_PREWAITS', '0')}/{e('LCD_FI_TRIGS', '0')} "
+            f"stages={e('LCD_FI_PREWAIT_STAGES', '0')} "
+            f"waitall={e('LCD_FI_PREWAIT_WAITALL', '0')}, "
             f"pid {os.getpid()})"
         )
         return importlib.util.spec_from_file_location(fullname, os.path.join(_DIR, f))

@@ -60,11 +60,16 @@ import os as _os
 # LCD_FI_TRIG=<0|1|2>: griddepcontrol_launch_dependents placement. 0 = stock (last instruction). 1 = MMA warp after
 # the CTA's last mainloop. 2 = epilogue warps after the last C TMA store is issued (before the store drain and TMEM
 # dealloc). PDL consumers still wait for this grid's completion before reading C.
+# LCD_FI_PREWAIT_STAGES=<n>: arm at most n stages before the wait (0 = all; also used by the split-K overlay).
+# LCD_FI_PREWAIT_WAITALL=1: the MMA and epilogue warps also execute griddepcontrol_wait once their pre-wait setup
+# (TMEM alloc, pointer handoff, partitioning) is done, instead of polling their mbarriers during the wait.
 _PFW = _os.environ.get("PFW", "0") == "1"
 _PFW_KB = int(_os.environ.get("PFW_KB", "0"))
 _PFW_TILES = int(_os.environ.get("PFW_TILES", "1"))
 _PFW_TRIG = _os.environ.get("PFW_TRIG", "0") == "1"
 _PREWAIT = _os.environ.get("LCD_FI_PREWAIT", "0") == "1"
+_PREWAIT_STAGES = int(_os.environ.get("LCD_FI_PREWAIT_STAGES", "0"))
+_PREWAIT_WAITALL = _os.environ.get("LCD_FI_PREWAIT_WAITALL", "0") == "1"
 _TRIG = int(_os.environ.get("LCD_FI_TRIG", "0"))
 if _TRIG not in (0, 1, 2):
     raise ValueError(f"LCD_FI_TRIG must be 0, 1 or 2, got {_TRIG}")
@@ -144,6 +149,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         self.pfw_trig = _PFW_TRIG
         self.pfw_weight_a = False
         self.prewait = _PREWAIT
+        self.prewait_stages = _PREWAIT_STAGES
+        self.prewait_waitall = _PREWAIT_WAITALL
         self.trig = _TRIG
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -884,6 +891,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     pre_coord = pre_work.tile_idx
                     pre_m = pre_coord[0] // cute.size(tiled_mma.thr_id.shape)
                     pre_left = min(cutlass.Int32(self.num_ab_stage), k_block_cnt)
+                    if cutlass.const_expr(self.prewait_stages > 0):
+                        pre_left = min(cutlass.Int32(self.prewait_stages), pre_left)
                     pre_state = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.Producer, self.num_ab_stage
                     )
@@ -940,7 +949,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                             for pf_k in cutlass.range(pre_left, pf_kend, unroll=1):
                                 cute.prefetch(tma_atom_b, pre_b[(None, pf_k)])
                                 cute.prefetch(tma_atom_sfb, pre_sfb[(None, pf_k)])
-                griddepcontrol_wait()
+                griddepcontrol_wait()  # [gemmpdl] TMA-warp PDL wait
 
             #
             # Persistent tile scheduling loop
@@ -1204,6 +1213,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
             )
 
+            # [gemmpdl] PREWAIT_WAITALL: sleep in the PDL wait instead of polling
+            # the stage mbarriers (TMEM pointer and partitions are ready).
+            if cutlass.const_expr(self.prewait and self.prewait_waitall):
+                griddepcontrol_wait()  # [gemmpdl] WAITALL
+
             #
             # Persistent tile scheduling loop
             #
@@ -1456,6 +1470,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                 num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
+
+            # [gemmpdl] PREWAIT_WAITALL: sleep in the PDL wait instead of polling
+            # the accumulator mbarrier (TMEM allocated, partitions ready).
+            if cutlass.const_expr(self.prewait and self.prewait_waitall):
+                griddepcontrol_wait()  # [gemmpdl] WAITALL
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler

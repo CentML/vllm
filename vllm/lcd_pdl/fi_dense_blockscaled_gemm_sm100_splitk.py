@@ -53,6 +53,8 @@ import os as _os
 _PFWS = _os.environ.get("PFWS", "0") == "1"
 _PFWS_TRIG = _os.environ.get("PFWS_TRIG", "0") == "1"
 _PREWAITS = _os.environ.get("LCD_FI_PREWAITS", "0") == "1"
+_PREWAIT_STAGES = int(_os.environ.get("LCD_FI_PREWAIT_STAGES", "0"))
+_PREWAIT_WAITALL = _os.environ.get("LCD_FI_PREWAIT_WAITALL", "0") == "1"
 _TRIGS = int(_os.environ.get("LCD_FI_TRIGS", "0"))
 if _TRIGS not in (0, 1, 2):
     raise ValueError(f"LCD_FI_TRIGS must be 0, 1 or 2, got {_TRIGS}")
@@ -1009,6 +1011,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         pre_l = cutlass.Int32(0)
                         pre_ks = cutlass.Int32(pre_coord[2]) * k_block_cnt
                     pre_left = min(cutlass.Int32(self.num_ab_stage), k_block_cnt)
+                    if cutlass.const_expr(_PREWAIT_STAGES > 0):
+                        pre_left = min(cutlass.Int32(_PREWAIT_STAGES), pre_left)
                     pre_state = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.Producer, self.num_ab_stage
                     )
@@ -1065,7 +1069,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                             for pf_k in cutlass.range(pre_left, k_block_cnt, unroll=1):
                                 cute.prefetch(tma_atom_b, pre_b[(None, pre_ks + pf_k)])
                                 cute.prefetch(tma_atom_sfb, pre_sfb[(None, pre_ks + pf_k)])
-                griddepcontrol_wait()
+                griddepcontrol_wait()  # [gemmpdl] TMA-warp PDL wait
 
             #
             # Persistent tile scheduling loop
@@ -1293,6 +1297,11 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = (
                 self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
             )
+
+            # [gemmpdl] PREWAIT_WAITALL: sleep in the PDL wait instead of polling
+            # the stage mbarriers (TMEM pointer and partitions are ready).
+            if cutlass.const_expr(_PREWAITS and _PREWAIT_WAITALL):
+                griddepcontrol_wait()  # [gemmpdl] WAITALL
 
             #
             # Persistent tile scheduling loop
@@ -1546,6 +1555,11 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
+
+            # [gemmpdl] PREWAIT_WAITALL: sleep in the PDL wait instead of polling
+            # the accumulator mbarrier (TMEM allocated, partitions ready).
+            if cutlass.const_expr(_PREWAITS and _PREWAIT_WAITALL):
+                griddepcontrol_wait()  # [gemmpdl] WAITALL
 
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
