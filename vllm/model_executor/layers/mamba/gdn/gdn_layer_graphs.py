@@ -83,6 +83,10 @@ _ARMED = [False]  # set after vLLM's capture phase (real KV cache, real buffers)
 _OFF = [False]  # disabled after a CHECK mismatch
 _BYPASS = [False]  # CHECK: the eager re-run of a replayed layer
 _KEY = "_gdn_layer_graph_step"  # md.__dict__: _Step or ineligibility reason
+# md.__dict__: set once a layer graph of the group ran this step (so a group's
+# eager layers do not re-zero fresh rows a replay already wrote:
+# VLLM_GDN_HOST_TRIM3 ZERO).
+REPLAYED_KEY = "_gdn_layer_graph_replayed"
 _BUFS: dict = {}  # layer names of a KV-cache group -> _GroupBufs
 _GRAPHS: dict = {}  # graph key -> torch.cuda.CUDAGraph
 _FAILED: set = set()  # graph keys whose capture failed (stay eager)
@@ -865,6 +869,7 @@ def try_replay(
         _GRAPHS[key] = graph
         _stat("captured")
         _stat("capture_us", int((time.perf_counter() - t0) * 1e6))
+    md.__dict__[REPLAYED_KEY] = True
     if _CHECK[0] > 0:
         _CHECK[0] -= 1
         return _check(

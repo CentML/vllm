@@ -301,6 +301,7 @@ def _metadata(gen, nr, prefill_lens, fresh):
 def _run(layers, md, bufs, use_graphs):
     fc = types.SimpleNamespace(
         attn_metadata={L.prefix: md for L in layers},
+        no_compile_layers={L.prefix: L for L in layers},
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
     )
     with (
@@ -550,3 +551,92 @@ def test_layer_graphs_bitwise_vsplit(scenario, _kernels):
         pytest.skip("V-split kernel did not compile")
     name, T, steps = scenario
     _check_scenario(name, T, steps, torch.bfloat16, "silu")
+
+
+@torch.inference_mode()
+def test_host_trim3_group_zero_after_partial_replay(_kernels, monkeypatch):
+    """VLLM_GDN_HOST_TRIM3's one zeroing launch for a KV-cache group's fresh
+    SSM rows (first eager layer of the step) must not run after a layer of
+    the group replayed its graph (which already wrote its fresh rows): here
+    layer 0 replays and layer 1 stays eager (capture refused); pools and
+    outputs must equal the all-eager path.
+    """
+    fake = types.SimpleNamespace(
+        choose_vsplit=lambda *a, **k: 2, chunk_gated_delta_rule_vsplit=_ref_vsplit
+    )
+    monkeypatch.setattr(M, "_gdn_vsplit_ready", [fake])
+    monkeypatch.setattr(lg, "_workspace", lambda *a: None)
+    monkeypatch.setattr(M, "GDN_HOST_TRIM3", True)
+    real_capture = lg._capture
+
+    def capture(layer, *args):
+        if layer.prefix == LAYERS[1]:
+            raise RuntimeError("refused by the test")
+        return real_capture(layer, *args)
+
+    monkeypatch.setattr(lg, "_capture", capture)
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    gen_cpu = torch.Generator().manual_seed(11)
+    lg.drop_graphs()
+    lg.STATS.clear()
+    eager = [_build_layer(p, gen, torch.float32, "silu") for p in LAYERS]
+    graph = [_build_layer(p, gen, torch.float32, "silu") for p in LAYERS]
+    for e, g in zip(eager, graph):
+        for name_ in ("A_log", "dt_bias"):
+            setattr(g, name_, getattr(e, name_))
+        g.conv1d.weight = e.conv1d.weight
+        g.norm.weight = e.norm.weight
+        g.kv_cache = tuple(t.clone() for t in e.kv_cache)
+    T, hidden = 2048, HV * V
+    bufs = []
+    for _ in range(2):
+        bufs.append(
+            [
+                (
+                    torch.empty(
+                        T, CONV_DIM + hidden, dtype=torch.bfloat16, device="cuda"
+                    ),
+                    torch.empty(T, 2 * HV, dtype=torch.bfloat16, device="cuda"),
+                    torch.empty(T, HV, V, dtype=torch.bfloat16, device="cuda"),
+                    torch.empty(T, hidden, dtype=torch.float8_e4m3fn, device="cuda"),
+                    torch.empty(
+                        gdn_mxfp8_scale_numel(T, hidden),
+                        dtype=torch.uint8,
+                        device="cuda",
+                    ),
+                )
+                for _ in LAYERS
+            ]
+        )
+    eb, gb = bufs
+    # Every step has a fresh (no initial state) prefill sequence.
+    for nr, lens, fresh in [
+        (0, [900, 600], [False, True]),
+        (5, [800, 600], [True, False]),
+    ]:
+        md_e = _metadata(gen_cpu, nr, lens, fresh)
+        md_g = GDNAttentionMetadata(
+            **{f: getattr(md_e, f) for f in md_e.__dataclass_fields__}
+        )
+        for (qe, be, _, _, _), (qg, bg, _, _, _) in zip(eb, gb):
+            src = torch.randn(T, CONV_DIM + hidden, device="cuda", generator=gen)
+            qe.copy_(src)
+            qg.copy_(src)
+            src = torch.randn(T, 2 * HV, device="cuda", generator=gen)
+            be.copy_(src)
+            bg.copy_(src)
+        _run(eager, md_e, eb, use_graphs=False)
+        _run(graph, md_g, gb, use_graphs=True)
+        torch.accelerator.synchronize()
+        N = md_e.num_actual_tokens
+        for li, (e, g) in enumerate(zip(eb, gb)):
+            assert torch.equal(e[3].view(torch.uint8), g[3].view(torch.uint8)), li
+            assert torch.equal(e[2][:N], g[2][:N]), li
+        for li, (e, g) in enumerate(zip(eager, graph)):
+            for what, x, y in zip(("conv", "ssm"), e.kv_cache, g.kv_cache):
+                assert torch.equal(x.view(torch.uint8), y.view(torch.uint8)), (
+                    f"nr={nr} lens={lens} layer {li}: {what} state differs"
+                )
+    assert lg.STATS.get("replays", 0) == 2 and lg.STATS.get("capture_errors") == 2, (
+        lg.STATS
+    )

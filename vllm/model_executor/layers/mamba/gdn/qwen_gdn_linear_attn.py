@@ -614,7 +614,15 @@ def _htrim3_group_zero(layer, m: GDNAttentionMetadata) -> bool:
     """
     done = m.__dict__.get("_htrim3_zeroed")
     if done is None:
-        done = m.__dict__["_htrim3_zeroed"] = _htrim3_launch_group_zero(layer, m)
+        if m.__dict__.get(gdn_layer_graphs.REPLAYED_KEY):
+            # A GDN layer graph of this group already ran this step (its own
+            # zeroing, then the chunk writing the fresh rows): zeroing the
+            # group's fresh rows now would erase that layer's new state. The
+            # group's eager layers zero their own rows.
+            done = frozenset()
+        else:
+            done = _htrim3_launch_group_zero(layer, m)
+        m.__dict__["_htrim3_zeroed"] = done
     return layer.prefix in done
 
 
