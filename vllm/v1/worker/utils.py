@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -723,7 +724,7 @@ def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
     """Compile the copy-on-write kernel before serving (first use would
     otherwise JIT inside a step).
     """
-    if device.type != "cuda":
+    if device.type != "cuda" or not envs.VLLM_KV_COW_ONE_LAUNCH:
         return
     buf = torch.zeros(8, dtype=torch.int32, device=device)
     table = torch.tensor([[0, 1, 1]], dtype=torch.int64, device=device)
@@ -739,9 +740,10 @@ def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
     )
 
 
-# Row layout -> (anchor int32 tensor, device table, num entries, max row len16),
-# or None when the layout cannot be copied in one launch.
-_cow_copy_plans: dict[tuple, tuple[torch.Tensor, torch.Tensor, int, int] | None] = {}
+# Row layout -> (device table, num entries, max row len16), or None when the
+# layout cannot be copied in one launch. Plans hold only addresses, never the
+# KV storage, so a released KV cache is freed.
+_cow_copy_plans: dict[tuple, tuple[torch.Tensor, int, int] | None] = {}
 
 
 def _cow_copy_rows(kv_caches: Iterable[torch.Tensor], num_blocks: int) -> tuple | None:
@@ -845,7 +847,8 @@ def copy_kv_cache_blocks_inplace(
     # Direct row copies equal gather-then-scatter only when destinations are
     # unique and no block is both a source and a destination.
     if (
-        len(np.unique(dst_np)) == len(dst_np)
+        envs.VLLM_KV_COW_ONE_LAUNCH
+        and len(np.unique(dst_np)) == len(dst_np)
         and not np.intersect1d(src_np, dst_np).size
     ):
         layout = _cow_copy_rows(kv_caches, num_blocks)
@@ -860,8 +863,10 @@ def copy_kv_cache_blocks_inplace(
     if plan is None:
         _copy_kv_cache_blocks_inplace_per_storage(kv_caches, num_blocks, indices_np)
         return
-    anchor, table, num_entries, max_len16 = plan
-    indices = async_tensor_h2d(np.concatenate([src_np, dst_np]), device=anchor.device)
+    table, num_entries, max_len16 = plan
+    anchor = torch.empty(0, dtype=torch.int32, device=device)
+    anchor.set_(anchor_storage, 0, (anchor_storage.nbytes() // 4,))
+    indices = async_tensor_h2d(np.concatenate([src_np, dst_np]), device=device)
     num_pairs = len(indices_np)
     grid = (
         num_pairs,
@@ -884,7 +889,7 @@ def _make_cow_copy_plan(
     anchor_storage: torch.UntypedStorage,
     rows: tuple[tuple[int, int, int, int], ...],
     num_blocks: int,
-) -> tuple[torch.Tensor, torch.Tensor, int, int] | None:
+) -> tuple[torch.Tensor, int, int] | None:
     if not _cow_copy_rows_commute(rows, num_blocks) or anchor_storage.data_ptr() % 16:
         logger.info_once(
             "KV copy-on-write: %d cache rows are not provably disjoint or "
@@ -900,15 +905,13 @@ def _make_cow_copy_plan(
         ],
         dtype=np.int64,
     )
-    anchor = torch.empty(0, dtype=torch.int32, device=device)
-    anchor.set_(anchor_storage, 0, (anchor_storage.nbytes() // 4,))
     max_len16 = max(length for _, _, length, _ in rows) // 16
     logger.info_once(
         "KV copy-on-write: %d cache rows of up to %d bytes in one launch.",
         len(rows),
         max_len16 * 16,
     )
-    return anchor, torch.from_numpy(table).to(device), len(rows), max_len16
+    return torch.from_numpy(table).to(device), len(rows), max_len16
 
 
 def _copy_kv_cache_blocks_inplace_per_storage(

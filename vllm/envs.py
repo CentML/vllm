@@ -258,6 +258,7 @@ if TYPE_CHECKING:
         Literal["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"]
         | None
     ) = None
+    VLLM_KV_COW_ONE_LAUNCH: bool = True
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
@@ -1882,6 +1883,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None,
         ["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"],
     ),
+    # Copy prefix-hit (copy-on-write) KV/state blocks of every cache storage
+    # in one vectorized launch. Set to 0 to copy storage by storage.
+    "VLLM_KV_COW_ONE_LAUNCH": lambda: bool(
+        int(os.getenv("VLLM_KV_COW_ONE_LAUNCH", "1"))
+    ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
     # - DS: (dim, state_len) — TP-sharded dim on dim1,
@@ -2460,6 +2466,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
         "VLLM_FLASHINFER_MXFP8_K64_MIN_M",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        # Worker-side KV block copy path; not part of traced graphs.
+        "VLLM_KV_COW_ONE_LAUNCH",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

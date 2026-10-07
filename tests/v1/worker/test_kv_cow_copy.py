@@ -122,3 +122,30 @@ def test_overlapping_pairs_keep_gather_then_scatter(copies):
         return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None)
 
     _run(make, copies, expect_fused=False)
+
+
+def test_disabled_uses_per_storage_path(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_COW_ONE_LAUNCH", "0")
+
+    def make(raw):
+        return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None)
+
+    _run(make, _copies(5), expect_fused=False)
+    assert not worker_utils._cow_copy_plans
+
+
+def test_cached_plan_does_not_keep_kv_cache_alive():
+    torch.accelerator.synchronize()
+    before = torch.cuda.memory_allocated()
+    raw = torch.zeros(_raw_bytes(torch.bfloat16), dtype=torch.int8, device="cuda")
+    worker_utils._cow_copy_plans.clear()
+    worker_utils.copy_kv_cache_blocks_inplace(
+        _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None),
+        NUM_BLOCKS,
+        _copies(3),
+    )
+    assert any(p is not None for p in worker_utils._cow_copy_plans.values())
+    torch.accelerator.synchronize()
+    del raw
+    # Only the small per-layout tables stay allocated.
+    assert torch.cuda.memory_allocated() - before < _raw_bytes(torch.bfloat16)
