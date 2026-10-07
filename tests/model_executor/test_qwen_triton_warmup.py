@@ -84,7 +84,12 @@ def test_mxfp8_producer_warmup_covers_every_launch_config(default_vllm_config) -
     attn.num_heads, attn.head_dim = heads, head_dim
     model = torch.nn.ModuleDict({"mlp": mlp, "attn": attn})
 
+    class _ModelConfig:
+        dtype = torch.bfloat16
+
     class _Runner:
+        model_config = _ModelConfig()
+
         def get_model(self) -> torch.nn.Module:
             return model
 

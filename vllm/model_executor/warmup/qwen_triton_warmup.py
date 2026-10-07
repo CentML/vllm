@@ -172,7 +172,8 @@ def _warm_mxfp8_producers(runner: "GPUModelRunner", device: torch.device) -> Non
         kMxfp8Dynamic,
     )
 
-    silu_dims: set[int] = set()
+    act_dtype = runner.model_config.dtype
+    silu_producers: dict[int, tuple[torch.nn.Module, torch.nn.Module]] = {}
     gate_shapes: set[tuple[int, int]] = set()
     for module in runner.get_model().modules():
         down_proj = getattr(module, "down_proj", None)
@@ -181,16 +182,21 @@ def _warm_mxfp8_producers(runner: "GPUModelRunner", device: torch.device) -> Non
             and down_proj is not None
             and get_input_quant_key(down_proj) == kMxfp8Dynamic
         ):
-            silu_dims.add(down_proj.input_size_per_partition)
+            silu_producers.setdefault(
+                down_proj.input_size_per_partition, (module.act_fn, down_proj)
+            )
         if getattr(module, "attn_gate_mxfp8", False):
             gate_shapes.add((module.num_heads, module.head_dim))
     bf16 = torch.bfloat16
-    if silu_dims:
+    if silu_producers:
         from vllm.model_executor.layers.fusion import silu_mul_mxfp8_quant as silu
 
-        for d in silu_dims:
+        for d, (act_fn, down_proj) in silu_producers.items():
             for num_tokens in silu.LAUNCH_CONFIG_TOKEN_COUNTS:
-                x = torch.zeros((num_tokens, 2 * d), dtype=bf16, device=device)
+                x = torch.zeros((num_tokens, 2 * d), dtype=act_dtype, device=device)
+                # Serving falls back to the plain activation for these inputs.
+                if not silu.silu_mul_mxfp8_supported(act_fn, x, down_proj):
+                    break
                 silu.silu_mul_mxfp8_quant(x)
     if gate_shapes:
         from vllm.model_executor.layers.fusion import attn_gate_mxfp8_quant as gate
