@@ -151,6 +151,13 @@ GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS",
 GDN_FUSED_DECODE_MAX_REQUESTS = int(
     os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_REQS", "0")
 )
+# ... and at most this many tokens per request (MTP k + 1). The kernel unrolls
+# up to MAX_FUSED_DECODE_TOKENS = 7 (k = 6); the default 6 keeps k = 6 on the
+# three-kernel path until the 7-token kernel is adopted.
+GDN_FUSED_DECODE_MAX_TOKENS = min(
+    int(os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_TOKENS", "6")),
+    MAX_FUSED_DECODE_TOKENS,
+)
 # Larger spec-decode batches run the register-resident CUDA kernel of
 # ops/gdn_mtp_cuda.py (JIT-built by the GDN warmup; same contract as the csrc
 # MTP kernel, VR 77 requests: 77.0 vs 81.6 us, 48: 48.3 vs 55.3 us) instead of
@@ -2853,7 +2860,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert state_indices is not None
         assert cu_seqlens is not None
         assert num_accepted_tokens is not None
-        assert state_indices.size(1) <= MAX_FUSED_DECODE_TOKENS
+        assert state_indices.size(1) <= GDN_FUSED_DECODE_MAX_TOKENS
         assert self._fused_decode_counters is not None
         num_requests = attn_metadata.num_spec_decodes
         conv_state = (
@@ -3093,7 +3100,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 and attn_metadata.num_spec_decodes <= GDN_FUSED_DECODE_MAX_REQUESTS
                 and attn_metadata.spec_state_indices_tensor is not None
                 and attn_metadata.spec_state_indices_tensor.size(1)
-                <= MAX_FUSED_DECODE_TOKENS
+                <= GDN_FUSED_DECODE_MAX_TOKENS
             ):
                 self._in_proj_ba_join()
                 self._forward_core_decode_spec_one_launch(
