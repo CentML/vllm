@@ -46,6 +46,7 @@ import array
 import hashlib
 import os
 import threading
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, cast
 
@@ -98,7 +99,8 @@ _last_arr = threading.local()
 
 def _int32_array(toks):
     """array('i') of ``toks`` (shared by prompt_id_min_max and the memo), or
-    None if a value does not fit int32."""
+    None if a value does not fit int32.
+    """
     c = getattr(_last_arr, "v", None)
     if c is not None and c[0] is toks and c[1] == len(toks):
         return c[2]
@@ -113,7 +115,16 @@ def _int32_array(toks):
 def prompt_id_min_max(toks) -> tuple[int, int]:
     """(min, max) of the prompt token ids. With VLLM_FEH_MEMO=1 one exact int32
     conversion (reused by the memo) + numpy min/max replaces two Python-level
-    passes over the prompt; same values."""
+    passes over the prompt; same values.
+    """
+    t0 = time.perf_counter() if FEH_TIME else 0.0
+    r = _prompt_id_min_max(toks)
+    if FEH_TIME:
+        TIME_STATS["minmax_ms"] += (time.perf_counter() - t0) * 1e3
+    return r
+
+
+def _prompt_id_min_max(toks) -> tuple[int, int]:
     if FEH_MEMO and len(toks) >= 4096:
         arr = _int32_array(toks)
         if arr is not None:
@@ -122,6 +133,8 @@ def prompt_id_min_max(toks) -> tuple[int, int]:
             a = np.frombuffer(arr, dtype=np.int32)
             return int(a.min()), int(a.max())
     return min(toks, default=0), max(toks, default=0)
+
+
 _memo_lru: "OrderedDict[int, list]" = OrderedDict()
 _memo_next = [0]
 
@@ -186,7 +199,8 @@ def _compute_prompt_block_hashes(
 
 def _hash_chain(fn, kvu, toks, salt, start: int, hashes: list) -> list:
     """Append the hashes of full blocks start.. of ``toks`` to ``hashes``
-    (whose last element is the parent of block ``start``)."""
+    (whose last element is the parent of block ``start``).
+    """
     parent = hashes[-1] if start else None
     for i in range(start, len(toks) // FEH_BLOCK):
         # Same extra keys as generate_block_hash_extra_keys() for a request
@@ -287,10 +301,23 @@ def log_frontend_enabled() -> None:
     )
 
 
+# VLLM_FEH_TIME=1: accumulate the front-end hashing (and the token-range check)
+# wall time per request; logged with the FEH front-end stats.
+FEH_TIME = os.environ.get("VLLM_FEH_TIME", "0") == "1"
+TIME_STATS = {
+    "n": 0,
+    "hash_ms": 0.0,
+    "n_long": 0,
+    "hash_ms_long": 0.0,
+    "minmax_ms": 0.0,
+}
+
+
 def attach_prompt_block_hashes(
     cache_config: "CacheConfig", request: "EngineCoreRequest"
 ) -> None:
     """Front end: set ``request.prompt_block_hashes`` when eligible."""
+    t0 = time.perf_counter() if FEH_TIME else 0.0
     try:
         blob = _compute_prompt_block_hashes(cache_config, request)
     except Exception as e:
@@ -299,12 +326,30 @@ def attach_prompt_block_hashes(
             "FEH front-end hashing failed (%r); request sent without hashes", e
         )
         blob = None
+    if FEH_TIME:
+        ms = (time.perf_counter() - t0) * 1e3
+        TIME_STATS["n"] += 1
+        TIME_STATS["hash_ms"] += ms
+        if len(request.prompt_token_ids or ()) >= 32768:
+            TIME_STATS["n_long"] += 1
+            TIME_STATS["hash_ms_long"] += ms
     if blob is None:
         STATS["fe_skipped"] += 1
         return
     STATS["fe_hashed"] += 1
     if STATS["fe_hashed"] % FEH_LOG_EVERY == 1:
         logger.info("FEH frontend stats %s", STATS)
+        if FEH_TIME:
+            n, nl = max(1, TIME_STATS["n"]), max(1, TIME_STATS["n_long"])
+            logger.info(
+                "FEH front-end time: reqs=%d hash_ms_mean=%.3f long(>=32K) "
+                "reqs=%d hash_ms_mean=%.3f minmax_ms_mean=%.3f",
+                TIME_STATS["n"],
+                TIME_STATS["hash_ms"] / n,
+                TIME_STATS["n_long"],
+                TIME_STATS["hash_ms_long"] / nl,
+                TIME_STATS["minmax_ms"] / n,
+            )
     request.prompt_block_hashes = blob
 
 
