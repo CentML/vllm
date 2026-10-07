@@ -1327,6 +1327,7 @@ class Scheduler(SchedulerInterface):
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
                     uses_mrope=self.model_uses_mrope,
+                    prefill_token_array=req.take_prompt_token_array(),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1574,6 +1575,7 @@ class Scheduler(SchedulerInterface):
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
+        session.prompt_token_array = None  # VLLM_PROMPT_TOKEN_ARRAY: stale now
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
         ]

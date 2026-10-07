@@ -1192,7 +1192,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
-                all_token_ids=new_req_data.prefill_token_ids,
+                # VLLM_PROMPT_TOKEN_ARRAY: the same tokens as an int32 array
+                # (staged with a memcpy instead of a list conversion).
+                all_token_ids=(
+                    new_req_data.prefill_token_ids
+                    if new_req_data.prefill_token_array is None
+                    else new_req_data.prefill_token_array
+                ),
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
                 staging_start=staging_start,
