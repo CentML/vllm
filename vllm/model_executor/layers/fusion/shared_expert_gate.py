@@ -15,10 +15,13 @@ import torch
 def round_to_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Round fp32 ``x`` to ``dtype`` precision, keeping it fp32."""
     if dtype == torch.bfloat16:
-        # c10::BFloat16's round-to-nearest-even, on the fp32 bit pattern.
+        # c10::BFloat16's round-to-nearest-even, on the fp32 bit pattern. The
+        # carry can turn a NaN payload into an infinity or -0.0, so NaNs pass
+        # through unrounded.
         bits = x.view(torch.int32)
         bits = bits + (0x7FFF + ((bits >> 16) & 1))
-        return (bits & -65536).view(torch.float32)
+        rounded = (bits & -65536).view(torch.float32)
+        return torch.where(x.isnan(), x, rounded)
     return x.to(dtype).float()
 
 
