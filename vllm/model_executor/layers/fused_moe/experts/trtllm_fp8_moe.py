@@ -486,6 +486,87 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 else torch.ones_like(self._g1_alphas) / self.quant_config.a2_scale
             )
 
+        # VLLM_MOE_DECODE_MAX_TOKENS > 0: decode calls (1 <= T <= it) of this MXFP8
+        # configuration run the single-launch kernel of moe_decode_cuda (built and
+        # its workspace allocated here, before any graph capture).
+        self._moe_decode = None
+        if self._moe_decode_config_ok():
+            from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+            self._moe_decode = moe_decode_cuda.get(
+                torch.accelerator.current_device_index()
+            )
+
+    def _moe_decode_config_ok(self) -> bool:
+        from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+        cfg = self.moe_config
+        return (
+            moe_decode_cuda.MAX_TOKENS > 0
+            and self.quant_config.block_shape == [1, 32]
+            and current_platform.is_cuda()
+            and current_platform.has_device_capability(100)
+            and self.routing_method_type
+            in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive)
+            and cfg.num_experts == moe_decode_cuda.E
+            and self.local_num_experts == moe_decode_cuda.E
+            and self.topk == moe_decode_cuda.TOPK
+            and self.hidden_dim == moe_decode_cuda.H
+            and self.intermediate_size_per_partition == moe_decode_cuda.INTER
+            and cfg.activation == MoEActivation.SILU
+            and self.gemm1_alpha is None
+            and self.gemm1_beta is None
+            and self.gemm1_clamp_limit is None
+        )
+
+    def _try_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor,
+        num_expert_group: int | None,
+        e_score_correction_bias: torch.Tensor | None,
+        routed_scaling_factor: float | None,
+    ) -> UnfinalizedMoEOutput | None:
+        """The single-launch decode MoE, or None if this call does not qualify."""
+        from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+        num_tokens = hidden_states.shape[0]
+        if not (
+            0 < num_tokens <= min(moe_decode_cuda.MAX_TOKENS, moe_decode_cuda.MAXT)
+            and self.moe_config.should_defer_moe_finalize(num_tokens)
+            and expert_map is None
+            and e_score_correction_bias is None
+            and routed_scaling_factor in (None, 1.0)
+            and (num_expert_group or 0) <= 1
+            and self.routing_replay_capture_fn is None
+            and router_logits.dtype in (torch.bfloat16, torch.float32)
+            and router_logits.is_contiguous()
+            and hidden_states.dtype == torch.float8_e4m3fn
+            and hidden_states.is_contiguous()
+            and a1q_scale.is_contiguous()
+            and a1q_scale.numel() == num_tokens * (moe_decode_cuda.H // 32)
+        ):
+            return None
+        assert self._moe_decode is not None
+        rows, weights, idx = self._moe_decode(
+            router_logits,
+            hidden_states,
+            a1q_scale,
+            w1,
+            self.quant_config.w1_scale,
+            w2,
+            self.quant_config.w2_scale,
+        )
+        return UnfinalizedMoEOutput(
+            gemm2_permuted=rows,
+            expert_weights=weights,
+            expanded_idx_to_permuted_idx=idx,
+        )
+
     @staticmethod
     def _supports_quant_scheme(
         weight_key: QuantKey | None,
@@ -579,6 +660,21 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         assert global_num_experts <= 512
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
+
+        if self._moe_decode is not None:
+            decoded = self._try_moe_decode(
+                hidden_states,
+                w1,
+                w2,
+                router_logits,
+                expert_map,
+                a1q_scale,
+                num_expert_group,
+                e_score_correction_bias,
+                routed_scaling_factor,
+            )
+            if decoded is not None:
+                return decoded
 
         is_mxfp8 = self.quant_config.block_shape == [1, 32]
         if is_mxfp8:
