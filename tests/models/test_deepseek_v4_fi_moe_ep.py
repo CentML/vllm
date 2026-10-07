@@ -638,6 +638,20 @@ def test_sm107_rank_local_batch_uses_largest_profile(monkeypatch):
     assert select(fake, 144)[1] == 256
 
 
+def test_sm107_fused_shared_add_needs_flashinfer_support_and_env(monkeypatch):
+    """The shared-expert add moves into flashinfer's top-k reduce only when the
+    backend advertises it (older flashinfer: the elementwise add stays) and
+    VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD is not 0."""
+    from vllm.models.deepseek_v4.nvidia.fi_moe import sm107_supports_fused_addend
+
+    supported = SimpleNamespace(supports_fused_addend=lambda workspace: True)
+    monkeypatch.delenv("VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD", raising=False)
+    assert sm107_supports_fused_addend(supported, object())
+    assert not sm107_supports_fused_addend(SimpleNamespace(), object())
+    monkeypatch.setenv("VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD", "0")
+    assert not sm107_supports_fused_addend(supported, object())
+
+
 def test_sm107_shared_mode_resolution():
     from vllm.models.deepseek_v4.nvidia.fi_moe import (
         resolve_sm107_shared_mode,

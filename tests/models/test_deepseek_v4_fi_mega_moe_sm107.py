@@ -478,3 +478,50 @@ def test_fi_mega_moe_sm107_overlap_tp_sharded_falls_back(sm107_dist, monkeypatch
     mod = _make_module("model.layers.shovtp2.ffn.experts", tp=2, pp=2)
     assert not mod.overlaps_shared_experts and mod._shared_mode == "separate"
     assert mod._shared_stream is None
+
+
+# ----------------------------------------------------------------------------
+# Shared-expert add inside flashinfer's top-k reduce (separate mode:
+# forward(shared_output=); overlap mode: deferred reduce after the join, covered
+# by the overlap == serial tests above).
+def _fi_fast_reduce(mod) -> bool:
+    from vllm.models.deepseek_v4.nvidia.fi_moe import sm107_supports_fused_addend
+
+    kernel, workspace, _ = mod._profiles[mod._profile_caps[0]]
+    return sm107_supports_fused_addend(kernel, workspace)
+
+
+def test_fi_mega_moe_sm107_shared_output_fused_add(sm107_dist, monkeypatch):
+    """separate mode: forward(shared_output=s) == forward() + s, bitwise (the
+    addend is added inside flashinfer's reduce when supported), eager and under
+    CUDA-graph replay."""
+    monkeypatch.setenv("VLLM_FI_MEGA_MOE_SHARED", "separate")
+    shared = _FakeSharedMLP(seed=51)
+    mod, *_ = _build(seed=8, prefix="model.layers.shfu1.ffn.experts")
+    assert mod.accepts_shared_output and not mod.overlaps_shared_experts
+    if not _fi_fast_reduce(mod):
+        pytest.skip("flashinfer without the fused-addend reduce")
+    for n in (1, 77, MAX_TOKENS):
+        x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16)
+        ids, wts = _routing(n, seed=20 + n)
+        s = shared(x)
+        y = mod(x, wts, ids, activation_clamp=CLAMP, shared_output=s).clone()
+        ref = mod(x, wts, ids, activation_clamp=CLAMP).clone() + s
+        assert torch.equal(y, ref), (n, _rel(y, ref))
+    n = 77
+    x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16)
+    ids, wts = _routing(n, seed=9)
+    s = shared(x)
+    mod(x, wts, ids, activation_clamp=CLAMP, shared_output=s)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y_graph = mod(x, wts, ids, activation_clamp=CLAMP, shared_output=s)
+    x.copy_(torch.randn_like(x))
+    s.copy_(shared(x))
+    graph.replay()
+    torch.accelerator.synchronize()
+    got = y_graph.clone()
+    ref = mod(x, wts, ids, activation_clamp=CLAMP).clone() + s
+    assert torch.equal(got, ref), _rel(got, ref)
+    del graph

@@ -1165,6 +1165,19 @@ class DeepseekV4MoE(nn.Module):
         overlap_shared = self.shared_experts is not None and getattr(
             self.experts, "overlaps_shared_experts", False
         )
+        separate_shared = (
+            self.shared_experts is not None
+            and not overlap_shared
+            and not self.experts.has_fused_shared_experts
+        )
+        # FlashInfer SM107 separate mode: the shared MLP runs first and its
+        # output is added inside flashinfer's top-k combine reduce.
+        shared_output = (
+            self.shared_experts(hidden_states)
+            if separate_shared
+            and getattr(self.experts, "accepts_shared_output", False)
+            else None
+        )
         final_hidden_states = self._forward_mega_routed(
             hidden_states,
             input_ids,
@@ -1173,12 +1186,9 @@ class DeepseekV4MoE(nn.Module):
             # the shared MLP on a side stream next to the megakernel and
             # return routed + shared.
             shared_experts=self.shared_experts if overlap_shared else None,
+            shared_output=shared_output,
         )
-        if (
-            self.shared_experts is not None
-            and not overlap_shared
-            and not self.experts.has_fused_shared_experts
-        ):
+        if separate_shared and shared_output is None:
             shared_output = self.shared_experts(hidden_states)
             final_hidden_states += shared_output
 
@@ -1190,9 +1200,11 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None,
         mega_gate_metadata: MegaGateRoutingMetadata | None,
         shared_experts: nn.Module | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Gate + routed MegaMoE experts (+ the shared expert when fused, or
-        overlapped when ``shared_experts`` is given)."""
+        overlapped when ``shared_experts`` is given, or added inside the
+        experts' combine when ``shared_output`` is given)."""
         bias_vl = getattr(self.gate, "bias_vl", None)
         # Small local padded batches favor GateLinear; 128-expert gates cross earlier.
         gate_threshold = 1 if self.gate.weight.shape[0] == 128 else 16
@@ -1259,6 +1271,14 @@ class DeepseekV4MoE(nn.Module):
                 topk_ids,
                 activation_clamp=activation_clamp,
                 shared_experts=shared_experts,
+            )
+        if shared_output is not None:
+            return self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+                shared_output=shared_output,
             )
         return self.experts(
             hidden_states,

@@ -201,8 +201,14 @@ def sm107_compute_with_shared(
         ctx,
     )
     fork, join = events
+    fused_add = sm107_supports_fused_addend(kernel, workspace)
     fork.record()
-    y = kernel.compute(workspace, transformed, output=None)
+    if fused_add:
+        # Megakernel only; the top-k reduce runs after the join with the shared
+        # output as its addend (no separate `y += shared` kernel).
+        y = kernel.compute(workspace, transformed, output=None, defer_reduce=True)
+    else:
+        y = kernel.compute(workspace, transformed, output=None)
     with torch.cuda.stream(stream):
         fork.wait()
         if debug_layer is not None:
@@ -212,8 +218,23 @@ def sm107_compute_with_shared(
             fi_mega_debug.mark(debug_layer, 0, hidden_states.shape[0], 3, side=True)
         join.record()
     join.wait()
-    y += shared
+    if fused_add:
+        kernel.finish_reduce(workspace, shared)
+    else:
+        y += shared
     return y
+
+
+def sm107_supports_fused_addend(kernel: Any, workspace: Any) -> bool:
+    """flashinfer's SM107 backend can add a tensor inside its top-k reduce
+    (compute(addend=...) / compute(defer_reduce=True) + finish_reduce) and
+    VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD is on."""
+    import vllm.envs as envs
+
+    if not envs.VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD:
+        return False
+    probe = getattr(kernel, "supports_fused_addend", None)
+    return bool(probe is not None and probe(workspace))
 
 
 def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
@@ -452,6 +473,19 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             self._realloc_nvfp4_params()
 
     # ----------------------------------------------------------- shared expert
+    @property
+    def accepts_shared_output(self) -> bool:
+        """SM107 separate mode: forward() takes the precomputed shared-expert output
+        (``shared_output=``) and adds it inside flashinfer's top-k reduce when the
+        flashinfer build supports it (else `y += shared_output`)."""
+        import vllm.envs as envs
+
+        return (
+            self._is_sm107
+            and self._shared_mode == "separate"
+            and envs.VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD
+        )
+
     @property
     def overlaps_shared_experts(self) -> bool:
         """VLLM_FI_MEGA_MOE_SHARED=overlap on SM107: the MoE block passes
@@ -875,6 +909,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         activation_clamp: float | None,
         fast_math: bool = True,
         shared_experts: nn.Module | None = None,
+        shared_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # fast_math is a native deep_gemm knob; the FI kernels have no
         # equivalent toggle, so it is accepted for signature parity only.
@@ -916,7 +951,15 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             kernel.stage_inputs(t, workspace, quantize_input=True)
             # Zero-copy workspace [:n] view: valid under stream ordering
             # until the next MoE layer's launch on the same profile.
-            if shared_experts is None:
+            if shared_output is not None:
+                if sm107_supports_fused_addend(kernel, workspace):
+                    y = kernel.compute(
+                        workspace, transformed, output=None, addend=shared_output
+                    )
+                else:
+                    y = kernel.compute(workspace, transformed, output=None)
+                    y += shared_output
+            elif shared_experts is None:
                 y = kernel.compute(workspace, transformed, output=None)
             else:
                 y = self._compute_with_overlapped_shared(

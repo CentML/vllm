@@ -321,6 +321,7 @@ if TYPE_CHECKING:
     VLLM_FI_MEGA_MOE_MAX_SM_COUNT: str = "auto"
     VLLM_FI_MEGA_MOE_DEBUG_DIR: str = ""
     VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE: bool = True
+    VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD: bool = True
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2215,6 +2216,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every padding row.
     "VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE": lambda: bool(
         int(os.getenv("VLLM_FI_MEGA_MOE_KEEP_ONE_ROUTE", "1"))
+    ),
+    # SM107 MegaMoE: add the shared-expert output inside flashinfer's top-k
+    # combine reduce (one launch; bit-identical to `routed += shared`) when the
+    # flashinfer build supports it (fast reduce). separate mode runs the shared
+    # MLP first, overlap mode joins the side stream before the deferred reduce.
+    # "0" restores the separate elementwise add.
+    "VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD": lambda: bool(
+        int(os.getenv("VLLM_FI_MEGA_MOE_FUSED_SHARED_ADD", "1"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
