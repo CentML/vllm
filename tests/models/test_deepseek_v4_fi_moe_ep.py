@@ -695,6 +695,30 @@ def test_mega_moe_padding_keeps_one_route_per_rank():
     assert apply_mega_moe_routing_preprocess(ids, keep_first_row=True) is ids
 
 
+def test_fi_stages_route_padding_mask_probes_moe_ep_tensors(
+    fake_flashinfer, monkeypatch
+):
+    """The padding mask goes to flashinfer's route staging only when its
+    MoEEpTensors has route_padding_mask + keep_first_route; older flashinfer
+    keeps vLLM's torch masking (apply_mega_moe_routing_preprocess)."""
+    from vllm.models.deepseek_v4.nvidia import fi_moe
+
+    @dataclass
+    class _Tensors:
+        hidden_states: Any = None
+        route_padding_mask: Any = None
+        keep_first_route: bool = False
+
+    @dataclass
+    class _OldTensors:
+        hidden_states: Any = None
+
+    for cls, expected in ((_Tensors, True), (_OldTensors, False)):
+        fake_flashinfer.MoEEpTensors = cls
+        monkeypatch.setattr(fi_moe, "_FI_PAD_MASK", None)
+        assert fi_moe.fi_stages_route_padding_mask() is expected
+
+
 def test_sm107_max_sm_count_spec():
     from vllm.models.deepseek_v4.nvidia.fi_moe import sm107_max_sm_count
 

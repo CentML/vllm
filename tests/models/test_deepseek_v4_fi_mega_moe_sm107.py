@@ -525,3 +525,28 @@ def test_fi_mega_moe_sm107_shared_output_fused_add(sm107_dist, monkeypatch):
     ref = mod(x, wts, ids, activation_clamp=CLAMP).clone() + s
     assert torch.equal(got, ref), _rel(got, ref)
     del graph
+
+
+# ----------------------------------------------------------------------------
+# Padding mask (+ keep-one-route) folded into flashinfer's route staging.
+def test_fi_mega_moe_sm107_padding_mask_folded(sm107_dist, monkeypatch):
+    """The padding mask (+ keep-first-row) staged by flashinfer == vLLM's torch
+    preprocess, bitwise."""
+    from vllm.models.deepseek_v4.nvidia import fi_moe
+
+    mod, *_ = _build(seed=10, prefix="model.layers.padfold.ffn.experts")
+    if not fi_moe.fi_stages_route_padding_mask():
+        pytest.skip("flashinfer without route_padding_mask")
+    n = 200
+    x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16)
+    ids, wts = _routing(n, seed=77)
+    pad = torch.zeros(n, dtype=torch.bool, device="cuda")
+    pad[150:] = True
+    pad[0] = True  # row 0 keeps its routes (keep-one-route)
+    monkeypatch.setattr(
+        fi_moe, "resolve_mega_moe_is_padding", lambda num_tokens: pad[:num_tokens]
+    )
+    got = mod(x, wts, ids, activation_clamp=CLAMP).clone()
+    monkeypatch.setattr(fi_moe, "fi_stages_route_padding_mask", lambda: False)
+    ref = mod(x, wts, ids, activation_clamp=CLAMP).clone()
+    assert torch.equal(got[:150], ref[:150]), _rel(got[:150], ref[:150])

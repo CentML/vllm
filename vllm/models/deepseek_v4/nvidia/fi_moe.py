@@ -265,6 +265,27 @@ def resolve_mega_moe_is_padding(num_tokens: int) -> torch.Tensor | None:
     return is_padding[:num_tokens]
 
 
+def fi_stages_route_padding_mask() -> bool:
+    """flashinfer folds the padding mask (+ keep-first-row) into its one-launch SM107
+    route staging (MoEEpTensors.route_padding_mask, n1024 k2): no separate masking
+    kernels before the MegaMoE call."""
+    global _FI_PAD_MASK
+    if _FI_PAD_MASK is None:
+        try:
+            import dataclasses
+
+            from flashinfer.moe_ep import MoEEpTensors
+
+            names = {f.name for f in dataclasses.fields(MoEEpTensors)}
+            _FI_PAD_MASK = {"route_padding_mask", "keep_first_route"} <= names
+        except Exception:
+            _FI_PAD_MASK = False
+    return _FI_PAD_MASK
+
+
+_FI_PAD_MASK: bool | None = None
+
+
 def apply_mega_moe_routing_preprocess(
     topk_ids: torch.Tensor,
     *,
@@ -925,11 +946,24 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
 
         num_tokens = hidden_states.shape[0]
         is_padding = resolve_mega_moe_is_padding(num_tokens)
-        topk_ids = apply_mega_moe_routing_preprocess(
-            topk_ids,
-            is_padding=is_padding,
-            keep_first_row=self._keep_first_route,
-        )
+        # SM107: flashinfer stages the padding mask inside its route staging launch.
+        pad_kwargs: dict[str, Any] = {}
+        if (
+            self._is_sm107
+            and is_padding is not None
+            and is_padding.is_contiguous()
+            and fi_stages_route_padding_mask()
+        ):
+            pad_kwargs = {
+                "route_padding_mask": is_padding,
+                "keep_first_route": bool(self._keep_first_route),
+            }
+        else:
+            topk_ids = apply_mega_moe_routing_preprocess(
+                topk_ids,
+                is_padding=is_padding,
+                keep_first_row=self._keep_first_route,
+            )
         scalars = self._scalar_kwargs()
 
         if self._is_sm107:
@@ -947,6 +981,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 topk_ids=topk_ids.contiguous(),
                 topk_weights=topk_weights.contiguous(),
                 **scalars,
+                **pad_kwargs,
             )
             kernel.stage_inputs(t, workspace, quantize_input=True)
             # Zero-copy workspace [:n] view: valid under stream ordering
