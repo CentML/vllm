@@ -61,7 +61,6 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion import norm_quant_kernels as K
-from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
 
 logger = init_logger(__name__)
 
@@ -526,33 +525,7 @@ def gdn_uncovered_row_ranges(covered, pm: int) -> list[tuple[int, int]]:
 
 def gdn_quant_uncovered_rows(x2, q, sf, ranges, T: int, psc: int) -> None:
     """Plain MXFP8 row quant of the uncovered ranges, one launch per range."""
-    if gdn_step_plan.MERGED_ROW_QUANT:
-        _gdn_quant_uncovered_rows_merged(x2, q, sf, ranges, T, psc)
-        return
     for lo, hi in ranges:
-        K.quant_rows(x2, q, sf, lo, hi, T, psc)
-
-
-def _gdn_quant_uncovered_rows_merged(x2, q, sf, ranges, T: int, psc: int) -> None:
-    """VLLM_GDN_MERGED_ROW_QUANT (GGM_OG2=1): exactly two non-empty ranges
-    (the spec-decode rows and the padding rows of a mixed step) with the same
-    launch config run as ONE launch of the two-range row-quant kernel (same
-    per-row math); otherwise one launch per non-empty range, in order.
-    """
-    pend = [(lo, hi) for lo, hi in ranges if hi > lo]
-    if not pend:
-        return
-    stats = gdn_step_plan.TRIM_STATS
-    if len(pend) == 2:
-        (lo1, hi1), (lo2, hi2) = pend
-        c1, c2 = K._qr_config(hi1 - lo1), K._qr_config(hi2 - lo2)
-        if c1 == c2 and hi1 <= lo2:
-            K.quant_rows2(x2, q, sf, (lo1, hi1), (lo2, hi2), T, psc, c1)
-            stats["qrows_merged"] += 1
-            logger.info_once("GDN uncovered-row quant: 2 launches merged into 1")
-            return
-    stats["qrows_single" if len(pend) == 1 else "qrows_multi"] += 1
-    for lo, hi in pend:
         K.quant_rows(x2, q, sf, lo, hi, T, psc)
 
 

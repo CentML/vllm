@@ -9,7 +9,6 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.mamba.gdn import gdn_step_plan
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -261,38 +260,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
-        if gdn_step_plan.MDREUSE:
-            # GGM_MDREUSE=1: derive the metadata of the other GDN KV-cache groups
-            # of a step from the first group's full build (see gdn_step_plan)
-            return gdn_step_plan.mdreuse_build(
-                self,
-                self._build_full,
-                common_prefix_len,
-                common_attn_metadata,
-                num_accepted_tokens,
-                num_decode_draft_tokens_cpu,
-                fast_build,
-            )
-        return self._build_full(
-            common_prefix_len,
-            common_attn_metadata,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            fast_build,
-        )
-
-    def _build_full(
-        self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        num_accepted_tokens: torch.Tensor | None = None,
-        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
-        fast_build: bool = False,
-    ) -> GDNAttentionMetadata:
         m = common_attn_metadata
-        # GGM_LAZY=1: metadata read only by the FLA / Triton-conv fallback paths is
-        # computed on demand (gdn_step_plan.fill_lazy) instead of here
-        lazy: list | None = [] if gdn_step_plan.LAZY else None
         # the deferred state commit post-step below uses the caller's arguments
         gsc_args = (
             (num_accepted_tokens, num_decode_draft_tokens_cpu)
@@ -483,26 +451,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_max_seqlen = int(
                 (prefill_query_start_loc_cpu[1:] - prefill_query_start_loc_cpu[:-1]).max()
             )
-            if lazy is not None:
-                lazy.append(
-                    (
-                        self._build_chunk_metadata,
-                        "chunk",
-                        (
-                            prefill_query_start_loc,
-                            prefill_query_start_loc_cpu,
-                            query_start_loc.device,
-                        ),
-                        {},
-                    )
-                )
-                chunk_indices, chunk_offsets = None, None
-            else:
-                chunk_indices, chunk_offsets = self._build_chunk_metadata(
-                    prefill_query_start_loc,
-                    prefill_query_start_loc_cpu,
-                    query_start_loc.device,
-                )
+            chunk_indices, chunk_offsets = self._build_chunk_metadata(
+                prefill_query_start_loc,
+                prefill_query_start_loc_cpu,
+                query_start_loc.device,
+            )
 
         if num_prefills > 0:
             context_lens_tensor = m.compute_num_computed_tokens()
@@ -510,23 +463,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            if lazy is not None:
-                lazy.append(
-                    (
-                        compute_causal_conv1d_metadata,
-                        "ccm",
-                        (non_spec_query_start_loc_cpu,),
-                        {"device": query_start_loc.device},
-                    )
+            nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc_cpu,
+                    device=query_start_loc.device,
                 )
-                nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
-            else:
-                nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                    compute_causal_conv1d_metadata(
-                        non_spec_query_start_loc_cpu,
-                        device=query_start_loc.device,
-                    )
-                )
+            )
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
@@ -646,8 +588,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             from vllm.model_executor.layers.mamba.ops import gdn_state_commit
 
             gdn_state_commit.postprocess_metadata(self, attn_metadata, *gsc_args)
-        if lazy:
-            gdn_step_plan.defer_metadata(attn_metadata, lazy)
         return attn_metadata
 
     def build_for_cudagraph_capture(

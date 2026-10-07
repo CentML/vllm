@@ -344,36 +344,6 @@ def quant_rows(x, q, sf, lo, hi, m, padded_sf_cols, config=None):
         PADDED_SF_COLS=padded_sf_cols, num_warps=c["num_warps"])
 
 
-@triton.jit(do_not_specialize=["LO", "HI", "LO2", "HI2", "NB1", "M"])
-def _quant_rows_two_range_kernel(X, Q, SF_SWZ, LO, HI, LO2, HI2, NB1, M, stride_x, stride_q,
-                                 N: tl.constexpr, BN: tl.constexpr, XB: tl.constexpr,
-                                 PADDED_SF_COLS: tl.constexpr):
-    """_nqf_quant_rows_kernel over rows [LO, HI) U [LO2, HI2): programs < NB1 take the first range."""
-    pid = tl.program_id(0).to(tl.int64)
-    first = pid < NB1
-    base = tl.where(first, LO + pid * XB, LO2 + (pid - NB1) * XB)
-    hi = tl.where(first, HI, HI2)
-    row = base + tl.arange(0, XB)[:, None]
-    in_rng = row < hi
-    dmask = in_rng & (row < M)
-    for c0 in tl.static_range(0, N, BN):
-        cols = c0 + tl.arange(0, BN)[None, :]
-        yb = tl.load(X + row * stride_x + cols, dmask, other=0.0)
-        _mx_epilogue(yb, row, cols, dmask, in_rng, Q, SF_SWZ, stride_q, c0 // 32, XB, BN, PADDED_SF_COLS)
-
-
-def quant_rows2(x, q, sf, r1, r2, m, padded_sf_cols, config):
-    """quant_rows over two row ranges r1 = (lo, hi), r2 = (lo2, hi2) (r1 before r2) in one launch; `config`
-    (= _qr_config of either range) must be the same for both ranges. Same per-row math as quant_rows."""
-    (lo1, hi1), (lo2, hi2) = r1, r2
-    xb = config["XB"]
-    nb1 = triton.cdiv(hi1 - lo1, xb)
-    nb2 = triton.cdiv(hi2 - lo2, xb)
-    _quant_rows_two_range_kernel[(nb1 + nb2,)](x, q, sf, lo1, hi1, lo2, hi2, nb1, m, x.stride(0), q.stride(0),
-                                               N=x.shape[-1], BN=config["BN"], XB=xb,
-                                               PADDED_SF_COLS=padded_sf_cols, num_warps=config["num_warps"])
-
-
 # ================================================================================================================
 # MoE finalize folded into the next pre-norm, and a single-launch GDN row fixup
 # (all bit-identical to the unfused chains they replace)

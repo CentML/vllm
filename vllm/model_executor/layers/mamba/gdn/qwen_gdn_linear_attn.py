@@ -31,7 +31,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc, gdn_step_plan
+from vllm.model_executor.layers.mamba.gdn import gdn_out_alloc
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -346,9 +346,6 @@ if _GDN_STATE_COMMIT and _GDN_MIXED_SPEC_TRITON:
         "gdn_state_commit requires VLLM_GDN_MIXED_SPEC_TRITON=0 (the FLA spec "
         "kernel writes per-token state slots)"
     )
-# Per-step plan / host trims of the mixed-step GDN core (GGM, GGM_OG2), see
-# gdn_step_plan.
-gdn_step_plan.check_config(_GDN_STATE_COMMIT, norm_quant.NQF)
 
 
 @triton.jit
@@ -662,10 +659,9 @@ def gdn_fused_conv_post_conv(
     num_k_heads: int,
     head_k_dim: int,
     head_v_dim: int,
-    use_cuda: bool | None = None,  # None: VLLM_GDN_CONV_CUDA; False: Triton only
 ):
     P = x.shape[0]
-    if _GDN_CONV_CUDA if use_cuda is None else use_cuda:
+    if _GDN_CONV_CUDA:
         # bit-exact CUDA (sm_107a) version of the v2 Triton kernel below
         res = _gdn_conv_cuda_call(x, conv_weights, conv_state, cache_indices, has_initial_state,
                                   cu_seqlens, num_seqs, a, b, A_log, dt_bias, num_k_heads,
@@ -1989,9 +1985,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        if gdn_step_plan.LAZY:
-            # GGM_LAZY=1: this path reads the deferred FLA / Triton-conv metadata
-            gdn_step_plan.fill_lazy(attn_metadata)
         if _GDN_STATE_COMMIT_DEFERRED:
             # commit pending token logs of the non-spec slots before they are read
             gdn_state_commit.forward_core_prologue(self, attn_metadata)
@@ -2973,12 +2966,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        if gdn_step_plan.ENABLED and gdn_step_plan.forward_core_fused_norm(
-            self, attn_metadata, attn_metadata_raw, mixed_qkv, b, a, output_gate,
-            core_attn_out
-        ):
-            # GGM=1: mixed step ran on the per-step plan (same kernels and order)
-            return
         if _GDN_STATE_COMMIT_DEFERRED and gdn_state_commit.fused_norm_prologue(
             self, attn_metadata, mixed_qkv, b, a, output_gate, core_attn_out
         ):
