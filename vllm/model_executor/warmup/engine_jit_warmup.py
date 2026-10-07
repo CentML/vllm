@@ -51,7 +51,6 @@ Environment variables:
 - ``EWARM_KEYS``: directory with recorded key files (``*.jsonl``); unset or
   empty disables group 2.
 - ``VLLM_JIT_WARMUP_GDN_PREFILL``: ``0`` disables group 3 (default ``1``).
-  Group 3 also requires ``VLLM_GDN_FI_STATE_POOL`` not to be ``0``.
 
 Key files are produced with the Triton compile recorder
 (``vllm/model_executor/warmup/triton_compile_recorder.py``,
@@ -307,7 +306,7 @@ def _register_all(registry: JitWarmupRegistry) -> None:
         _INSTANCES.append(kern)
         kern.register_warmup()
         STATS["triton_keys"] += len(lst)
-    if _GDN and os.environ.get("VLLM_GDN_FI_STATE_POOL", "1") != "0":
+    if _GDN:
         gdn = FiGdnPrefillWarmup(registry.vllm_config)
         _INSTANCES.append(gdn)
         gdn.register_warmup()
