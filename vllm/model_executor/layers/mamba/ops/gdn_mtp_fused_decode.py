@@ -9,7 +9,7 @@ roll), the value-split Triton recurrence (``gdn_mtp_decode``) and
 
 - every program owns ``(request, value head, BLOCK_V value rows)``. It computes
   the causal conv + SiLU of the q/k channels of its key head and of its own v
-  channels for each of the request's (at most 6) tokens as separate vectors,
+  channels for each of the request's (at most 7) tokens as separate vectors,
   straight from the pre-conv projection rows and the previous step's conv
   window, then runs the gated delta rule token by token and writes the raw
   core output (bf16 scratch) and the per-token SSM states. Keeping each
@@ -40,8 +40,9 @@ from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 
-# Tokens per request the kernel unrolls for (MTP with up to 5 draft tokens).
-MAX_FUSED_DECODE_TOKENS = 6
+# Tokens per request the kernel unrolls for (MTP with up to 6 draft tokens).
+# Token 6 (k = 6) is only compiled in when S = 7.
+MAX_FUSED_DECODE_TOKENS = 7
 
 
 @triton.jit
@@ -71,7 +72,7 @@ def _token_row(x_ptr, tok0, t: tl.constexpr, stride_x, ch, n, S: tl.constexpr):
 
 @triton.jit
 def _token_rows(x_ptr, tok0, stride_x, ch, n, S: tl.constexpr):
-    """Rows of tokens 0..5 (``_token_row``)."""
+    """Rows of tokens 0..6 (``_token_row``)."""
     return (
         _token_row(x_ptr, tok0, 0, stride_x, ch, n, S),
         _token_row(x_ptr, tok0, 1, stride_x, ch, n, S),
@@ -79,13 +80,14 @@ def _token_rows(x_ptr, tok0, stride_x, ch, n, S: tl.constexpr):
         _token_row(x_ptr, tok0, 3, stride_x, ch, n, S),
         _token_row(x_ptr, tok0, 4, stride_x, ch, n, S),
         _token_row(x_ptr, tok0, 5, stride_x, ch, n, S),
+        _token_row(x_ptr, tok0, 6, stride_x, ch, n, S),
     )
 
 
 @triton.jit
-def _conv_tokens(c0, c1, c2, x0, x1, x2, x3, x4, x5, w0, w1, w2, w3, apply):
-    """Conv + SiLU of tokens 0..5: token t's window is
-    ``[c0, c1, c2, x0, .., x5][t : t + 4]``.
+def _conv_tokens(c0, c1, c2, x0, x1, x2, x3, x4, x5, x6, w0, w1, w2, w3, apply):
+    """Conv + SiLU of tokens 0..6: token t's window is
+    ``[c0, c1, c2, x0, .., x6][t : t + 4]``.
     """
     return (
         _conv_token(c0, c1, c2, x0, w0, w1, w2, w3, x0, apply),
@@ -94,6 +96,7 @@ def _conv_tokens(c0, c1, c2, x0, x1, x2, x3, x4, x5, w0, w1, w2, w3, apply):
         _conv_token(x0, x1, x2, x3, w0, w1, w2, w3, x3, apply),
         _conv_token(x1, x2, x3, x4, w0, w1, w2, w3, x4, apply),
         _conv_token(x2, x3, x4, x5, w0, w1, w2, w3, x5, apply),
+        _conv_token(x3, x4, x5, x6, w0, w1, w2, w3, x6, apply),
     )
 
 
@@ -122,7 +125,7 @@ def _conv_weights(w_ptr, ch, stride_w_dim, stride_w_width):
 @triton.jit
 def _store_window(
     conv_state_ptr, slot_base, stride_cs_dim, stride_cs_tok, ch, n, c1, c2,
-    x0, x1, x2, x3, x4, x5, apply, S: tl.constexpr,
+    x0, x1, x2, x3, x4, x5, x6, apply, S: tl.constexpr,
 ):  # fmt: skip
     """``_causal_conv1d_update_kernel``'s spec-decode roll: the slot's new
     window is ``[c1, c2, x0, .., x_{n-1}]`` (positions ``< 2 + n``).
@@ -141,6 +144,8 @@ def _store_window(
         tl.store(p + 6 * stride_cs_tok, x4, mask=apply & (n > 4))
     if S > 5:
         tl.store(p + 7 * stride_cs_tok, x5, mask=apply & (n > 5))
+    if S > 6:
+        tl.store(p + 8 * stride_cs_tok, x6, mask=apply & (n > 6))
 
 
 @triton.jit
@@ -338,18 +343,21 @@ def _gdn_mtp_fused_decode_kernel(
         tl.extra.cuda.gdc_wait()
 
     tok0 = bos.to(tl.int64)
-    qx0, qx1, qx2, qx3, qx4, qx5 = _token_rows(x_ptr, tok0, stride_x, q_ch, n, S)
-    kx0, kx1, kx2, kx3, kx4, kx5 = _token_rows(x_ptr, tok0, stride_x, k_ch, n, S)
-    vx0, vx1, vx2, vx3, vx4, vx5 = _token_rows(x_ptr, tok0, stride_x, v_ch, n, S)
-    q0, q1, q2, q3, q4, q5 = _conv_tokens(
-        qc0, qc1, qc2, qx0, qx1, qx2, qx3, qx4, qx5, qw0, qw1, qw2, qw3, apply_conv
-    )
-    k0, k1, k2, k3, k4, k5 = _conv_tokens(
-        kc0, kc1, kc2, kx0, kx1, kx2, kx3, kx4, kx5, kw0, kw1, kw2, kw3, apply_conv
-    )
-    v0, v1, v2, v3, v4, v5 = _conv_tokens(
-        vc0, vc1, vc2, vx0, vx1, vx2, vx3, vx4, vx5, vw0, vw1, vw2, vw3, apply_conv
-    )
+    qx0, qx1, qx2, qx3, qx4, qx5, qx6 = _token_rows(x_ptr, tok0, stride_x, q_ch, n, S)
+    kx0, kx1, kx2, kx3, kx4, kx5, kx6 = _token_rows(x_ptr, tok0, stride_x, k_ch, n, S)
+    vx0, vx1, vx2, vx3, vx4, vx5, vx6 = _token_rows(x_ptr, tok0, stride_x, v_ch, n, S)
+    q0, q1, q2, q3, q4, q5, q6 = _conv_tokens(
+        qc0, qc1, qc2, qx0, qx1, qx2, qx3, qx4, qx5, qx6, qw0, qw1, qw2, qw3,
+        apply_conv,
+    )  # fmt: skip
+    k0, k1, k2, k3, k4, k5, k6 = _conv_tokens(
+        kc0, kc1, kc2, kx0, kx1, kx2, kx3, kx4, kx5, kx6, kw0, kw1, kw2, kw3,
+        apply_conv,
+    )  # fmt: skip
+    v0, v1, v2, v3, v4, v5, v6 = _conv_tokens(
+        vc0, vc1, vc2, vx0, vx1, vx2, vx3, vx4, vx5, vx6, vw0, vw1, vw2, vw3,
+        apply_conv,
+    )  # fmt: skip
 
     si_row = state_indices_ptr + request * S
     q0, k0, g0, b0, d0 = _token_prep(q0, k0, 0, n, tok0, a_ptr, b_ptr, stride_a,
@@ -370,6 +378,9 @@ def _gdn_mtp_fused_decode_kernel(
     q5, k5, g5, b5, d5 = _token_prep(q5, k5, 5, n, tok0, a_ptr, b_ptr, stride_a,
                                      stride_b, value_head, dt_bias, a_log, scale,
                                      si_row, stride_state_slot, S)  # fmt: skip
+    q6, k6, g6, b6, d6 = _token_prep(q6, k6, 6, n, tok0, a_ptr, b_ptr, stride_a,
+                                     stride_b, value_head, dt_bias, a_log, scale,
+                                     si_row, stride_state_slot, S)  # fmt: skip
 
     out_cols = value_head * V + offs_v
     st = state_ptr + head_offset + tile
@@ -385,13 +396,16 @@ def _gdn_mtp_fused_decode_kernel(
                     valid, S)  # fmt: skip
     h = _token_step(h, q5, k5, v5, g5, b5, d5, 5, n, tok0, o_ptr, QH, out_cols, st,
                     valid, S)  # fmt: skip
+    h = _token_step(h, q6, k6, v6, g6, b6, d6, 6, n, tok0, o_ptr, QH, out_cols, st,
+                    valid, S)  # fmt: skip
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
     # Only this program reads its v channels' window: roll it.
     slot_base = conv_slot * stride_cs_slot
     _store_window(conv_state_ptr, slot_base, stride_cs_dim, stride_cs_tok, v_ch, n,
-                  vc1, vc2, vx0, vx1, vx2, vx3, vx4, vx5, apply_conv, S)  # fmt: skip
+                  vc1, vc2, vx0, vx1, vx2, vx3, vx4, vx5, vx6, apply_conv,
+                  S)  # fmt: skip
 
     # --- group tail: the last of the G * NVB programs of (request, key head) ---
     tl.debug_barrier()
@@ -403,9 +417,11 @@ def _gdn_mtp_fused_decode_kernel(
 
     # Every sibling has read the q/k window: roll it.
     _store_window(conv_state_ptr, slot_base, stride_cs_dim, stride_cs_tok, q_ch, n,
-                  qc1, qc2, qx0, qx1, qx2, qx3, qx4, qx5, apply_conv, S)  # fmt: skip
+                  qc1, qc2, qx0, qx1, qx2, qx3, qx4, qx5, qx6, apply_conv,
+                  S)  # fmt: skip
     _store_window(conv_state_ptr, slot_base, stride_cs_dim, stride_cs_tok, k_ch, n,
-                  kc1, kc2, kx0, kx1, kx2, kx3, kx4, kx5, apply_conv, S)  # fmt: skip
+                  kc1, kc2, kx0, kx1, kx2, kx3, kx4, kx5, kx6, apply_conv,
+                  S)  # fmt: skip
 
     # Gated RMSNorm (per head, norm before gate) + MXFP8 of the group's
     # heads, as _gdn_gated_norm_mxfp8_kernel.
@@ -461,12 +477,19 @@ def gdn_mtp_fused_decode_launch_config(
     """(BLOCK_V, num_warps). Measured on VR (SM107, DRAM 4752 MHz) between
     the in_proj/out_proj MXFP8 GEMMs at H=16, HV=32, K=V=128 (job 675792):
     4 tokens/request: 16/4 at 1-3 requests, 32/4 at 4, 64/4 at 5-6;
-    5 tokens/request: 16/4 at 1-2 and 4 requests, 32/4 at 3.
+    5 tokens/request: 16/4 at 1-2 and 4 requests, 32/4 at 3 (also used at
+    6 tokens/request).
+    7 tokens/request, same production-shaped bench (job 709421; us per layer,
+    fused vs chain): 8/4 at 1 request (18.7 vs 20.7), 32/4 at 2-4 (23.8 vs
+    23.7, 25.3 vs 26.8, 35.4 vs 34.0). Core-only benches without the GEMMs
+    favour 16/2 and 64/4, which lose 1-12 us/layer between the GEMMs.
     """
     if tokens_per_request <= 4:
         if num_requests <= 3:
             return 16, 4
         return (32, 4) if num_requests == 4 else (64, 4)
+    if tokens_per_request >= 7:
+        return (8, 4) if num_requests == 1 else (32, 4)
     return (32, 4) if num_requests == 3 else (16, 4)
 
 

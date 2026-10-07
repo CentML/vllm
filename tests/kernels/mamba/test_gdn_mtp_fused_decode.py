@@ -167,7 +167,7 @@ def _padding_scales(out_scale, rows, n_valid):
     "num_requests,num_padded", [(1, 0), (2, 0), (3, 1), (4, 0), (6, 2)]
 )
 @pytest.mark.parametrize("block_v,num_warps", [(None, None), (8, 2), (32, 4)])
-@pytest.mark.parametrize("spec_tokens", [1, 4, 5, 6])
+@pytest.mark.parametrize("spec_tokens", [1, 4, 5, 6, 7])
 def test_fused_decode_matches_three_kernels(
     num_requests, num_padded, block_v, num_warps, spec_tokens
 ):
