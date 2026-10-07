@@ -307,6 +307,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -2100,6 +2101,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
+    # SM107 only: run the small unquantized BF16 decode projections (MoE router,
+    # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.
+    # Set to 0 to keep the default unquantized GEMM.
+    "VLLM_LOWM_BF16_GEMM": lambda: bool(int(os.getenv("VLLM_LOWM_BF16_GEMM", "1"))),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many

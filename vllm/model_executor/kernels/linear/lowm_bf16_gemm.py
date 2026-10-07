@@ -22,9 +22,12 @@ elements (different fp32 summation order); accumulation stays fp32.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -98,6 +101,30 @@ def _tinygemm(
     return out
 
 
+@functools.cache
+def _tinygemm_available(device: torch.device) -> bool:
+    """Whether FlashInfer's ``tinygemm_bf16`` imports and runs on ``device``.
+
+    One tiny call at layer construction also moves its JIT build out of
+    profiling and graph capture.
+    """
+    try:
+        x = torch.zeros((1, 64), dtype=torch.bfloat16, device=device)
+        w = torch.zeros((16, 64), dtype=torch.bfloat16, device=device)
+        zero_bias = torch.zeros(16, dtype=torch.bfloat16, device=device)
+        _tinygemm(x, w, zero_bias)
+        torch.cuda.synchronize(device)
+    except Exception as e:
+        logger.warning_once(
+            "FlashInfer tinygemm_bf16 unavailable on %s (%s); low-M BF16 GEMM "
+            "keeps the default GEMM for its shapes.",
+            device,
+            e,
+        )
+        return False
+    return True
+
+
 def lowm_bf16_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor
 ) -> torch.Tensor:
@@ -169,10 +196,11 @@ def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
     the default unquantized GEMM. Call after the layer is constructed.
     """
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-    from vllm.utils.flashinfer import has_flashinfer
 
     if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((10, 7))
+        envs.VLLM_LOWM_BF16_GEMM
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((10, 7))
     ):
         return False
     quant_method = getattr(layer, "quant_method", None)
@@ -189,7 +217,7 @@ def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
     plan = _SM107_PLANS.get((n, k))
     if plan is None:
         return False
-    if plan[1] == "tinygemm" and not has_flashinfer():
+    if plan[1] == "tinygemm" and not _tinygemm_available(weight.device):
         return False
     layer.register_buffer(
         "lowm_zero_bias",
