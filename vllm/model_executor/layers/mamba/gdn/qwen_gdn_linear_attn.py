@@ -1131,12 +1131,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
         self._lcd2_ba = False
         _w_ba = getattr(self.in_proj_ba, "weight", None)
-        # Gate on env + weights only: the traced graph must not depend on
-        # whether TinyGEMM2 loads on this node (the AOT key only sees env).
-        # available() still runs here (load + log); if it fails, _ba_impl
-        # falls back to F.linear at runtime inside the same graph.
-        if _w_ba is not None and _lcd2.ba_eligible(_w_ba):
-            _lcd2.available()
+        if _w_ba is not None and _lcd2.ba_eligible(_w_ba) and _lcd2.available():
             # zero bias: TinyGEMM2's sm100 variants run with a bias tensor
             self.register_buffer(
                 "_lcd2_ba_b",
@@ -2525,7 +2520,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             return
         self._forward_core_fused_norm_packed_impl(mixed_qkvz, ba, core_attn_out)
-        gdn_out_alloc.zero_pad_rows_late(core_attn_out, False)
 
     def _forward_core_fused_norm_packed_impl(
         self,

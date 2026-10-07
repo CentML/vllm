@@ -483,17 +483,7 @@ class Qwen3NextAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
-        if gate is not None and gate.shape[-1] == 2 * attn_output.shape[-1]:
-            # gb300 glue (GLUE_EWS_NOGATE): gate = the [q | gate]-interleaved QKV columns
-            if norm_quant.NQF and norm_quant.gate_mul_qkv_fusable(self, attn_output, gate):
-                attn_output = torch.ops.nqf.gate_mul_mxfp8_qkv(
-                    attn_output, gate, self.head_dim
-                )
-            else:
-                g = gate.reshape(-1, self.num_heads, 2 * self.head_dim)
-                g = g[:, :, self.head_dim :].reshape(attn_output.shape)
-                attn_output = attn_output * torch.sigmoid(g)
-        elif gate is not None:
+        if gate is not None:
             if norm_quant.NQF and norm_quant.gate_mul_fusable(self, attn_output, gate):
                 # sigmoid gate-mul fused with the o_proj MXFP8 input quant
                 attn_output = torch.ops.nqf.gate_mul_mxfp8(

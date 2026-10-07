@@ -599,11 +599,6 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
         tpp = os.environ.get("EWS_QKV_TPP", "1")
         zeros = int(os.environ.get("VLLM_GDN_OUT_ZERO_PAD_ROWS_ONLY", "1") == "1")
         factors.append(f"ews-v1-qkv{qkv}-tpp{tpp}-z{zeros}")
-        if os.environ.get("GLUE_EWS_NOGATE", "0") == "1":
-            # gb300 glue: Qwen3NextAttention.forward reads the gate from the
-            # [q | gate]-interleaved QKV rows (nqf::gate_mul_mxfp8_qkv or a
-            # slice + sigmoid) and ews_qkv_prologue's output loses the gate.
-            factors.append("ews-nogate-v1")
     if os.environ.get("NQF", "0") != "0":
         # Fused residual-add + norm + MXFP8 quant (see
         # model_executor/layers/fusion/norm_quant.py).
