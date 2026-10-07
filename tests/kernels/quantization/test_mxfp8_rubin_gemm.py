@@ -37,3 +37,38 @@ def test_rubin_mxfp8_backends_match_cute_dsl(k, n, m):
     den = ref.float().abs().max()
     for out in outs:
         assert ((out.float() - ref.float()).abs().max() / den).item() < 1e-2
+
+
+# (N, K) keys of rubin._AUTO_TABLE whose entries are checked one by one:
+# the DSV4.1 shared expert's gate_up / down (separate linears when the routed
+# experts run FlashInfer MegaMoE).
+_TABLE_SHAPES = [(4608, 5120), (5120, 2304)]
+
+
+@pytest.mark.parametrize("n,k", _TABLE_SHAPES)
+def test_rubin_auto_table_entries_dispatch_and_match_cute_dsl(n, k):
+    """Every _AUTO_TABLE entry of these shapes is what select_backend picks at
+    its M, its Sm107 tactic can implement that GEMM (otherwise the dispatch
+    silently falls back to cute-dsl), and its output matches cute-dsl."""
+    from flashinfer import mm_mxfp8, mxfp8_quantize
+
+    from vllm.model_executor.kernels.linear.mxfp8 import rubin as R
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    w = torch.randn(n, k, device="cuda", generator=g).bfloat16() * 0.02
+    w_q, w_sf = mxfp8_quantize(w, is_sf_swizzled_layout=True)
+    b = w_q.t()
+    for m, choice in R._AUTO_TABLE[(n, k)]:
+        assert R._lookup(R._AUTO_TABLE, m, n, k) == choice
+        a = torch.randn(m, k, device="cuda", generator=g).bfloat16()
+        a_q, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout=True)
+        ref = mm_mxfp8(a_q, b, a_sf, w_sf, out_dtype=torch.bfloat16, backend="cute-dsl")
+        if choice == "cublaslt":
+            out = R.cublaslt_mm_mxfp8(a_q, b, a_sf, w_sf, torch.bfloat16)
+        else:
+            t = R.Sm107Tactic.parse(choice)
+            assert R.sm107_can_implement(t, m, n, k), (m, choice)
+            out = R.sm107_mm_mxfp8(a_q, b, a_sf, w_sf, torch.bfloat16, t)
+        den = ref.float().abs().max()
+        err = ((out.float() - ref.float()).abs().max() / den).item()
+        assert err < 1e-2, (m, choice, err)
