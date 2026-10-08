@@ -394,7 +394,7 @@ constexpr int UI = 6;                           // unit-info ring depth (publish
 constexpr int SCHED_MAX = 128;
 constexpr int GMAX = 256;                       // groups (expert, 32-token sub-block) per domain
 constexpr int NTHREADS = 320;
-constexpr int TMEM_COLS = 256, ACCW = 64;
+constexpr int TMEM_COLS = 256, ACCW = 32, NACC = 4;   // 4 accumulator buffers of N <= 32 columns, then SF columns
 constexpr int W13SF_E = 2 * I * H / 32, W2SF_E = H * I / 32;  // scale bytes per expert (128x4-interleaved)
 
 // One (expert, sub-block of <= 32 tokens) of a domain: the unit record the producer bulk-copies into SMEM.
@@ -623,10 +623,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
   unsigned char* sSFA = sB + S * B_ST;
   unsigned char* sSFB = sSFA + S * SF_ST;
   u64* bars = (u64*)(sSFB + S * SF_ST);
-  u64* full = bars; u64* empty = bars + S; u64* accf = bars + 2 * S; u64* acce = accf + 2; u64* inff = acce + 2; u64* infe = inff + UI;
+  u64* full = bars; u64* empty = bars + S; u64* accf = bars + 2 * S; u64* acce = accf + NACC; u64* inff = acce + NACC;
+  u64* infe = inff + UI;
   Info* sinfo = (Info*)(infe + UI);
-  float* sam = (float*)(sinfo + UI);                     // FC1 requant: per-warp partial amax [4 warps][2 parities][8 cols]
-  volatile int* sdom = (volatile int*)(sam + 64);        // [0] served domain, [1] rank in it
+  float* sam = (float*)(sinfo + UI);                     // FC1 requant amax exchange [2 chunks][4 warps][2 parities][8 cols]
+  volatile int* sdom = (volatile int*)(sam + 128);       // [0] served domain, [1] rank in it
   uint32_t* stmem = (uint32_t*)(sdom + 4);
   int* ssched = (int*)(stmem + 4);                       // this CTA's units (entry 0 = wave-0 unit)
   __nv_bfloat16* sstage = (__nv_bfloat16*)(ssched + SCHED_MAX + 4);   // FC2 epilogue: [16 tokens][128 ch] bf16
@@ -642,7 +643,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     if (r >= (unsigned)(d ? p.nd1 : p.nd0)) { d ^= 1; r = atomicAdd(&p.st->rank[d], 1u); }
     sdom[0] = d; sdom[1] = (int)r;
     for (int s = 0; s < S; s++) { mbar_init(sa(&full[s]), 1 + 128); mbar_init(sa(&empty[s]), 1); }
-    for (int b = 0; b < 2; b++) { mbar_init(sa(&accf[b]), 1); mbar_init(sa(&acce[b]), 1); }
+    for (int b = 0; b < NACC; b++) { mbar_init(sa(&accf[b]), 1); mbar_init(sa(&acce[b]), 4); }
     for (int i = 0; i < UI; i++) { mbar_init(sa(&inff[i]), 1); mbar_init(sa(&infe[i]), 3); }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
@@ -818,8 +819,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         const int kind = f->kind, ntok = f->r.ntok, nkb = f->nkb;
         mbar_arrive(sa(&infe[slot]));
         if (kind < 0) break;
-        const int b = ui & 1;
-        if (ui >= 2) TW(c_macce, mbar_wait(sa(&acce[b]), ((ui >> 1) - 1) & 1));
+        const int b = ui % NACC;
+        if (ui >= NACC) TW(c_macce, mbar_wait(sa(&acce[b]), ((ui / NACC) - 1) & 1));
         tc_fence_after();
         const int npad = (ntok + 15) & ~15;
         const uint32_t dacc = tmem + b * ACCW;
@@ -831,7 +832,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
           fence_proxy_async();                                 // cp.async (generic proxy) writes -> tcgen05 reads
           tc_fence_after();
           if (ntok > 0) {
-            const uint32_t sfa_col = tmem + 2 * ACCW + (k & 1) * 16, sfb_col = sfa_col + 8;
+            const uint32_t sfa_col = tmem + NACC * ACCW + (k & 1) * 16, sfb_col = sfa_col + 8;
             const u64 ads = ad0 + (u64)((s * A_ST) >> 4), bds = bd0 + (u64)((s * B_ST) >> 4);
             const u64 fas = fa0 + (u64)((s * SF_ST) >> 4), fbs = fb0 + (u64)((s * SF_ST) >> 4);
 #pragma unroll
@@ -871,8 +872,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       if (kind < 0) { named_bar(2, 128); if (ew == 0 && lane == 0) mbar_arrive(sa(&infe[slot])); break; }
       const int ntok = f->r.ntok, rb = f->rb, slot0 = f->r.slot0, gid = f->r.gid;
       const short* js = f->r.j;
-      const int b = ui & 1;
-      TW(c_eaccf, mbar_wait(sa(&accf[b]), (ui >> 1) & 1));
+      const int b = ui % NACC;
+      TW(c_eaccf, mbar_wait(sa(&accf[b]), (ui / NACC) & 1));
       const long long t_w = clock64();
       tc_fence_after();
       const int npad = (ntok + 15) & ~15;
@@ -883,8 +884,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       if (npad > 0 && !(p.abl & 8)) tmem_ld16(taddr, vv);
       if (npad > 16 && !(p.abl & 8)) tmem_ld16(taddr + 16, vv + 16);
       tc_fence_before();
-      named_bar(2, 128);
-      if (ew == 0 && lane == 0) mbar_arrive(sa(&acce[b]));
+      __syncwarp();
+      if (lane == 0) mbar_arrive(sa(&acce[b]));                // one arrival per epilogue warp (count 4)
 #pragma unroll
       for (int cc = 0; cc < NMAX / 16; cc++) {
         if (cc * 16 >= npad || (p.abl & 4)) break;
@@ -910,13 +911,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
             for (int jj = 0; jj < 8; jj++) am[jj] = fmaxf(am[jj], __shfl_xor_sync(0xffffffffu, am[jj], o));
           }
+          float* sm_ = sam + cc * 64;                          // per-chunk buffer: no reuse barrier inside a unit
           if ((lane & 0x17) == 0) {
 #pragma unroll
-            for (int jj = 0; jj < 8; jj++) sam[(q * 2 + (int)isgate) * 8 + jj] = am[jj];
+            for (int jj = 0; jj < 8; jj++) sm_[(q * 2 + (int)isgate) * 8 + jj] = am[jj];
           }
-          named_bar(2, 128);
+          named_bar(3 + (q >> 1), 64);                         // only the partner warp (q ^ 1) shares the 32-ch block
 #pragma unroll
-          for (int jj = 0; jj < 8; jj++) am[jj] = fmaxf(am[jj], sam[((q ^ 1) * 2 + (int)isgate) * 8 + jj]);
+          for (int jj = 0; jj < 8; jj++) am[jj] = fmaxf(am[jj], sm_[((q ^ 1) * 2 + (int)isgate) * 8 + jj]);
           unsigned char qb[8]; int e8s[8];
 #pragma unroll
           for (int jj = 0; jj < 8; jj++) {
@@ -938,29 +940,30 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
               if ((lane & 0x17) == 0 && !(q & 1)) p.intersfd[d][srow * (I / 32) + rb * 2 + cb] = (unsigned char)e8s[jj];
             }
           }
-          named_bar(2, 128);                                   // sam is reused by the next chunk
         } else {
-          // FC2: stage the bf16 [16 tokens][128 channels] chunk in SMEM, then 16-B coalesced row stores
-          const int hl = q * 32 + 4 * (lane & 7) + a;
+          // FC2: each warp owns hidden channels rb * 128 + q * 32 + [0, 32): stage its bf16 [16 tokens][32 ch] in its
+          // own SMEM slice and store 64-B row segments (16-B per lane); only __syncwarp, no cross-warp barrier
+          __nv_bfloat16* sw = sstage + q * 16 * 32;
+          const int hl = 4 * (lane & 7) + a;
 #pragma unroll
-          for (int j = 0; j < 16; j++) sstage[j * 128 + hl] = __float2bfloat16(v[j]);
-          named_bar(2, 128);
+          for (int j = 0; j < 16; j++) sw[j * 32 + hl] = __float2bfloat16(v[j]);
+          __syncwarp();
 #pragma unroll
-          for (int c = et; c < 256; c += 128) {
-            const int j = c >> 4, part = c & 15, col = c0 + j;
+          for (int c = lane; c < 64; c += 32) {
+            const int j = c >> 2, part = c & 3, col = c0 + j;
             if (col < ntok && !(p.abl & 2))
-              *(uint4*)(p.out + (size_t)js[col] * H + rb * 128 + part * 8) = *(const uint4*)(sstage + j * 128 + part * 8);
+              *(uint4*)(p.out + (size_t)js[col] * H + rb * 128 + q * 32 + part * 8) = *(const uint4*)(sw + j * 32 + part * 8);
           }
-          named_bar(2, 128);
+          __syncwarp();
         }
       }
-      if (kind == 0 && ntok > 0) {
-        // every epilogue thread's intermediate stores happen-before (bar.sync) the one gpu-scope release (cumulative)
-        named_bar(2, 128);
-        if (ew == 0 && lane == 0) { __threadfence(); red_release(&p.st->fc1done[gid], 1u); }
+      // FC1: every epilogue thread's intermediate stores happen-before (bar.sync) the one gpu-scope release
+      // (cumulative); the same barrier ends all reads of the slot's token list and of sam
+      named_bar(2, 128);
+      if (ew == 0 && lane == 0) {
+        if (kind == 0 && ntok > 0) { __threadfence(); red_release(&p.st->fc1done[gid], 1u); }
+        mbar_arrive(sa(&infe[slot]));
       }
-      named_bar(2, 128);                                       // the slot's token list is no longer read
-      if (ew == 0 && lane == 0) mbar_arrive(sa(&infe[slot]));
       c_ework += clock64() - t_w; n_units++;
     }
     if (p.dbg && ew == 0 && lane == 0) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[12] = c_eaccf; q_[13] = c_ework; q_[14] = n_units; }
@@ -989,7 +992,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
   }
 }
 
-constexpr int SMEM_BYTES = 1024 + S * (A_ST + B_ST + 2 * SF_ST) + (2 * S + 4 + 2 * UI) * 8 + UI * (int)sizeof(Info) + 64 * 4 +
+constexpr int SMEM_BYTES = 1024 + S * (A_ST + B_ST + 2 * SF_ST) + (2 * S + 2 * NACC + 2 * UI) * 8 + UI * (int)sizeof(Info) + 128 * 4 +
                            4 * 4 + 4 * 4 + (SCHED_MAX + 4) * 4 + 16 * 128 * 2;
 
 // ------------------------------------------------------------------ host
