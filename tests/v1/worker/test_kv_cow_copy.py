@@ -35,7 +35,13 @@ def layout_cache(request, monkeypatch):
 
 
 def _hybrid_views(
-    raw, layout, attn_dtype, block_size, kernel_block_size, ssm_dtype=torch.float32
+    raw,
+    layout,
+    attn_dtype,
+    block_size,
+    kernel_block_size,
+    ssm_dtype=torch.float32,
+    gdn_first=True,
 ):
     attn = FullAttentionSpec(
         block_size=block_size, num_kv_heads=2, head_size=64, dtype=attn_dtype
@@ -48,21 +54,38 @@ def _hybrid_views(
         dtypes=(torch.bfloat16, ssm_dtype),
         page_size_padded=attn.page_size_bytes,
     )
-    views = dense_kv_cache_views(
+    attn_views = dense_kv_cache_views(
         raw, attn, NUM_BLOCKS, NUM_LAYERS, layout, kernel_block_size
     )
-    views += dense_kv_cache_views(raw, mamba, NUM_BLOCKS, NUM_LAYERS, layout)
-    return views
+    mamba_views = dense_kv_cache_views(raw, mamba, NUM_BLOCKS, NUM_LAYERS, layout)
+    # The V2 runner hands GDN/Mamba views BEFORE the attention views that alias
+    # the same bytes: exercise that order by default.
+    return mamba_views + attn_views if gdn_first else attn_views + mamba_views
+
+
+def _block_byte_span(cache):
+    one = cache[: max(1, cache.shape[0] // NUM_BLOCKS)]
+    return (
+        sum((d - 1) * st for d, st in zip(one.shape, one.stride())) + 1
+    ) * cache.element_size()
 
 
 def _gather_copy(caches, copies):
-    """Independent gather/scatter oracle, including whole-storage ownership."""
+    """Independent gather/scatter oracle, including whole-storage ownership.
+
+    Order-independent: of the views aliasing one address, copy the one that
+    covers the most bytes of a block (an attention page, not the GDN payload
+    prefix that aliases it), so the reference is the whole page whatever the
+    view order.
+    """
     src, dst = torch.tensor(copies, dtype=torch.int64, device="cuda").T
-    seen_views, seen_storages = set(), set()
+    widest = {}
     for cache in caches:
-        if cache.data_ptr() in seen_views:
-            continue
-        seen_views.add(cache.data_ptr())
+        prev = widest.get(cache.data_ptr())
+        if prev is None or _block_byte_span(cache) > _block_byte_span(prev):
+            widest[cache.data_ptr()] = cache
+    seen_storages = set()
+    for cache in widest.values():
         kernel_blocks_per_block = cache.shape[0] // NUM_BLOCKS
         storage = cache.untyped_storage()
         block_stride = cache.stride(0) * cache.element_size() * kernel_blocks_per_block
@@ -120,12 +143,17 @@ def _copies(num_pairs, seed=0):
 @pytest.mark.parametrize("attn_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("num_pairs", [1, 7, 12])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
-def test_hybrid_attention_and_state_views(layout, attn_dtype, num_pairs, ssm_dtype):
+@pytest.mark.parametrize("gdn_first", [True, False], ids=["gdn_first", "attn_first"])
+def test_hybrid_attention_and_state_views(
+    layout, attn_dtype, num_pairs, ssm_dtype, gdn_first
+):
     if layout == KVCacheLayout.LHBNC:
         pytest.skip("head-split rows are not one contiguous block row")
 
     def make(raw):
-        return _hybrid_views(raw, layout, attn_dtype, 128, None, ssm_dtype)
+        return _hybrid_views(
+            raw, layout, attn_dtype, 128, None, ssm_dtype, gdn_first=gdn_first
+        )
 
     _run(make, _copies(num_pairs, seed=num_pairs), attn_dtype)
 
@@ -361,3 +389,22 @@ def test_layout_cache_walks_once_per_layout(layout_cache, monkeypatch):
     copy_and_check(head_split, raw, _copies(3, seed=9))
     assert len(walks) == 4
     assert any(plan is None for plan in worker_utils._cow_layout_plans.values())
+
+
+@pytest.mark.parametrize(
+    "layout", [KVCacheLayout.LBHNC, KVCacheLayout.LBNHC, KVCacheLayout.BLHNC]
+)
+@pytest.mark.parametrize("one_launch", ["1", "0"], ids=["one_launch", "per_storage"])
+def test_gdn_first_partial_hit_copies_whole_attention_page(
+    layout, one_launch, monkeypatch
+):
+    """Regression for first-seen dedup: with the GDN views
+    first, a copy must still move every byte of the aliased attention page,
+    not only the GDN payload prefix, on both copy paths.
+    """
+    monkeypatch.setenv("VLLM_KV_COW_ONE_LAUNCH", one_launch)
+
+    def make(raw):
+        return _hybrid_views(raw, layout, torch.bfloat16, 128, None, gdn_first=True)
+
+    _run(make, _copies(5, seed=11))
