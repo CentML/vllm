@@ -143,6 +143,42 @@ def test_legacy_flashinfer_file_and_host_mismatch():
         pin.parse_table({"_records": {pin.NAMESPACE: {"schema": 1}}})
 
 
+MOE_OP = "flashinfer::trtllm_fp8_block_scale_moe"
+
+
+class _MoERunner:
+    pass
+
+
+def test_moe_fingerprint_keys_on_prebuilt_content_not_path(tmp_path, monkeypatch):
+    a, b, c = tmp_path / "a.so", tmp_path / "copy" / "a.so", tmp_path / "c.so"
+    b.parent.mkdir()
+    a.write_bytes(b"kernels v1")
+    b.write_bytes(b"kernels v1")  # the same .so at a recipe-specific path
+    c.write_bytes(b"kernels v2")
+
+    def parts(path):
+        monkeypatch.setenv("GS2_ROUTE_PREBUILT", str(path))
+        return pin.op_fingerprint_parts(MOE_OP, _MoERunner())
+
+    pa, pb, pc = parts(a), parts(b), parts(c)
+    assert "GS2_ROUTE_PREBUILT" not in pa["env"]
+    assert pin.stable_hash(pa) == pin.stable_hash(pb) != pin.stable_hash(pc)
+
+    # A record written while the path was still in "env" merges into the
+    # group the loader computes now, so its entries are not stale.
+    old = {**pa, "env": {**pa["env"], "GS2_ROUTE_PREBUILT": str(a)}}
+    old_fp = pin.stable_hash(old)
+    old_g = pin.make_gid(MOE_OP, "_MoERunner", old_fp)
+    groups = {old_g: {"op": MOE_OP, "runner": "_MoERunner", "fp": old_fp, "parts": old}}
+    fk = f"('{MOE_OP}', '_MoERunner', ((16, 256),), ())"
+    rec = _record({fk: _rec_key([[2.0], [1.0]], g=old_g)}, groups=groups)
+    table, _ = pin.merge_records([("s", [rec])])
+    new_g = pin.make_gid(MOE_OP, "_MoERunner", pin.stable_hash(pb))
+    assert table[fk][1] == 1 and table[fk][2]["g"] == new_g
+    assert pin.parse_table(table).groups[new_g]["parts"] == pb
+
+
 def test_write_json_atomic_failure_keeps_old_file(tmp_path, monkeypatch):
     path = tmp_path / "t.json"
     pin.write_json_atomic(path, {"v": 1})

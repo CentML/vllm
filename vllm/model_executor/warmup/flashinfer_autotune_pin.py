@@ -408,7 +408,9 @@ class _OpRule:
     kernel_modules: tuple[str, ...] = ()
     # Env-name prefixes that select or modify those kernels / tactic lists.
     env_prefixes: tuple[str, ...] = ()
-    # Envs naming a binary whose content identifies the kernels.
+    # Envs naming a binary whose content identifies the kernels. Only the
+    # content sha is fingerprinted ("binaries"), not the path ("env"): the
+    # same .so at another path (per-recipe location) runs the same kernels.
     binary_envs: tuple[str, ...] = ()
 
 
@@ -496,6 +498,19 @@ def _runner_source_parts(cls: type) -> dict[str, str]:
     return out
 
 
+def normalize_fingerprint_parts(op: str, parts: dict[str, Any]) -> dict[str, Any]:
+    """Drop the path-valued binary envs of ``op`` from ``parts["env"]``.
+
+    Applied at run time and by ``merge`` (records written before the binary
+    path was dropped get the gid the loader computes now).
+    """
+    drop = _op_rule(op).binary_envs
+    env = parts.get("env")
+    if not drop or not isinstance(env, dict) or not any(e in env for e in drop):
+        return parts
+    return {**parts, "env": {k: v for k, v in env.items() if k not in drop}}
+
+
 def op_fingerprint_parts(op: str, runner: Any) -> dict[str, Any]:
     """Everything (besides host and per-entry tactic list) that decides what
     a tactic of ``op`` on ``runner`` runs.
@@ -504,7 +519,11 @@ def op_fingerprint_parts(op: str, runner: Any) -> dict[str, Any]:
     parts: dict[str, Any] = {
         "runner_src": _runner_source_parts(type(runner)),
         "kernels": {m: _module_source_sha(m) for m in rule.kernel_modules},
-        "env": _env_parts(rule.env_prefixes),
+        "env": {
+            k: v
+            for k, v in _env_parts(rule.env_prefixes).items()
+            if k not in rule.binary_envs
+        },
         "binaries": {
             e: _cached_file_sha(os.environ[e])
             for e in rule.binary_envs
@@ -1415,13 +1434,22 @@ def merge_records(
                 if diff:
                     raise ValueError(f"records from different hosts/builds: {diff}")
             workers[name].append(rec["worker"])
+            # Records written before a fingerprint normalization (e.g. the
+            # binary path dropped from "env") get the gid the loader computes.
+            remap: dict[str, str] = {}
             for g, info in rec["groups"].items():
-                if g in groups and groups[g]["fp"] != info["fp"]:
-                    raise ValueError(f"group {g} fingerprint conflict")
-                groups.setdefault(g, info)
+                parts = normalize_fingerprint_parts(info["op"], info["parts"])
+                ng = g
+                if parts is not info["parts"]:
+                    fp = stable_hash(parts)
+                    ng = make_gid(info["op"], info["runner"], fp)
+                    info = {**info, "fp": fp, "parts": parts}
+                remap[g] = ng
+                groups.setdefault(ng, info)
             for fk, k in rec["keys"].items():
-                set_groups[name].add(k["g"])
-                per_key.setdefault((k["g"], fk), []).append(k)
+                ng = remap.get(k["g"], k["g"])
+                set_groups[name].add(ng)
+                per_key.setdefault((ng, fk), []).append({**k, "g": ng})
     if primary not in set_groups:
         raise ValueError(f"primary set {primary!r} not among {list(set_groups)}")
 
