@@ -2522,7 +2522,8 @@ def compile_factors() -> dict[str, object]:
     # (The other round-4 knobs act inside custom ops or the runner, not in the
     # traced forward: VLLM_GDN_MIXED_FORK, VLLM_ROWDOT_PDL,
     # VLLM_GDN_MTP_CUDA_PDL, VLLM_GDN_MTP_CUDA_TUNE, VLLM_GDN_HOST_TRIM2,
-    # VLLM_GDN_FUSED_DECODE_MAX_TOKENS, VLLM_STAGED_WRITE_CHUNKED.)
+    # VLLM_GDN_FUSED_DECODE_MAX_TOKENS, VLLM_STAGED_WRITE_CHUNKED,
+    # VLLM_MOE_LOCALITY_KERNEL[_MIN_TOKENS|_MAX_TOKENS].)
     if os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1":
         factors["VLLM_GDN_BA_LATE_JOIN"] = "1"
 

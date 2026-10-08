@@ -53,6 +53,15 @@ MAX_TOKENS = 512
 MAX_SLOTS = MAX_TOKENS * TOPK + 7 * E  # per-expert slot ranges are 8-aligned
 CHUNK = 2 << 20
 
+# VLLM_MOE_LOCALITY_KERNEL=1: place MXFP8 trtllm-gen expert weights by expert
+# pair and serve deferred-finalize calls with MIN_TOKENS <= T <= MAX_TOKENS by
+# this kernel (acts inside the MoE custom op: no compile-key change).
+ENABLED = os.environ.get("VLLM_MOE_LOCALITY_KERNEL", "0") == "1"
+GATE_MIN_TOKENS = int(os.environ.get("VLLM_MOE_LOCALITY_KERNEL_MIN_TOKENS", "1"))
+GATE_MAX_TOKENS = min(
+    MAX_TOKENS, int(os.environ.get("VLLM_MOE_LOCALITY_KERNEL_MAX_TOKENS", "512"))
+)
+
 _ext: list = []
 
 
@@ -220,6 +229,62 @@ def runtime(device: int) -> LocalityMoE:
     if rt is None:
         rt = _RUNTIME[device] = LocalityMoE(device)
     return rt
+
+
+# (w13 data_ptr, w2 data_ptr) of pair-placed layers -> their tensor maps
+_LAYERS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def maybe_place(
+    w13: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load-time hook (trtllm-gen MXFP8 layout): pair-placed copies of w13/w2
+    when the kernel is enabled and applies, else the inputs unchanged.
+    """
+    if not ENABLED or w13.shape != (E, 2 * INTER, HID) or w2.shape != (E, HID, INTER):
+        return w13, w2
+    from vllm.model_executor.layers.locality.topology import get_topology
+
+    topo = get_topology(w13.device.index)
+    if topo is None or topo.num_domains != 2:
+        return w13, w2
+    rt = runtime(w13.device.index)
+    l13, l2 = place_expert_pairs(w13.contiguous(), w2.contiguous())
+    _LAYERS[(l13.data_ptr(), l2.data_ptr())] = rt.tensor_maps(l13, l2)
+    return l13, l2
+
+
+def try_apply(
+    router_logits: torch.Tensor,
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_sf: torch.Tensor,
+    w2_sf: torch.Tensor,
+):
+    """(gemm2_permuted, expert_weights, expanded_idx_to_permuted_idx), or None
+    when this call is not served (T outside the gate, layer not placed, or
+    input layouts other than [T, H] e4m3 + linear [T, H/32] UE8M0).
+    """
+    T = x.shape[0]
+    if not GATE_MIN_TOKENS <= T <= GATE_MAX_TOKENS:
+        return None
+    tm = _LAYERS.get((w13.data_ptr(), w2.data_ptr()))
+    if tm is None:
+        return None
+    if (
+        x.dim() != 2
+        or x.shape[1] != HID
+        or not x.is_contiguous()
+        or x_sf.numel() != T * (HID // 32)
+        or not x_sf.is_contiguous()
+        or router_logits.shape != (T, E)
+    ):
+        return None
+    return runtime(x.device.index).forward(
+        router_logits.contiguous(), x, x_sf, tm, w13_sf, w2_sf
+    )
 
 
 _SOURCE = r"""
@@ -777,6 +842,8 @@ void init(int64_t dev) {
   int occ = 0;
   RTC(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_moe, NTHREADS, SMEM_BYTES));
   TORCH_CHECK(occ == 1, "k_moe occupancy ", occ, " (expected 1 CTA/SM)");
+  cudaFuncAttributes fa;                    // load both functions now (lazy loading must not happen in graph capture)
+  RTC(cudaFuncGetAttributes(&fa, k_plan));
   g_init[dev] = true;
 }
 

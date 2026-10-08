@@ -562,6 +562,14 @@ def convert_to_fp8_moe_kernel_format(
             w2_input_scale=w2_input_scale,
             is_trtllm=(fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM),
         )
+        if fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM and getattr(
+            layer, "weight_block_size", None
+        ) == [1, 32]:
+            from vllm.model_executor.layers.fused_moe import locality_moe
+
+            if locality_moe.ENABLED:
+                # one copy, same layout: expert pair p on locality domain p & 1
+                w13, w2 = locality_moe.maybe_place(w13, w2)
     elif fp8_backend == Fp8MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
             prepare_fp8_moe_layer_for_xpu,

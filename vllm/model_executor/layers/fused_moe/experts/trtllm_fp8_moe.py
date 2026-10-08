@@ -602,6 +602,32 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             num_tokens=hidden_states.shape[0],
             device=hidden_states.device,
         )
+        num_tokens = hidden_states.shape[0]
+        # FlashInfer's 0-token call keeps the finalized (empty) form.
+        defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
+        if (
+            defer
+            and routing_replay_out is None
+            and activation == MoEActivation.SILU
+            and self.routing_method_type == RoutingMethodType.RenormalizeNaive
+            and e_score_correction_bias is None
+            and routed_scaling_factor in (None, 1.0)
+            and self.local_num_experts == global_num_experts
+        ):
+            from vllm.model_executor.layers.fused_moe import locality_moe
+
+            if locality_moe.ENABLED:
+                out = locality_moe.try_apply(
+                    router_logits,
+                    hidden_states,
+                    a1q_scale,
+                    w1,
+                    w2,
+                    self.quant_config.w1_scale,
+                    self.quant_config.w2_scale,
+                )
+                if out is not None:
+                    return UnfinalizedMoEOutput(*out)
 
         kwargs = dict(
             routing_logits=router_logits,
@@ -632,9 +658,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        num_tokens = hidden_states.shape[0]
-        # FlashInfer's 0-token call keeps the finalized (empty) form.
-        defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
         if defer:
             kwargs["do_finalize"] = False
         with _sm107_moe_pdl(
