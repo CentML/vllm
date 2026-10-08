@@ -338,9 +338,7 @@ def test_layout_cache_walks_once_per_layout(layout_cache, monkeypatch):
     def copy_and_check(make, raw, copies):
         ref_raw = raw.clone()
         worker_utils.copy_kv_cache_blocks_inplace(make(raw), NUM_BLOCKS, copies)
-        worker_utils._copy_kv_cache_blocks_inplace_per_storage(
-            make(ref_raw), NUM_BLOCKS, np.array(copies, dtype=np.int64)
-        )
+        _gather_copy(make(ref_raw), copies)
         torch.accelerator.synchronize()
         assert torch.equal(raw, ref_raw)
 
