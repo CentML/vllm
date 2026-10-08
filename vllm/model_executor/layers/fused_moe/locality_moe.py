@@ -265,6 +265,7 @@ class LocalityMoE:
         pdl: bool = True,
         inter_local: bool = True,
         xrep: torch.Tensor | None = None,
+        abl: int = 0,
     ):
         """Returns (gemm2_permuted [T*8, H] bf16, expert_weights [T, 8] bf16,
         expanded_idx_to_permuted_idx [T, 8] int32). ``dbg`` (int64 [nsm, 4])
@@ -300,6 +301,7 @@ class LocalityMoE:
             lw.blk[0] if lw.blk else None,
             lw.blk[1] if lw.blk else None,
             xrep,
+            abl,
         )
         return out, ew, self.idx[: T * TOPK].view(T, TOPK)
 
@@ -416,6 +418,7 @@ struct Params {
   u64* dbg;                           // optional per-CTA stamps [grid][4]: start, producer past wait, end, smid|dom|rank
   const uint8_t* blk13; const uint8_t* blk2;   // optional (diagnostics): pre-blocked weight copies, see issue_stage
   const uint8_t* xd[2]; const uint8_t* xsfd[2]; // activations read by domain d's CTAs (replicas, or both = x / xsf)
+  int abl;                            // diagnostics (results invalid when set): bit 0 skip FC1 stores, bit 1 skip FC2 stores
 };
 // scale block of expert e: expert-major (production tensors) or domain-major (localized copy: domain d's 128 experts,
 // local index k, at slot d * 128 + k, so each domain's scales fill whole 2 MiB chunks of that domain)
@@ -877,14 +880,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       // Read the whole accumulator (<= 32 columns) and hand the buffer back to the MMA warp before any math or store,
       // so global-store latency and the FC1 release fence stay off the MMA's critical path.
       float vv[NMAX];
-      if (npad > 0) tmem_ld16(taddr, vv);
-      if (npad > 16) tmem_ld16(taddr + 16, vv + 16);
+      if (npad > 0 && !(p.abl & 8)) tmem_ld16(taddr, vv);
+      if (npad > 16 && !(p.abl & 8)) tmem_ld16(taddr + 16, vv + 16);
       tc_fence_before();
       named_bar(2, 128);
       if (ew == 0 && lane == 0) mbar_arrive(sa(&acce[b]));
 #pragma unroll
       for (int cc = 0; cc < NMAX / 16; cc++) {
-        if (cc * 16 >= npad) break;
+        if (cc * 16 >= npad || (p.abl & 4)) break;
         const int c0 = cc * 16;
         const float* v = vv + c0;
         if (kind == 0) {
@@ -929,7 +932,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
           for (int jj = 0; jj < 8; jj++) {
             const int col = c0 + jb + jj;
-            if (col < ntok) {
+            if (col < ntok && !(p.abl & 1)) {
               const size_t srow = (size_t)(slot0 + col);
               p.interd[d][srow * I + ch] = qb[jj];
               if ((lane & 0x17) == 0 && !(q & 1)) p.intersfd[d][srow * (I / 32) + rb * 2 + cb] = (unsigned char)e8s[jj];
@@ -945,7 +948,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
           for (int c = et; c < 256; c += 128) {
             const int j = c >> 4, part = c & 15, col = c0 + j;
-            if (col < ntok)
+            if (col < ntok && !(p.abl & 2))
               *(uint4*)(p.out + (size_t)js[col] * H + rb * 128 + part * 8) = *(const uint4*)(sstage + j * 128 + part * 8);
           }
           named_bar(2, 128);
@@ -1051,7 +1054,7 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
 void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, torch::Tensor x, torch::Tensor xsf,
                 torch::Tensor inter, torch::Tensor intersf, torch::Tensor out, torch::Tensor plan, torch::Tensor state,
                 torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl, bool sf_dmajor,
-                std::optional<torch::Tensor> blk13, std::optional<torch::Tensor> blk2, std::optional<torch::Tensor> xrep) {
+                std::optional<torch::Tensor> blk13, std::optional<torch::Tensor> blk2, std::optional<torch::Tensor> xrep, int64_t abl) {
   TORCH_CHECK(tmaps.device().is_cpu() && tmaps.numel() == 2 * (int64_t)sizeof(CUtensorMap));
   TORCH_CHECK(x.is_contiguous() && x.size(1) == H && xsf.is_contiguous() && xsf.numel() == x.size(0) * (H / 32));
   TORCH_CHECK(out.is_contiguous() && out.size(0) == x.size(0) * TOPK && out.size(1) == H && out.dtype() == torch::kBFloat16);
@@ -1064,6 +1067,7 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   prm.sf_dmajor = sf_dmajor ? 1 : 0;
   prm.blk13 = blk13.has_value() ? (const uint8_t*)blk13->data_ptr() : nullptr;
   prm.blk2 = blk2.has_value() ? (const uint8_t*)blk2->data_ptr() : nullptr;
+  prm.abl = (int)abl;
   if (xrep.has_value()) {             // [2][T * (H + H / 32)] uint8: per domain, x then x_sf
     TORCH_CHECK(xrep->numel() >= 2 * x.size(0) * (H + H / 32));
     const int64_t half = xrep->numel() / 2;
