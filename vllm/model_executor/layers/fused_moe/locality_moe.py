@@ -201,9 +201,24 @@ class LocalityMoE:
         self.ext.init(device)
         self.plan = torch.zeros(self.ext.plan_bytes(), dtype=torch.uint8, device=dev)
         self.state = torch.zeros(self.ext.state_bytes(), dtype=torch.uint8, device=dev)
-        self.inter = torch.empty(MAX_SLOTS, INTER, dtype=torch.uint8, device=dev)
-        self.inter_sf = torch.empty(
-            MAX_SLOTS, INTER // 32, dtype=torch.uint8, device=dev
+        # FC1 -> FC2 intermediate: one slot space per domain, on that domain
+        # (FC1 and FC2 of a group run in the same domain); [1, ...] cudaMalloc
+        # copies for A/B
+        from vllm.model_executor.layers.locality.memory import alloc_chunks
+
+        ib = -(-MAX_SLOTS * INTER // CHUNK) * CHUNK
+        sb = -(-MAX_SLOTS * (INTER // 32) // CHUNK) * CHUNK
+        self.inter = alloc_chunks(
+            2 * ib, [0] * (ib // CHUNK) + [1] * (ib // CHUNK), CHUNK, device
+        ).view(2, ib)
+        self.inter_sf = alloc_chunks(
+            2 * sb, [0] * (sb // CHUNK) + [1] * (sb // CHUNK), CHUNK, device
+        ).view(2, sb)
+        self.inter_glob = torch.empty(
+            1, MAX_SLOTS * INTER, dtype=torch.uint8, device=dev
+        )
+        self.inter_sf_glob = torch.empty(
+            1, MAX_SLOTS * (INTER // 32), dtype=torch.uint8, device=dev
         )
         self.idx = torch.arange(MAX_TOKENS * TOPK, dtype=torch.int32, device=dev)
         self.smdom = topo.sm_domain
@@ -248,6 +263,8 @@ class LocalityMoE:
         topk: tuple[torch.Tensor, torch.Tensor] | None = None,
         dbg: torch.Tensor | None = None,
         pdl: bool = True,
+        inter_local: bool = True,
+        xrep: torch.Tensor | None = None,
     ):
         """Returns (gemm2_permuted [T*8, H] bf16, expert_weights [T, 8] bf16,
         expanded_idx_to_permuted_idx [T, 8] int32). ``dbg`` (int64 [nsm, 4])
@@ -268,8 +285,8 @@ class LocalityMoE:
             lw.s2,
             x,
             x_sf.view(torch.uint8),
-            self.inter,
-            self.inter_sf,
+            self.inter if inter_local else self.inter_glob,
+            self.inter_sf if inter_local else self.inter_sf_glob,
             out,
             self.plan,
             self.state,
@@ -282,6 +299,7 @@ class LocalityMoE:
             lw.sf_dmajor,
             lw.blk[0] if lw.blk else None,
             lw.blk[1] if lw.blk else None,
+            xrep,
         )
         return out, ew, self.idx[: T * TOPK].view(T, TOPK)
 
@@ -391,12 +409,13 @@ struct State { unsigned rank[2]; unsigned done; unsigned pad; unsigned fc1done[2
 struct alignas(16) Info { GRec r; int kind, rb, nkb, kb0; int pad[4]; };                       // 128 B
 struct Params {
   const uint8_t* w13sf; const uint8_t* w2sf; const uint8_t* x; const uint8_t* xsf;
-  uint8_t* inter; uint8_t* intersf; __nv_bfloat16* out;
+  uint8_t* interd[2]; uint8_t* intersfd[2]; __nv_bfloat16* out;   // FC1 -> FC2 intermediate of domain d's groups
   const Plan* plan; State* st; const signed char* smdom;
   int nd0, nd1;
   int sf_dmajor;                      // scales: 0 = production expert-major, 1 = domain-major localized copy
   u64* dbg;                           // optional per-CTA stamps [grid][4]: start, producer past wait, end, smid|dom|rank
   const uint8_t* blk13; const uint8_t* blk2;   // optional (diagnostics): pre-blocked weight copies, see issue_stage
+  const uint8_t* xd[2]; const uint8_t* xsfd[2]; // activations read by domain d's CTAs (replicas, or both = x / xsf)
 };
 // scale block of expert e: expert-major (production tensors) or domain-major (localized copy: domain d's 128 experts,
 // local index k, at slot d * 128 + k, so each domain's scales fill whole 2 MiB chunks of that domain)
@@ -728,8 +747,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       const int kind = f->kind;
       if (kind < 0) { named_bar(1, 128); if (gt == 0) mbar_arrive(sa(&infe[slot])); break; }
       const int ntok = f->r.ntok, nkb = f->nkb;
-      const uint8_t* bsrc = kind ? p.inter : p.x;
-      const uint8_t* bsf = kind ? p.intersf : p.xsf;
+      const uint8_t* bsrc = kind ? p.interd[d] : p.xd[d];
+      const uint8_t* bsf = kind ? p.intersfd[d] : p.xsfd[d];
       const int bstride = kind ? I : H, bsfstride = kind ? I / 32 : H / 32;
       const uint8_t* csrc[MAXC]; uint32_t cdst[MAXC]; int nc = 0;
       const uint8_t* fsrc[MAXF]; uint32_t fdst[MAXF]; int nf = 0;
@@ -889,8 +908,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
             const int col = c0 + jb + jj;
             if (col < ntok) {
               const size_t srow = (size_t)(slot0 + col);
-              p.inter[srow * I + ch] = qb[jj];
-              if ((lane & 0x17) == 0 && !(q & 1)) p.intersf[srow * (I / 32) + rb * 2 + cb] = (unsigned char)e8s[jj];
+              p.interd[d][srow * I + ch] = qb[jj];
+              if ((lane & 0x17) == 0 && !(q & 1)) p.intersfd[d][srow * (I / 32) + rb * 2 + cb] = (unsigned char)e8s[jj];
             }
           }
           named_bar(2, 128);                                   // sam is reused by the next chunk
@@ -1008,7 +1027,7 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
 void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, torch::Tensor x, torch::Tensor xsf,
                 torch::Tensor inter, torch::Tensor intersf, torch::Tensor out, torch::Tensor plan, torch::Tensor state,
                 torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl, bool sf_dmajor,
-                std::optional<torch::Tensor> blk13, std::optional<torch::Tensor> blk2) {
+                std::optional<torch::Tensor> blk13, std::optional<torch::Tensor> blk2, std::optional<torch::Tensor> xrep) {
   TORCH_CHECK(tmaps.device().is_cpu() && tmaps.numel() == 2 * (int64_t)sizeof(CUtensorMap));
   TORCH_CHECK(x.is_contiguous() && x.size(1) == H && xsf.is_contiguous() && xsf.numel() == x.size(0) * (H / 32));
   TORCH_CHECK(out.is_contiguous() && out.size(0) == x.size(0) * TOPK && out.size(1) == H && out.dtype() == torch::kBFloat16);
@@ -1021,9 +1040,27 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   prm.sf_dmajor = sf_dmajor ? 1 : 0;
   prm.blk13 = blk13.has_value() ? (const uint8_t*)blk13->data_ptr() : nullptr;
   prm.blk2 = blk2.has_value() ? (const uint8_t*)blk2->data_ptr() : nullptr;
+  if (xrep.has_value()) {             // [2][T * (H + H / 32)] uint8: per domain, x then x_sf
+    TORCH_CHECK(xrep->numel() >= 2 * x.size(0) * (H + H / 32));
+    const int64_t half = xrep->numel() / 2;
+    for (int dd = 0; dd < 2; dd++) {
+      prm.xd[dd] = (const uint8_t*)xrep->data_ptr() + dd * half;
+      prm.xsfd[dd] = prm.xd[dd] + x.size(0) * H;
+    }
+  } else {
+    prm.xd[0] = prm.xd[1] = (const uint8_t*)x.data_ptr();
+    prm.xsfd[0] = prm.xsfd[1] = (const uint8_t*)xsf.data_ptr();
+  }
   prm.w13sf = (const uint8_t*)w13sf.data_ptr(); prm.w2sf = (const uint8_t*)w2sf.data_ptr();
   prm.x = (const uint8_t*)x.data_ptr(); prm.xsf = (const uint8_t*)xsf.data_ptr();
-  prm.inter = (uint8_t*)inter.data_ptr(); prm.intersf = (uint8_t*)intersf.data_ptr();
+  // inter / intersf: [2][...] (one slot space per domain, e.g. localized) or [1][...] (shared by both domains)
+  TORCH_CHECK(inter.dim() == 2 && intersf.dim() == 2 && inter.size(0) == intersf.size(0) && inter.size(0) <= 2);
+  TORCH_CHECK(inter.size(1) >= (int64_t)(TMAX * TOPK + 7 * E) * I && intersf.size(1) >= (int64_t)(TMAX * TOPK + 7 * E) * (I / 32));
+  for (int dd = 0; dd < 2; dd++) {
+    const int64_t r = inter.size(0) == 2 ? dd : 0;
+    prm.interd[dd] = (uint8_t*)inter.data_ptr() + r * inter.stride(0);
+    prm.intersfd[dd] = (uint8_t*)intersf.data_ptr() + r * intersf.stride(0);
+  }
   prm.out = (__nv_bfloat16*)out.data_ptr(); prm.plan = (const Plan*)plan.data_ptr(); prm.st = (State*)state.data_ptr();
   prm.smdom = (const signed char*)smdom.data_ptr(); prm.nd0 = (int)n0; prm.nd1 = (int)n1;
   prm.dbg = dbg.has_value() ? (u64*)dbg->data_ptr() : nullptr;
