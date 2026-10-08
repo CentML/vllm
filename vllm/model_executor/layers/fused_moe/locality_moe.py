@@ -425,6 +425,9 @@ __host__ __device__ __forceinline__ int sf_slot(int e, int dmajor) {
 
 #define RTC(x) do { cudaError_t e_ = (x); TORCH_CHECK(e_ == cudaSuccess, #x " failed: ", cudaGetErrorString(e_)); } while (0)
 #define DRV(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { const char* s_ = "?"; cuGetErrorName(r_, &s_); TORCH_CHECK(false, #x " failed: ", s_); } } while (0)
+// diagnostics: accumulate the cycles spent in `stmt` (a wait) into `acc`; dumped to Params::dbg when it is set
+#define TW(acc, stmt) do { const long long t0_ = clock64(); stmt; acc += clock64() - t0_; } while (0)
+constexpr int DBGW = 16;              // u64 per CTA in Params::dbg
 
 // ------------------------------------------------------------------ PTX helpers
 __device__ __forceinline__ unsigned get_smid() { unsigned r; asm volatile("mov.u32 %0, %%smid;" : "=r"(r)); return r; }
@@ -666,7 +669,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
                     blk_unit(p, 0, e0, rb0));
     }
     griddep_wait();
-    if (p.dbg && lane == 0) p.dbg[blockIdx.x * 4 + 1] = gtime();
+    if (p.dbg && lane == 0) p.dbg[blockIdx.x * DBGW + 1] = gtime();
     const Plan* pl = p.plan;
     int nmine = 0;
     if (live) {
@@ -684,9 +687,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     if (lane == 0) {
       uint32_t k = live ? S : 0;
       int pub = 0;
+      long long c_pinfe = 0, c_pinff = 0, c_pempty = 0;
       auto pub_next = [&]() {
         const int slot = pub % UI;
-        if (pub >= UI) mbar_wait(sa(&infe[slot]), ((pub / UI) - 1) & 1);
+        if (pub >= UI) TW(c_pinfe, mbar_wait(sa(&infe[slot]), ((pub / UI) - 1) & 1));
         Info* f = &sinfo[slot];
         if (pub >= nmine) {
           f->kind = -1;
@@ -711,7 +715,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       pub_next(); pub_next();
       for (int uj = 0;; uj++) {
         const int slot = uj % UI;
-        mbar_wait(sa(&inff[slot]), (uj / UI) & 1);
+        TW(c_pinff, mbar_wait(sa(&inff[slot]), (uj / UI) & 1));
         const Info* f = &sinfo[slot];
         const int kind = f->kind;
         if (kind < 0) break;
@@ -723,11 +727,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         const uint8_t* blk = blk_unit(p, kind, e, rb);
         for (int kb = f->kb0; kb < nkb; kb += KSB, k++) {
           const int s = k % S;
-          if (k >= (uint32_t)S) mbar_wait(sa(&empty[s]), ((k / S) - 1) & 1);
+          if (k >= (uint32_t)S) TW(c_pempty, mbar_wait(sa(&empty[s]), ((k / S) - 1) & 1));
           issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), tm, sf, row0, kb, blk);
         }
         if (pub < nmine + 1) pub_next();
       }
+      if (p.dbg) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[4] = c_pinfe; q_[5] = c_pinff; q_[6] = c_pempty; }
     }
   } else if (warp <= 4) {
     // ---------------------------------------------------------------- gather (128 threads)
@@ -740,6 +745,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     constexpr int MAXC = (NMAX * CPR + 127) / 128;
     constexpr int MAXF = (NMAX * KSB + 127) / 128;
     uint32_t k = 0;
+    long long c_gdep = 0, c_gempty = 0;
     for (int ui = 0; live; ui++) {
       const int slot = ui % UI;
       mbar_wait(sa(&inff[slot]), (ui / UI) & 1);
@@ -779,12 +785,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       if (gt == 0) mbar_arrive(sa(&infe[slot]));
       if (kind == 1) {
         // FC2 reads the FC1 outputs of this group (written by other CTAs): wait for its 8 FC1 units.
-        if (gt == 0) { while (ld_acquire(&p.st->fc1done[gid]) < (unsigned)FC1_NRB) __nanosleep(64); }
+        if (gt == 0) { TW(c_gdep, while (ld_acquire(&p.st->fc1done[gid]) < (unsigned)FC1_NRB) __nanosleep(64)); }
         named_bar(1, 128);
       }
       for (int kb = 0; kb < nkb; kb += KSB, k++) {
         const int s = k % S;
-        if (k >= (uint32_t)S) mbar_wait(sa(&empty[s]), ((k / S) - 1) & 1);
+        if (k >= (uint32_t)S) TW(c_gempty, mbar_wait(sa(&empty[s]), ((k / S) - 1) & 1));
         const uint32_t bdst = sa(sB + s * B_ST), sdst = sa(sSFB + s * SF_ST);
 #pragma unroll
         for (int i = 0; i < MAXC; i++) if (i < nc) cp_async16(bdst + cdst[i], csrc[i] + kb * 128);
@@ -794,10 +800,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       }
     }
     cp_wait_all();
+    if (p.dbg && gt == 0) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[7] = c_gdep; q_[8] = c_gempty; }
   } else if (warp == 5) {
     // ---------------------------------------------------------------- MMA issuer
     if (lane == 0 && live) {
       uint32_t k = 0;
+      long long c_macce = 0, c_mfull = 0, c_missue = 0;
       const u64 ad0 = sdesc_sw128(sa(sA)), bd0 = sdesc_sw128(sa(sB));
       const u64 fa0 = sdesc_sf(sa(sSFA)), fb0 = sdesc_sf(sa(sSFB));
       for (int ui = 0;; ui++) {
@@ -808,14 +816,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         mbar_arrive(sa(&infe[slot]));
         if (kind < 0) break;
         const int b = ui & 1;
-        if (ui >= 2) mbar_wait(sa(&acce[b]), ((ui >> 1) - 1) & 1);
+        if (ui >= 2) TW(c_macce, mbar_wait(sa(&acce[b]), ((ui >> 1) - 1) & 1));
         tc_fence_after();
         const int npad = (ntok + 15) & ~15;
         const uint32_t dacc = tmem + b * ACCW;
         const uint32_t id0 = idesc_mx(npad, 0, 0), id2 = idesc_mx(npad, 2, 2);
         for (int kb = 0; kb < nkb; kb += KSB, k++) {
           const int s = k % S;
-          mbar_wait(sa(&full[s]), (k / S) & 1);
+          TW(c_mfull, mbar_wait(sa(&full[s]), (k / S) & 1));
+          const long long t_i = clock64();
           fence_proxy_async();                                 // cp.async (generic proxy) writes -> tcgen05 reads
           tc_fence_after();
           if (ntok > 0) {
@@ -834,9 +843,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
           } else {
             mbar_arrive(sa(&empty[s]));
           }
+          c_missue += clock64() - t_i;
         }
         if (ntok > 0) tc_commit(sa(&accf[b])); else mbar_arrive(sa(&accf[b]));
       }
+      if (p.dbg) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[9] = c_macce; q_[10] = c_mfull; q_[11] = c_missue; }
     }
   } else {
     // ---------------------------------------------------------------- epilogue (warps 6-9; TMEM lane quarter = warp % 4)
@@ -848,6 +859,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     const int q = warp & 3, ew = warp - 6, et = tid - 192;
     const int a = lane >> 3;
     const bool isgate = a & 1;
+    long long c_eaccf = 0, c_ework = 0, n_units = 0;
     for (int ui = 0; live; ui++) {
       const int slot = ui % UI;
       mbar_wait(sa(&inff[slot]), (ui / UI) & 1);
@@ -857,7 +869,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       const int ntok = f->r.ntok, rb = f->rb, slot0 = f->r.slot0, gid = f->r.gid;
       const short* js = f->r.j;
       const int b = ui & 1;
-      mbar_wait(sa(&accf[b]), (ui >> 1) & 1);
+      TW(c_eaccf, mbar_wait(sa(&accf[b]), (ui >> 1) & 1));
+      const long long t_w = clock64();
       tc_fence_after();
       const int npad = (ntok + 15) & ~15;
       const uint32_t taddr = tmem + ((uint32_t)(q * 32) << 16) + b * ACCW;
@@ -936,7 +949,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       tc_fence_before();
       named_bar(2, 128);
       if (ew == 0 && lane == 0) { mbar_arrive(sa(&acce[b])); mbar_arrive(sa(&infe[slot])); }
+      c_ework += clock64() - t_w; n_units++;
     }
+    if (p.dbg && ew == 0 && lane == 0) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[12] = c_eaccf; q_[13] = c_ework; q_[14] = n_units; }
   }
   tc_fence_before();
   __syncthreads();
@@ -946,8 +961,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
   }
   if (tid == 0) {
     if (p.dbg) {
-      p.dbg[blockIdx.x * 4 + 0] = t_start; p.dbg[blockIdx.x * 4 + 2] = gtime();
-      p.dbg[blockIdx.x * 4 + 3] = (u64)get_smid() | ((u64)d << 16) | ((u64)rank << 24);
+      p.dbg[blockIdx.x * DBGW + 0] = t_start; p.dbg[blockIdx.x * DBGW + 2] = gtime();
+      p.dbg[blockIdx.x * DBGW + 3] = (u64)get_smid() | ((u64)d << 16) | ((u64)rank << 24);
     }
     // the last CTA resets the ranks and FC1 counters for the next call (every other CTA is past all its reads)
     __threadfence();
@@ -1064,7 +1079,7 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   prm.out = (__nv_bfloat16*)out.data_ptr(); prm.plan = (const Plan*)plan.data_ptr(); prm.st = (State*)state.data_ptr();
   prm.smdom = (const signed char*)smdom.data_ptr(); prm.nd0 = (int)n0; prm.nd1 = (int)n1;
   prm.dbg = dbg.has_value() ? (u64*)dbg->data_ptr() : nullptr;
-  TORCH_CHECK(!dbg.has_value() || dbg->numel() * dbg->element_size() >= nsm * 32);
+  TORCH_CHECK(!dbg.has_value() || dbg->numel() * dbg->element_size() >= nsm * DBGW * 8);
   cudaLaunchConfig_t cfg; memset(&cfg, 0, sizeof(cfg));
   cfg.gridDim = dim3((unsigned)nsm); cfg.blockDim = dim3(NTHREADS); cfg.dynamicSmemBytes = SMEM_BYTES;
   cfg.stream = at::cuda::getCurrentCUDAStream().stream();
