@@ -52,6 +52,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_3bit_nc": torch.uint8,
     "nvfp4": torch.uint8,
     "nvfp4_4over6": torch.uint8,
+    "mxfp4k_fp8v": torch.uint8,  # dec107: MXFP4 K + FP8 V byte pages (dec107_mxk.py)
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -80,6 +81,7 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype.startswith("nvfp4")
+        or kv_cache_dtype == "mxfp4k_fp8v"
     )
 
 
