@@ -145,16 +145,16 @@ logger = init_logger(__name__)
 
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
-# Spec-decode batches of at most this many requests run the GDN recurrence in
-# the value-split Triton kernel (gdn_mtp_recurrence; latency-bound regime) and
-# the gated norm in the MXFP8/norm kernel after it. Larger batches use the CUDA
-# MTP kernel (bandwidth-bound regime). VR crossover, norm included: ~4-6.
+# Spec-decode routing selects the recurrence kernel by batch size.
+
+
+
 GDN_MTP_TRITON_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_MTP_TRITON_MAX_REQS", "4"))
-# Decode-only spec batches of at most this many requests run the whole GDN core
-# (conv window roll + recurrence + gated norm + out_proj's MXFP8 quant) as one
-# launch (gdn_mtp_fused_decode) instead of three. Off at 0 (default). VR, 4
-# tokens per request, per GDN layer: -2.9 us at 1-2 requests, -3.4 at 3, -2.2 at
-# 4, none at 6.
+# Optionally fuse decode preparation and recurrence.
+
+
+
+
 GDN_FUSED_DECODE_MAX_REQUESTS = int(
     os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_REQS", "0")
 )
@@ -165,10 +165,10 @@ GDN_FUSED_DECODE_MAX_TOKENS = min(
     int(os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_TOKENS", "6")),
     MAX_FUSED_DECODE_TOKENS,
 )
-# Larger spec-decode batches run the register-resident CUDA kernel of
-# ops/gdn_mtp_cuda.py (JIT-built by the GDN warmup; same contract as the csrc
-# MTP kernel, VR 77 requests: 77.0 vs 81.6 us, 48: 48.3 vs 55.3 us) instead of
-# the csrc kernel; VLLM_GDN_MTP_JIT=0 keeps the csrc kernel.
+# Larger speculative batches may use the JIT-built CUDA kernel.
+
+
+
 GDN_MTP_CUDA_JIT = os.environ.get("VLLM_GDN_MTP_JIT", "1") == "1"
 # VLLM_GDN_BA_LATE_JOIN=1: in FULL-graph decode-only spec batches, the main
 # stream waits for the aux-stream in_proj_ba GEMM right before the recurrence
@@ -187,10 +187,10 @@ GDN_BA_LATE_JOIN = os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1"
 # in_proj_qkvz / conv1d stream as their PDL consumer instead of moving behind
 # the BA GEMM onto the aux stream.
 GDN_BA_LATE_CAPTURE = os.environ.get("VLLM_GDN_BA_LATE_CAPTURE", "0") == "1"
-# FlashInfer GDN prefill: a single sequence of at most this many tokens runs
-# the non-CP chunked kernel. FlashInfer's auto heuristic picks CP for every
-# single sequence on SM10x, but on VR CP is slower up to ~4.6k tokens
-# (2144 tokens: 96 vs 76 us).
+# Select non-CP prefill below the configured threshold.
+
+
+
 GDN_FI_NON_CP_MAX_TOKENS = int(os.environ.get("VLLM_GDN_FI_NON_CP_MAX_TOKENS", "4608"))
 # Prefill rows: causal conv1d and the post-conv prep (L2 norm, exp(g), beta) in
 # one kernel (gdn_fused_conv_prep), bitwise equal to the two-kernel pair.
@@ -209,22 +209,22 @@ GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "1") == "1"
 _GDN_FI_VSPLIT_V1 = envs.VLLM_GDN_FI_VSPLIT_V1
 _gdn_vsplit_ready: list = []  # [module] once the warmup compiled the kernel
 _gdn_vsplit_tried: list = []
-# With V-split, the non-CP kernel beats CP for single sequences up to ~8.5k
-# tokens on VR (us, CP -> V-split: 5120 130 -> 107, 6144 138 -> 127, 8192
-# 167 -> 166; 10240 196 -> 205), so the CP threshold moves up while V-split is
-# enabled.
+# V-split has a separate non-CP admission threshold.
+
+
+
 GDN_FI_VSPLIT_NON_CP_MAX_TOKENS = int(
     os.environ.get("VLLM_GDN_FI_VSPLIT_NON_CP_MAX_TOKENS", "8192")
 )
-# Mixed batches (spec-decode rows + prefill rows): the spec rows' MTP recurrence
-# and the prefill rows' conv + chunked prefill touch disjoint state slots and
-# output rows, so with VLLM_GDN_MIXED_FORK=1 the two halves run on two streams
-# (same kernels and inputs: bitwise). Steps with at least
-# VLLM_GDN_MIXED_FORK_PREFILL_FIRST prefill tokens run the prefill half on a
-# high-priority side stream (its one-CTA-per-SM chunk kernel is dispatched first
-# and the MTP kernel fills the SMs it leaves); smaller ones run the spec half on
-# a side stream. VR microbench (r4 mixed track), per GDN layer, 64 spec
-# requests: -3 us at <= 1000 prefill tokens, -15 us at 2000, -29 us at 3000+.
+# Mixed batches may run disjoint speculative and prefill work on separate streams.
+
+
+
+
+
+
+
+
 GDN_MIXED_FORK = os.environ.get("VLLM_GDN_MIXED_FORK", "0") == "1"
 GDN_MIXED_FORK_PREFILL_FIRST = int(
     os.environ.get("VLLM_GDN_MIXED_FORK_PREFILL_FIRST", "1500")
@@ -939,6 +939,43 @@ class ChunkGatedDeltaRule(CustomOp):
         return o, final_state
 
 
+_BLOCK_EXTENT_CHECKED = False
+
+
+def _check_block_vs_gdn_extent(vllm_config: VllmConfig, spec) -> None:
+    """Fail closed: an attention block larger than the GDN state
+    extent (+32 tokens) relies on whole-page CoW copies of aliased hybrid
+    slots (vllm/v1/worker/utils.py widest_alias_views). Without them a
+    partial-hit copy moves only the GDN payload prefix of the attention page.
+    bound = floor(state payload bytes / attention bytes per token) + 32.
+    """
+    global _BLOCK_EXTENT_CHECKED
+    if _BLOCK_EXTENT_CHECKED or not isinstance(spec, MambaSpec):
+        return
+    _BLOCK_EXTENT_CHECKED = True
+    from vllm.v1.worker import utils as worker_utils
+
+    block = int(vllm_config.cache_config.block_size)
+    padded = spec.page_size_padded
+    if not padded or block <= 0:
+        return  # unpadded: the attention page equals the GDN payload, no tail
+    per_tok = max(1, int(padded) // block)
+    bound = int(spec.real_page_size_bytes) // per_tok + 32
+    fix = bool(getattr(worker_utils, "COW_WIDEST_ALIAS_FIX", False))
+    ok = fix or block <= bound
+    logger.warning(
+        "[lowc-opt] block-vs-extent: block=%d state_bytes=%d "
+        "attn_bytes/token=%d bound=%d cow_fix=%s -> %s",
+        block, spec.real_page_size_bytes, per_tok, bound, fix,
+        "OK" if ok else "REFUSE",
+    )
+    if not ok:
+        raise RuntimeError(
+            f"block-size {block} > GDN state extent bound {bound} without the "
+            "KV CoW whole-page fix (widest_alias_views)"
+        )
+
+
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
@@ -956,6 +993,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         spec = super().get_kv_cache_spec(vllm_config)
+        _check_block_vs_gdn_extent(vllm_config, spec)
         if not (
             envs.VLLM_GDN_PREFILL_CHECKPOINT
             and isinstance(spec, MambaSpec)
