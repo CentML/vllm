@@ -280,20 +280,181 @@ def _gen(
 
 
 def gen_rule_accepts(T: int, B: int, max_q: int) -> bool:
-    """Whether ``FMHA_GEN_RULE`` sends an eligible launch to ``gen``.
+    """Whether the selected rule sends an eligible launch to generation.
 
-    ``rubin``: always. ``gb300`` (SM103 microbenchmarks, FP8 hd256 P32): the
-    generation kernels win on under-filled launches (one short chunk over a
-    long prefix: 1.5-12x; a few short requests: 2-5x; many tiny chunks behind
-    one long chunk: 1.5x), while the SM103 context kernel wins on large chunks
-    (single request >= ~800 new tokens: 2-30%, balanced multi-request batches
-    with longer chunks: up to 32%).
+    The default rule accepts every eligible launch; the alternative rule
+    retains context kernels for larger chunks.
     """
     if _GEN_RULE != "gb300":
         return True
     if B <= 1:
         return max_q < _GEN_B1_STOCK_Q
     return T <= _GEN_MULTI_MAX_T or T <= _GEN_MULTI_MAX_MEANQ * B
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# PRE107: sm_107a-native prefill FMHA (patches/pre107, 1-CTA kernel, lazy rescale). Opt-in, default off.
+#   PRE107=1                 enable
+#   PRE107_LIB=<path>        libpre1.so (sm_107a build of patches/pre107/kernel/pre1.cu)
+#   PRE107_VARIANT=60        kernel variant (60 = 1-CTA, Q in SMEM, separate P, rounded l, HW row max)
+#   PRE107_TAU=0.8           lazy rescale threshold, log2 units (0 = exact class)
+#   PRE107_MINQ=513          launches with max_q < MINQ stay on gen / stock
+# Needs host per-request q / kv lengths for the step (set by the FlashInfer backend via pre107_set_step); a launch without
+# them, or with an unexpected layout, falls back to the existing route. Numerics: float-order vs trtllm-gen; tau > 0 is a
+# numerics-class change (det + accuracy x3 + SWE before adoption).
+_PRE107 = os.environ.get("PRE107", "0") == "1"
+_PRE107_LIB = os.environ.get("PRE107_LIB", "")
+_PRE107_VARIANT = int(os.environ.get("PRE107_VARIANT", "60"))
+_PRE107_TAU = float(os.environ.get("PRE107_TAU", "0.8"))
+_PRE107_MINQ = int(os.environ.get("PRE107_MINQ", "513"))
+_pre107 = {"lib": None, "key": None, "host": None, "plan": None, "ws": None, "n": 0, "fallback": 0}
+
+
+def pre107_set_step(key: int, q_lens_cpu: Any, kv_lens_cpu: Any) -> None:
+    """Called once per step by the FlashInfer backend with host prefill lengths (kv may be an upper bound)."""
+    if _PRE107:
+        _pre107["host"] = (key, [int(x) for x in q_lens_cpu], [int(x) for x in kv_lens_cpu])
+
+
+def _pre107_lib():
+    if _pre107["lib"] is None:
+        import ctypes
+
+        lib = ctypes.CDLL(_PRE107_LIB)
+        lib.pre_plan.restype = ctypes.c_int
+        lib.pre_plan.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        lib.pre_run.restype = ctypes.c_int
+        lib.pre_run.argtypes = ([ctypes.c_void_p] * 2 + [ctypes.c_int, ctypes.c_void_p, ctypes.c_int] + [ctypes.c_void_p] * 3
+                                + [ctypes.c_float, ctypes.c_float, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+                                + [ctypes.c_void_p] * 4 + [ctypes.c_int, ctypes.c_float, ctypes.c_void_p, ctypes.c_int])
+        _pre107["lib"] = lib
+    return _pre107["lib"]
+
+
+def _pre107_run(query, kv_cache, block_tables, seq_lens, max_q_len, bmm1_scale, bmm2_scale, batch_size, cum_seq_lens_q,
+                out) -> bool:
+    import ctypes
+
+    host = _pre107["host"]
+    B = int(batch_size)
+    if host is None or len(host[1]) != B or int(max_q_len) < _PRE107_MINQ:
+        return False
+    k, v = kv_cache
+    # layout: per-layer [pages, Hkv=2, 32, 2*256] fp8 with K|V packed in the last dim (k / v are split views)
+    if not (k.dim() == 4 and k.shape[1] == 2 and k.shape[2] == 32 and k.shape[3] == 256 and k.stride(3) == 1
+            and k.stride(2) == 512 and k.stride(1) == 32 * 512 and k.stride(0) == 2 * 32 * 512
+            and v.data_ptr() == k.data_ptr() + 256 and query.is_contiguous() and out.is_contiguous()
+            and query.shape[1] == 16 and query.shape[2] == 256 and block_tables.dtype == torch.int32):
+        _pre107["fallback"] += 1
+        return False
+    lib = _pre107_lib()
+    key = host[0]
+    if _pre107["key"] != key:  # plan once per step, reused by every full-attention layer
+        q_l, kv_l = host[1], host[2]
+        n_max = 1 << 15
+        dev = query.device
+        bufs = _pre107.get("bufs")
+        if bufs is None:
+            # persistent planner buffers: 2 pinned host slots (alternating, each guarded by an event on its last H2D copy)
+            # + one device buffer per table. Avoids per-step 2 MB ctypes allocs and 262K-element list() conversions.
+            pin = [(torch.empty(8 * n_max, dtype=torch.int32, pin_memory=True),
+                    torch.empty(8 * n_max, dtype=torch.int32, pin_memory=True), torch.cuda.Event()) for _ in range(2)]
+            bufs = dict(pin=pin, slot=0, cnt=(ctypes.c_int * 3)(),
+                        d_it=torch.empty(8 * n_max, dtype=torch.int32, device=dev),
+                        d_mg=torch.empty(8 * n_max, dtype=torch.int32, device=dev),
+                        sms=torch.cuda.get_device_properties(dev).multi_processor_count)
+            _pre107["bufs"] = bufs
+        h_it, h_mg, ev = bufs["pin"][bufs["slot"]]
+        ev.synchronize()  # the H2D copy issued from this slot two plans ago has completed
+        cnt = bufs["cnt"]
+        r = lib.pre_plan((ctypes.c_int * B)(*q_l), (ctypes.c_int * B)(*kv_l), B, bufs["sms"], 0.0, 8, 1,
+                         h_it.data_ptr(), n_max, h_mg.data_ptr(), n_max, cnt)
+        if r:
+            _pre107["fallback"] += 1
+            return False
+        ni, nm, npart = cnt[0], cnt[1], cnt[2]
+        it = bufs["d_it"][: 8 * ni]; it.copy_(h_it[: 8 * ni], non_blocking=True)
+        mg = bufs["d_mg"][: 8 * max(nm, 1)]; mg.copy_(h_mg[: 8 * max(nm, 1)], non_blocking=True)
+        ev.record(); bufs["slot"] ^= 1
+        _npc = int(os.environ.get("PRE107_PLANCHK", "0"))
+        if _npc and _pre107.setdefault("pc", [0, 0])[0] < _npc:
+            # PRE107_PLANCHK (diagnostic): rebuild this step's plan on the old synchronous path (fresh ctypes tables, list
+            # conversion, blocking copy) and require byte-equal device tables; re-verified at every later call of the step.
+            items = (ctypes.c_int * (8 * n_max))(); merges = (ctypes.c_int * (8 * n_max))(); cnt2 = (ctypes.c_int * 3)()
+            r2 = lib.pre_plan((ctypes.c_int * B)(*q_l), (ctypes.c_int * B)(*kv_l), B, bufs["sms"], 0.0, 8, 1, items, n_max,
+                              merges, n_max, cnt2)
+            ref_it = torch.tensor(list(items)[: 8 * cnt2[0]], dtype=torch.int32).to(dev)
+            ref_mg = torch.tensor(list(merges)[: 8 * max(cnt2[1], 1)], dtype=torch.int32).to(dev)
+            ok = (r2 == 0 and tuple(cnt2) == (ni, nm, npart) and torch.equal(it, ref_it) and torch.equal(mg, ref_mg))
+            _pre107["pc_ref"] = (ref_it, ref_mg)
+            pc = _pre107["pc"]; pc[0] += 1; pc[1] += (not ok)
+            if not ok or pc[0] % 50 == 0 or pc[0] == _npc:
+                logger.warning("PRE107_PLANCHK n=%d mismatch=%d calls_checked=%d", pc[0], pc[1], _pre107.get("pc_calls", 0))
+        else:
+            _pre107["pc_ref"] = None
+        ws = _pre107["ws"]
+        if ws is None or ws[0].numel() < max(npart, 1) * 128 * 256:
+            cap = max(npart, 4096)
+            ws = (torch.empty(cap * 128 * 256, dtype=torch.float32, device=dev),
+                  torch.empty(cap * 128 * 2, dtype=torch.float32, device=dev),
+                  torch.zeros(4, dtype=torch.int32, device=dev))
+            _pre107["ws"] = ws
+        _pre107["plan"] = (it, ni, mg, nm)
+        _pre107["key"] = key
+    it, ni, mg, nm = _pre107["plan"]
+    if _pre107.get("pc_ref") is not None:  # PRE107_PLANCHK: tables still intact at this call of the step
+        _pre107["pc_calls"] = _pre107.get("pc_calls", 0) + 1
+        if not (torch.equal(it, _pre107["pc_ref"][0]) and torch.equal(mg, _pre107["pc_ref"][1])):
+            _pre107["pc"][1] += 1
+            logger.warning("PRE107_PLANCHK n=%d mismatch=%d calls_checked=%d (stale at call)", _pre107["pc"][0],
+                           _pre107["pc"][1], _pre107["pc_calls"])
+    ws_o, ws_ml, flags = _pre107["ws"]
+    rc = lib.pre_run(query.data_ptr(), k.data_ptr(), int(k.shape[0]), block_tables.data_ptr(), int(block_tables.stride(0)),
+                     seq_lens.data_ptr(), cum_seq_lens_q.data_ptr(), out.data_ptr(), float(bmm1_scale), float(bmm2_scale),
+                     it.data_ptr(), ni, mg.data_ptr(), nm, ws_o.data_ptr(), ws_ml.data_ptr(), flags.data_ptr(),
+                     torch.cuda.current_stream().cuda_stream, _PRE107_VARIANT, _PRE107_TAU, None, -1)
+    if rc:
+        _pre107["fallback"] += 1
+        return False
+    _pre107["n"] += 1
+    if os.environ.get("PRE107_LOG", "0") == "1" and _pre107["n"] % 1000 == 1:
+        logger.info("PRE107: routed=%d fallback=%d no_host=%d", _pre107["n"], _pre107["fallback"], _pre107.get("no_host", 0))
+    return True
+
+
+def _pre107_check(query, kv_cache, block_tables, seq_lens, cum_seq_lens_q, bmm1_scale, bmm2_scale, out, ship_out) -> None:
+    """PRE107_CHECK: per-row rel-L2 of PRE107 and of ship vs an fp32 recompute on <= 64 sampled rows (diagnostic only)."""
+    import random
+
+    k, v = kv_cache
+    cq = cum_seq_lens_q.tolist(); sl = seq_lens.tolist(); B = len(sl)
+    rng = random.Random(len(_pre107.setdefault("chk", [])))
+    rows = []
+    for _ in range(64):
+        b = rng.randrange(B); q = cq[b + 1] - cq[b]
+        if q > 0: rows.append((b, rng.randrange(q)))
+    e_pre, e_ship = [], []
+    scale = float(bmm1_scale)
+    for b, t in rows:
+        q0 = cq[b]; kvl = sl[b]; P = kvl - (cq[b + 1] - cq[b])
+        npg = (kvl + 31) // 32
+        pages = block_tables[b, :npg].long()
+        K = k[pages].float().permute(1, 0, 2, 3).reshape(2, -1, 256)[:, : P + t + 1]
+        V = v[pages].float().permute(1, 0, 2, 3).reshape(2, -1, 256)[:, : P + t + 1]
+        Q = query[q0 + t].float()
+        ref = torch.empty(16, 256, device=query.device)
+        for h in range(16):
+            sc = (K[h // 8] @ Q[h]) * scale
+            ref[h] = (torch.softmax(sc, -1) @ V[h // 8]) * float(bmm2_scale)
+        nr = ref.norm().clamp_min(1e-12)
+        e_pre.append(((out[q0 + t].float() - ref).norm() / nr).item())
+        e_ship.append(((ship_out[q0 + t].float() - ref).norm() / nr).item())
+    def p99(x): x = sorted(x); return x[min(len(x) - 1, int(0.99 * len(x)))]
+    rec = dict(B=B, T=int(query.shape[0]), pre_max=max(e_pre), pre_p99=p99(e_pre), ship_max=max(e_ship), ship_p99=p99(e_ship),
+               nan=int(torch.isnan(out).any().item()))
+    _pre107["chk"].append(rec)
+    logger.warning("PRE107_CHECK %s", rec)
 
 
 def trtllm_batch_context_with_kv_cache(
@@ -342,6 +503,29 @@ def trtllm_batch_context_with_kv_cache(
                 route,
             )
     try:
+        if _PRE107 and sup and _pre107_run(query, kv_cache, block_tables, seq_lens, max_q_len, bmm1_scale, bmm2_scale,
+                                           batch_size, cum_seq_lens_q, out):
+            _ncheck = int(os.environ.get("PRE107_CHECK", "0"))
+            if _ncheck and len(_pre107.get("chk", [])) < _ncheck:
+                ship_out = torch.empty_like(out)
+                if not (route == "gen" and _gen(query, kv_cache, workspace_buffer, block_tables, seq_lens, max_q_len, max_kv_len,
+                                                bmm1_scale, batch_size, cum_seq_lens_q, ship_out)):
+                    _stock_trtllm_batch_context_with_kv_cache(query, kv_cache, workspace_buffer, block_tables, seq_lens, max_q_len,
+                                                              max_kv_len, bmm1_scale, bmm2_scale, batch_size, cum_seq_lens_q,
+                                                              cum_seq_lens_kv, *args, **dict(kw, out=ship_out))
+                _pre107_check(query, kv_cache, block_tables, seq_lens, cum_seq_lens_q, bmm1_scale, bmm2_scale, out, ship_out)
+            _ndet = int(os.environ.get("PRE107_DET", "0"))
+            if _ndet and _pre107.setdefault("det", [0, 0])[0] < _ndet:
+                # PRE107_DET: rerun on the same inputs (same step plan) and require bitwise-equal output (diagnostic only)
+                out2 = torch.empty_like(out)
+                ok2 = _pre107_run(query, kv_cache, block_tables, seq_lens, max_q_len, bmm1_scale, bmm2_scale, batch_size,
+                                  cum_seq_lens_q, out2)
+                d = _pre107["det"]; d[0] += 1
+                if not (ok2 and torch.equal(out.view(torch.uint8), out2.view(torch.uint8))):
+                    d[1] += 1
+                if d[0] % 50 == 0 or d[0] == _ndet or d[1] == 1:
+                    logger.warning("PRE107_DET n=%d mismatch=%d T=%d B=%d", d[0], d[1], int(query.shape[0]), int(batch_size))
+            return out
         if route == "gen" and _gen(
             query,
             kv_cache,
