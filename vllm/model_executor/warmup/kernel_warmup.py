@@ -244,6 +244,20 @@ def _kf_decode_attn_warmup(worker: "Worker") -> None:
     warmup_runtime(runner.device, qlens)
 
 
+def _locality_lm_head_warmup(worker: "Worker") -> None:
+    """VLLM_LOCALITY_LM_HEAD: launch every domain-kernel specialization the
+    localized target / draft heads can reach (the extension itself was built
+    when the weights were localized at load time)."""
+    from vllm.model_executor.layers.locality import lm_head as loc_lm
+
+    if not loc_lm.enabled():
+        return
+    runner = worker.model_runner
+    spec = getattr(runner, "speculator", None) or getattr(runner, "drafter", None)
+    done = loc_lm.warmup(runner.model, getattr(spec, "model", None))
+    logger.info("Locality lm_head kernels warmed up: %s.", done)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -315,6 +329,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         _kf_prefill_attn_warmup(worker)
     if envs.VLLM_KF_DECODE_ATTN:
         _kf_decode_attn_warmup(worker)
+    _locality_lm_head_warmup(worker)
 
     if process_local_only:
         return
