@@ -29,6 +29,7 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+_DP2G_HITLOG = __import__("os").environ.get("VLLM_DP2G_HITLOG", "0") == "1"
 
 
 @dataclass
@@ -317,6 +318,20 @@ class KVCacheManager:
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
 
+        if _DP2G_HITLOG:  # [dp2g] VLLM_DP2G_HITLOG=1: per-request, per-group prefix hit diagnostics
+            try:
+                per_blocks, per_len = self.coordinator.find_longest_cache_hit_per_group(
+                    request.block_hashes, max_cache_hit_length
+                )
+                logger.info(
+                    "[dp2g-hit] req=%s ntok=%d reconciled=%d uncached_common=%d per_group_len=%s "
+                    "per_group_nblk=%s reconciled_nblk=%s last_blk=%s",
+                    request.request_id, request.num_tokens, num_new_computed_tokens, num_uncached,
+                    list(per_len), [len(b) for b in per_blocks], [len(b) for b in computed_blocks],
+                    [(b[-1].block_id if b else None) for b in computed_blocks],
+                )
+            except Exception as e:  # noqa: BLE001  diagnostics only
+                logger.info("[dp2g-hit] req=%s log failed: %r", request.request_id, e)
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
@@ -467,6 +482,15 @@ class KVCacheManager:
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
+        # [dp2g] VLLM_LOCALITY_SPLIT: steer this request's new blocks to its domain.
+        assigner = getattr(self.block_pool, "domain_assigner", None)
+        if assigner is not None:
+            hit_ids = None
+            if new_computed_blocks is not None and new_computed_blocks.blocks:
+                hit_ids = [b.block_id for b in new_computed_blocks.blocks[0]]
+            self.block_pool.free_block_queue.preferred = assigner.assign(
+                request.request_id, hit_ids
+            )
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
@@ -612,6 +636,9 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        assigner = getattr(self.block_pool, "domain_assigner", None)
+        if assigner is not None:
+            assigner.release(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -886,8 +913,12 @@ class KVCacheManager:
     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
         """Drain pending copies and return their retained endpoints."""
         pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        for mgr in self.coordinator.single_type_managers:
-            pending_copies.extend(mgr.take_pending_cow_copies())
+        for _gi, mgr in enumerate(self.coordinator.single_type_managers):
+            _pc = mgr.take_pending_cow_copies()
+            if _DP2G_HITLOG and _pc:
+                logger.info("[dp2g-cow] group=%d %s copies=%s", _gi, type(mgr).__name__,
+                            [(s.block_id, d.block_id) for s, d in _pc])
+            pending_copies.extend(_pc)
         copies = [
             KVCacheBlockCopy(
                 src_block_id=source_block.block_id,

@@ -1935,7 +1935,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
     ),
     # Optional locality/decode configuration; tuning keys do not activate features.
+    "VLLM_LOCALITY_SPLIT": lambda: os.getenv("VLLM_LOCALITY_SPLIT", "0") == "1",
+    "VLLM_LOCALITY_SPLIT_ALLOC": lambda: os.getenv("VLLM_LOCALITY_SPLIT_ALLOC", "chunks"),
+    "VLLM_LOCALITY_BUILD_DIR": lambda: os.getenv("VLLM_LOCALITY_BUILD_DIR") or None,
+    "VLLM_LOCALITY_DOMAIN_WEIGHTS": lambda: os.getenv("VLLM_LOCALITY_DOMAIN_WEIGHTS", "1,1"),
     "VLLM_LOCALITY_MIN_MEMCLK": lambda: int(os.getenv("VLLM_LOCALITY_MIN_MEMCLK", "3600")),
+    "VLLM_DP2G_HITLOG": lambda: os.getenv("VLLM_DP2G_HITLOG", "0") == "1",
     "VLLM_LOCALITY_LM_HEAD": lambda: os.getenv("VLLM_LOCALITY_LM_HEAD", "0"),
     "VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M": lambda: int(os.getenv("VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M", "16")),
     "VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M": lambda: int(os.getenv("VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M", "32")),

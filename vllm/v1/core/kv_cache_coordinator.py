@@ -93,12 +93,16 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
+        from vllm.v1.core import locality as _loc
+
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            # [dp2g] same block-granular domain boundary as the worker's KV placement
+            locality_boundary=_loc.boundary(kv_cache_config) if _loc.enabled() else None,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
