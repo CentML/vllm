@@ -874,9 +874,19 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       tc_fence_after();
       const int npad = (ntok + 15) & ~15;
       const uint32_t taddr = tmem + ((uint32_t)(q * 32) << 16) + b * ACCW;
-      for (int c0 = 0; c0 < npad; c0 += 16) {
-        float v[16];
-        tmem_ld16(taddr + c0, v);
+      // Read the whole accumulator (<= 32 columns) and hand the buffer back to the MMA warp before any math or store,
+      // so global-store latency and the FC1 release fence stay off the MMA's critical path.
+      float vv[NMAX];
+      if (npad > 0) tmem_ld16(taddr, vv);
+      if (npad > 16) tmem_ld16(taddr + 16, vv + 16);
+      tc_fence_before();
+      named_bar(2, 128);
+      if (ew == 0 && lane == 0) mbar_arrive(sa(&acce[b]));
+#pragma unroll
+      for (int cc = 0; cc < NMAX / 16; cc++) {
+        if (cc * 16 >= npad) break;
+        const int c0 = cc * 16;
+        const float* v = vv + c0;
         if (kind == 0) {
           float pr[16];
 #pragma unroll
@@ -942,13 +952,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         }
       }
       if (kind == 0 && ntok > 0) {
-        __threadfence();
+        // every epilogue thread's intermediate stores happen-before (bar.sync) the one gpu-scope release (cumulative)
         named_bar(2, 128);
-        if (ew == 0 && lane == 0) red_release(&p.st->fc1done[gid], 1u);
+        if (ew == 0 && lane == 0) { __threadfence(); red_release(&p.st->fc1done[gid], 1u); }
       }
-      tc_fence_before();
-      named_bar(2, 128);
-      if (ew == 0 && lane == 0) { mbar_arrive(sa(&acce[b])); mbar_arrive(sa(&infe[slot])); }
+      named_bar(2, 128);                                       // the slot's token list is no longer read
+      if (ew == 0 && lane == 0) mbar_arrive(sa(&infe[slot]));
       c_ework += clock64() - t_w; n_units++;
     }
     if (p.dbg && ew == 0 && lane == 0) { u64* q_ = p.dbg + blockIdx.x * DBGW; q_[12] = c_eaccf; q_[13] = c_ework; q_[14] = n_units; }
