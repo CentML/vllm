@@ -569,7 +569,7 @@ def convert_to_fp8_moe_kernel_format(
 
             if locality_moe.ENABLED:
                 # one copy, same layout: expert pair p on locality domain p & 1
-                w13, w2 = locality_moe.maybe_place(w13, w2)
+                w13, w2 = locality_moe.maybe_place(w13, w2, w13_scale, w2_scale)
     elif fp8_backend == Fp8MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
             prepare_fp8_moe_layer_for_xpu,

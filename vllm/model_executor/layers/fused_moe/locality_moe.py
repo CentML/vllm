@@ -43,6 +43,7 @@ by file path.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 
@@ -142,6 +143,43 @@ def place_expert_pairs(w13: torch.Tensor, w2: torch.Tensor):
     return out[0], out[1]
 
 
+def place_scales_domain_major(s13: torch.Tensor, s2: torch.Tensor):
+    """Localized copies of the (128x4-interleaved, expert-major) MXFP8 weight
+    scales re-ordered domain-major: domain d's experts (local index k) at slot
+    d * 128 + k, so each domain's scales fill whole 2 MiB chunks on that domain.
+    The production tensors are kept for the trtllm-gen path (3 % of the weight
+    bytes per layer); reading the scales from interleaved memory couples every
+    stage of the per-SM ring to fabric latency.
+    """
+    from vllm.model_executor.layers.locality.memory import alloc_chunks, chunk_ordinals
+
+    dev = s13.device.index
+    perm = torch.tensor(
+        [4 * (k >> 1) + 2 * d + (k & 1) for d in (0, 1) for k in range(E // 2)],
+        device=s13.device,
+    )
+    out = []
+    for s in (s13, s2):
+        per = s.numel() // E
+        nbytes = s.numel() * s.element_size()
+        assert nbytes % (2 * CHUNK) == 0
+        plan = [0] * (nbytes // CHUNK // 2) + [1] * (nbytes // CHUNK // 2)
+        flat = alloc_chunks(nbytes, plan, CHUNK, dev)
+        if chunk_ordinals(flat, nbytes, CHUNK) != plan:
+            raise RuntimeError("locality placement mismatch (scales)")
+        flat.view(E, per).copy_(s.reshape(E, per).view(torch.uint8)[perm])
+        out.append(flat)
+    return out[0], out[1]
+
+
+@dataclasses.dataclass
+class LayerWeights:
+    tmaps: torch.Tensor  # host bytes of the w13 / w2 tensor maps
+    s13: torch.Tensor  # w13 scales (domain-major localized copy or production)
+    s2: torch.Tensor
+    sf_dmajor: bool
+
+
 # ---------------------------------------------------------------- runtime
 class LocalityMoE:
     """Per-device state of the locality MoE kernel (topology, scratch)."""
@@ -183,14 +221,28 @@ class LocalityMoE:
         ops.topk_softmax(topk_w, topk_ids, tok_idx, router_logits, True)
         return topk_ids, topk_w
 
+    def layer_weights(
+        self,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        s13: torch.Tensor,
+        s2: torch.Tensor,
+        localize_scales: bool = True,
+    ) -> LayerWeights:
+        """Kernel view of one layer: tensor maps of w13/w2 (as placed) and the
+        scales (a domain-major localized copy, or the production tensors).
+        """
+        if localize_scales:
+            ls13, ls2 = place_scales_domain_major(s13, s2)
+            return LayerWeights(self.tensor_maps(w13, w2), ls13, ls2, True)
+        return LayerWeights(self.tensor_maps(w13, w2), s13, s2, False)
+
     def forward(
         self,
         router_logits: torch.Tensor,
         x: torch.Tensor,
         x_sf: torch.Tensor,
-        tmaps: torch.Tensor,
-        w13_sf: torch.Tensor,
-        w2_sf: torch.Tensor,
+        lw: LayerWeights,
         topk: tuple[torch.Tensor, torch.Tensor] | None = None,
         dbg: torch.Tensor | None = None,
         pdl: bool = True,
@@ -209,9 +261,9 @@ class LocalityMoE:
             topk_ids, topk_w, ew, self.plan, T, self.nd[0], self.nd[1], pdl
         )
         self.ext.moe_launch(
-            tmaps,
-            w13_sf,
-            w2_sf,
+            lw.tmaps,
+            lw.s13,
+            lw.s2,
             x,
             x_sf.view(torch.uint8),
             self.inter,
@@ -225,6 +277,7 @@ class LocalityMoE:
             self.nsm,
             dbg,
             pdl,
+            lw.sf_dmajor,
         )
         return out, ew, self.idx[: T * TOPK].view(T, TOPK)
 
@@ -239,15 +292,17 @@ def runtime(device: int) -> LocalityMoE:
     return rt
 
 
-# (w13 data_ptr, w2 data_ptr) of pair-placed layers -> their tensor maps
-_LAYERS: dict[tuple[int, int], torch.Tensor] = {}
+# (w13 data_ptr, w2 data_ptr) of pair-placed layers -> their kernel view
+_LAYERS: dict[tuple[int, int], LayerWeights] = {}
 
 
 def maybe_place(
-    w13: torch.Tensor, w2: torch.Tensor
+    w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load-time hook (trtllm-gen MXFP8 layout): pair-placed copies of w13/w2
-    when the kernel is enabled and applies, else the inputs unchanged.
+    (which replace the originals) plus domain-major localized scale copies (the
+    originals stay for trtllm-gen) when the kernel is enabled and applies; else
+    the inputs unchanged.
     """
     if not ENABLED or w13.shape != (E, 2 * INTER, HID) or w2.shape != (E, HID, INTER):
         return w13, w2
@@ -258,7 +313,7 @@ def maybe_place(
         return w13, w2
     rt = runtime(w13.device.index)
     l13, l2 = place_expert_pairs(w13.contiguous(), w2.contiguous())
-    _LAYERS[(l13.data_ptr(), l2.data_ptr())] = rt.tensor_maps(l13, l2)
+    _LAYERS[(l13.data_ptr(), l2.data_ptr())] = rt.layer_weights(l13, l2, s13, s2)
     return l13, l2
 
 
@@ -268,8 +323,6 @@ def try_apply(
     x_sf: torch.Tensor,
     w13: torch.Tensor,
     w2: torch.Tensor,
-    w13_sf: torch.Tensor,
-    w2_sf: torch.Tensor,
 ):
     """(gemm2_permuted, expert_weights, expanded_idx_to_permuted_idx), or None
     when this call is not served (T outside the gate, layer not placed, or
@@ -278,8 +331,8 @@ def try_apply(
     T = x.shape[0]
     if not GATE_MIN_TOKENS <= T <= GATE_MAX_TOKENS:
         return None
-    tm = _LAYERS.get((w13.data_ptr(), w2.data_ptr()))
-    if tm is None:
+    lw = _LAYERS.get((w13.data_ptr(), w2.data_ptr()))
+    if lw is None:
         return None
     if (
         x.dim() != 2
@@ -290,9 +343,7 @@ def try_apply(
         or router_logits.shape != (T, E)
     ):
         return None
-    return runtime(x.device.index).forward(
-        router_logits.contiguous(), x, x_sf, tm, w13_sf, w2_sf
-    )
+    return runtime(x.device.index).forward(router_logits.contiguous(), x, x_sf, lw)
 
 
 _SOURCE = r"""
@@ -339,8 +390,14 @@ struct Params {
   uint8_t* inter; uint8_t* intersf; __nv_bfloat16* out;
   const Plan* plan; State* st; const signed char* smdom;
   int nd0, nd1;
+  int sf_dmajor;                      // scales: 0 = production expert-major, 1 = domain-major localized copy
   u64* dbg;                           // optional per-CTA stamps [grid][4]: start, producer past wait, end, smid|dom|rank
 };
+// scale block of expert e: expert-major (production tensors) or domain-major (localized copy: domain d's 128 experts,
+// local index k, at slot d * 128 + k, so each domain's scales fill whole 2 MiB chunks of that domain)
+__host__ __device__ __forceinline__ int sf_slot(int e, int dmajor) {
+  return dmajor ? ((e >> 1) & 1) * 128 + (e >> 2) * 2 + (e & 1) : e;
+}
 
 #define RTC(x) do { cudaError_t e_ = (x); TORCH_CHECK(e_ == cudaSuccess, #x " failed: ", cudaGetErrorString(e_)); } while (0)
 #define DRV(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { const char* s_ = "?"; cuGetErrorName(r_, &s_); TORCH_CHECK(false, #x " failed: ", s_); } } while (0)
@@ -412,81 +469,99 @@ __device__ __forceinline__ int warp_iscan(int v) {
 __host__ __device__ __forceinline__ int expert_of(int d, int k) { return 4 * (k >> 1) + 2 * d + (k & 1); }
 
 // ------------------------------------------------------------------ k_plan: per-expert token lists + work lists
-// One CTA of 1024 threads. Token lists are in ascending expanded index (t * 8 + k), so ascending token order.
+// One CTA of 1024 threads. The plan is built in SMEM and copied out with coalesced 16-B stores (scattered per-thread
+// record stores from one SM took ~8 us). Token order within an expert is the order of shared-memory atomics, i.e.
+// not fixed; outputs do not depend on it (every token is its own MMA column, K order is fixed per unit, and every
+// output row t * 8 + k is written once), so results stay bitwise run-to-run.
+constexpr int PLAN_HDR = (int)offsetof(Plan, k2g) + (int)sizeof(((Plan*)0)->k2g);    // header + k2g, copied whole
+constexpr int PLAN_SMEM = (int)sizeof(Plan) + 8 * E * 4 + 2 * TMAX * TOPK * 2 + 2 * GMAX * 4 + 64;
 __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, const float* __restrict__ tw,
                                                   __nv_bfloat16* __restrict__ ew, Plan* __restrict__ pl, int T, int n0, int n1) {
-  __shared__ short sid[TMAX * TOPK];
-  __shared__ short srt[TMAX * TOPK];
-  __shared__ short wc[32][E];
-  __shared__ int cnt[E], eoff[E], soff[E];
-  __shared__ int ws[2][8];
+  extern __shared__ __align__(16) unsigned char psm[];
+  Plan* P = (Plan*)psm;
+  int* cnt = (int*)(psm + sizeof(Plan));
+  int* fill = cnt + E; int* eoff = fill + E; int* soff = eoff + E;
+  int* g0e = soff + E; int* f0e = g0e + E; int* nse = f0e + E; int* ws = nse + E;      // ws: [4][8]
+  short* sid = (short*)(ws + 32);
+  short* srt = sid + TMAX * TOPK;
+  int* gmap = (int*)(srt + TMAX * TOPK);                                                  // [2][GMAX]: e << 8 | sub
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   griddep_wait();
   griddep_launch();                   // k_moe may start its weight prefetch now; it waits for this grid before reading pl
-  if (tid == 0) pl->ts[0] = gtime();
+  const u64 t0 = gtime();
   const int N = T * TOPK;
-  for (int i = tid; i < N; i += 1024) { sid[i] = (short)ids[i]; ew[i] = __float2bfloat16(tw[i]); }
-  for (int i = tid; i < 32 * E; i += 1024) (&wc[0][0])[i] = 0;
+  if (tid < E) { cnt[tid] = 0; fill[tid] = 0; }
   __syncthreads();
-  const int CH = (((N + 31) >> 5) + 31) & ~31;          // entries per warp (contiguous chunk), multiple of 32
-  const int b0 = w * CH;
-  for (int it = 0; it < CH; it += 32) {
-    const int i = b0 + it + lane;
-    const int e = i < N ? sid[i] : -1;
-    const unsigned peers = __match_any_sync(0xffffffffu, e);
-    if (e >= 0 && lane == __ffs(peers) - 1) wc[w][e] += (short)__popc(peers);
-    __syncwarp();
+  for (int i = tid; i < N; i += 1024) {
+    const int e = ids[i];
+    sid[i] = (short)e;
+    atomicAdd(&cnt[e], 1);
+    ew[i] = __float2bfloat16(tw[i]);
   }
   __syncthreads();
-  if (tid < E) { int run = 0; for (int x = 0; x < 32; x++) { const int c = wc[x][tid]; wc[x][tid] = (short)run; run += c; } cnt[tid] = run; }
-  __syncthreads();
-  if (tid < E) {
-    const int c = cnt[tid], c8 = (c + 7) & ~7;
-    const int a = warp_iscan(c), b = warp_iscan(c8);
-    if (lane == 31) { ws[0][w] = a; ws[1][w] = b; }
-    named_bar(1, E);
-    int ba = 0, bb = 0;
-    for (int x = 0; x < w; x++) { ba += ws[0][x]; bb += ws[1][x]; }
-    eoff[tid] = ba + a - c; soff[tid] = bb + b - c8;
-    if (tid == E - 1) { pl->nslots = bb + b; pl->T = T; pl->ts[1] = gtime(); }
-  }
-  __syncthreads();
-  for (int it = 0; it < CH; it += 32) {
-    const int i = b0 + it + lane;
-    const int e = i < N ? sid[i] : -1;
-    const unsigned peers = __match_any_sync(0xffffffffu, e);
-    if (e >= 0) srt[eoff[e] + wc[w][e] + __popc(peers & ((1u << lane) - 1u))] = (short)i;
-    __syncwarp();
-    if (e >= 0 && lane == __ffs(peers) - 1) wc[w][e] += (short)__popc(peers);
-    __syncwarp();
-  }
-  __syncthreads();
-  if (tid == 0) pl->ts[2] = gtime();
   if (tid < 2 * 128) {
-    const int d = tid >> 7, k = tid & 127, e = expert_of(d, k);
-    const int c = cnt[e], nsub = (c + 31) >> 5, nd = d ? n1 : n0;
-    const int skip0 = nsub ? min(max(nd - 8 * k, 0), 8) : 0;       // wave-0 units of this expert (static, in k_moe)
+    // (a) expert order: compact offsets and 8-aligned slot offsets; (b) per domain, local expert order: groups and the
+    // dynamic FC1 list (wave-0 units, the first nd static FC1 units of the domain, are run by k_moe directly)
+    const int c = cnt[tid], c8 = (c + 7) & ~7;
+    const int d = tid >> 7, k = tid & 127, e2 = expert_of(d, k);
+    const int c2 = cnt[e2], nsub = (c2 + 31) >> 5, nd = d ? n1 : n0;
+    const int skip0 = nsub ? min(max(nd - 8 * k, 0), 8) : 0;
     const int nf = 8 * nsub - skip0;
-    const int a = warp_iscan(nsub), b = warp_iscan(nf);
-    if (lane == 31) { ws[0][w] = a; ws[1][w] = b; }
+    const int a = warp_iscan(c), b = warp_iscan(c8), a2 = warp_iscan(nsub), b2 = warp_iscan(nf);
+    if (lane == 31) { ws[w] = a; ws[8 + w] = b; ws[16 + w] = a2; ws[24 + w] = b2; }
     named_bar(1, 256);
-    int ba = 0, bb = 0;
-    for (int x = d * 4; x < w; x++) { ba += ws[0][x]; bb += ws[1][x]; }
-    const int g0 = ba + a - nsub;
-    int f = bb + b - nf;
-    if (k == 127) { pl->ng[d] = g0 + nsub; pl->nfc1[d] = f + nf; }
-    pl->k2g[d][k] = (short)(nsub ? g0 : -1);
-    for (int s = 0; s < nsub; s++) {
-      const int g = g0 + s, nt = min(32, c - 32 * s);
-      GRec* R = &pl->grec[d][g];
-      R->e = e; R->sub = s; R->ntok = nt; R->slot0 = soff[e] + 32 * s; R->gid = d * GMAX + g;
-      R->pad0 = R->pad1 = R->pad2 = 0;
-      for (int q = 0; q < 32; q++) R->j[q] = q < nt ? srt[eoff[e] + 32 * s + q] : (short)0;
-      for (int rb = 0; rb < 8; rb++) if (!(s == 0 && 8 * k + rb < nd)) pl->fc1list[d][f++] = (short)(g * 8 + rb);
+    int ba = 0, bb = 0, ba2 = 0, bb2 = 0;
+    for (int x = 0; x < w; x++) { ba += ws[x]; bb += ws[8 + x]; }
+    for (int x = d * 4; x < w; x++) { ba2 += ws[16 + x]; bb2 += ws[24 + x]; }
+    eoff[tid] = ba + a - c; soff[tid] = bb + b - c8;
+    const int g0 = ba2 + a2 - nsub;
+    g0e[e2] = g0; f0e[e2] = bb2 + b2 - nf; nse[e2] = nsub;
+    P->k2g[d][k] = (short)(nsub ? g0 : -1);
+    if (k == 127) { P->ng[d] = g0 + nsub; P->nfc1[d] = bb2 + b2; }
+    if (tid == E - 1) { P->nslots = bb + b; P->T = T; }
+    for (int s = 0; s < nsub; s++) gmap[d * GMAX + g0 + s] = (e2 << 8) | s;
+  }
+  __syncthreads();
+  for (int i = tid; i < N; i += 1024) {
+    const int e = sid[i];
+    srt[eoff[e] + atomicAdd(&fill[e], 1)] = (short)i;
+  }
+  __syncthreads();
+  const u64 t1 = gtime();
+  const int ng0 = P->ng[0], ng1 = P->ng[1];
+  for (int it = tid; it < (ng0 + ng1) * 32; it += 1024) {
+    const int d = it >= ng0 * 32, gi = it - d * ng0 * 32, g = gi >> 5, q = gi & 31;
+    const int m = gmap[d * GMAX + g], e = m >> 8, s = m & 255, c = cnt[e], nt = min(32, c - 32 * s);
+    GRec* R = &P->grec[d][g];
+    R->j[q] = q < nt ? srt[eoff[e] + 32 * s + q] : (short)0;
+    if (q == 0) { R->e = e; R->sub = s; R->ntok = nt; R->slot0 = soff[e] + 32 * s; R->gid = d * GMAX + g; R->pad0 = R->pad1 = R->pad2 = 0; }
+    if (q < 8) {
+      const int rb = q, k = (e >> 2) * 2 + (e & 1), nd = d ? n1 : n0;
+      const int skip0 = min(max(nd - 8 * k, 0), 8);
+      if (s > 0) P->fc1list[d][f0e[e] + (8 - skip0) + 8 * (s - 1) + rb] = (short)(g * 8 + rb);
+      else if (rb >= skip0) P->fc1list[d][f0e[e] + rb - skip0] = (short)(g * 8 + rb);
     }
   }
   __syncthreads();
-  if (tid == 0) pl->ts[3] = gtime();
+  const u64 t2 = gtime();
+  if (tid == 0) { P->ts[0] = t0; P->ts[1] = t1; P->ts[2] = t2; P->ts[3] = 0; }
+  __syncthreads();
+  // copy out: header + k2g, fc1list[d][0, nfc1[d]), grec[d][0, ng[d]) as 16-B chunks
+  const int nh = PLAN_HDR / 16, nl0 = (P->nfc1[0] * 2 + 15) / 16, nl1 = (P->nfc1[1] * 2 + 15) / 16;
+  const int nr0 = ng0 * (int)sizeof(GRec) / 16, nr1 = ng1 * (int)sizeof(GRec) / 16;
+  constexpr int OL = (int)offsetof(Plan, fc1list) / 16, OLD = GMAX * 8 * 2 / 16;
+  constexpr int OR = (int)offsetof(Plan, grec) / 16, ORD = GMAX * (int)sizeof(GRec) / 16;
+  const uint4* src = (const uint4*)psm;
+  uint4* dst = (uint4*)pl;
+  for (int i = tid; i < nh + nl0 + nl1 + nr0 + nr1; i += 1024) {
+    int o;
+    if (i < nh) o = i;
+    else if (i < nh + nl0) o = OL + (i - nh);
+    else if (i < nh + nl0 + nl1) o = OL + OLD + (i - nh - nl0);
+    else if (i < nh + nl0 + nl1 + nr0) o = OR + (i - nh - nl0 - nl1);
+    else o = OR + ORD + (i - nh - nl0 - nl1 - nr0);
+    dst[o] = src[o];
+  }
 }
 
 // ------------------------------------------------------------------ k_moe
@@ -552,8 +627,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       asm volatile("prefetch.tensormap [%0];" :: "l"((u64)&tm13) : "memory");
       asm volatile("prefetch.tensormap [%0];" :: "l"((u64)&tm2) : "memory");
       for (int s = 0; s < S; s++)
-        issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), &tm13, p.w13sf + (size_t)e0 * W13SF_E + rb0 * FC1_NKB * SF_ATOM,
-                    e0 * 2 * I + rb0 * 128, KSB * s);
+        issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), &tm13,
+                    p.w13sf + (size_t)sf_slot(e0, p.sf_dmajor) * W13SF_E + rb0 * FC1_NKB * SF_ATOM, e0 * 2 * I + rb0 * 128, KSB * s);
     }
     griddep_wait();
     if (p.dbg && lane == 0) p.dbg[blockIdx.x * 4 + 1] = gtime();
@@ -607,7 +682,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         if (kind < 0) break;
         const int e = f->r.e, rb = f->rb, nkb = f->nkb;
         const CUtensorMap* tm = kind ? &tm2 : &tm13;
-        const uint8_t* sf = kind ? p.w2sf + (size_t)e * W2SF_E + rb * FC2_NKB * SF_ATOM : p.w13sf + (size_t)e * W13SF_E + rb * FC1_NKB * SF_ATOM;
+        const size_t es = (size_t)sf_slot(e, p.sf_dmajor);
+        const uint8_t* sf = kind ? p.w2sf + es * W2SF_E + rb * FC2_NKB * SF_ATOM : p.w13sf + es * W13SF_E + rb * FC1_NKB * SF_ATOM;
         const int row0 = kind ? e * H + rb * 128 : e * 2 * I + rb * 128;
         for (int kb = f->kb0; kb < nkb; kb += KSB, k++) {
           const int s = k % S;
@@ -865,6 +941,7 @@ void init(int64_t dev) {
   TORCH_CHECK(occ == 1, "k_moe occupancy ", occ, " (expected 1 CTA/SM)");
   cudaFuncAttributes fa;                    // load both functions now (lazy loading must not happen in graph capture)
   RTC(cudaFuncGetAttributes(&fa, k_plan));
+  RTC(cudaFuncSetAttribute(k_plan, cudaFuncAttributeMaxDynamicSharedMemorySize, PLAN_SMEM));
   g_init[dev] = true;
 }
 
@@ -903,7 +980,7 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
   TORCH_CHECK(ids.is_contiguous() && tw.is_contiguous() && ew.is_contiguous() && plan.numel() >= (int64_t)sizeof(Plan));
   c10::cuda::CUDAGuard guard(ids.device());
   cudaLaunchConfig_t cfg; memset(&cfg, 0, sizeof(cfg));
-  cfg.gridDim = dim3(1); cfg.blockDim = dim3(1024); cfg.dynamicSmemBytes = 0;
+  cfg.gridDim = dim3(1); cfg.blockDim = dim3(1024); cfg.dynamicSmemBytes = PLAN_SMEM;
   cfg.stream = at::cuda::getCurrentCUDAStream().stream();
   cudaLaunchAttribute at[1] = {pdl_attr(pdl)};
   cfg.attrs = at; cfg.numAttrs = 1;
@@ -913,7 +990,7 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
 
 void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, torch::Tensor x, torch::Tensor xsf,
                 torch::Tensor inter, torch::Tensor intersf, torch::Tensor out, torch::Tensor plan, torch::Tensor state,
-                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl) {
+                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl, bool sf_dmajor) {
   TORCH_CHECK(tmaps.device().is_cpu() && tmaps.numel() == 2 * (int64_t)sizeof(CUtensorMap));
   TORCH_CHECK(x.is_contiguous() && x.size(1) == H && xsf.is_contiguous() && xsf.numel() == x.size(0) * (H / 32));
   TORCH_CHECK(out.is_contiguous() && out.size(0) == x.size(0) * TOPK && out.size(1) == H && out.dtype() == torch::kBFloat16);
@@ -923,6 +1000,7 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   CUtensorMap m[2];
   memcpy(m, tmaps.data_ptr(), sizeof(m));
   Params prm;
+  prm.sf_dmajor = sf_dmajor ? 1 : 0;
   prm.w13sf = (const uint8_t*)w13sf.data_ptr(); prm.w2sf = (const uint8_t*)w2sf.data_ptr();
   prm.x = (const uint8_t*)x.data_ptr(); prm.xsf = (const uint8_t*)xsf.data_ptr();
   prm.inter = (uint8_t*)inter.data_ptr(); prm.intersf = (uint8_t*)intersf.data_ptr();

@@ -623,8 +623,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                     a1q_scale,
                     w1,
                     w2,
-                    self.quant_config.w1_scale,
-                    self.quant_config.w2_scale,
                 )
                 if out is not None:
                     return UnfinalizedMoEOutput(*out)
