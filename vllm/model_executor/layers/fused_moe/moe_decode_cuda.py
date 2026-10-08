@@ -70,7 +70,7 @@ CLUSTER = int(os.environ.get("VLLM_MOE_DECODE_CLUSTER", "8"))
 STAGES = int(os.environ.get("VLLM_MOE_DECODE_STAGES", "0"))
 # Persistent clusters (0 = as many as can be co-resident).
 CLUSTERS = int(os.environ.get("VLLM_MOE_DECODE_CLUSTERS", "0"))
-# Build macros "K=V+K=V" (MDC_FAST_EXP, MDC_DEBUG, MDC_EARLY_PDL).
+# Build macros "K=V+K=V" (MDC_DEBUG, MDC_EARLY_PDL).
 TUNE = os.environ.get("VLLM_MOE_DECODE_TUNE", "")
 
 _SOURCE = r"""
@@ -85,9 +85,6 @@ _SOURCE = r"""
 
 #ifndef MDC_DEBUG
 #define MDC_DEBUG 0
-#endif
-#ifndef MDC_FAST_EXP
-#define MDC_FAST_EXP 0
 #endif
 #ifndef MDC_EARLY_PDL
 #define MDC_EARLY_PDL 1   // griddepcontrol.launch_dependents right after routing (else at the end)
@@ -501,11 +498,7 @@ __global__ void __launch_bounds__(NTHR, 1) moe_tc_kernel(const __grid_constant__
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
     float ev = 0.f;
     if (lane < TOPK) {
-#if MDC_FAST_EXP
-      ev = __expf(myv - mx);
-#else
-      ev = expf(myv - mx);
-#endif
+      ev = expf(myv - mx);   // fast math (build flags): ex2.approx, as trtllm-gen's routing
     }
     float sum = ev;
 #pragma unroll
@@ -747,12 +740,9 @@ __global__ void __launch_bounds__(NTHR, 1) moe_tc_kernel(const __grid_constant__
             const float g = isg ? v[c] : recv;
             const float u = isg ? recv : v[c + N / 2];
             const int col = isg ? c : c + N / 2;
-#if MDC_FAST_EXP
-            const float sg = g / (1.f + __expf(-g));
-#else
-            const float sg = g / (1.f + expf(-g));
-#endif
-            act[(f * N + col) * 64 + il] = sg * u;
+            // built with -use_fast_math: approximate exp and division, as trtllm-gen's FC1 epilogue (the IEEE
+            // forms differ from the chain in ~1 route per 100 calls on real activations: mt5 714632, verify 714808)
+            act[(f * N + col) * 64 + il] = g / (1.f + expf(-g)) * u;
           }
         }
         tc_fence_before();
@@ -1051,7 +1041,7 @@ def tuned_source(tune: str) -> str:
     defines = ""
     for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         key, val = item.split("=")
-        assert key in ("FAST_EXP", "DEBUG", "EARLY_PDL"), key
+        assert key in ("DEBUG", "EARLY_PDL"), key
         defines += f"#define MDC_{key} {int(val)}\n"
     return defines + _SOURCE
 
@@ -1071,7 +1061,9 @@ def load():
     bdir = build_dir(arch)
     os.makedirs(bdir, exist_ok=True)
     source = tuned_source(TUNE)
-    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+    # -use_fast_math: the chain's routing softmax and SwiGLU are fast-math (bitwise requirement)
+    cuda_flags = ["-O3", "-std=c++20", "-lineinfo", "-use_fast_math"]
+    digest = hashlib.sha256((source + " ".join(cuda_flags)).encode()).hexdigest()[:16]
     src = os.path.join(bdir, f"moe_decode_cuda_{digest}.cu")
     if not os.path.exists(src):
         tmp = f"{src}.{os.getpid()}.tmp"
@@ -1086,7 +1078,7 @@ def load():
         ext = cpp.load(
             name=f"_moe_decode_cuda_{digest}",
             sources=[src],
-            extra_cuda_cflags=["-O3", "-std=c++20", "-lineinfo"],
+            extra_cuda_cflags=cuda_flags,
             extra_cflags=["-O3", "-std=c++20"],
             build_directory=bdir,
             verbose=False,
