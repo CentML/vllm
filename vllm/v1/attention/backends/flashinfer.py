@@ -433,6 +433,27 @@ def draft_prefill_rows(
     return rows, kv_lens
 
 
+def _bounded_dequant_block_tables(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Bound temporary KV pages by live context, not model/table capacity.
+
+    Zero out each request's unused tail before the dequantizer reads page IDs:
+    persistent tables may retain stale IDs beyond that request's causal span.
+    The returned table is contiguous, as required by the dequant kernel.
+    """
+    width = min(cdiv(max_seq_len, block_size), block_tables.shape[1])
+    page_starts = (
+        torch.arange(width, dtype=torch.int32, device=block_tables.device) * block_size
+    )
+    return torch.where(
+        page_starts[None, :] < seq_lens[:, None], block_tables[:, :width], 0
+    )
+
+
 def _pack_draft_block_bool_mask(
     bool_mask: torch.Tensor, num_packed: int
 ) -> torch.Tensor:
@@ -3242,6 +3263,14 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
+                    # FlashInfer multiplies an explicitly supplied Q scale
+                    # even for 16-bit Q; only FP8 queries need dequantization.
+                    prefill_q_scale = (
+                        layer._q_scale_float
+                        if prefill_query.dtype
+                        in (torch.float8_e4m3fn, torch.float8_e5m2)
+                        else 1.0
+                    )
                     if isinstance(
                         prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
                     ):
@@ -3250,7 +3279,7 @@ class FlashInferImpl(AttentionImpl):
                             prefill_query,
                             kv_cache_for_fi,
                             self.sinks,
-                            self.scale * layer._q_scale_float * layer._k_scale_float,
+                            self.get_xqa_bmm1_scale(layer, prefill_query.dtype),
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
                         )
@@ -3258,7 +3287,7 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_for_fi,
-                            q_scale=layer._q_scale_float,
+                            q_scale=prefill_q_scale,
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
@@ -3307,6 +3336,8 @@ class FlashInferImpl(AttentionImpl):
                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
 
                 prefill_kv_block_scales = None
+                prefill_bmm1_scale = self.get_xqa_bmm1_scale(layer, prefill_query.dtype)
+                prefill_bmm2_scale = self.bmm2_scale
                 if self.is_kvcache_nvfp4:
                     # NVFP4 trtllm-gen kernel requires FP8 query.
                     assert attn_metadata.q_data_type_prefill == FP8_DTYPE, (
@@ -3342,13 +3373,21 @@ class FlashInferImpl(AttentionImpl):
                     B_kv, H_kv, N_kv = kv_cache_permute.shape[:3]
                     kv_cache_5d = kv_cache_permute.view(B_kv, H_kv, N_kv, 2, hs)
                     kv_cache_5d = kv_cache_5d.permute(0, 3, 1, 2, 4)
+                    dequant_block_tables = _bounded_dequant_block_tables(
+                        block_tables_prefill,
+                        seq_lens_prefill,
+                        attn_metadata.prefill.max_seq_len,
+                        N_kv,
+                    )
                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
                         kv_cache_5d,
-                        block_tables_prefill,
+                        dequant_block_tables,
                         layer._k_scale,
                         layer._v_scale,
                         attn_metadata.q_data_type_prefill,
                     )
+                    # K/V scales are already applied by the dequantization.
+                    prefill_bmm1_scale, prefill_bmm2_scale = self.scale, 1.0
                 else:
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
@@ -3417,8 +3456,8 @@ class FlashInferImpl(AttentionImpl):
                             block_tables=mock_block_table,
                             seq_lens=seq_lens_prefill,
                             max_seq_len=attn_metadata.prefill.max_seq_len,
-                            bmm1_scale=self.bmm1_scale,
-                            bmm2_scale=self.bmm2_scale,
+                            bmm1_scale=prefill_bmm1_scale,
+                            bmm2_scale=prefill_bmm2_scale,
                             window_left=self.window_left,
                             sinks=self.sinks,
                             out=out,
@@ -3450,8 +3489,8 @@ class FlashInferImpl(AttentionImpl):
                         seq_lens=seq_lens_prefill,
                         max_q_len=attn_metadata.prefill.max_q_len,
                         max_kv_len=attn_metadata.prefill.max_seq_len,
-                        bmm1_scale=self.bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
+                        bmm1_scale=prefill_bmm1_scale,
+                        bmm2_scale=prefill_bmm2_scale,
                         batch_size=attn_metadata.num_prefills,
                         cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
                         cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
@@ -3500,6 +3539,12 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_for_fi = kv_cache_tuple
                 kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
 
+                decode_q_scale = (
+                    layer._q_scale_float
+                    if decode_query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    else 1.0
+                )
+
                 # NVFP4 kernel only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
@@ -3521,7 +3566,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -3539,7 +3584,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,
@@ -3691,7 +3736,9 @@ class FlashInferImpl(AttentionImpl):
                             block_tables=block_tables_decode,
                             seq_lens=seq_lens_decode,
                             max_seq_len=trt_decode.max_seq_len,
-                            bmm1_scale=self.bmm1_scale,
+                            bmm1_scale=self.get_xqa_bmm1_scale(
+                                layer, decode_query.dtype
+                            ),
                             bmm2_scale=self.bmm2_scale,
                             window_left=self.window_left,
                             sinks=self.sinks,

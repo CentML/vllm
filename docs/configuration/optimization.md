@@ -513,6 +513,10 @@ alignment specializations.
 
 ### Draft and Sampling Limits
 
+A prefill/capture fallback that requires KV
+dequantization limits its table to the needed context width and clears stale
+per-request tail page IDs.
+
 Fused sampling preparation preserves full processed-logit consumers and supports
 eligible logprob, probabilistic-draft, block, synthetic, watermark, and adaptive
 fallbacks. Other active logits transformations can still require ordinary
@@ -537,7 +541,8 @@ Use a built development environment and the normal test dependencies:
 
 ```bash
 python -m pytest -q tests/test_envs.py \
-  tests/kernels/test_lowm_bf16_gemm_optin.py
+  tests/kernels/test_lowm_bf16_gemm_optin.py \
+  tests/v1/attention/test_draft_prefill_rows.py
 
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
   tests/kernels/test_lowm_bf16_gemm.py \

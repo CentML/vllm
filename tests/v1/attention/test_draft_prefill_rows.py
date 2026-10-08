@@ -7,7 +7,10 @@ import torch
 
 pytest.importorskip("flashinfer")
 
-from vllm.v1.attention.backends.flashinfer import draft_prefill_rows  # noqa: E402
+from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
+    _bounded_dequant_block_tables,
+    draft_prefill_rows,
+)
 
 
 def _batch(reqs, max_num_reqs=None, lti_dtype=torch.int64, meta_dtype=torch.int32):
@@ -152,3 +155,26 @@ def test_out_of_span_high_index_is_clamped_to_span_end():
     cum_q = kwargs["cum_q"].long()
     torch.testing.assert_close(rows, cum_q[1:] - 1, rtol=0, atol=0)
     torch.testing.assert_close(kv_lens, kwargs["seq_lens"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_dequant_tables_bound_live_pages_not_model_capacity(block_size):
+    # A 262k-token model's persistent table contains stale, out-of-cache IDs.
+    # Only two live pages are needed in this batch; rejected tails also must
+    # not cause the shorter request's stale second page to be read.
+    capacity = 262144 // block_size
+    block_tables = torch.full((32, capacity), 1_000_000, dtype=torch.int32)
+    block_tables[:, 0] = torch.arange(1, 33, dtype=torch.int32)
+    block_tables[0, 1] = 33
+    seq_lens = torch.full((32,), block_size - 1, dtype=torch.int32)
+    seq_lens[0] = block_size + 1
+    actual = _bounded_dequant_block_tables(
+        block_tables, seq_lens, block_size + 1, block_size
+    )
+    assert actual.shape == (32, 2)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual[:, 0], block_tables[:, 0], atol=0, rtol=0)
+    assert actual[0, 1] == 33
+    assert torch.count_nonzero(actual[1:, 1]) == 0
+    # Dequantization's allocation is one null page + requests * table width.
+    assert 1 + actual.numel() == 65
