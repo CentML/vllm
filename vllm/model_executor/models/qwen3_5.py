@@ -38,6 +38,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
+from vllm.model_executor.layers import l2x_prefetch  # [l2-x] L2X-A, inert unless VLLM_L2X=1
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -202,6 +203,30 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+        # [l2-x] L2X-A: per-layer L2 prefetch site (no-op unless VLLM_L2X=1).
+        l2x_prefetch.configure_decoder_layer(self, prefix)
+
+    def _l2x_forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+        **kwargs: object,
+    ):
+        # [l2-x] fork the prefetch of this layer's non-MoE weights right after MoE(i-1)
+        # (qwen-v2: kwargs carries out_rows for the last full-attention layer; the join
+        # anchors on whatever rows the layer returns)
+        l2x_prefetch.site(self, hidden_states)
+        hidden_states, residual = super().forward(
+            hidden_states, residual, positions, **kwargs
+        )
+        l2x_prefetch.after_layer(self, hidden_states)
+        return hidden_states, residual
+
+
+if l2x_prefetch.ENABLED:  # [l2-x] base forward is untouched when VLLM_L2X is unset
+    Qwen3_5DecoderLayer.forward = Qwen3_5DecoderLayer._l2x_forward
 
 
 @support_torch_compile(
