@@ -313,3 +313,66 @@ def test_gdn_mtp_cuda_fused_quant_rejects_bad_outputs():
     ):
         assert not run_quant(*run_args, out, q_, scale_, K**-0.5, EPS, False)
     assert (q.view(torch.uint8) == 0x7F).all() and (scale == 0xFF).all()
+
+
+@pytest.mark.parametrize("H,HV", [(2, 4), (1, 4)])
+@pytest.mark.parametrize("width", [4, 5, 6, 7, 8])
+@pytest.mark.parametrize("act", ["silu", "sigmoid"])
+@pytest.mark.parametrize("tune", ["1", "QS=3+PF=3"])
+def test_gdn_mtp_cuda_wy(H, HV, width, act, tune):
+    """VLLM_GDN_MTP_CUDA_WY build (bf16 state): matches the float64 reference
+    like the stock kernel, agrees with the stock kernel to bf16 rounding, and
+    leaves every slot that no destination names untouched.
+    """
+    torch.manual_seed(width + HV // H)
+    n, lens, slots, L, args = _inputs(torch.bfloat16, H, HV, width)
+    qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w = args
+    scale = K**-0.5
+    ref_out, ref_state = _reference(
+        qkv, a, b, A_log, dt_bias, si, cu, acc, state, gate, w, scale, act, H
+    )
+    res = []
+    for ext in (
+        gdn_mtp_cuda.build(gdn_mtp_cuda.tuned_source("", pdl=False)),
+        gdn_mtp_cuda.build(gdn_mtp_cuda.wy_source(tune, pdl=True)),
+    ):
+        st = state.clone()
+        out = torch.full((L, HV, V), 7.0, dtype=torch.bfloat16, device=state.device)
+        run_args = list(args)
+        run_args[8] = st
+        assert ext.run(*run_args, out, scale, EPS, act == "sigmoid")
+        res.append((st, out))
+    (stock_state, stock_out), (wy_state, wy_out) = res
+
+    torch.testing.assert_close(wy_out.double(), ref_out, atol=3e-2, rtol=3e-2)
+    written = torch.zeros(slots, dtype=torch.bool, device=state.device)
+    for r in range(n):
+        n_acc = int(acc[r])
+        if 0 < n_acc <= width and int(si[r, n_acc - 1]) > 0:
+            for t in range(lens[r]):
+                if int(si[r, t]) > 0:
+                    written[int(si[r, t])] = True
+    torch.testing.assert_close(
+        wy_state[written].double(), ref_state[written], atol=2e-2, rtol=2e-2
+    )
+    assert torch.equal(wy_state[~written], state[~written])
+    # Same values as the stock kernel up to bf16 rounding of the stored state
+    # and of the output before the norm (fp32 re-association only).
+    ref = stock_state.double()
+    ds = (wy_state.double() - ref).norm() / ref.norm()
+    do = (wy_out.double() - stock_out.double()).norm() / stock_out.double().norm()
+    assert ds < 1e-4, ds
+    assert do < 1e-3, do
+    # Requests with an invalid source: zero output (as stock).
+    assert torch.equal(
+        wy_out[int(cu[2]) : int(cu[3])], stock_out[int(cu[2]) : int(cu[3])]
+    )
+
+
+def test_gdn_mtp_cuda_wy_rejects_fp32_state():
+    """The WY build supports the bf16 state only: fp32 launches nothing."""
+    _, _, _, L, args = _inputs(torch.float32, 2, 4, 4)
+    ext = gdn_mtp_cuda.build(gdn_mtp_cuda.wy_source("1", pdl=False))
+    out = torch.full((L, 4, V), 7.0, dtype=torch.bfloat16, device=args[0].device)
+    assert not ext.run(*args, out, K**-0.5, EPS, False)
+    assert torch.all(out == 7.0)
