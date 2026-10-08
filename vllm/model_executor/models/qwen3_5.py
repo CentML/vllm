@@ -427,6 +427,13 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # VLLM_LOCALITY_LM_HEAD: domain-local BF16 head for small M (set by
+        # locality.lm_head.maybe_enable after loading; None otherwise)
+        loc_head = getattr(self, "locality_lm_head", None)
+        if loc_head is not None:
+            logits = loc_head(hidden_states)
+            if logits is not None:
+                return logits
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_logits_local(

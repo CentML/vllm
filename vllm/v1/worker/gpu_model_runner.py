@@ -5381,6 +5381,15 @@ class GPUModelRunner(
                         self.drafter.set_eplb_state(self.eplb_state)
                         eplb_models += 1
 
+                # VLLM_LOCALITY_LM_HEAD: move the lm_head weights to domain-local
+                # memory (after lm_head sharing, before memory profiling).
+                from vllm.model_executor.layers.locality import lm_head as loc_lm
+
+                if loc_lm.enabled():
+                    loc_lm.maybe_enable(
+                        self.model, getattr(getattr(self, "drafter", None), "model", None)
+                    )
+
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

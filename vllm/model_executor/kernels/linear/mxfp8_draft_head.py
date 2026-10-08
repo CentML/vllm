@@ -89,8 +89,39 @@ class Mxfp8DraftLmHead(torch.nn.Module):
         self.register_buffer(
             "weight_scale", weight_scale.contiguous(), persistent=False
         )
+        # VLLM_LOCALITY_LM_HEAD (draft): domain-aware kernel for M <= loc_max_m
+        self.loc_gemm = None
+        self.loc_max_m = 0
+
+    def enable_locality(
+        self, topo, weight: torch.Tensor, max_m: int, cfg: int | None
+    ) -> bool:
+        """Move the e4m3 weight to a 2 MiB-interleaved localized range (the
+        FlashInfer fallback reads it there too) and serve M <= max_m rows with
+        ``locality.DomainGemm`` (plain [N, K/32] scales, one copy per domain)."""
+        from vllm.model_executor.layers.locality.memory import localize
+        from vllm.model_executor.layers.locality.skinny import FP8_MAX_M, DomainGemm
+
+        n, k = weight.shape
+        weight_q, scale_plain = mxfp8_e4m3_quantize(weight.contiguous())
+        if not torch.equal(weight_q.t(), self.weight_q_t):
+            # the head was built from a different (MTP checkpoint) weight
+            return False
+        loc = localize(weight_q.view(torch.uint8), "interleave")
+        del weight_q
+        self.weight_q_t = loc.tensor.view(self.weight_q_t.dtype).t()
+        self.loc_gemm = DomainGemm(
+            topo, loc, scale=scale_plain.view(n, k // MXFP8_BLOCK_SIZE), cfg=cfg
+        )
+        self.loc_max_m = min(max_m, FP8_MAX_M)
+        return True
 
     def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if self.loc_gemm is not None:
+            x_2d = x.reshape(-1, x.shape[-1])
+            m = x_2d.shape[0]
+            if 0 < m <= self.loc_max_m and x_2d.stride(-1) == 1:
+                return self.loc_gemm(x_2d).view(*x.shape[:-1], self.loc_gemm.n)
         return torch.ops.vllm.mtp_draft_logits_mxfp8(
             x, weight, self.weight_q_t, self.weight_scale
         )

@@ -431,6 +431,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            # VLLM_LOCALITY_LM_HEAD: move the lm_head weights to domain-local
+            # memory (after lm_head sharing, before memory profiling).
+            from vllm.model_executor.layers.locality import lm_head as loc_lm
+
+            if loc_lm.enabled():
+                loc_lm.maybe_enable(
+                    self.model, getattr(self.speculator, "model", None)
+                )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

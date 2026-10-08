@@ -11,9 +11,11 @@ sources and cross-checked:
    (100 + 100 on VR200); a ``%smid`` kernel run in each green context lists
    them. The SMs left in the remainder (12 on VR200, the "unassigned TPCs")
    get -1 there.
-2. a latency probe: every SM chases a pointer chain (L2-resident) in a buffer
-   placed on domain 0 and in one placed on domain 1; the near buffer is
-   ~1.3-1.7x faster. This places the remainder SMs on their physical die.
+2. a latency probe: every SM chases a pointer chain of fresh lines (L2
+   flushed, so every load misses to DRAM) in a buffer placed on domain 0 and
+   in one placed on domain 1; the near buffer is ~1.4-1.7x faster. This places
+   the remainder SMs on their physical die. (L2-hit latency is the same for
+   both domains, so the probe must miss.)
 
 ``sm_domain`` (int8, on the device) is the green-context domain where there is
 one and the probe's domain otherwise, so every SM has a domain. Kernels index
@@ -63,14 +65,19 @@ class Topology:
 def _probe(device: int) -> tuple[list[int], list[tuple[float, float]]]:
     from .memory import alloc_chunks
 
-    gran = _ext.load().granularity(device)
-    b0 = alloc_chunks(gran, [0], gran, device)
-    b1 = alloc_chunks(gran, [1], gran, device)
+    ext = _ext.load()
+    gran = ext.granularity(device)
+    nsm = ext.device_info(device)[0]
+    need = nsm * 32 * 4096  # N_PROBE lines 4 KB apart per SM (see _ext)
+    size = -(-need // gran) * gran
+    b0 = alloc_chunks(size, [0] * (size // gran), gran, device)
+    b1 = alloc_chunks(size, [1] * (size // gran), gran, device)
     with torch.cuda.device(device):
-        cyc = _ext.load().probe_sm_latency(b0, b1)
+        flush = torch.empty(512 << 20, dtype=torch.uint8, device=f"cuda:{device}")
+        cyc = ext.probe_sm_latency(b0, b1, flush)
         torch.cuda.synchronize(device)
     cyc = cyc.cpu().tolist()
-    del b0, b1
+    del b0, b1, flush
     pmap = []
     for c0, c1 in cyc:
         if c0 <= 0 or c1 <= 0 or max(c0, c1) / min(c0, c1) < 1.1:
