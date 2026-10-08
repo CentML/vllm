@@ -19,9 +19,9 @@ post-top-K pipeline (17-256 tokens) and after the large-batch score kernels
 metadata except the within-expert row order (nondeterministic in the stock
 atomics-based kernels too) is identical and the packed scores are copied to the
 expert weights as before, so MoE outputs are unchanged. The kernel waits on its
-producer before touching global memory and triggers its dependents after its
-last write, which makes it PDL-safe (unlike the cluster / cooperative launches
-FlashInfer PR #4806 disabled MoE PDL for on SM107).
+producer before touching global memory and by default triggers its dependents
+after its last write. The opt-in early trigger below requires wait-first
+consumers. Cluster / cooperative routing remains excluded from SM107 PDL.
 
 When enabled, the patch is applied to the installed FlashInfer sources and
 FlashInfer's trtllm fused-MoE JIT module is built from them under a renamed
@@ -45,9 +45,18 @@ Environment:
   flags, include dirs, FlashInfer version, device capability) load it instead
   of rebuilding. Start-up only: the loaded code is the code the build would
   produce.
+* ``VLLM_MOE_ROUTING_EARLY_PDL`` (default ``0``): release GS2's
+  dependents just after its input wait, before global accesses, instead of
+  after its writes. Requires ``GS2_ROUTE``, a positive
+  ``VLLM_FI_SM107_MOE_PDL_MAX_TOKENS`` and configured Inductor PDL off.
+  Rejects prebuilt modules; JIT/cache uses a separate ``_earlypdl`` name.
+  The existing per-call safety bounds still decide whether routing uses PDL.
+  This does not enable GS2 or change GEMM selection. Pair with the existing
+  ``VLLM_LOWM_BF16_GEMM_PDL=1`` only where the router already uses TinyGEMM;
+  the fused cuBLAS gate remains a non-PDL boundary.
 * Read by the patched C++: ``GS2_ROUTE_MAXN`` (max ``numTokens * topK``,
-  default 8192 = 1024 tokens at top-8, capped at 32768; above
-  that the single CTA was slower than the cooperative kernel on VR), ``GS2_ROUTE_MINTOK`` (default 17),
+  default 8192 = 1024 tokens at top-8, capped at 32768),
+  ``GS2_ROUTE_MINTOK`` (default 17),
   ``GS2_ROUTE_PACKED`` (default 1: packed top-K input), ``GS2_ROUTE_LARGE``
   (default 1: also after the large-batch score kernels), ``GS2_ROUTE_AGG``
   (warp-aggregated atomics), ``GS2_ROUTE_LOG``.
@@ -422,6 +431,35 @@ def _pdl_fc_enabled() -> bool:
     return True
 
 
+def _routing_early_pdl_enabled() -> bool:
+    """Fail closed: early release requires the existing safe consumer policy."""
+    if not envs.VLLM_MOE_ROUTING_EARLY_PDL:
+        return False
+    if not ENABLED or PREBUILT:
+        raise ValueError(
+            "VLLM_MOE_ROUTING_EARLY_PDL requires GS2_ROUTE with a JIT module "
+            "(GS2_ROUTE_PREBUILT is not supported)"
+        )
+    if envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS <= 0:
+        raise ValueError(
+            "VLLM_MOE_ROUTING_EARLY_PDL requires "
+            "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0"
+        )
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_device_capability(107):
+        raise ValueError("VLLM_MOE_ROUTING_EARLY_PDL is restricted to SM107")
+    from vllm.model_executor.layers.fusion.mxfp8_pdl import (
+        mxfp8_producer_early_trigger,
+    )
+
+    if not mxfp8_producer_early_trigger():
+        raise ValueError(
+            "VLLM_MOE_ROUTING_EARLY_PDL requires configured Inductor PDL off"
+        )
+    return True
+
+
 def maybe_install() -> None:
     """Build (or load the prebuilt) FlashInfer trtllm fused-MoE module from the
     patched routing sources (``GS2_ROUTE``) and / or the routing-never-PDL
@@ -431,6 +469,7 @@ def maybe_install() -> None:
     global _installed, _pdl_fc_installed
     if _installed or _pdl_fc_installed:
         return
+    early_pdl = _routing_early_pdl_enabled()
     pdl_fc = _pdl_fc_enabled()
     if not (ENABLED or pdl_fc):
         return
@@ -453,6 +492,8 @@ def maybe_install() -> None:
         name = f"{spec.name}_{TAG}" if ENABLED else spec.name
         if pdl_fc:
             name = f"{name}_pdlfc"
+        if early_pdl:
+            name = f"{name}_earlypdl"
         out_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "vllm_patched" / name
         srcs = list(spec.sources)
         mapping: dict[Path, Path] = {}
@@ -466,6 +507,14 @@ def maybe_install() -> None:
             lsrc = patched_launcher_source(Path(stock_l[0]), out_dir)
             srcs = [lsrc if Path(p).name == LAUNCHER_SOURCE_NAME else p for p in srcs]
         new = dataclasses.replace(spec, name=name, sources=srcs)
+        if early_pdl:
+            new = dataclasses.replace(
+                new,
+                extra_cuda_cflags=[
+                    *(new.extra_cuda_cflags or []),
+                    "-DVLLM_MOE_ROUTING_EARLY_PDL=1",
+                ],
+            )
         if prebuilt is not None:
             # JitSpecNvcc loads ``aot_path`` without building when it exists.
             new = dataclasses.replace(
@@ -548,7 +597,7 @@ FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_rout
  
  #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
  #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
-@@ -38,12 +40,334 @@
+@@ -38,12 +40,340 @@
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -617,6 +666,10 @@ FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_rout
 +  // the PDL primary (score kernel), so it is read with coherent loads, not ld.global.nc.
 +#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 +  if (p.usePdl) cudaGridDependencySynchronize();
++#if defined(VLLM_MOE_ROUTING_EARLY_PDL) && VLLM_MOE_ROUTING_EARLY_PDL
++  // Consumers must wait before loading any routing output.
++  if (p.usePdl) cudaTriggerProgrammaticLaunchCompletion();
++#endif
 +#endif
 +  int32_t eIdx[EPT];
 +  int32_t eOff[EPT];
@@ -732,17 +785,19 @@ FLASHINFER_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_rout
 +      }
 +    }
 +  }
-+  // Trigger after every global write (CTA tables, sizes, permutation maps, weights).
++  // Default: trigger after all writes. Early mode already triggered after the wait.
 +#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++#if !defined(VLLM_MOE_ROUTING_EARLY_PDL) || !VLLM_MOE_ROUTING_EARLY_PDL
 +  if (p.usePdl) cudaTriggerProgrammaticLaunchCompletion();
++#endif
 +#endif
 +}
 +
 +struct Cfg {
 +  int mode = 1;          // GS2_ROUTE: 0 = stock, 1 = on
-+  int maxN = 8 * NT;     // GS2_ROUTE_MAXN: max expanded entries (numTokens*topK); measured on
-+                         // VR (E=256, top-8) slower than the stock cooperative kernel from
-+                         // 1536 tokens (12288 entries) on
++  int maxN = 8 * NT;     // GS2_ROUTE_MAXN bounds expanded entries.
++                         // Entries are numTokens*topK.
++                         // Larger inputs use the stock cooperative kernel.
 +  int minTok = 17;       // GS2_ROUTE_MINTOK
 +  int packed = 1;        // GS2_ROUTE_PACKED: also take packed (bf16 score, idx) top-K input
 +  int large = 1;         // GS2_ROUTE_LARGE: also replace the cooperative/multi-kernel permutation

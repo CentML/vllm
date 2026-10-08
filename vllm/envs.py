@@ -341,6 +341,8 @@ if TYPE_CHECKING:
     VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
     VLLM_MOE_PDL_FC: bool = False
+    VLLM_MOE_ROUTING_EARLY_PDL: bool = False
+    VLLM_MOE_FINALIZE_PDL: bool = False
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_LOWM_BF16_GEMM_PDL: bool = False
     VLLM_LOWM_BF16_GEMM_SM100: bool = False
@@ -2325,6 +2327,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (flashinfer_exact_routing). Ignored when VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
     # > 0 or GS2_ROUTE_PREBUILT is set.
     "VLLM_MOE_PDL_FC": lambda: os.getenv("VLLM_MOE_PDL_FC", "0") == "1",
+    # Release GS2 routing dependents immediately after its input wait.
+    # Requires GS2_ROUTE, per-call MoE PDL, and Inductor PDL disabled.
+    # No routing algorithm, token bound, or GEMM backend is changed.
+    "VLLM_MOE_ROUTING_EARLY_PDL": lambda: bool(
+        int(os.getenv("VLLM_MOE_ROUTING_EARLY_PDL", "0"))
+    ),
+    # PDL for the standalone deferred MoE finalize, not the fused norm path.
+    # Wait before all input reads; early release uses the MXFP8 safety policy.
+    "VLLM_MOE_FINALIZE_PDL": lambda: bool(
+        int(os.getenv("VLLM_MOE_FINALIZE_PDL", "0"))
+    ),
     # Persistent directory for the JIT-built exact-routing FlashInfer MoE module
     # (GS2_ROUTE, flashinfer_exact_routing), keyed by a hash of its build
     # inputs; ignored with GS2_ROUTE_PREBUILT. Empty = no cache.

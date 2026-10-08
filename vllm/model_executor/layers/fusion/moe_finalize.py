@@ -14,10 +14,20 @@ written; the standalone op serves consumers that are not fused.
 ``permuted`` is the ``[tokens * top_k, hidden]`` leading view of the GEMM2
 output, whose storage holds every permuted row (the expert-tile padding makes
 it longer); rows are addressed through ``idx``.
+
+``VLLM_MOE_FINALIZE_PDL=1`` opts the standalone launch into PDL on supported
+devices. It waits before reading the deferred triple and releases dependents
+early only under the same safe-consumer policy as the fused MXFP8 producers.
+The default is off; reduction order, rounding and launch geometry do not change.
 """
 
 import torch
 
+from vllm import envs
+from vllm.model_executor.layers.fusion.mxfp8_pdl import (
+    mxfp8_producer_early_trigger,
+)
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -58,7 +68,13 @@ def _moe_finalize_kernel(
     HIDDEN: tl.constexpr,
     BLOCK: tl.constexpr,
     TOP_K: tl.constexpr,
+    LAUNCH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
+    if LAUNCH_PDL:
+        tl.extra.cuda.gdc_wait()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < HIDDEN
@@ -66,6 +82,8 @@ def _moe_finalize_kernel(
         permuted_ptr, weights_ptr, idx_ptr, row, cols, mask, permuted_stride, TOP_K
     )
     tl.store(out_ptr + row * HIDDEN + cols, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    if LAUNCH_PDL and not EARLY_TRIGGER:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def check_unfinalized(
@@ -88,6 +106,9 @@ def moe_finalize(
     out = torch.empty((tokens, hidden), dtype=permuted.dtype, device=permuted.device)
     if tokens:
         block = triton.next_power_of_2(hidden)
+        launch_pdl = (
+            envs.VLLM_MOE_FINALIZE_PDL and current_platform.is_arch_support_pdl()
+        )
         _moe_finalize_kernel[(tokens,)](
             permuted,
             expert_weights,
@@ -97,6 +118,9 @@ def moe_finalize(
             HIDDEN=hidden,
             BLOCK=block,
             TOP_K=top_k,
+            LAUNCH_PDL=launch_pdl,
+            EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
+            launch_pdl=launch_pdl,
             # 16-byte loads per thread for bf16, as finalizeKernelVecLoad.
             num_warps=max(1, min(8, block // 256)),
         )

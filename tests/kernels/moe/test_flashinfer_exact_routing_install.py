@@ -96,6 +96,7 @@ def install(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "_device_support_moe_pdl", stock_gate)
     for var in (
         "VLLM_MOE_PDL_FC",
+        "VLLM_MOE_ROUTING_EARLY_PDL",
         "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS",
         "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE",
     ):
@@ -225,3 +226,35 @@ def test_launcher_patch_refuses_mismatched_source(tmp_path):
     bad.write_bytes(b"\n".join(lines[:i] + [b"  enable_pdl);"] + lines[i + 1 :]))
     with pytest.raises(ValueError, match="context mismatch"):
         fer.patched_launcher_source(bad, tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    "enabled,gs2,prebuilt,bound,sm107,early,accepted",
+    [
+        (False, False, "unverified.so", 0, False, False, False),
+        (True, True, None, 208, True, True, True),
+        (True, False, None, 208, True, True, None),
+        (True, True, "unverified.so", 208, True, True, None),
+        (True, True, None, 0, True, True, None),
+        (True, True, None, -1, True, True, None),
+        (True, True, None, 208, False, True, None),
+        (True, True, None, 208, True, False, None),
+    ],
+)
+def test_early_routing_policy(
+    monkeypatch, enabled, gs2, prebuilt, bound, sm107, early, accepted
+):
+    from vllm.model_executor.layers.fusion import mxfp8_pdl
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(fer.envs, "VLLM_MOE_ROUTING_EARLY_PDL", enabled)
+    monkeypatch.setattr(fer.envs, "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", bound)
+    monkeypatch.setattr(fer, "ENABLED", gs2)
+    monkeypatch.setattr(fer, "PREBUILT", prebuilt)
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: sm107)
+    monkeypatch.setattr(mxfp8_pdl, "_early_trigger", early)
+    if accepted is None:
+        with pytest.raises(ValueError):
+            fer._routing_early_pdl_enabled()
+    else:
+        assert fer._routing_early_pdl_enabled() is accepted
