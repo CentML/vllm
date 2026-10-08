@@ -85,6 +85,10 @@ from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
 )
+from vllm.v1.attention.ops.flashinfer_decode_splitkv import (
+    check_workspace as check_splitkv_workspace,
+    policy_sm_count as splitkv_policy_sm_count,
+)
 from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
     ENABLED as PREFILL_GEN_ROUTING_ENABLED,
 )
@@ -2446,6 +2450,12 @@ class FlashInferImpl(AttentionImpl):
         if max_kv_per_cta is None:
             max_kv_per_cta = 16384 if current_platform.is_device_capability(107) else 0
         self.trtllm_decode_max_kv_per_cta = max_kv_per_cta
+        self._f1_splitkv = envs.FI_DECODE_SPLITKV not in ("off", "0", "false", "none")
+        self._f1_splitkv_policy = (
+            envs.FI_DECODE_VSM_SCALE,
+            envs.FI_DECODE_SPLITKV_CTAS_PER_SM,
+            envs.FI_DECODE_SPLITKV_MAX_SPLITS,
+        )
         self._trtllm_decode_max_reqs: int | None = None
         self._trtllm_decode_max_model_len: int | None = None
         if vllm_config is not None and vllm_config.model_config is not None:
@@ -2519,33 +2529,58 @@ class FlashInferImpl(AttentionImpl):
             self._device_sm_count = flashinfer_decode.get_device_sm_count(query.device)
         num_qo_heads = query.size(1)
         workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
-        sm_count = _trtllm_gen_decode_sm_count(
-            num_reqs,
-            max_q_len,
-            max_seq_len,
-            num_qo_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self._device_sm_count,
-            workspace_bytes,
-            self.trtllm_decode_max_kv_per_cta,
-        )
+        if self._f1_splitkv:
+            sm_count = splitkv_policy_sm_count(
+                self._device_sm_count,
+                num_reqs,
+                self.num_kv_heads,
+                *self._f1_splitkv_policy,
+            )
+            check_splitkv_workspace(
+                workspace_bytes,
+                sm_count,
+                max_q_len * (num_qo_heads // self.num_kv_heads),
+                self.head_size,
+            )
+        else:
+            sm_count = _trtllm_gen_decode_sm_count(
+                num_reqs,
+                max_q_len,
+                max_seq_len,
+                num_qo_heads,
+                self.num_kv_heads,
+                self.head_size,
+                self._device_sm_count,
+                workspace_bytes,
+                self.trtllm_decode_max_kv_per_cta,
+            )
         if self._trtllm_decode_max_reqs is None:
             return sm_count, None
         max_reqs = self._trtllm_decode_max_reqs
         assert self._trtllm_decode_max_model_len is not None
-        # Worst case: every request split ceil(max_model_len / max_kv_per_cta)
-        # ways (the policy never reports more SMs than that).
-        max_splits = (
-            cdiv(self._trtllm_decode_max_model_len, self.trtllm_decode_max_kv_per_cta)
-            if self.trtllm_decode_max_kv_per_cta > 0
-            else 1
-        )
+        # Bound the selected policy at the largest configured batch before
+        # capture. The virtual-SM budget is independent of sequence length.
+        if self._f1_splitkv:
+            max_sm_count = splitkv_policy_sm_count(
+                self._device_sm_count,
+                max_reqs,
+                self.num_kv_heads,
+                *self._f1_splitkv_policy,
+            )
+        else:
+            max_splits = (
+                cdiv(self._trtllm_decode_max_model_len, self.trtllm_decode_max_kv_per_cta)
+                if self.trtllm_decode_max_kv_per_cta > 0
+                else 1
+            )
+            max_sm_count = max(
+                self._device_sm_count, max_splits * self.num_kv_heads * max_reqs
+            )
         counter_buffer = _get_trtllm_gen_decode_counter_buffer(
             get_trtllm_gen_multi_ctas_kv_counter_bytes(
                 max_reqs,
                 num_qo_heads,
-                max(self._device_sm_count, max_splits * self.num_kv_heads * max_reqs),
+                max_sm_count,
             ),
             query.device,
         )
