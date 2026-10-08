@@ -1268,11 +1268,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GDN_PREFILL_CHECKPOINT": lambda: bool(
         int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT", "0"))
     ),
-    # With VLLM_GDN_PREFILL_CHECKPOINT and no copy-initial capability (Mamba
-    # prefill lookahead <= 1), a prefill whose tail export is valid runs to
+    # Align-mode Mamba prefill checkpoints without the copy-initial capability
+    # (GDN with VLLM_GDN_PREFILL_CHECKPOINT and prefill lookahead <= 1, and
+    # KDA's flashkda backend): a prefill whose tail export is valid runs to
     # its end in one chunk. 1 also stops it at the block-aligned replay and
     # extension boundaries, so siblings with a shorter shared prefix can reuse
-    # those full-block states, at the cost of up to two extra prefill steps.
+    # those full-block states, at the cost of extra prefill steps (three for a
+    # cold 4608-token prompt at block size 1152).
     "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS": lambda: bool(
         int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS", "0"))
     ),

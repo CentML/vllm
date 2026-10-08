@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -135,6 +136,7 @@ def _split(
     checkpoint_alignment: int | None = 16,
     reuse_initial_block: bool = False,
     reuse_stops: bool = False,
+    num_prefill_lookahead: int = 1,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -156,6 +158,7 @@ def _split(
         mamba_prefill_checkpoint_reuses_initial_block=reuse_initial_block,
         mamba_prefill_checkpoint_copies_initial_block=False,
         mamba_prefill_checkpoint_reuse_stops=reuse_stops,
+        num_prefill_lookahead=num_prefill_lookahead,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
@@ -303,6 +306,71 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             )
             == tail - MAMBA_BLOCK_SIZE
         )
+
+
+@pytest.mark.parametrize("reuse_stops", [False, True])
+@pytest.mark.parametrize(
+    ("mm_offset", "num_outputs", "lookahead", "capped"),
+    [
+        # Text-only: nothing after the split can shorten the chunk.
+        (None, 0, 1, False),
+        # An encoder input inside the chunk may be unschedulable this step.
+        (3000, 0, 1, True),
+        # The prompt's last token.
+        (3601, 0, 1, True),
+        # Already behind the chunk start: it cannot cap the chunk.
+        (100, 0, 1, False),
+        # A resumed request whose chunk ends inside the lookahead reservation.
+        (None, 2, 4, True),
+        (None, 2, 1, False),
+    ],
+)
+def test_mid_block_export_chunk_that_may_be_capped_stops_at_next_boundary(
+    mm_offset: int | None,
+    num_outputs: int,
+    lookahead: int,
+    capped: bool,
+    reuse_stops: bool,
+) -> None:
+    """A later cap can cancel the export a mid-block chunk relies on.
+
+    Its untouched private initial column would then be hashed as the state at
+    the next block boundary, so such a chunk stops there instead.
+    """
+    prompt_len = 3602
+    resume_at = 1984
+    (request,) = create_requests(
+        1,
+        num_tokens=prompt_len,
+        mm_positions=(
+            [[PlaceholderRange(offset=mm_offset, length=1)]]
+            if mm_offset is not None
+            else None
+        ),
+        block_size=ATTN_BLOCK_SIZE,
+    )
+    for _ in range(num_outputs):
+        request.append_output_token_ids(0)
+    request.num_computed_tokens = resume_at
+    # Ends at the prefill end: the prompt, or the last output to replay.
+    num_new_tokens = max(prompt_len, request.num_tokens - 1) - resume_at
+    expected = (
+        2 * MAMBA_BLOCK_SIZE - resume_at if capped or reuse_stops else num_new_tokens
+    )
+    assert (
+        _split(
+            request,
+            num_new_tokens,
+            use_eagle=False,
+            partial_hit=True,
+            num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
+            reuse_initial_block=True,
+            reuse_stops=reuse_stops,
+            num_prefill_lookahead=lookahead,
+        )
+        == expected
+    )
 
 
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:

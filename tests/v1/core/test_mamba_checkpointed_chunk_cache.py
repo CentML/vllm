@@ -24,6 +24,7 @@ import torch
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm import envs
 from vllm.distributed.kv_events import BlockRemoved
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -127,8 +128,13 @@ def _split(
     hit: int,
     *,
     max_prefill_tokens: int = TOKEN_BUDGET,
+    encoder_cap: int | None = None,
 ) -> int:
-    """The real `Scheduler._mamba_block_aligned_split` with the incident flags."""
+    """The real `Scheduler._mamba_block_aligned_split` with the incident flags.
+
+    ``encoder_cap`` mirrors `_try_schedule_encoder_inputs` stopping before an
+    unschedulable encoder input at that position, after the split.
+    """
     stub = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=BLOCK),
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
@@ -151,6 +157,9 @@ def _split(
         mamba_fine_grained_prefix_cache=manager.mamba_fine_grained_prefix_cache,
     )
     scheduled = Scheduler._mamba_block_aligned_split(stub, request, num_new, hit)
+    start = request.num_computed_tokens + hit
+    if encoder_cap is not None and start < encoder_cap:
+        scheduled = min(scheduled, encoder_cap - start)
     return Scheduler._reserve_prefill_lookahead(
         stub, request, request.num_computed_tokens + hit, scheduled
     )
@@ -240,15 +249,25 @@ def _run(
     free_done: set[str],
     arrival_step: dict[str, int] | None = None,
     finalize_draft_kv: bool = False,
+    mm_positions: dict[str, list[PlaceholderRange]] | None = None,
+    encoder_caps: dict[str, int] | None = None,
 ) -> _Trace:
     """FCFS steps under the incident token budget.
 
     Requests arrive at step 0 unless ``arrival_step`` says otherwise. Prefill
     only: a request leaves once its prompt is computed (and is freed if listed
-    in ``free_done``).
+    in ``free_done``). ``encoder_caps`` caps a request's first scheduled chunk
+    as an encoder input that is unschedulable in that step would.
     """
+    mm_positions = mm_positions or {}
+    encoder_caps = dict(encoder_caps or {})
     trace = _Trace(
-        {rid: make_request(rid, ids, HASH, sha256) for rid, ids in prompts.items()}
+        {
+            rid: make_request(
+                rid, ids, HASH, sha256, mm_positions=mm_positions.get(rid)
+            )
+            for rid, ids in prompts.items()
+        }
     )
     num_spec = _mamba_managers(manager)[0].num_speculative_blocks
     arrival_step = arrival_step or {}
@@ -274,7 +293,13 @@ def _run(
         for req in list(waiting):
             blocks, hit, junction = manager.get_computed_blocks(req)
             req.shared_prefix_boundary = junction
-            num_new = _split(manager, req, min(req.num_tokens - hit, budget), hit)
+            num_new = _split(
+                manager,
+                req,
+                min(req.num_tokens - hit, budget),
+                hit,
+                encoder_cap=encoder_caps.get(req.request_id),
+            )
             if num_new == 0:
                 break
             if (
@@ -299,6 +324,7 @@ def _run(
                 [(b.block_id, trace.state_at.get(b.block_id)) for b in hit_blocks],
             )
             waiting.remove(req)
+            encoder_caps.pop(req.request_id, None)
             running.append(req)
             _gdn_forward(manager, trace, req, hit, hit + num_new)
             req.num_computed_tokens = hit + num_new
@@ -690,6 +716,54 @@ def test_warm_eagle_preserves_private_initial_checkpoint_export(
     # 4352 would turn the following step's column into a forbidden shared alias.
     assert trace.chunk_ends["P"] == [prompt_len]
     _check_cached_states_and_free(manager, trace)
+
+
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
+@pytest.mark.parametrize("encoder_cap", [None, 4353, 4369, 4384])
+def test_encoder_cap_never_publishes_unexported_initial_column(
+    manager: KVCacheManager,
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_cap: int | None,
+    reuse_stops: bool,
+) -> None:
+    """A later encoder cap must not cancel the export a warm chunk relies on.
+
+    C extends P and hits P's tail checkpoint at 4320, inside block 1. Its
+    one-chunk run to 7000 passes boundary 4352 only because the internal
+    export rewrites that private initial column. An image at
+    ``encoder_cap + 1`` that the encoder cannot schedule in C's first step
+    caps the chunk just past 4352: no export, and block 1 (still P@4320)
+    would be hashed as state@4352, which D, sharing C's first 6600 tokens,
+    then restores. C instead stops at 4352 whenever such an input lies in
+    its window; text-only C keeps the one-chunk path.
+    """
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
+    rng = random.Random(17)
+    p_ids = _tokens(rng, 4360)
+    c_ids = p_ids + _tokens(rng, 7000 - len(p_ids))
+    # Past C's attention block at 6528, so Eagle's drop can reach state@4352.
+    d_ids = c_ids[:6600] + _tokens(rng, 600)
+    image = (
+        [PlaceholderRange(offset=encoder_cap + 1, length=8)]
+        if encoder_cap is not None
+        else None
+    )
+    trace = _run(
+        manager,
+        {"P": p_ids, "C": c_ids, "D": d_ids},
+        free_done=set(),
+        arrival_step={"C": 2, "D": 6},
+        mm_positions={"C": image, "D": image} if image else {},
+        encoder_caps={"C": encoder_cap} if encoder_cap is not None else {},
+    )
+    # Every hit and hashed block holds the state its hash claims (fails
+    # without the stop: D restores C's block 1 as state@4352, holding P@4320).
+    _check_cached_states_and_free(manager, trace)
+    stopped = encoder_cap is not None or reuse_stops
+    assert trace.chunk_ends["P"] == ([BLOCK, 4360] if reuse_stops else [4360])
+    assert trace.hits["C"][0] == 4320
+    assert trace.chunk_ends["C"] == ([2 * BLOCK, 7000] if stopped else [7000])
+    assert trace.hits["D"][0] == (2 * BLOCK if stopped else 4320)
 
 
 @pytest.mark.parametrize("retention", [None, 0, BLOCK, 2 * BLOCK])

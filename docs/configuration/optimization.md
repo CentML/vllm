@@ -485,7 +485,7 @@ backend when a shape, layout, sampling mode, or platform is unsupported.
 | `VLLM_LOWM_BF16_GEMM_PDL` | `0` | Programmatic dependent launch for TinyGEMM. Availability is checked and warmed before capture. |
 | `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
 | `VLLM_GDN_PREFILL_CHECKPOINT` | `0` | Internal GDN tail export. Requires align mode and retention interval `0`. |
-| `VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS` | `0` | Without the GDN initial-state copy capability, also stops an exporting prefill at its reusable replay/extension boundaries (sibling reuse at the cost of extra prefill steps). |
+| `VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS` | `0` | Without the initial-state copy capability (GDN with prefill lookahead at most one, and KDA's flashkda backend), also stops an exporting prefill at its reusable replay/extension boundaries (sibling reuse at the cost of extra prefill steps). |
 | `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
 | `VLLM_MTP_DRAFT_PREFILL_PRUNE` | `0` | Attention computes sampled draft-prefill rows across decode and prefill buckets after writing every scheduled KV row. |
 | `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
@@ -519,11 +519,16 @@ alignment specializations.
 An internal tail export does not generally provide the full-block state that a
 sibling with a shorter shared prefix, or a block-aligned resend, needs.
 
-Without the GDN initial-state copy capability (MTP lookahead of at most one,
-e.g. single-module MTP), a prefill whose tail export is valid runs to its end in
-one chunk by default. This is correct: the export never aliases a block-aligned,
-shareable initial state, and boundaries the chunk runs through are not hashed.
-Those siblings then miss the unmaterialized full-block states.
+Without the initial-state copy capability (GDN with MTP lookahead of at most
+one, e.g. single-module MTP, and KDA's flashkda backend), a prefill whose tail
+export is valid runs to its end in one chunk by default. This is correct: the
+export never aliases a block-aligned, shareable initial state, and boundaries
+the chunk runs through are not hashed. A chunk that starts mid-block and could
+still be shortened afterwards, by an encoder input in its window that may not be
+schedulable or by multi-module MTP's lookahead reservation, stops at the next
+block boundary instead: the shortened chunk would not export, and its untouched
+initial column would otherwise be hashed as that boundary's state. Siblings with
+a shorter shared prefix miss the unmaterialized full-block states.
 `VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS=1` instead retains distinct
 replay/extension stops, keeping the fast path only when the export itself
 supplies the boundary or safely reuses a private mid-block initial state. An
@@ -531,7 +536,8 @@ export that would then overwrite a block-aligned initial state requires a
 tail-boundary split. For example, a cold 5,000-token prompt with block size
 2,176 and hash unit 32 runs as one chunk by default; with reuse stops it ends
 chunks at 4,352, 4,992, and 5,000, retaining both reusable states at the cost of
-two additional prefill steps.
+two additional prefill steps (a cold 4,608-token prompt at block size 1,152
+takes three).
 
 GDN with MTP lookahead greater than one can instead preserve the initial state
 in an immutable CoW snapshot before reusing its physical column for the internal

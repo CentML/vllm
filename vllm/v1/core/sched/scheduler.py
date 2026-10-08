@@ -77,6 +77,26 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _mamba_chunk_may_be_capped(
+    request: Request, start: int, end: int, num_prefill_lookahead: int
+) -> bool:
+    """Whether a cap applied after the Mamba split may shorten [start, end).
+
+    Mirrors the two later caps: `_reserve_prefill_lookahead` and
+    `_try_schedule_encoder_inputs`, which can stop before any encoder input in
+    its lookahead-shifted window. Conservative: an input that turns out to be
+    cached or schedulable does not cap the chunk.
+    """
+    if 0 < request.num_tokens - end < num_prefill_lookahead:
+        return True
+    if not request.has_encoder_inputs:
+        return False
+    lo, hi = get_mm_features_in_window(
+        request.mm_features, start=start, end=end + num_prefill_lookahead
+    )
+    return lo < hi
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -500,8 +520,10 @@ class Scheduler(SchedulerInterface):
         # it alias a block-aligned (shareable) initial column, and the manager
         # hashes no boundary the chunk runs through. The stops above would only
         # add full-block states for siblings with a shorter shared prefix or a
-        # block-aligned resend, at the cost of up to two prefill steps, so
-        # they are opt-in (VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS).
+        # block-aligned resend, at the cost of extra prefill steps (three for a
+        # cold 4608-token prompt at block size 1152), so they are opt-in
+        # (VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS). This also covers KDA
+        # (flashkda) align-mode checkpoints.
         if (
             use_internal_checkpoint
             and not self.mamba_prefill_checkpoint_copies_initial_block
@@ -515,6 +537,19 @@ class Scheduler(SchedulerInterface):
         stop_at_next_boundary = (
             not use_internal_checkpoint or max(replay_stop, extension_stop) > start
         )
+        # Running past the next boundary from mid-block relies on the export
+        # rewriting the private initial column. If a later encoder or drafter
+        # lookahead cap can end the chunk early, the export is cancelled and
+        # that column would still hold the chunk-start state when the manager
+        # hashes it as the boundary state.
+        if (
+            not stop_at_next_boundary
+            and start % block_size != 0
+            and _mamba_chunk_may_be_capped(
+                request, start, end, self.num_prefill_lookahead
+            )
+        ):
+            stop_at_next_boundary = True
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
