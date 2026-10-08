@@ -80,6 +80,11 @@ class SharedExperts(torch.nn.Module):
                 self._input_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
                 self._output_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
 
+    @property
+    def layer(self) -> torch.nn.Module:
+        """The wrapped shared-expert module."""
+        return self._layer
+
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
         self.moe_config = new_moe_config

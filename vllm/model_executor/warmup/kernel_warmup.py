@@ -247,7 +247,8 @@ def _kf_decode_attn_warmup(worker: "Worker") -> None:
 def _locality_lm_head_warmup(worker: "Worker") -> None:
     """VLLM_LOCALITY_LM_HEAD: launch every domain-kernel specialization the
     localized target / draft heads can reach (the extension itself was built
-    when the weights were localized at load time)."""
+    when the weights were localized at load time).
+    """
     from vllm.model_executor.layers.locality import lm_head as loc_lm
 
     if not loc_lm.enabled():
@@ -256,6 +257,29 @@ def _locality_lm_head_warmup(worker: "Worker") -> None:
     spec = getattr(runner, "speculator", None) or getattr(runner, "drafter", None)
     done = loc_lm.warmup(runner.model, getattr(spec, "model", None))
     logger.info("Locality lm_head kernels warmed up: %s.", done)
+
+
+def _locality_moe_warmup(worker: "Worker") -> None:
+    """VLLM_MOE_LOCALITY_KERNEL: attach the per-domain shared-expert copies to
+    every pair-placed MoE layer of the target and draft models before CUDA-graph
+    capture (the extension was built when the experts were placed at load).
+    """
+    from vllm.model_executor.layers.fused_moe import locality_moe
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    if not locality_moe.ENABLED:
+        return
+    runner = worker.model_runner
+    spec = getattr(runner, "speculator", None) or getattr(runner, "drafter", None)
+    served = total = 0
+    for model in (runner.model, getattr(spec, "model", None)):
+        if model is None:
+            continue
+        for module in model.modules():
+            if isinstance(module, MoERunner):
+                total += 1
+                served += bool(module.prepare_locality_moe())
+    logger.info("Locality MoE kernel serves %d of %d MoE layers.", served, total)
 
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
@@ -330,6 +354,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if envs.VLLM_KF_DECODE_ATTN:
         _kf_decode_attn_warmup(worker)
     _locality_lm_head_warmup(worker)
+    _locality_moe_warmup(worker)
 
     if process_local_only:
         return

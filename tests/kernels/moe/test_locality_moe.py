@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """VLLM_MOE_LOCALITY_KERNEL (layers/fused_moe/locality_moe.py) on a GPU with two
-locality domains (VR200): the one-launch MoE (router GEMM + routing + FC1 + FC2)
-against the production chain (router GEMM through vllm::lowm_bf16_gemm, then
-FlashInfer's trtllm-gen MXFP8 MoE with do_finalize=False) and an fp32 reference
-of the same MXFP8 operands.
+locality domains (VR200): the one-launch MoE block (router GEMM + routing + FC1 +
+FC2 + shared expert) against the production chain (router GEMM through
+vllm::lowm_bf16_gemm, FlashInfer's trtllm-gen MXFP8 MoE with do_finalize=False;
+shared expert = mm_mxfp8 gate_up -> silu_mul_mxfp8_quant -> mm_mxfp8 down, gate
+logits by the lowm row-dot) and an fp32 reference of the same MXFP8 operands.
 
 - Routing: on logits that every accumulation order computes exactly (identity
   router; integer and tie-gate rows, kfmoeA/tie), the selected experts equal
@@ -12,11 +13,14 @@ of the same MXFP8 operands.
   the bf16 expert weights equal trtllm-gen's bit for bit. With a dense router
   the kernel's own logits may differ from production's in the last bit; its
   selection then equals production's rule applied to its own logits.
-- Output: relL2 of the finalized output vs the fp32 reference within 1.10x of
-  trtllm-gen's; bitwise run to run and under CUDA-graph replay.
+- Output: relL2 of the finalized routed output and of the ungated shared-expert
+  output vs the fp32 reference within 1.10x of production's; shared-expert gate
+  logits within one bf16 step of production's; bitwise run to run, on cudaMalloc
+  weights, with or without the shared expert and under CUDA-graph replay.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -31,12 +35,20 @@ import flashinfer  # noqa: E402
 from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout  # noqa: E402
 
 import vllm.model_executor.kernels.linear.lowm_bf16_gemm  # noqa: E402, F401
+from vllm.model_executor.kernels.linear.lowm_bf16_gemm import _rowdot  # noqa: E402
 from vllm.model_executor.layers.fused_moe import locality_moe as lm  # noqa: E402
+from vllm.model_executor.layers.fusion.silu_mul_mxfp8_quant import (  # noqa: E402
+    silu_mul_mxfp8_quant,
+)
 from vllm.model_executor.layers.locality import get_topology  # noqa: E402
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (  # noqa: E402
     _shuffle_mxfp8_moe_weights,
     swap_w13_to_w31,
 )
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (  # noqa: E402
+    swizzle_mxfp8_scale,
+)
+from vllm.utils.flashinfer import mm_mxfp8  # noqa: E402
 
 E, K, H, INTER = lm.E, lm.TOPK, lm.HID, lm.INTER
 BF = torch.bfloat16
@@ -72,6 +84,19 @@ def _dq(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     return q.float() * s.repeat_interleave(32, dim=-1)
 
 
+def _mxfp8_linear(w: torch.Tensor, s: torch.Tensor) -> SimpleNamespace:
+    """An MXFP8 linear as FlashInferCutedslMxfp8LinearKernel leaves it: weight
+    = [K, N] view of [N, K], F8_128x4-swizzled scales.
+    """
+    n, k = w.shape
+    return SimpleNamespace(
+        weight=w.t(),
+        weight_scale=swizzle_mxfp8_scale(s, M=n, K=k),
+        output_size_per_partition=n,
+        input_size_per_partition=k,
+    )
+
+
 @pytest.fixture(scope="module")
 def layer():
     dev = torch.accelerator.current_device_index()
@@ -91,16 +116,35 @@ def layer():
         swap_w13_to_w31(w13), w2, swap_w13_to_w31(s13), s2, True
     )
     p13, ps13, p2, ps2 = (t.contiguous() for t in (p13, ps13, p2, ps2))
+    # shared expert (gate rows first) + its bf16 gate, shaped like Qwen2MoeMLP
+    gu, gus = _mx_quant(torch.randn(2 * INTER, H, device="cuda", generator=g) * 0.09)
+    dn, dns = _mx_quant(torch.randn(H, INTER, device="cuda", generator=g) * 0.18)
+    wg = (torch.randn(1, H, device="cuda", generator=g) * 0.05).to(BF)
+    mlp = SimpleNamespace(
+        gate_up_proj=_mxfp8_linear(gu, gus),
+        down_proj=_mxfp8_linear(dn, dns),
+        expert_gate=SimpleNamespace(weight=wg),
+    )
     rt = lm.runtime(dev)
     l13, l2 = lm.place_expert_pairs(p13, p2)
-    return dict(
+    lw = rt.layer_weights(l13, l2, ps13, ps2)
+    key = (l13.data_ptr(), l2.data_ptr())
+    lm._LAYERS[key] = lw  # as maybe_place registers it
+    assert lm.is_placed(l13, l2) and not lm.is_placed(p13, p2)
+    assert lm.attach_shared_expert(l13, l2, mlp)
+    lw_plain = rt.layer_weights(p13, p2, ps13, ps2)
+    lw_plain.shared = lw.shared
+    yield dict(
         bank=bank,
         prod=(p13, ps13, p2, ps2),
+        se=(gu, gus, dn, dns, wg),
+        mlp=mlp,
         rt=rt,
-        lw=rt.layer_weights(l13, l2, ps13, ps2),
-        lw_plain=rt.layer_weights(p13, p2, ps13, ps2),
+        lw=lw,
+        lw_plain=lw_plain,
         zero_bias=torch.zeros(E, dtype=BF, device="cuda"),
     )
+    del lm._LAYERS[key]
 
 
 def _trt(prod, logits, xq, xsf):
@@ -226,14 +270,14 @@ def _run(layer, T, case, seed=0):
     xq, xsf = _mx_quant(xb)
     logits_prod = torch.ops.vllm.lowm_bf16_gemm(xb, wr, layer["zero_bias"])
     own = torch.empty(T, E, dtype=BF, device="cuda")
-    g2, ew, idx, ids = layer["rt"].forward(xb, wr, xq, xsf, layer["lw"], logits=own)
-    return xb, wr, xq, xsf, logits_prod, own, g2, ew, idx, ids
+    out = layer["rt"].forward(xb, wr, xq, xsf, layer["lw"], logits=own)
+    return xb, wr, xq, xsf, logits_prod, own, out
 
 
 @pytest.mark.parametrize("T", [17, 150, 384, 385, 512])
 @pytest.mark.parametrize("case", ["integer", "tie", "near", "inside"])
 def test_routing_equals_production(layer, T: int, case: str):
-    xb, wr, xq, xsf, lp, own, g2, ew, idx, ids = _run(layer, T, case)
+    xb, wr, xq, xsf, lp, own, (g2, ew, idx, ids, _, _) = _run(layer, T, case)
     assert torch.equal(own, lp)  # exact logits for any accumulation order
     assert torch.equal(ids, _select(lp))
     _, tw, _ = _trt(layer["prod"], lp, xq, xsf)
@@ -242,7 +286,7 @@ def test_routing_equals_production(layer, T: int, case: str):
 
 @pytest.mark.parametrize("T", [17, 64, 208, 209, 370, 512])
 def test_dense_router(layer, T: int):
-    xb, wr, xq, xsf, lp, own, g2, ew, idx, ids = _run(layer, T, "dense")
+    xb, wr, xq, xsf, lp, own, (g2, ew, idx, ids, _, _) = _run(layer, T, "dense")
     # bf16 logits within one bf16 step of production's (different fp32 order)
     mag = torch.maximum(own.float().abs(), lp.float().abs())
     assert bool(((own.float() - lp.float()).abs() <= mag * 2.0**-7 + 1e-6).all())
@@ -258,14 +302,51 @@ def test_dense_router(layer, T: int):
     assert math.isfinite(rel) and rel <= 1.10 * rel_t + 1e-6
 
 
+@pytest.mark.parametrize("T", [17, 150, 370, 512])
+def test_shared_expert_vs_production(layer, T: int):
+    xb, wr, xq, xsf, lp, own, (_, _, _, _, so, sg) = _run(layer, T, "dense")
+    gu, gus, dn, dns, wg = layer["se"]
+    mlp = layer["mlp"]
+    # production: the MXFP8 linears on the norm's input (swizzled scales)
+    pgu = mm_mxfp8(
+        xq,
+        mlp.gate_up_proj.weight,
+        swizzle_mxfp8_scale(xsf, M=T, K=H),
+        mlp.gate_up_proj.weight_scale,
+        BF,
+        backend="cute-dsl",
+    )
+    aq, asf = silu_mul_mxfp8_quant(pgu)
+    po = mm_mxfp8(
+        aq, mlp.down_proj.weight, asf, mlp.down_proj.weight_scale, BF, "cute-dsl"
+    )
+    pg = _rowdot(xb, wg)
+    # fp32 reference: bf16 gate_up, silu * up -> bf16 -> MXFP8 (ceil rule), down
+    h = (_dq(xq, xsf) @ _dq(gu, gus).t()).to(BF).float()
+    act = (h[:, :INTER] / (torch.exp(-h[:, :INTER]) + 1) * h[:, INTER:]).to(BF)
+    ref = _dq(*_mx_quant(act)) @ _dq(dn, dns).t()
+    rel = ((so.float() - ref).norm() / ref.norm()).item()
+    rel_p = ((po.float() - ref).norm() / ref.norm()).item()
+    assert math.isfinite(rel) and rel <= 1.10 * rel_p + 1e-6
+    assert sg.shape == (T, 1) and so.shape == (T, H)
+    # gate logits: one bf16 step, plus fp32 summation-order slack on cancellation
+    mag = torch.maximum(sg.float().abs(), pg.float().abs())
+    slack = (xb.float().abs() @ wg.float().abs().t()) * 2.0**-20
+    assert bool(((sg.float() - pg.float()).abs() <= mag * 2.0**-7 + slack).all())
+
+
 @pytest.mark.parametrize("T", [17, 290, 512])
 def test_bitwise_rerun_placement_and_graph(layer, T: int):
     rt = layer["rt"]
-    xb, wr, xq, xsf, lp, own, g2, ew, idx, ids = _run(layer, T, "dense")
+    xb, wr, xq, xsf, lp, own, first = _run(layer, T, "dense")
     again = rt.forward(xb, wr, xq, xsf, layer["lw"])
     plain = rt.forward(xb, wr, xq, xsf, layer["lw_plain"])
-    for a, b in ((again, (g2, ew, idx, ids)), (plain, (g2, ew, idx, ids))):
-        assert all(torch.equal(u, v) for u, v in zip(a, b))
+    for a in (again, plain):
+        assert all(torch.equal(u, v) for u, v in zip(a, first))
+    # the routed output does not depend on the shared expert running too
+    nose = rt.forward(xb, wr, xq, xsf, layer["lw"], shared=False)
+    assert nose[4] is None and nose[5] is None
+    assert all(torch.equal(u, v) for u, v in zip(nose[:4], first[:4]))
     # CUDA graph: capture once, replay with fresh inputs, compare with eager
     sx, sq, ss = xb.clone(), xq.clone(), xsf.clone()
     s = torch.cuda.Stream()
@@ -288,23 +369,30 @@ def test_bitwise_rerun_placement_and_graph(layer, T: int):
 
 
 def test_try_apply_gating(layer):
-    l13, l2 = layer["lw"].w13, layer["lw"].w2
-    lm._LAYERS[(l13.data_ptr(), l2.data_ptr())] = layer["lw"]
-    try:
-        for T, served in ((16, False), (17, True), (512, True), (513, False)):
-            xb, wr = _inputs(T, "dense")
-            xq, xsf = _mx_quant(xb)
-            out = lm.try_apply(xb, wr, xq, xsf, l13, l2)
-            assert (out is not None) == (
-                served and lm.GATE_MIN_TOKENS <= T <= lm.GATE_MAX_TOKENS
-            )
-        xb, wr = _inputs(64, "dense")
+    lw = layer["lw"]
+    l13, l2 = lw.w13, lw.w2
+    for T, served in ((16, False), (17, True), (512, True), (513, False)):
+        xb, wr = _inputs(T, "dense")
         xq, xsf = _mx_quant(xb)
-        p13, _, p2, _ = layer["prod"]
-        assert lm.try_apply(xb, wr, xq, xsf, p13, p2) is None  # not placed
-        assert lm.try_apply(xb.float(), wr, xq, xsf, l13, l2) is None
-        assert lm.try_apply(xb, wr.t(), xq, xsf, l13, l2) is None
-        x_strided = xb.t().contiguous().t()  # [64, H], not contiguous
-        assert lm.try_apply(x_strided, wr, xq, xsf, l13, l2) is None
+        out = lm.try_apply(xb, wr, xq, xsf, l13, l2, True)
+        assert (out is not None) == (
+            served and lm.GATE_MIN_TOKENS <= T <= lm.GATE_MAX_TOKENS
+        )
+        if out is not None:
+            assert len(out) == 4 and out[3] is not None
+    xb, wr = _inputs(64, "dense")
+    xq, xsf = _mx_quant(xb)
+    p13, _, p2, _ = layer["prod"]
+    assert lm.try_apply(xb, wr, xq, xsf, p13, p2, True) is None  # not placed
+    assert lm.try_apply(xb.float(), wr, xq, xsf, l13, l2, True) is None
+    assert lm.try_apply(xb, wr.t(), xq, xsf, l13, l2, True) is None
+    x_strided = xb.t().contiguous().t()  # [64, H], not contiguous
+    assert lm.try_apply(x_strided, wr, xq, xsf, l13, l2, True) is None
+    # a shared expert requested but not attached: not served; without it: served
+    sw, lw.shared = lw.shared, None
+    try:
+        assert lm.try_apply(xb, wr, xq, xsf, l13, l2, True) is None
+        out = lm.try_apply(xb, wr, xq, xsf, l13, l2, False)
+        assert out is not None and out[3] is None
     finally:
-        del lm._LAYERS[(l13.data_ptr(), l2.data_ptr())]
+        lw.shared = sw

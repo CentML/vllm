@@ -552,13 +552,16 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         w_router: torch.Tensor,
         a1q: torch.Tensor,
         a1q_scale: torch.Tensor,
-    ) -> UnfinalizedMoEOutput | None:
-        """VLLM_MOE_LOCALITY_KERNEL: the whole routed MoE of a deferred-finalize
-        MXFP8 decode call, router GEMM (``x_bf16 @ w_router^T``) included, in
-        one locality-domain kernel (``locality_moe.try_apply``) on the
-        pair-placed weights of ``layer``. ``a1q`` / ``a1q_scale`` are the
-        pre-quantized e4m3 input and its linear UE8M0 scales. None when the
-        call is not served; the caller then runs the router GEMM and
+        shared: bool,
+    ) -> tuple[UnfinalizedMoEOutput, tuple[torch.Tensor, torch.Tensor] | None] | None:
+        """VLLM_MOE_LOCALITY_KERNEL: the whole MoE block of a deferred-finalize
+        MXFP8 decode call, router GEMM (``x_bf16 @ w_router^T``) included and,
+        when ``shared``, the layer's shared expert too, in one locality-domain
+        kernel (``locality_moe.try_apply``) on the pair-placed weights of
+        ``layer``. ``a1q`` / ``a1q_scale`` are the pre-quantized e4m3 input and
+        its linear UE8M0 scales. Returns (routed output, (ungated shared
+        output, shared gate logits) or None), or None when the call is not
+        served; the caller then runs the shared expert, router GEMM and
         ``apply``.
         """
         from vllm.model_executor.layers.fused_moe import locality_moe
@@ -577,9 +580,11 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         ):
             return None
         out = locality_moe.try_apply(
-            x_bf16, w_router, a1q, a1q_scale, layer.w13_weight, layer.w2_weight
+            x_bf16, w_router, a1q, a1q_scale, layer.w13_weight, layer.w2_weight, shared
         )
-        return None if out is None else UnfinalizedMoEOutput(*out)
+        if out is None:
+            return None
+        return UnfinalizedMoEOutput(*out[:3]), out[3]
 
     def _apply_block_scale(
         self,
