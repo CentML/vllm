@@ -318,6 +318,19 @@ def _gdn_vsplit_warmup(
                 state_indices=torch.ones(1, device=device, dtype=torch.int32),
                 v_split=1,
             )
+        if envs.VLLM_GDN_VSPLIT_HEAD_MAJOR:
+            hm_gate = torch.ones(
+                num_v_heads, ((T + 63) // 64) * 64,
+                device=device, dtype=torch.float32,
+            )[:, :T].t()
+            for vsf in ((2, 1) if _GDN_FI_VSPLIT_V1 else (2,)):
+                gdn_vsplit.chunk_gated_delta_rule_vsplit(
+                    q, q, v, hm_gate, hm_gate, torch.empty_like(v),
+                    torch.tensor([0, T], device=device, dtype=torch.int32),
+                    pool, pool, head_dim**-0.5,
+                    state_indices=torch.ones(1, device=device, dtype=torch.int32),
+                    v_split=vsf,
+                )
         from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
         chunk_gated_delta_rule(
@@ -682,6 +695,15 @@ def fi_chunk_gated_delta_rule(
     ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
     copy of ``cu_seqlens``) feed the V-split path; both are optional.
     """
+    # CUDA conv may return [T, HV] views of head-major storage. Preserve
+    # those strides only for the vendored kernel; FlashInfer still receives
+    # its original contiguous contract on every fallback/CP path.
+    head_major = (
+        envs.VLLM_GDN_VSPLIT_HEAD_MAJOR
+        and g.dtype == beta.dtype == torch.float32
+        and g.squeeze(0).stride(0) == 1
+        and g.squeeze(0).shape[1] > 1
+    )
     if GDN_HOST_TRIM:
         # Same tensors as below without the no-op dispatches (contiguous()
         # of a contiguous tensor and .to() to its own dtype return it).
@@ -691,8 +713,8 @@ def fi_chunk_gated_delta_rule(
         q = _contig(q.squeeze(0))
         k = _contig(k.squeeze(0))
         v = _contig(v.squeeze(0))
-        g = _contig(g.squeeze(0))
-        beta = _contig(beta.squeeze(0))
+        g = g.squeeze(0) if head_major else _contig(g.squeeze(0))
+        beta = beta.squeeze(0) if head_major else _contig(beta.squeeze(0))
         fi_state = (
             initial_state
             if state_indices is not None
@@ -712,8 +734,8 @@ def fi_chunk_gated_delta_rule(
         k = k.squeeze(0).contiguous()
         v = v.squeeze(0).contiguous()
 
-        g = g.squeeze(0).contiguous()
-        beta = beta.squeeze(0).contiguous()
+        g = g.squeeze(0) if head_major else g.squeeze(0).contiguous()
+        beta = beta.squeeze(0) if head_major else beta.squeeze(0).contiguous()
         # The in-place pool is passed as is (FlashInfer indexes its rows).
         fi_state = (
             initial_state
@@ -766,6 +788,8 @@ def fi_chunk_gated_delta_rule(
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
 
+    if head_major:
+        fi_g, fi_beta = fi_g.contiguous(), fi_beta.contiguous()
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,

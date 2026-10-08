@@ -51,6 +51,51 @@ _fast_ws: dict = {}
 # compile key and of the GDN_HOST_TRIM fast-path key.
 _CG0_SPLIT = envs.VLLM_GDN_VSPLIT_CG0SPLIT
 _C1_REORDER = envs.VLLM_GDN_VSPLIT_C1REORDER
+_STAGED = envs.VLLM_GDN_VSPLIT_STAGED_STORE
+_STAGED_LOAD = envs.VLLM_GDN_VSPLIT_STAGED_LOAD
+_VEC_STATE = envs.VLLM_GDN_VSPLIT_VEC_STATE
+_EARLY_REL = envs.VLLM_GDN_VSPLIT_EARLY_RELINQUISH
+_PDL = envs.VLLM_GDN_VSPLIT_PDL
+_HEAD_MAJOR = envs.VLLM_GDN_VSPLIT_HEAD_MAJOR
+
+
+def _dense_bf16_state(t):
+    """The vector/bulk copies require a dense, aligned per-head state tile."""
+    return (
+        t is not None
+        and t.ndim == 4
+        and tuple(t.shape[-2:]) == (128, 128)
+        and t.dtype == torch.bfloat16
+        and t.stride(3) == 1
+        and t.stride(2) == 128
+        and t.stride(1) >= 128 * 128
+        and t.stride(1) % 8 == 0
+        and t.stride(0) % 8 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def _variants(initial_state, output_state, state_indices, v_split,
+              gate, beta, pdl, h0_late):
+    indexed = state_indices is not None
+    staged = (_STAGED and v_split == 2 and indexed
+              and _dense_bf16_state(output_state))
+    sload = staged and _STAGED_LOAD and _dense_bf16_state(initial_state)
+    vec = (_VEC_STATE and v_split == 1 and indexed
+           and _dense_bf16_state(initial_state)
+           and _dense_bf16_state(output_state))
+    pdl = bool(pdl and _PDL)
+    late = bool(pdl and h0_late)
+    hm = bool(_HEAD_MAJOR and gate.stride(0) == 1 and gate.size(1) > 1)
+    if hm:
+        assert gate.dtype == beta.dtype == torch.float32
+        assert gate.stride(1) % 64 == 0 and beta.stride() == gate.stride()
+    # Both caches must distinguish every code/layout specialization, including
+    # guard-dependent variants when a pool changes alignment on the same stream.
+    suffix = ((staged, sload, vec, pdl, late, _EARLY_REL, hm),) if (
+        staged or sload or vec or pdl or _EARLY_REL or hm
+    ) else ()
+    return staged, sload, vec, pdl, late, hm, suffix
 
 
 def _cg0_split(v_split: int, use_init: bool) -> bool:
@@ -95,6 +140,9 @@ def chunk_gated_delta_rule_vsplit(
     state_indices: Optional[torch.Tensor] = None,
     v_split: int = 2,
     workspace: Optional[torch.Tensor] = None,
+    *,
+    pdl: bool = False,
+    h0_late: bool = True,
 ) -> None:
     """Same contract as flashinfer chunk_gated_delta_rule_sm100 (no checkpoints).
     q/k: [T, HQ, 128] bf16, v/output: [T, HV, 128], gate (=exp(g)) / beta: [T, HV] fp32,
@@ -102,12 +150,18 @@ def chunk_gated_delta_rule_vsplit(
     ``workspace``: caller-owned int8 scratch of at least ``get_workspace_size`` bytes (the
     persistent kernel's size depends only on the SM count), used instead of one allocated
     here; CUDA-graph captures pass one allocated outside the capture."""
+    # PDL is an explicit caller contract, never inferred from a global knob:
+    # the immediate predecessor must be the triggering conv producer. By
+    # default even the initial state is read only after its dependency wait.
     HQ, HV, DK = q.size(1), v.size(1), q.size(2)
     assert DK == 128 and v.size(2) == 128
     assert cu_seqlens.dtype == torch.int32
     use_init = initial_state is not None
     store_final = output_state is not None
     use_idx = state_indices is not None
+    staged, sload, vec, pdl, h0_late, gb_hm, suffix = _variants(
+        initial_state, output_state, state_indices, v_split,
+        gate, beta, pdl, h0_late)
     if GDN_HOST_TRIM:
         # Same compiled kernel and arguments; the key, the workspace (scratch
         # for per-CTA TMA descriptors, written before use) and the stream
@@ -122,7 +176,7 @@ def chunk_gated_delta_rule_vsplit(
             initial_state.stride()[1:] if (use_idx and use_init) else None,
             output_state.stride()[1:] if (use_idx and store_final) else None,
             v_split, _cg0_split(v_split, use_init), _c1_reorder(use_init),
-        )
+        ) + suffix
         compiled = _fast_compiled.get(fkey)
         if compiled is not None:
             handle = torch._C._cuda_getCurrentRawStream(dev)
@@ -152,7 +206,7 @@ def chunk_gated_delta_rule_vsplit(
            str(state_indices.dtype) if use_idx else "none",
            tuple(initial_state.stride()[1:]) if (use_idx and use_init) else None,
            tuple(output_state.stride()[1:]) if (use_idx and store_final) else None,
-           int(v_split), _cg0_split(v_split, use_init), _c1_reorder(use_init))
+           int(v_split), _cg0_split(v_split, use_init), _c1_reorder(use_init)) + suffix
     c = _cache(*key)
     dv = 128 // v_split
     if "compiled" not in c:
@@ -166,14 +220,21 @@ def chunk_gated_delta_rule_vsplit(
             mma_tiler_kv=(dv, 128, 64), max_active_clusters=num_sm, num_sm=num_sm, is_GQA=is_GQA,
             use_initial_state=use_init, store_final_state=store_final, enable_checkpoints=False,
             is_persistent=True, v_split=v_split,
-            cg0_split=_cg0_split(v_split, use_init), c1_reorder=_c1_reorder(use_init))
+            cg0_split=_cg0_split(v_split, use_init), c1_reorder=_c1_reorder(use_init),
+            staged_store=staged, staged_load=sload, vec_state=vec,
+            early_relinquish=_EARLY_REL, pdl=pdl, pdl_h0_late=h0_late)
 
         def dyn(t, nd):
             x = from_dlpack(t, assumed_align=16)
             x.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(nd)), divisibility=1)
             return x
         qc, kc, vc = dyn(q, 3), dyn(k, 3), dyn(v, 3)
-        gc, bc, oc = dyn(gate, 2), dyn(beta, 2), dyn(output, 3)
+        if gb_hm:
+            gc = from_dlpack(gate, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+            bc = from_dlpack(beta, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        else:
+            gc, bc = dyn(gate, 2), dyn(beta, 2)
+        oc = dyn(output, 3)
         cuc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
         sic = soc = sidx = None
         if use_init:

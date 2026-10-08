@@ -104,6 +104,9 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.cute.testing as testing
+from cutlass.cute.arch import griddepcontrol_wait
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 # ---------------------------------------------------------------------------
 # cutlass-dsl 4.4.2 compatibility: TmaInfo was removed; make_tiled_tma_atom_*
@@ -166,6 +169,26 @@ def _wrap_tma(ret):
     return TmaInfo(ret[0], ret[1])
 
 
+@dsl_user_op
+def _bulk_s2g(gaddr, saddr, nbytes, *, loc=None, ip=None):
+    """Copy a 16-byte-aligned contiguous state slice from SMEM to GMEM."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(gaddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(saddr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(nbytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 from .gdn_sched_vs import (
     GDNTileSchedulerParams,
     GDNTileScheduler,
@@ -220,7 +243,29 @@ class GatedDeltaNetChunkedKernel:
         v_split: int = 1,
         cg0_split: bool = False,
         c1_reorder: bool = False,
+        staged_store: bool = False,
+        staged_load: bool = False,
+        vec_state: bool = False,
+        early_relinquish: bool = False,
+        pdl: bool = False,
+        pdl_h0_late: bool = False,
     ):
+        # EXACT: only state transport changes; retain the TMEM partitions and
+        # state_dtype conversions. The adapter guards contiguous, aligned pages.
+        self.staged_store = (
+            bool(staged_store) and v_split == 2 and state_dtype == cutlass.BFloat16
+        )
+        self.staged_load = bool(staged_load) and self.staged_store
+        self.vec_state = (
+            bool(vec_state) and v_split == 1 and state_dtype == cutlass.BFloat16
+        )
+        # One persistent TMEM allocation; releasing its permit early does not
+        # free the allocation or change any computation.
+        self.early_relinquish = bool(early_relinquish)
+        # PDL overlaps setup and (optionally) h0 loading with the producer.
+        # Late h0 is required when the dependency includes a state-page writer.
+        self.pdl = bool(pdl)
+        self.pdl_h0_late = bool(pdl_h0_late)
         # V-split: v_split in {1, 2}: each CTA owns DV/v_split value rows of the
         # state (rows are independent, so the split is exact).
         assert v_split in (1, 2), v_split
@@ -796,6 +841,14 @@ class GatedDeltaNetChunkedKernel:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(qk_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            # Like sAinvCal, allocate no scratch when disabled. sO already has
+            # this alignment, so a zero-sized field preserves its stock offset.
+            sSt: cute.struct.Align[
+                cute.struct.MemRange[
+                    self.state_dtype, self.dv_tile * 128 if self.staged_store else 0
+                ],
+                self.buffer_align_bytes,
+            ]
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.io_dtype, cute.cosize(o_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -929,6 +982,7 @@ class GatedDeltaNetChunkedKernel:
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.pdl,
         )
 
     # -----------------------------------------------------------------------
@@ -1304,6 +1358,8 @@ class GatedDeltaNetChunkedKernel:
             pipeline_init_wait(cluster_shape_mn=cute.make_layout((2, 1)))
         else:
             pipeline_init_wait()
+        if cutlass.const_expr(self.staged_store):
+            self._sSt_ptr = storage.sSt.data_ptr()
         if cutlass.const_expr(self.cg0_split):
             # SMEM bases of the A_inv / W_qkv rings (bulk-copy sources / peer destinations)
             self._sAinv_base = storage.sAinv.data_ptr()
@@ -1326,6 +1382,8 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.setmaxregister_increase(self.num_regs_compute_group_0)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
 
             scheduler = GDNTileScheduler.create(
                 scheduler_params, (bidx, bidy, bidz), grid_dim
@@ -1431,8 +1489,12 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.setmaxregister_increase(self.num_regs_compute_group_1)
             # Total TMEM columns: state + q_state_acc + shared_acc + input staging.
             tmem.allocate(self.tmem_alloc_cols)
+            if cutlass.const_expr(self.early_relinquish):
+                tmem.relinquish_alloc_permit()
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.pdl and self.pdl_h0_late):
+                griddepcontrol_wait()
 
             scheduler = GDNTileScheduler.create(
                 scheduler_params, (bidx, bidy, bidz), grid_dim
@@ -1458,6 +1520,10 @@ class GatedDeltaNetChunkedKernel:
                             tiled_mma_kv,
                             kv_acc_producer,
                         )
+                    if cutlass.const_expr(self.pdl and not self.pdl_h0_late):
+                        # Preserve the independent h0 prologue, but make every
+                        # CG1 consumer wait before consuming producer results.
+                        griddepcontrol_wait()
                     sV_pisl = self._transform_to_position_independent_layout(
                         sV, v_smem_layout_staged.inner
                     )
@@ -1541,6 +1607,8 @@ class GatedDeltaNetChunkedKernel:
                 elif cutlass.const_expr(
                     self.store_final_state and self.use_initial_state
                 ):
+                    if cutlass.const_expr(self.pdl and not self.pdl_h0_late):
+                        griddepcontrol_wait()
                     self._store_empty_final_state(
                         tidx,
                         mS_init,
@@ -1553,7 +1621,8 @@ class GatedDeltaNetChunkedKernel:
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
 
-            tmem.relinquish_alloc_permit()
+            if cutlass.const_expr(not self.early_relinquish):
+                tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
             o_store_producer.tail()
@@ -1566,6 +1635,8 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
             scheduler = GDNTileScheduler.create(
                 scheduler_params, (bidx, bidy, bidz), grid_dim
             )
@@ -1629,6 +1700,8 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
             scheduler = GDNTileScheduler.create(
                 scheduler_params, (bidx, bidy, bidz), grid_dim
             )
@@ -1754,6 +1827,8 @@ class GatedDeltaNetChunkedKernel:
                 )
                 tensormap_manager.fence_tensormap_initialization()
 
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
             while work.is_valid_tile:
                 batch_idx, head_idx, v_slice = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
@@ -1871,6 +1946,8 @@ class GatedDeltaNetChunkedKernel:
                 )
                 tensormap_manager.fence_tensormap_initialization()
 
+            if cutlass.const_expr(self.pdl):
+                griddepcontrol_wait()
             while work.is_valid_tile:
                 batch_idx, head_idx, v_slice = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
@@ -4257,6 +4334,21 @@ class GatedDeltaNetChunkedKernel:
         return tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8))
 
     @cute.jit
+    def _vec_state_view(self, g):
+        """Static-stride, 16-byte-aligned view of an adapter-validated page slice."""
+        ptr = cute.make_ptr(
+            self.state_dtype, g.iterator.toint(), cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        return cute.make_tensor(
+            ptr,
+            cute.make_layout(
+                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                stride=(self.mma_tiler_kv[1], 1),
+            ),
+        )
+
+    @cute.jit
     def _load_initial_state(
         self,
         tidx,
@@ -4309,15 +4401,44 @@ class GatedDeltaNetChunkedKernel:
             mS_init[None, None, head_idx, state_row],
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
         )[None, None, v_slice, 0]
-        tGR_tCgState = thr_state_r2t.partition_S(gS_init)
+        if cutlass.const_expr(self.staged_load):
+            # Coalesced 16-byte copies of the same bf16 page bytes, then the
+            # original per-thread state partition reads the staged slice.
+            n16 = self.mma_tiler_kv[0] * self.mma_tiler_kv[1] // 8
+            g16 = cute.make_tensor(
+                gS_init.iterator, cute.make_layout((n16, 8), stride=(8, 1))
+            )
+            sSt16 = cute.make_tensor(
+                self._sSt_ptr, cute.make_layout((n16, 8), stride=(8, 1))
+            )
+            for r in cutlass.range(cg1_tidx, n16, num_threads_cg1, unroll=1):
+                cute.autovec_copy(g16[r, None], sSt16[r, None])
+            self.init_state_store_barrier.arrive_and_wait()
+            sSt_src = cute.make_tensor(
+                self._sSt_ptr,
+                cute.make_layout(
+                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                    stride=(self.mma_tiler_kv[1], 1),
+                ),
+            )
+            tGR_tCgState = thr_state_r2t.partition_S(sSt_src)
+        elif cutlass.const_expr(self.vec_state):
+            tGR_tCgState = thr_state_r2t.partition_S(self._vec_state_view(gS_init))
+        else:
+            tGR_tCgState = thr_state_r2t.partition_S(gS_init)
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
         for sub in cutlass.range(tGR_tCrState.shape[2]):
-            # 1. Load S_init state_dtype GMEM -> state_dtype registers
-            cute.autovec_copy(
-                tGR_tCgState[None, 0, sub],
-                tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-            )
+            # 1. Load state_dtype GMEM (or staged SMEM) -> state_dtype registers
+            if cutlass.const_expr(self.staged_load):
+                cute.autovec_copy(
+                    tGR_tCgState[None, 0, sub], tGR_tCrState[None, 0, sub]
+                )
+            else:
+                cute.autovec_copy(
+                    tGR_tCgState[None, 0, sub],
+                    tGR_tCrState[None, 0, sub],
+                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
                 tRT_tCrState[None, 0, sub].store(
                     tGR_tCrState[None, 0, sub].load().to(self.acc_dtype)
@@ -4425,6 +4546,15 @@ class GatedDeltaNetChunkedKernel:
         batch_idx, v_slice = batch_idx
         # Wait for last GEMM-7 to finish.
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
+        if cutlass.const_expr(self.staged_store):
+            sSt = cute.make_tensor(
+                self._sSt_ptr,
+                cute.make_layout(
+                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                    stride=(self.mma_tiler_kv[1], 1),
+                ),
+            )
+            tRS_sSt = thr_state_t2r.partition_D(sSt)
 
         for sub in cutlass.range(tTR_rState.shape[2]):
             cute.copy(
@@ -4453,21 +4583,49 @@ class GatedDeltaNetChunkedKernel:
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
             if cutlass.const_expr(self.store_final_state):
-                if cutlass.const_expr(mS_indices is not None):
-                    state_row = cutlass.Int32(mS_indices[batch_idx])
+                if cutlass.const_expr(self.staged_store):
+                    cute.autovec_copy(
+                        tRG_rState[None, 0, sub], tRS_sSt[None, 0, sub]
+                    )
                 else:
-                    state_row = batch_idx
-                gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, state_row],
-                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                )[None, None, v_slice, 0]
-                tRG_tCgState = thr_state_t2r.partition_D(gS_out)
-                cute.autovec_copy(
-                    tRG_rState[None, 0, sub],
-                    tRG_tCgState[None, 0, sub],
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
+                    if cutlass.const_expr(mS_indices is not None):
+                        state_row = cutlass.Int32(mS_indices[batch_idx])
+                    else:
+                        state_row = batch_idx
+                    gS_out = cute.flat_divide(
+                        mS_out[None, None, head_idx, state_row],
+                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                    )[None, None, v_slice, 0]
+                    if cutlass.const_expr(self.vec_state):
+                        gS_out = self._vec_state_view(gS_out)
+                    tRG_tCgState = thr_state_t2r.partition_D(gS_out)
+                    cute.autovec_copy(
+                        tRG_rState[None, 0, sub],
+                        tRG_tCgState[None, 0, sub],
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
         kv_acc_handle.release()
+        if cutlass.const_expr(self.staged_store and self.store_final_state):
+            if cutlass.const_expr(mS_indices is not None):
+                state_row_s = cutlass.Int32(mS_indices[batch_idx])
+            else:
+                state_row_s = batch_idx
+            gS_out_s = cute.flat_divide(
+                mS_out[None, None, head_idx, state_row_s],
+                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+            )[None, None, v_slice, 0]
+            # Publish generic-proxy writes before the single bulk-copy issuer.
+            cute.arch.fence_view_async_shared()
+            self.init_state_store_barrier.arrive_and_wait()
+            if cg1_tidx == 0:
+                _bulk_s2g(
+                    gS_out_s.iterator.toint(), self._sSt_ptr.toint(),
+                    self.mma_tiler_kv[0] * self.mma_tiler_kv[1] * 2,
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # Do not reuse staging for another tile before the copy reads it.
+            self.init_state_store_barrier.arrive_and_wait()
         return kv_acc_consumer
 
     @cute.jit

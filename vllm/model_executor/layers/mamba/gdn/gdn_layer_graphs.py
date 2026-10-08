@@ -63,6 +63,7 @@ import time
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM
 from vllm.triton_utils import tl, triton
@@ -700,9 +701,22 @@ def graph_core(
     q = torch.empty(T, H, K, dtype=mixed_qkv.dtype, device=dev)
     k = torch.empty(T, H, K, dtype=mixed_qkv.dtype, device=dev)
     v = torch.empty(T, HV, V, dtype=mixed_qkv.dtype, device=dev)
-    g = torch.empty(T, HV, dtype=torch.float32, device=dev)
-    beta = torch.empty(T, HV, dtype=torch.float32, device=dev)
+    gb_ts = 0
+    if envs.VLLM_GDN_VSPLIT_HEAD_MAJOR:
+        gb_ts = max(64, ((T + 63) // 64) * 64)
+        g = torch.empty(HV, gb_ts, dtype=torch.float32, device=dev)[:, :T].t()
+        beta = torch.empty(HV, gb_ts, dtype=torch.float32, device=dev)[:, :T].t()
+    else:
+        g = torch.empty(T, HV, dtype=torch.float32, device=dev)
+        beta = torch.empty(T, HV, dtype=torch.float32, device=dev)
     npf = st.npf
+    pdl = envs.VLLM_GDN_VSPLIT_PDL
+    # Resolve scratch before the producer; no intervening GPU work is allowed
+    # between its early trigger and the chunk's dependency wait. Fresh SSM
+    # zeroing is independent of the conv-state update and moves before conv.
+    ws = _workspace(dev, H, HV) if pdl else None
+    if pdl and st.zero:
+        zero_fresh_state_rows(ssm, gb.ci_chunk[:npf], gb.hi_chunk[:npf])
     ok = gdn_conv_cuda._ext[0].run(
         mixed_qkv,
         conv_w,
@@ -723,10 +737,12 @@ def graph_core(
         H,
         st.tph,
         0,
+        gb_ts=gb_ts,
+        pdl=int(pdl),
     )
     if not ok:
         raise RuntimeError("GDN layer graphs: CUDA conv contract")
-    if st.zero:
+    if st.zero and not pdl:
         zero_fresh_state_rows(ssm, gb.ci_chunk[:npf], gb.hi_chunk[:npf])
     M._gdn_vsplit_ready[0].chunk_gated_delta_rule_vsplit(
         q,
@@ -741,7 +757,9 @@ def graph_core(
         K**-0.5,
         state_indices=gb.ci_chunk[:npf],
         v_split=st.vsf,
-        workspace=_workspace(dev, H, HV),
+        workspace=ws if pdl else _workspace(dev, H, HV),
+        pdl=pdl,
+        h0_late=True,
     )
     # Gated RMSNorm + out_proj's MXFP8 activation (_gated_norm_mxfp8) with
     # [num_valid, norm_lo, norm_hi] read on the device.
