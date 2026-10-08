@@ -38,9 +38,11 @@ HBM:
      of its domain and derives its schedule: its static "wave-0" FC1 unit, a
      static round-robin share of the domain's FC1 units, then FC2 units from a
      per-domain work queue (FC2 waits on a per-group FC1 counter).
-- Shared expert: its FC1/FC2 units (tokens in 32-token groups, alternate groups
-  per domain) need no routing, so every CTA first runs its static share of
-  them while the routing completes, then streams its wave-0 unit into the ring.
+- Shared expert: tokens in 32-token groups, alternate groups per domain. Its
+  FC1 units need no routing, so CTAs run a static round-robin share of them
+  while the routing completes, then stream their wave-0 unit into the ring;
+  its FC2 units head the domain's FC2 work queue (no CTA waits on another
+  CTA's FC1 before it has scheduled its routed units).
 - Output: :class:`UnfinalizedMoEOutput` with ``gemm2_permuted[T * 8, H]``,
   ``expert_weights[T, 8]`` (bf16) and the constant
   ``expanded_idx_to_permuted_idx = arange(T * 8)`` (the DLC-8 deferred-finalize
@@ -532,7 +534,8 @@ constexpr int SE = E;                           // expert id of the shared exper
 constexpr int SE_GMAX = TMAX / 64;              // shared-expert groups per domain (alternate 32-token groups)
 constexpr int GMAX = 256 + SE_GMAX;             // groups per domain: routed (expert, 32-token sub-block), then shared
 constexpr int SE_SLOT0 = TMAX * TOPK + 7 * E;   // first shared-expert row of a domain's intermediate
-constexpr int NTHREADS = 320, NGATHER = 64;     // warps 1-2 gather
+constexpr int NTHREADS = 320, NGATHER = 64;     // warps 1-2 gather (128 gather threads measured no faster)
+constexpr int W_ROUTE = 3, W_MMA = 5, W_EPI = 6;  // warps 3-4 route, 5 issues MMAs, 6-9 epilogue (warp % 4 = TMEM quarter)
 constexpr int TMEM_COLS = 512, ACCW = 32, NACC = 4;   // 4 MoE accumulators of N <= 32 columns, then SF columns
 constexpr int RCOL = 256;                       // router accumulator: TMEM columns [256, 256 + nt)
 constexpr int RX_EXTRA = 8192;                  // SMEM after the B slots: router operands (48 KB window), then the schedule
@@ -830,7 +833,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     mbar_init(sa(rfull), 1); mbar_init(sa(racc), 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  if (warp == 5) {
+  if (warp == W_MMA) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(sa(stmem)), "r"(TMEM_COLS) : "memory");
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
   }
@@ -866,8 +869,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     const int nd = d ? p.nd1 : p.nd0;
     const bool live = rank < nd;
     const int k0 = rank >> 3, rb0 = rank & 7, e0 = expert_of(d, k0);
-    // static shared-expert units of this rank: entries rank + i nd of the domain's list
-    const int ngd = p.nseg > d ? (p.nseg - d + 1) >> 1 : 0, nse_tot = 24 * ngd;
+    // static shared-expert units of this rank: FC1 entries rank + i nd of the domain's list (no routing needed, they
+    // run in the routing window); the shared expert's FC2 units head the domain's FC2 work queue, so no CTA waits on
+    // another CTA's FC1 before it has scheduled its routed units
+    const int ngd = p.nseg > d ? (p.nseg - d + 1) >> 1 : 0, nse_tot = 8 * ngd;
     const int nse = live && rank < nse_tot ? (nse_tot - rank + nd - 1) / nd : 0;
     // weights of a unit: (tensor map, scales, first row, K128 blocks)
     auto unit_src = [&](int ty, int kk, int sub, int rb, const CUtensorMap*& tm, const uint8_t*& sf, int& row0, int& nkb) {
@@ -1036,11 +1041,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     }
     __syncwarp();
     if (q_ && lane == 0) q_[20] = gtime();
-    // (4) routed units: records two ahead, FC2 entries from the queue one record ahead of their use
+    // (4) routed units: records two ahead, FC2 entries from the queue one record ahead of their use; queue entries
+    // [0, 16 ngd) are the shared expert's FC2 units, then the routed FC2 units in group order
     if (lane == 0) {
       int ndyn = 0, nrt = 0;
       bool fin = false;
-      const unsigned n2 = 16u * (unsigned)ng;
+      const unsigned nse2 = 16u * (unsigned)ngd, n2 = nse2 + 16u * (unsigned)ng;
       unsigned* q2 = &p.st->q2[d * 32];
       unsigned nxt = n2;
       int codes[UI];                                     // codes of the published, not yet streamed routed units
@@ -1049,9 +1055,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         if (nrt < nstat) {
           c = ssched[nrt];
           if (nrt == nstat - 1) nxt = atomicAdd(q2, 1u);
+        } else if (nxt < nse2) {
+          c = se_code(nse_tot + (int)nxt, ngd);
+          nxt = atomicAdd(q2, 1u);
+          ndyn++;
         } else if (nxt < n2) {
-          const int gg = (int)(nxt >> 4), kk = find_pre(s_g0, gg);
-          c = (2 << 24) | (kk << 16) | ((gg - s_g0[kk]) << 8) | (int)(nxt & 15);
+          const unsigned r = nxt - nse2;
+          const int gg = (int)(r >> 4), kk = find_pre(s_g0, gg);
+          c = (2 << 24) | (kk << 16) | ((gg - s_g0[kk]) << 8) | (int)(r & 15);
           nxt = atomicAdd(q2, 1u);
           ndyn++;
         }
@@ -1075,8 +1086,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       }
       if (q_) { q_[26] = c_pempty; q_[30] = nstat; q_[31] = ndyn; q_[29] = nse; }
     }
-  } else if (warp <= 2) {
-    // ---------------------------------------------------------------- gather (64 threads)
+  } else if (warp < W_ROUTE) {
+    // ---------------------------------------------------------------- gather (NGATHER threads)
     // B rows by 16-B cp.async.cg (L2), SFB words by 4-B cp.async.ca (per-expert slot ranges are 8-row aligned, so no
     // 128-B line of the intermediate scales mixes two groups); per-thread, per-stage arrival by
     // cp.async.mbarrier.arrive.noinc. Row ids are read once per unit.
@@ -1147,23 +1158,23 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     }
     cp_wait_all();
     if (q_ && gt == 0) { q_[23] = c_gdep; q_[27] = c_gempty; }
-  } else if (warp <= 4) {
+  } else if (warp < W_MMA) {
     // ---------------------------------------------------------------- routing (64 threads)
     // tokens rj + 2 sk w of this item's tile (the CTAs holding the tile's items cover the whole tile); the shared
     // expert's gate logit first, while the router partials complete
     griddep_wait();
     if (hasr) {
-      for (int u = rj + 2 * p.sk * (warp - 3); u < r_nv; u += 4 * p.sk) {
+      for (int u = rj + 2 * p.sk * (warp - W_ROUTE); u < r_nv; u += 4 * p.sk) {
         if (p.nseg) se_gate(p, r_t0 + u, lane);
         if (lane == 0) while (ld_acquire(&p.st->ctr[rn * 32]) < (unsigned)(2 * p.sk)) __nanosleep(20);
         __syncwarp();
-        u64* qs = (q_ && warp == 3 && u == rj) ? q_ : nullptr;
+        u64* qs = (q_ && warp == W_ROUTE && u == rj) ? q_ : nullptr;
         if (qs && lane == 0) qs[14] = gtime();
         route_token(p, r_t0 + u, rn, lane, qs);
       }
-      if (q_ && warp == 3 && lane == 0) q_[6] = gtime();
+      if (q_ && warp == W_ROUTE && lane == 0) q_[6] = gtime();
     }
-  } else if (warp == 5) {
+  } else if (warp == W_MMA) {
     // ---------------------------------------------------------------- MMA issuer
     if (lane == 0 && hasr) {
       // router: [128 experts] x [r_np tokens] over this K slice, kind::f16 (K = 16 per instruction: +32 B in the atom)
@@ -1231,7 +1242,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     //       rb * 64 + q * 16 + 2 * (l & 7) + (a >> 1); its partner (the other half of SwiGLU) is lane l ^ 8.
     //   FC2 (w2): hidden channel rb * 128 + q * 32 + 4 * (l & 7) + (l >> 3).
     griddep_wait();
-    const int q = warp & 3, ew = warp - 6;
+    const int q = warp & 3, ew = warp - W_EPI;
     if (hasr) {
       // router partials of this item: expert rm * 128 + 32 q + lane, tokens r_t0 + column -> part[rs][t][e]
       mbar_wait(sa(racc), 0);
@@ -1275,6 +1286,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       tc_fence_before();
       __syncwarp();
       if (lane == 0) mbar_arrive(sa(&acce[b]));                // one arrival per epilogue warp (count 4)
+      // one code path per unit kind: a per-element `se` branch inside the unrolled loops costs ~3 µs (C512 CTA time)
+      auto chunks = [&]<bool SEU>() {
 #pragma unroll
       for (int cc = 0; cc < NMAX / 16; cc++) {
         if (cc * 16 >= npad) break;
@@ -1290,7 +1303,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
           for (int jj = 0; jj < 8; jj++) {
             float g = isgate ? v[8 + jj] : pr[jj], up = isgate ? pr[8 + jj] : v[jj];
-            if (se) {
+            if constexpr (SEU) {
               // the shared expert's production chain: bf16 gate_up GEMM output, then silu(g) * up as Inductor lowers
               // it (g / (exp(-g) + 1) * up, fp32), rounded to bf16 before the MXFP8 quant (silu_mul_mxfp8_quant)
               g = __bfloat162float(__float2bfloat16_rn(g)); up = __bfloat162float(__float2bfloat16_rn(up));
@@ -1319,7 +1332,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
           for (int jj = 0; jj < 8; jj++) {
             int e8 = 0; float inv = 0.f;
-            if (se) {
+            if constexpr (SEU) {
               // FlashInfer's MXFP8 rule (the production SiLU*mul quant): sf = ceil(log2(amax / 448)) by the bits
               const float nrm = am[jj] * (1.f / 448.f);
               const unsigned bits = __float_as_uint(nrm), ex = (bits >> 23) & 255u, man = bits & 0x7FFFFFu;
@@ -1352,18 +1365,20 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
 #pragma unroll
           for (int j = 0; j < 16; j++) sw[j * 32 + hl] = __float2bfloat16(v[j]);
           __syncwarp();
-          __nv_bfloat16* obase = se ? p.sout : p.out;
+          __nv_bfloat16* obase = SEU ? p.sout : p.out;
 #pragma unroll
           for (int c = lane; c < 64; c += 32) {
             const int j = c >> 2, part = c & 3, col = c0 + j;
             if (col < ntok) {
-              const int row = se ? (js[col] >> 3) : js[col];
+              const int row = SEU ? (js[col] >> 3) : js[col];
               *(uint4*)(obase + (size_t)row * H + rb * 128 + q * 32 + part * 8) = *(const uint4*)(sw + j * 32 + part * 8);
             }
           }
           __syncwarp();
         }
       }
+      };
+      if (se) chunks.template operator()<true>(); else chunks.template operator()<false>();
       // FC1: every epilogue thread's intermediate stores happen-before (bar.sync) the one gpu-scope release
       // (cumulative); the same barrier ends all reads of the slot's token list and of sam
       named_bar(2, 128);
@@ -1377,7 +1392,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
   }
   tc_fence_before();
   __syncthreads();
-  if (warp == 5) {
+  if (warp == W_MMA) {
     tc_fence_after();
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem), "r"(TMEM_COLS) : "memory");
   }
