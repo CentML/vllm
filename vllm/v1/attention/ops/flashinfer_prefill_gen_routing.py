@@ -32,9 +32,11 @@ a device sync). With ``FMHA_GEN=1`` a launch goes to ``gen`` when
 accepts it; otherwise to stock. Unsupported launches, CUDA-graph capture, a
 too small workspace and any exception fall back to the stock kernel.
 
-Environment (read at import):
+Environment (registered in vllm.envs, read at import):
 
 * ``FMHA107=1`` enables the routing (default ``0``: stock path only).
+  On SM107, also set ``VLLM_FLASHINFER_F1_PREFILL=1`` to replace the
+  metadata gen-prefill cost model; unset keeps that stock model.
 * ``FMHA107_LOG=1`` logs the route of each new (T, B) class.
 * ``FMHA107_MAX_B`` (1000000).
 * ``FMHA_GEN=1`` enables the ``gen`` route (default 0), ``FMHA_GEN_MAX_T``
@@ -43,9 +45,8 @@ Environment (read at import):
   multi-CTA scratch in the trtllm workspace), ``FMHA_GEN_REAL_B1_MAXQ`` (512),
   ``FMHA_GEN_PDL`` (0).
 * ``FMHA_GEN_RULE`` selects which eligible launches take the ``gen`` route:
-  ``rubin`` (default; every eligible launch, the behaviour measured on SM107)
-  or ``gb300`` (selective; measured on SM103 where the arch-specific context
-  kernel wins on large chunks). With ``gb300`` the default
+  ``rubin`` (default; every eligible launch) or ``gb300`` (selective;
+  retains the context kernel for larger chunks). With ``gb300`` the default
   ``FMHA_GEN_TARGET`` is 450 and a launch goes to ``gen`` only if
 
   - one request with ``max_q < FMHA_GEN_B1_STOCK_Q`` (800), or
@@ -68,7 +69,6 @@ the virtual SM count and restored afterwards. The proper home of this knob is
 an explicit argument in FlashInfer.
 """
 
-import os
 from typing import Any
 
 import flashinfer.decode as fid
@@ -77,31 +77,28 @@ from flashinfer.prefill import (
     trtllm_batch_context_with_kv_cache as _stock_trtllm_batch_context_with_kv_cache,
 )
 
+from vllm import envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ENABLED = os.environ.get("FMHA107", "0") == "1"
-_LOG = os.environ.get("FMHA107_LOG", "0") == "1"
-_MAX_B = int(os.environ.get("FMHA107_MAX_B", "1000000"))
-_GEN = os.environ.get("FMHA_GEN", "0") == "1"
-_GEN_MAX_T = int(os.environ.get("FMHA_GEN_MAX_T", "1000000000"))
-_GEN_RULE = os.environ.get("FMHA_GEN_RULE", "rubin").strip().lower()
+ENABLED = envs.FMHA107
+_LOG = envs.FMHA107_LOG
+_MAX_B = envs.FMHA107_MAX_B
+_GEN = envs.FMHA_GEN
+_GEN_MAX_T = envs.FMHA_GEN_MAX_T
+_GEN_RULE = envs.FMHA_GEN_RULE
 if _GEN_RULE not in ("rubin", "gb300"):
     raise ValueError(f"FMHA_GEN_RULE must be 'rubin' or 'gb300', got {_GEN_RULE!r}")
-_GEN_TARGET = float(
-    os.environ.get("FMHA_GEN_TARGET", "450" if _GEN_RULE == "gb300" else "768")
-)
-_GEN_B1_STOCK_Q = int(os.environ.get("FMHA_GEN_B1_STOCK_Q", "800"))
-_GEN_MULTI_MAX_T = int(os.environ.get("FMHA_GEN_MULTI_MAX_T", "1280"))
-_GEN_MULTI_MAX_MEANQ = int(os.environ.get("FMHA_GEN_MULTI_MAX_MEANQ", "96"))
-_GEN_MAX_S = int(os.environ.get("FMHA_GEN_MAX_S", "8"))
+_GEN_TARGET = envs.FMHA_GEN_TARGET
+_GEN_B1_STOCK_Q = envs.FMHA_GEN_B1_STOCK_Q
+_GEN_MULTI_MAX_T = envs.FMHA_GEN_MULTI_MAX_T
+_GEN_MULTI_MAX_MEANQ = envs.FMHA_GEN_MULTI_MAX_MEANQ
+_GEN_MAX_S = envs.FMHA_GEN_MAX_S
 # None: 8x the device SM count, resolved on the first ``gen`` launch.
-_GEN_MAX_VSM: int | None = (
-    int(os.environ["FMHA_GEN_MAX_VSM"]) if "FMHA_GEN_MAX_VSM" in os.environ else None
-)
-_GEN_REAL_B1_MAXQ = int(os.environ.get("FMHA_GEN_REAL_B1_MAXQ", "512"))
-_GEN_PDL = os.environ.get("FMHA_GEN_PDL", "0") == "1"
+_GEN_MAX_VSM: int | None = envs.FMHA_GEN_MAX_VSM
+_GEN_REAL_B1_MAXQ = envs.FMHA_GEN_REAL_B1_MAXQ
+_GEN_PDL = envs.FMHA_GEN_PDL
 
 _state: dict[str, Any] = {
     "logged": set(),
@@ -280,14 +277,10 @@ def _gen(
 
 
 def gen_rule_accepts(T: int, B: int, max_q: int) -> bool:
-    """Whether ``FMHA_GEN_RULE`` sends an eligible launch to ``gen``.
+    """Select eligible generation launches using the configured rule.
 
-    ``rubin``: always. ``gb300`` (SM103 microbenchmarks, FP8 hd256 P32): the
-    generation kernels win on under-filled launches (one short chunk over a
-    long prefix: 1.5-12x; a few short requests: 2-5x; many tiny chunks behind
-    one long chunk: 1.5x), while the SM103 context kernel wins on large chunks
-    (single request >= ~800 new tokens: 2-30%, balanced multi-request batches
-    with longer chunks: up to 32%).
+    ``rubin`` accepts every supported launch. ``gb300`` keeps the context
+    kernel for large single-request chunks and balanced longer chunks.
     """
     if _GEN_RULE != "gb300":
         return True
