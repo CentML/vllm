@@ -1004,6 +1004,11 @@ class MambaSpec(KVCacheSpec):
     # running block). The backend reads the initial state from the running
     # block, which the align pre-copy filled, so overwriting it is safe.
     prefill_checkpoint_reuses_initial_block: bool = False
+    # A backend may also export into a block-aligned initial column when the
+    # manager CoWs cached initial states before forward. This preserves the
+    # immutable replay state while the align pre-copy supplies the running
+    # column used by the checkpoint kernel. Needed for multi-module lookahead.
+    prefill_checkpoint_copies_initial_block: bool = False
     num_heads: int = 1
     tokens_per_state: int = -1
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
@@ -1043,8 +1048,18 @@ class MambaSpec(KVCacheSpec):
                 cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
+            preserved_blocks = 0
+            if self.prefill_checkpoint_copies_initial_block:
+                # Immutable copies can retain both Eagle replay boundaries, a
+                # shared junction and the original prompt tail while replaying
+                # generated tokens after preemption. GDN enables this capability
+                # only for semantic retention (0).
+                preserved_blocks = 4
             return self.page_size_bytes * (
-                2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+                2
+                + self.num_speculative_blocks
+                + self.num_prefill_checkpoint_blocks
+                + preserved_blocks
             )
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
@@ -1053,10 +1068,9 @@ class MambaSpec(KVCacheSpec):
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
         # no CP scaling applies.
         if vllm_config.cache_config.mamba_cache_mode == "align":
-            # Block table rows are position-indexed over the full sequence
-            # even though only 2 + num_speculative_blocks state blocks are
-            # resident at a time (earlier states are nulled out by
-            # remove_skipped_blocks), so the row length must cover max_len
+            # Rows are position-indexed over the full sequence; old entries
+            # are nulled by remove_skipped_blocks. Immutable preserved
+            # snapshots live outside the table, so its length covers max_len
             # rather than max_memory_usage_bytes.
             return cdiv(max_len, self.block_size) + self.num_speculative_blocks
         return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
@@ -1071,6 +1085,8 @@ class MambaSpec(KVCacheSpec):
             and spec.prefill_checkpoint_alignment == self.prefill_checkpoint_alignment
             and spec.prefill_checkpoint_reuses_initial_block
             == self.prefill_checkpoint_reuses_initial_block
+            and spec.prefill_checkpoint_copies_initial_block
+            == self.prefill_checkpoint_copies_initial_block
             and spec.page_size_bytes == self.page_size_bytes
             and spec.tp_replicated == self.tp_replicated
             for spec in kv_cache_specs.values()
@@ -1081,12 +1097,33 @@ def get_mamba_prefill_checkpoint_position(
     num_tokens: int,
     hash_block_size: int,
     drop_eagle_block: bool,
+    *,
+    query_start: int = 0,
+    mamba_block_size: int | None = None,
+    copy_initial_block: bool = False,
 ) -> int:
-    """Return the reusable Mamba checkpoint boundary for a prefill."""
+    """Return a reusable prefill checkpoint, optionally selected for a query.
+
+    If the desired tail is already the initial state, copy-capable backends
+    may export the next full boundary instead. Its strict validity is still
+    checked by ``is_mamba_prefill_checkpoint_valid``; the manager preserves the
+    initial tail independently. This finishes near-boundary MTP prefills
+    without splitting inside the drafter's lookahead runway.
+    """
     checkpoint_position = (num_tokens - 1) // hash_block_size * hash_block_size
     if drop_eagle_block:
         checkpoint_position -= hash_block_size
-    return max(checkpoint_position, 0)
+    checkpoint_position = max(checkpoint_position, 0)
+    if (
+        copy_initial_block
+        and mamba_block_size is not None
+        and query_start > 0
+        and checkpoint_position == query_start
+    ):
+        next_boundary = (query_start // mamba_block_size + 1) * mamba_block_size
+        if query_start < next_boundary < num_tokens:
+            return next_boundary
+    return checkpoint_position
 
 
 def is_mamba_prefill_checkpoint_valid(
@@ -1097,14 +1134,15 @@ def is_mamba_prefill_checkpoint_valid(
     mamba_block_size: int,
     checkpoint_alignment: int | None,
     reuse_initial_block: bool = False,
+    copy_initial_block: bool = False,
 ) -> bool:
     """Whether a backend can export the checkpoint in this query.
 
     The checkpoint goes to block column ``cdiv(query_end, mamba_block_size) -
-    2``. It must not alias the column holding the initial state, unless
-    ``reuse_initial_block`` and the query starts mid-block (then that block is
-    private to the request and its state was already copied to the running
-    column before the forward).
+    2``. It must not alias the column holding the initial state, unless the
+    backend can reuse a private mid-block initial column or the manager
+    guarantees a private copy via ``copy_initial_block``. In either case the
+    align pre-copy fills the running column before the backend overwrites it.
     """
     if checkpoint_alignment is None:
         return False
@@ -1113,9 +1151,11 @@ def is_mamba_prefill_checkpoint_valid(
     initial_state_col = (query_start - 1) // mamba_block_size
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     column_ok = checkpoint_col > initial_state_col or (
-        reuse_initial_block
-        and checkpoint_col == initial_state_col
-        and query_start % mamba_block_size != 0
+        checkpoint_col == initial_state_col >= 0
+        and (
+            copy_initial_block
+            or (reuse_initial_block and query_start % mamba_block_size != 0)
+        )
     )
     return (
         query_start % hash_block_size == 0

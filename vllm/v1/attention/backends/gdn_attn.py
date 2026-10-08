@@ -437,6 +437,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 seq_len,
                 hash_block_size,
                 drop_eagle_block=self.checkpoint_drop_eagle_block,
+                query_start=query_start,
+                mamba_block_size=block_size,
+                copy_initial_block=spec.prefill_checkpoint_copies_initial_block,
             )
             if is_mamba_prefill_checkpoint_valid(
                 query_start=query_start,
@@ -446,6 +449,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 mamba_block_size=block_size,
                 checkpoint_alignment=spec.prefill_checkpoint_alignment,
                 reuse_initial_block=spec.prefill_checkpoint_reuses_initial_block,
+                copy_initial_block=spec.prefill_checkpoint_copies_initial_block,
             ):
                 checkpoints.append(
                     (i, row, position - query_start, cdiv(seq_len, block_size) - 2)

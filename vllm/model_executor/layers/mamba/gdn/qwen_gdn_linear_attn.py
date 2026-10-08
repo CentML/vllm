@@ -833,6 +833,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_prefill_checkpoint_blocks=1,
             prefill_checkpoint_alignment=1,
             prefill_checkpoint_reuses_initial_block=True,
+            # Finishing prefill in one step avoids a tail-boundary split
+            # inside the multi-module drafter's required runway.
+            prefill_checkpoint_copies_initial_block=(
+                vllm_config.num_prefill_lookahead_tokens > 1
+            ),
         )
 
     def __init__(

@@ -297,7 +297,7 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     manager.new_step_starts()
     step(first_chunk_blocks * block_size, prompt_tokens)
 
-    checkpoint_position, checkpoint_idx = manager._checkpoints["r"]
+    checkpoint_position, checkpoint_idx, _ = manager._checkpoints["r"]
     checkpoint_block = manager.req_to_blocks["r"][checkpoint_idx]
     assert all(
         b.block_hash is None or b is checkpoint_block for b in speculative_blocks

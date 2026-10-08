@@ -74,7 +74,8 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         # they exist only to compensate for the drop.
         use_eagle_block_drop=block_drop,
         hash_block_size=hash_block_size,
-        mamba_has_prefill_checkpoint_blocks=False,  # forced False under eagle
+        mamba_has_prefill_checkpoint_blocks=False,  # exercises the split fallback
+        mamba_prefill_checkpoint_copies_initial_block=False,
         mamba_partial_cache_hit=partial_hit,
         mamba_fine_grained_prefix_cache=(
             partial_hit and manager.mamba_fine_grained_prefix_cache

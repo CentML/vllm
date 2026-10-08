@@ -351,6 +351,14 @@ class Scheduler(SchedulerInterface):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        self.mamba_prefill_checkpoint_copies_initial_block = (
+            self.has_mamba_layers
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_checkpoint_copies_initial_block
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -437,14 +445,22 @@ class Scheduler(SchedulerInterface):
         # Eagle, FullAttn prunes the last matching block, so back off one
         # block to avoid a Mamba cache miss.
         last_cache_position = request.num_tokens - request.num_tokens % block_size
+        # An identical resend recomputes its final token for logits. If the
+        # prompt ends exactly on a block boundary, its reusable replay state
+        # is one block earlier than an extension's state.
+        replay_cache_position = (request.num_tokens - 1) // block_size * block_size
         if self.use_eagle_block_drop:
             last_cache_position = max(last_cache_position - block_size, 0)
+            replay_cache_position = max(replay_cache_position - block_size, 0)
 
         end = start + num_new_tokens
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
             self.hash_block_size,
             drop_eagle_block=self.use_eagle_block_drop,
+            query_start=start,
+            mamba_block_size=block_size,
+            copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
         )
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
@@ -457,10 +473,29 @@ class Scheduler(SchedulerInterface):
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
                 reuse_initial_block=self.mamba_prefill_checkpoint_reuses_initial_block,
+                copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
             )
         )
-        if use_internal_checkpoint:
-            last_cache_position = 0
+        # Preserve full-block replay states distinct from the internal tail.
+        # When the tail itself is a replay boundary, its export already
+        # materializes that state and a separate stop would be redundant.
+        replay_stop = (
+            0
+            if use_internal_checkpoint and replay_cache_position == checkpoint_position
+            else replay_cache_position
+        )
+        extension_stop = (
+            0
+            if use_internal_checkpoint and last_cache_position == checkpoint_position
+            else last_cache_position
+        )
+        # A warm request need not re-align if all reusable boundaries are
+        # behind it (or covered by the export). Re-aligning there can destroy
+        # a valid private-initial-block export by turning it into a shared,
+        # block-aligned initial-column alias on the following step.
+        stop_at_next_boundary = (
+            not use_internal_checkpoint or max(replay_stop, extension_stop) > start
+        )
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
@@ -476,19 +511,30 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
-        tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
-            if self.mamba_partial_cache_hit and not use_internal_checkpoint
-            else 0
+        tail_boundary = 0
+        has_checkpoint_exporter = (
+            self.mamba_has_prefill_checkpoint_blocks
+            and self.mamba_prefill_checkpoint_alignment is not None
+            and (checkpoint_position - start) % self.mamba_prefill_checkpoint_alignment
+            == 0
         )
-        if tail_boundary and self.use_eagle_block_drop:
-            # Eagle matches one hash unit past the candidate and drops it, so
-            # nothing proves the prompt's own last hash boundary. Materialize
-            # the state one unit lower, where the hit can actually land. Keyed on
-            # the block-drop bit, not plain use_eagle: this shift exists only to
-            # compensate for the drop, and the Mamba manager's matching gate
-            # reads the same bit (the coordinator is handed use_eagle_block_drop).
-            tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+        if self.mamba_partial_cache_hit and not use_internal_checkpoint:
+            if has_checkpoint_exporter:
+                # Alias fallback must preserve the same tail that an internal
+                # export would have written, including hash-aligned prompts.
+                tail_boundary = get_mamba_prefill_checkpoint_position(
+                    request.num_prompt_tokens,
+                    self.hash_block_size,
+                    drop_eagle_block=self.use_eagle_block_drop,
+                )
+            else:
+                tail_boundary = (
+                    request.num_prompt_tokens
+                    // self.hash_block_size
+                    * self.hash_block_size
+                )
+                if self.use_eagle_block_drop:
+                    tail_boundary = max(tail_boundary - self.hash_block_size, 0)
         junction = request.shared_prefix_boundary
         # Block-floored: a sub-block junction's state is not separately cacheable.
         block_floored = start + (junction - start) // block_size * block_size
@@ -501,22 +547,28 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        junction_requires_split = start < junction_stop < end and not (
+            use_internal_checkpoint and junction_stop == checkpoint_position
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
+            if start % block_size != 0
+            and (stop_at_next_boundary or junction_requires_split)
             else 0,
-            # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
+            # Never run past a reusable boundary not covered by the export.
+            extension_stop,
+            replay_stop,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+            if tail_boundary < request.num_prompt_tokens
+            and (has_checkpoint_exporter or last_cache_position < tail_boundary)
             else 0,
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
-            junction_stop if start < junction < end else 0,
+            junction_stop if junction_requires_split else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

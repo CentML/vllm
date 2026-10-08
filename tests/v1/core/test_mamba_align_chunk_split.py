@@ -132,7 +132,7 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
-    checkpoint_alignment: int = 16,
+    checkpoint_alignment: int | None = 16,
     reuse_initial_block: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
@@ -153,6 +153,7 @@ def _split(
             checkpoint_alignment if num_prefill_checkpoint_blocks > 0 else None
         ),
         mamba_prefill_checkpoint_reuses_initial_block=reuse_initial_block,
+        mamba_prefill_checkpoint_copies_initial_block=False,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
@@ -160,9 +161,9 @@ def _split(
 @pytest.mark.parametrize(
     ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
     [
-        (2002, 2002, False, 2002),
+        (2002, 2002, False, MAMBA_BLOCK_SIZE),
         (3602, 2000, False, MAMBA_BLOCK_SIZE),
-        (3602, 3602, True, 3602),
+        (3602, 3602, True, MAMBA_BLOCK_SIZE),
         (2002, 2002, True, 2002),
         (3602, 512, True, 0),
         (3602, 1700, True, MAMBA_BLOCK_SIZE),
@@ -180,6 +181,44 @@ def test_internal_checkpoint_split(
             num_prefill_checkpoint_blocks=1,
         )
         == expected
+    )
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("alignment", [None, 256])
+def test_reserved_slot_without_eligible_export_keeps_legacy_hash_aligned_tail(
+    use_eagle: bool,
+    alignment: int | None,
+) -> None:
+    prompt_len = 2000
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    request.num_computed_tokens = MAMBA_BLOCK_SIZE
+    legacy_tail = prompt_len - (ATTN_BLOCK_SIZE if use_eagle else 0)
+    for reserved_slots in (0, 1):
+        assert (
+            _split(
+                request,
+                prompt_len - MAMBA_BLOCK_SIZE,
+                use_eagle=use_eagle,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=reserved_slots,
+                checkpoint_alignment=alignment,
+            )
+            == legacy_tail - MAMBA_BLOCK_SIZE
+        )
+
+    # A real exporter instead promises the preceding hash unit; its aligned
+    # initial-state alias must split at that same promised checkpoint.
+    assert (
+        _split(
+            request,
+            prompt_len - MAMBA_BLOCK_SIZE,
+            use_eagle=use_eagle,
+            partial_hit=True,
+            num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
+        )
+        == legacy_tail - ATTN_BLOCK_SIZE - MAMBA_BLOCK_SIZE
     )
 
 
@@ -215,8 +254,8 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # GDN exports the checkpoint at any offset and may put it in the private
-    # initial-state block of a mid-block resume: one forward to the end.
+    # GDN can export the tail in a private initial block, but that must not
+    # replace the reusable full-block state at the warm replay boundary.
     assert (
         _split(
             request,
@@ -227,7 +266,7 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
             checkpoint_alignment=1,
             reuse_initial_block=True,
         )
-        == prompt_len - resume_at
+        == 2 * MAMBA_BLOCK_SIZE - resume_at
     )
     # A block-aligned resume whose checkpoint column is the initial-state one
     # holds the (shared) boundary state there, so it keeps stopping at the

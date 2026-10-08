@@ -76,6 +76,12 @@ CHECKPOINTED = (0, 1, 3)
 LAYOUTS = {
     "three": (PREFILLS, CHECKPOINTED),
     "one": ([PREFILLS[2], PREFILLS[3], PREFILLS[4]], (1,)),
+    # Aligned private-initial alias between cold one-block rows. The cold rows
+    # must never acquire a negative checkpoint column under copy capability.
+    "aligned": ([(0, 200), (512, 700), (0, 128)], (1,)),
+    # Eagle's desired tail is already the initial state; export boundary512
+    # instead, with the original tail retained by the manager's immutable copy.
+    "initial_tail": ([(0, 200), (480, 530), (0, 128)], (1,)),
 }
 
 
@@ -92,7 +98,9 @@ def _make_vllm_config(backend: str):
     return cfg
 
 
-def _make_builder(vllm_config, checkpoints: bool, drop_eagle: bool, device):
+def _make_builder(
+    vllm_config, checkpoints: bool, drop_eagle: bool, device, copy_initial: bool = False
+):
     spec = MambaSpec(
         block_size=BLOCK,
         shapes=((16, 64),),
@@ -101,6 +109,7 @@ def _make_builder(vllm_config, checkpoints: bool, drop_eagle: bool, device):
         num_prefill_checkpoint_blocks=int(checkpoints),
         prefill_checkpoint_alignment=1 if checkpoints else None,
         prefill_checkpoint_reuses_initial_block=checkpoints,
+        prefill_checkpoint_copies_initial_block=checkpoints and copy_initial,
     )
     builder = GDNAttentionMetadataBuilder(
         kv_cache_spec=spec,  # type: ignore[arg-type]
@@ -198,7 +207,7 @@ def _conv_window(conv_pool: torch.Tensor) -> torch.Tensor:
     return view[..., : CONV_KERNEL - 1]
 
 
-@pytest.mark.parametrize("layout", ["three", "one"])
+@pytest.mark.parametrize("layout", ["three", "one", "aligned", "initial_tail"])
 @pytest.mark.parametrize("num_spec", [0, 3])
 @pytest.mark.parametrize("drop_eagle", [False, True])
 @pytest.mark.parametrize("num_decodes", [0, 2])
@@ -221,7 +230,13 @@ def test_prefill_checkpoint_matches_split_prefill(
     torch.manual_seed(0)
     device = torch.device("cuda")
     vllm_config = _make_vllm_config(backend)
-    ckpt_builder = _make_builder(vllm_config, True, drop_eagle, device)
+    ckpt_builder = _make_builder(
+        vllm_config,
+        True,
+        drop_eagle,
+        device,
+        copy_initial=layout in ("aligned", "initial_tail"),
+    )
     ref_builder = _make_builder(vllm_config, False, drop_eagle, device)
 
     # Decodes (1 token, with context) first, then the prefills.
@@ -261,9 +276,16 @@ def test_prefill_checkpoint_matches_split_prefill(
 
     positions = {}
     for i in checkpointed:
-        _, end = prefills[i]
+        start, end = prefills[i]
         positions[num_decodes + i] = get_mamba_prefill_checkpoint_position(
-            end, UNIT, drop_eagle_block=drop_eagle
+            end,
+            UNIT,
+            drop_eagle_block=drop_eagle,
+            query_start=start,
+            mamba_block_size=BLOCK,
+            copy_initial_block=(
+                ckpt_builder.kv_cache_spec.prefill_checkpoint_copies_initial_block
+            ),
         )
 
     # ---- One forward with internal checkpoints ----

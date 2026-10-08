@@ -85,6 +85,7 @@ def _stub(manager):
         use_eagle_block_drop=True,
         hash_block_size=HASH,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_prefill_checkpoint_copies_initial_block=False,
         mamba_partial_cache_hit=partial,
         mamba_fine_grained_prefix_cache=False,
     )

@@ -484,6 +484,7 @@ backend when a shape, layout, sampling mode, or platform is unsupported.
 | `VLLM_LOWM_BF16_GEMM` | `1` | TinyGEMM for eligible small BF16 projections and measured larger-M plans on SM107. SM100 and SM103 additionally require `VLLM_LOWM_BF16_GEMM_SM100=1`. |
 | `VLLM_LOWM_BF16_GEMM_PDL` | `0` | Programmatic dependent launch for TinyGEMM. Availability is checked and warmed before capture. |
 | `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
+| `VLLM_GDN_PREFILL_CHECKPOINT` | `0` | Internal GDN tail export with reusable replay/extension boundaries preserved. Requires align mode and retention interval `0`. |
 | `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
 | `VLLM_MTP_DRAFT_PREFILL_PRUNE` | `0` | Attention computes sampled draft-prefill rows across decode and prefill buckets after writing every scheduled KV row. |
 | `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
@@ -511,6 +512,38 @@ layer-outer regions. Both direct paths require unique destinations disjoint from
 sources; overlapping physical rows and subword layouts retain gather/scatter.
 The index upload is shared across storages, and warmup covers the direct kernel's
 alignment specializations.
+
+### Checkpoint Coverage and Scheduling
+
+An internal tail export does not generally provide the full-block state that a
+sibling with a shorter shared prefix needs. The scheduler therefore retains
+distinct reusable replay/extension stops. It keeps the internal-export fast path
+when that export itself supplies the required boundary or safely reuses a private
+mid-block initial state.
+
+Without the GDN initial-state copy capability, an internal export that would
+overwrite a reusable block-aligned initial state requires a tail-boundary split.
+For example, a cold 5,000-token prompt with block size 2,176 and hash unit 32 can
+end chunks at 4,352, 4,992, and 5,000, retaining both reusable states at the cost
+of an additional prefill step.
+
+GDN with MTP lookahead greater than one can instead preserve the initial state
+in an immutable CoW snapshot before reusing its physical column for the internal
+export. Cached hits are privatized before mutation. Retained snapshots and own
+pins consume cache pages in addition to the running table. Copy-capable align-mode
+memory budgeting reserves four extra snapshot pages: two replay/extension states,
+one junction, and the original prompt tail when a request resumes after generating
+output tokens. These holds are released when the request is freed. A near-tail
+query whose desired checkpoint equals its start may export the next full boundary
+strictly inside the query instead.
+The scheduler, metadata builder, and cache manager use the same boundary selector.
+An exporter-ineligible query retains ordinary partial-tail caching.
+
+Eagle's block/hash drops still apply. A sibling admitted before a producer exports
+its state may legitimately start cold; prefix hits are not retroactively applied
+to running requests. Very small prefill budgets below one Mamba block can still
+stall an unaligned near-tail MTP chunk. This restoration does not relax the
+alignment guards for that pre-existing case.
 
 ### Draft and Sampling Limits
 
@@ -546,6 +579,7 @@ Use a built development environment and the normal test dependencies:
 ```bash
 python -m pytest -q tests/test_envs.py \
   tests/kernels/test_lowm_bf16_gemm_optin.py \
+  tests/v1/core/test_mamba_checkpointed_chunk_cache.py \
   tests/v1/attention/test_draft_prefill_rows.py
 
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
