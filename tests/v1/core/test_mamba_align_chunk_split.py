@@ -373,6 +373,49 @@ def test_mid_block_export_chunk_that_may_be_capped_stops_at_next_boundary(
     )
 
 
+@pytest.mark.parametrize("prompt_len", [3201, 3202, 3203])
+def test_mid_block_export_within_lookahead_runway_never_stalls(
+    prompt_len: int,
+) -> None:
+    """An image in the window must not force a stop inside the runway.
+
+    Stopping at boundary 3200 would leave fewer than the drafter's four
+    lookahead tokens; the reservation then pulls every later chunk back
+    below 3200 and the request is never scheduled again. Any capped end past
+    3200 is pulled back to or below it anyway, so no stop is needed.
+    """
+    lookahead = 4
+    (request,) = create_requests(
+        1,
+        num_tokens=prompt_len,
+        mm_positions=[[PlaceholderRange(offset=3100, length=1)]],
+        block_size=ATTN_BLOCK_SIZE,
+    )
+    request.num_computed_tokens = 1984
+    chunk_ends: list[int] = []
+    while request.num_computed_tokens < prompt_len:
+        num_new = _split(
+            request,
+            prompt_len - request.num_computed_tokens,
+            use_eagle=False,
+            partial_hit=True,
+            num_prefill_checkpoint_blocks=1,
+            checkpoint_alignment=1,
+            reuse_initial_block=True,
+            num_prefill_lookahead=lookahead,
+        )
+        num_new = Scheduler._reserve_prefill_lookahead(
+            SimpleNamespace(num_prefill_lookahead=lookahead),
+            request,
+            request.num_computed_tokens,
+            num_new,
+        )
+        assert num_new > 0, f"stalled after chunk ends {chunk_ends}"
+        request.num_computed_tokens += num_new
+        chunk_ends.append(request.num_computed_tokens)
+    assert chunk_ends == [prompt_len]
+
+
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
     (request,) = create_requests(1, num_tokens=3602, block_size=ATTN_BLOCK_SIZE)
 

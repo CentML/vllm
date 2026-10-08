@@ -766,6 +766,42 @@ def test_encoder_cap_never_publishes_unexported_initial_column(
     assert trace.hits["D"][0] == (2 * BLOCK if stopped else 4320)
 
 
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
+@pytest.mark.parametrize("eagle_drop", [False, True])
+@pytest.mark.parametrize("prompt_len", [3 * BLOCK + 1, 3 * BLOCK + 2, 3 * BLOCK + 3])
+def test_multimodule_encoder_window_never_stalls_near_tail_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_len: int,
+    eagle_drop: bool,
+    reuse_stops: bool,
+) -> None:
+    """A warm near-tail multi-module MTP prefill with an image finishes.
+
+    The copy-initial export covers the boundary at 6528, so the request runs
+    to its end in one chunk even though a schedulable image lies in its
+    encoder window. Forcing a stop at 6528 would leave fewer tokens than the
+    drafter's runway: the lookahead reservation then pulls each chunk back
+    into block 2, and the request is never scheduled again.
+    """
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
+    manager = _make_manager(num_spec=4, eagle_drop=eagle_drop, prefill_lookahead=4)
+    request = make_request(
+        "C",
+        _tokens(random.Random(18), prompt_len),
+        HASH,
+        sha256,
+        mm_positions=[PlaceholderRange(offset=6506, length=8)],
+    )
+    request.num_computed_tokens = 3 * BLOCK - HASH
+    chunk_ends: list[int] = []
+    while request.num_computed_tokens < prompt_len:
+        num_new = _split(manager, request, prompt_len - request.num_computed_tokens, 0)
+        assert num_new > 0, f"stalled after chunk ends {chunk_ends}"
+        request.num_computed_tokens += num_new
+        chunk_ends.append(request.num_computed_tokens)
+    assert chunk_ends == [prompt_len]
+
+
 @pytest.mark.parametrize("retention", [None, 0, BLOCK, 2 * BLOCK])
 def test_internal_export_at_replay_boundary_needs_no_extra_step(
     monkeypatch: pytest.MonkeyPatch, retention: int | None

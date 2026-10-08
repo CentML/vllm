@@ -541,10 +541,18 @@ class Scheduler(SchedulerInterface):
         # rewriting the private initial column. If a later encoder or drafter
         # lookahead cap can end the chunk early, the export is cancelled and
         # that column would still hold the chunk-start state when the manager
-        # hashes it as the boundary state.
+        # hashes it as the boundary state. Copy-initial backends need no stop:
+        # they preserve the initial column and select the next boundary as
+        # the export. Neither does a boundary within the drafter's runway of
+        # the prefill end: `_reserve_prefill_lookahead` pulls any early end
+        # back to or below it, while stopping there would leave a remainder
+        # shorter than the runway that the reservation then never schedules.
+        next_block_boundary = (start // block_size + 1) * block_size
         if (
             not stop_at_next_boundary
             and start % block_size != 0
+            and not self.mamba_prefill_checkpoint_copies_initial_block
+            and prefill_end - next_block_boundary >= self.num_prefill_lookahead
             and _mamba_chunk_may_be_capped(
                 request, start, end, self.num_prefill_lookahead
             )
@@ -564,7 +572,6 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
 
-        next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = 0
         has_checkpoint_exporter = (
             self.mamba_has_prefill_checkpoint_blocks
