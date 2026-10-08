@@ -880,6 +880,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_overlapping: bool = False,
         shared_quantized_input: QuantizedActivation | None = None,
         routed_quantized_input: QuantizedActivation | None = None,
+        routed_out: UnfinalizedMoEOutput | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -894,12 +895,16 @@ class MoERunner(MoERunnerInterface):
         The optional quantized inputs are pre-quantized copies of the MoE input
         (written by the post-attention norm) that replace the shared expert's
         and the monolithic routed experts' own input quantization.
+        ``routed_out``, when given, is the routed output already computed by
+        the locality MoE kernel.
         """
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_quantized_input
         )
 
-        if self.routed_experts.quant_method.is_monolithic:
+        if routed_out is not None:
+            fused_out = routed_out
+        elif self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
             fused_out = self.routed_experts.forward_monolithic(
                 x=(
@@ -1259,6 +1264,38 @@ class MoERunner(MoERunnerInterface):
             )
         return shared_q, routed_q
 
+    def _maybe_locality_moe(
+        self,
+        hidden_states: torch.Tensor,
+        routed_q: QuantizedActivation | None,
+    ) -> UnfinalizedMoEOutput | None:
+        """The routed MoE output of this call from the locality-domain kernel
+        (VLLM_MOE_LOCALITY_KERNEL, layers/fused_moe/locality_moe.py), which
+        computes the router GEMM itself from the runner-held gate weight and
+        reads the pre-quantized linear MXFP8 input; None when it does not serve
+        the call (the gate and the routed experts then run as usual).
+        """
+        if (
+            routed_q is None
+            or self.gate is None
+            or self._fse_fuse_gate
+            or self.do_naive_dispatch_combine
+            or self.moe_config.pcp_size > 1
+        ):
+            return None
+        kernel = getattr(self._quant_method, "moe_kernel", None)
+        experts = getattr(kernel, "fused_experts", None)
+        try_locality_moe = getattr(experts, "try_locality_moe", None)
+        if try_locality_moe is None:
+            return None
+        return try_locality_moe(
+            self.routed_experts,
+            hidden_states,
+            self.gate.weight,
+            routed_q.data,
+            routed_q.scale,
+        )
+
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -1302,10 +1339,13 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input, shared_q
             )
 
-        # If the Runner holds the gate, apply it after the stream sync,
-        # so it can run overlapped with the
+        # VLLM_MOE_LOCALITY_KERNEL: one kernel runs the router GEMM and the
+        # routed experts. Otherwise, if the Runner holds the gate, apply it
+        # after the stream sync, so it can run overlapped with the shared
+        # experts.
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        routed_out = self._maybe_locality_moe(hidden_states, routed_q)
+        if self.gate is not None and routed_out is None:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
@@ -1329,6 +1369,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_overlapping=shared_experts_overlapping,
                 shared_quantized_input=shared_q,
                 routed_quantized_input=routed_q,
+                routed_out=routed_out,
             )
 
             result = self._maybe_combine(
