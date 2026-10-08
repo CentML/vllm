@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -9,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -19,6 +21,7 @@ from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
+from vllm.v1.worker.gpu.spec_decode.autoregressive import one_graph
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -53,6 +56,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # call passes ``out_rows``, the rows its layer keeps after attention.
         self.draft_out_rows = False
         self._draft_row_ids: torch.Tensor | None = None
+
+        # VLLM_DRAFT_ONE_GRAPH (one_graph.py); set by capture_one_graphs().
+        self._one_graphs: one_graph.DraftOneGraphs | None = None
 
     def enable_draft_out_rows(self) -> None:
         """Draft prefill: the draft model runs everything after its attention
@@ -240,6 +246,20 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 
+    def capture_one_graphs(
+        self, target_tokens_padded: Callable[[int], int | None]
+    ) -> None:
+        """VLLM_DRAFT_ONE_GRAPH: capture the single-graph draft (after capture())."""
+        if not one_graph.ENABLED:
+            return
+        reason = one_graph.unsupported_reason(self)
+        if reason is not None:
+            logger.warning("VLLM_DRAFT_ONE_GRAPH not applied: %s", reason)
+            return
+        graphs = one_graph.DraftOneGraphs(self)
+        graphs.capture(target_tokens_padded)
+        self._one_graphs = graphs if graphs.graphs else None
+
     @torch.inference_mode()
     def propose(
         self,
@@ -290,11 +310,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+        one = self._one_graphs
         self._copy_request_inputs(
             num_reqs,
             input_batch.idx_mapping,
             temperature,
             seeds,
+            # VLLM_DRAFT_ONE_GRAPH: static num_rejected, same launch.
+            num_rejected=num_rejected if one is not None else None,
+            num_rejected_out=one.num_rejected if one is not None else None,
         )
 
         # Get the input ids and last token indices for the speculator.
@@ -348,6 +372,44 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         self._prepare_eplb_forward(num_tokens)
+
+        if (
+            one is not None
+            and not (dummy_run or is_profile)
+            and dp_sync is None
+            and self.pcp_manager is None
+            and input_batch.seq_lens.data_ptr()
+            == self.target_input_buffers.seq_lens.data_ptr()
+            and (hit := one.lookup(num_reqs, prefill_batch_desc)) is not None
+        ):
+            graph, decode_batch_desc = hit
+            self.on_prefill_begin(num_reqs)
+            # The draft-decode attention metadata build, hoisted before the
+            # draft prefill (one_graph.py: valid for its accepted backends).
+            self._build_uniform_attn_metadata(
+                num_reqs=num_reqs,
+                batch_desc=decode_batch_desc,
+                num_query_per_req=1,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                step=1,
+            )
+            get_offloader().sync_prev_onload()
+            graph.replay()
+            one.replays += 1
+            if one.replays == 1:
+                logger.info("Draft one-graph: first replay (%d requests)", num_reqs)
+            self.on_prefill_end(num_reqs)
+            self.on_multi_step_decode_begin(num_reqs)
+            self.on_multi_step_decode_end(num_reqs)
+            if self.draft_vocab_head is not None:
+                draft_vocab_head.observe_target(
+                    self.draft_vocab_head,
+                    last_sampled,
+                    input_batch.idx_mapping,
+                    num_sampled,
+                )
+                draft_vocab_head.maybe_log(self.draft_vocab_head)
+            return self.draft_tokens[:num_reqs]
 
         self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:

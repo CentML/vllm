@@ -1109,6 +1109,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
+                            if not profile_only and hasattr(
+                                self.speculator, "capture_one_graphs"
+                            ):
+                                # VLLM_DRAFT_ONE_GRAPH (no-op when unset).
+                                self.speculator.capture_one_graphs(
+                                    self._uniform_decode_target_tokens
+                                )
                     if self.adaptive_verification is not None:
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
@@ -1138,6 +1145,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _uniform_decode_target_tokens(self, num_reqs: int) -> int | None:
+        """Padded token count of the target FULL graph that a uniform decode
+        batch of num_reqs requests dispatches to (the execute_model dispatch
+        without DP / LoRA / microbatching), or None if it is not FULL.
+        """
+        assert self.cudagraph_manager is not None
+        q = self.decode_query_len
+        desc = self.cudagraph_manager.dispatch(
+            num_reqs, num_reqs * q, q, num_active_loras=0, max_query_len=q
+        )
+        return desc.num_tokens if desc.cg_mode == CUDAGraphMode.FULL else None
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
