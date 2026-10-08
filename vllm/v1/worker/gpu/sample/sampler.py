@@ -26,12 +26,14 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
-from vllm.v1.worker.gpu.sample.spec_topk_topp import MAX_TOP_K
+from vllm.v1.worker.gpu.sample.spec_topk_topp import (
+    MAX_TOP_K,
+    prepare_spec_top_k_top_p,
+)
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
-
 
 # GB300 lowc2: skip unchanged sampler-state staging on steps without new requests.
 _STATE_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
@@ -280,6 +282,39 @@ class Sampler:
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        states = self.sampling_states
+        if (
+            not skip_top_k_top_p
+            and states.use_split_row_top_k
+            and states.use_fused_prep
+            and logits.is_cuda
+            and logits.stride(1) == 1
+        ):
+            params = self.fused_spec_sampling_params(idx_mapping_np)
+            if params is not None:
+                max_top_k, use_top_p, use_penalties = params
+                penalties = self.penalties_state
+                return prepare_spec_top_k_top_p(
+                    logits,
+                    expanded_idx_mapping,
+                    input_ids,
+                    expanded_local_pos,
+                    states.temperature.gpu,
+                    states.top_k.gpu,
+                    states.top_p.gpu,
+                    (
+                        penalties.repetition_penalty.gpu,
+                        penalties.frequency_penalty.gpu,
+                        penalties.presence_penalty.gpu,
+                        penalties.prompt_bin_mask,
+                        penalties.output_bin_counts,
+                    )
+                    if use_penalties
+                    else None,
+                    max_top_k,
+                    use_top_p,
+                )
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)

@@ -89,6 +89,87 @@ def _submax_kernel(
 
 
 @triton.jit
+def _prepare_kernel(
+    raw_logits_ptr,
+    raw_logits_stride,
+    logits_ptr,
+    logits_stride,
+    submax_ptr,
+    submax_stride,
+    expanded_idx_mapping_ptr,
+    input_ids_ptr,
+    expanded_local_pos_ptr,
+    temperature_ptr,
+    repetition_penalty_ptr,
+    frequency_penalty_ptr,
+    presence_penalty_ptr,
+    prompt_bin_mask_ptr,
+    prompt_bin_mask_stride,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+    SUB_SIZE: tl.constexpr,
+    HAS_PENALTIES: tl.constexpr,
+):
+    """Copy, penalties, temperature and top-k submax in a single row pass."""
+    row = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
+    offs = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < vocab_size
+    req = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
+    x = tl.load(
+        raw_logits_ptr + row * raw_logits_stride + offs,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    if HAS_PENALTIES:
+        rep = tl.load(repetition_penalty_ptr + req)
+        freq = tl.load(frequency_penalty_ptr + req)
+        pres = tl.load(presence_penalty_ptr + req)
+        if rep != 1.0 or freq != 0.0 or pres != 0.0:
+            counts = tl.load(
+                output_bin_counts_ptr + req * output_bin_counts_stride + offs,
+                mask=mask,
+                other=0,
+            )
+            pos = tl.load(expanded_local_pos_ptr + row)
+            start = row - pos
+            for prev in range(pos):
+                token = tl.load(input_ids_ptr + start + prev + 1)
+                counts += (offs == token).to(tl.int32)
+            output_mask = counts > 0
+            if rep != 1.0:
+                packed_offs = block_idx * BLOCK_SIZE // 32 + tl.arange(
+                    0, BLOCK_SIZE // 32
+                )
+                packed = tl.load(
+                    prompt_bin_mask_ptr + req * prompt_bin_mask_stride + packed_offs,
+                    mask=packed_offs < tl.cdiv(vocab_size, 32),
+                    other=0,
+                )
+                prompt_mask = (
+                    ((packed[:, None] >> tl.arange(0, 32)[None, :]) & 1)
+                    .to(tl.int1)
+                    .reshape(BLOCK_SIZE)
+                )
+                scale = tl.where(prompt_mask | output_mask, rep, 1.0)
+                x *= tl.where(x > 0, 1.0 / scale, scale)
+            x -= freq * counts
+            x -= pres * output_mask
+    temp = tl.load(temperature_ptr + req)
+    if temp != 0.0 and temp != 1.0:
+        x = x / temp
+    x = tl.where(mask, x, float("-inf"))
+    tl.store(logits_ptr + row * logits_stride + offs, x, mask=mask)
+    NUM_SUB: tl.constexpr = BLOCK_SIZE // SUB_SIZE
+    tl.store(
+        submax_ptr + row * submax_stride + block_idx * NUM_SUB + tl.arange(0, NUM_SUB),
+        tl.max(tl.reshape(x, (NUM_SUB, SUB_SIZE)), axis=1),
+    )
+
+
+@triton.jit
 def _lower_bound_kernel(
     submax_ptr,
     submax_stride,
@@ -372,12 +453,15 @@ def apply_spec_top_k_top_p(
     top_p: torch.Tensor,
     max_top_k: int,
     use_top_p: bool,
+    prepared_submax: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Mask `logits` to each row's top-k/top-p survivors (in place).
 
     Every row must have 1 <= top_k <= max_top_k <= MAX_TOP_K. `top_k`/`top_p`
     are the persistent per-request state arrays, indexed through
     `expanded_idx_mapping` inside the kernels.
+    A fused preparation pass can supply `prepared_submax` while producing the
+    fp32 canvas, avoiding a second full-row read in _submax_kernel.
     """
     assert logits.dtype == torch.float32 and logits.stride(1) == 1
     assert 1 <= max_top_k <= MAX_TOP_K
@@ -393,16 +477,20 @@ def apply_spec_top_k_top_p(
     num_blocks = triton.cdiv(vocab_size, _SUBMAX_BLOCK)
     submax = scratch["submax"]
     num_submax = submax.shape[1]
-    _submax_kernel[(num_rows, num_blocks)](
-        logits,
-        logits.stride(0),
-        submax,
-        submax.stride(0),
-        vocab_size,
-        BLOCK_SIZE=_SUBMAX_BLOCK,
-        SUB_SIZE=_SUBMAX_SUB,
-        num_warps=4,
-    )
+    if prepared_submax is None:
+        _submax_kernel[(num_rows, num_blocks)](
+            logits,
+            logits.stride(0),
+            submax,
+            submax.stride(0),
+            vocab_size,
+            BLOCK_SIZE=_SUBMAX_BLOCK,
+            SUB_SIZE=_SUBMAX_SUB,
+            num_warps=4,
+        )
+    else:
+        submax = prepared_submax
+        num_submax = submax.shape[1]
     _lower_bound_kernel[(num_rows,)](
         submax,
         submax.stride(0),
@@ -445,3 +533,70 @@ def apply_spec_top_k_top_p(
         num_warps=4,
     )
     return logits
+
+
+def prepare_spec_top_k_top_p(
+    logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    input_ids: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    penalties: tuple[torch.Tensor, ...] | None,
+    max_top_k: int,
+    use_top_p: bool,
+) -> torch.Tensor:
+    """Fused preparation with a full, initialized fp32 top-k/top-p canvas.
+
+    Unlike compact rejection, this canvas is safe for probabilistic drafts,
+    block/synthetic/adaptive verification, watermarking and processed logprobs.
+    Raw logits are never modified. Only penalties, temperature and bounded
+    top-k/top-p may be active; callers must exclude other logits processors.
+    """
+    assert logits.stride(1) == 1 and 1 <= max_top_k <= MAX_TOP_K
+    num_rows, vocab_size = logits.shape
+    out = torch.empty_like(logits, dtype=torch.float32)
+    if num_rows == 0:
+        return out
+    submax = _get_scratch(logits.device, num_rows, vocab_size)["submax"]
+    if penalties is None:
+        rep = freq = pres = prompt = counts = temperature
+        prompt_stride = counts_stride = 0
+    else:
+        rep, freq, pres, prompt, counts = penalties
+        prompt_stride = prompt.stride(0)
+        counts_stride = counts.stride(0)
+    _prepare_kernel[(num_rows, triton.cdiv(vocab_size, _SUBMAX_BLOCK))](
+        logits,
+        logits.stride(0),
+        out,
+        out.stride(0),
+        submax,
+        submax.stride(0),
+        expanded_idx_mapping,
+        input_ids,
+        expanded_local_pos,
+        temperature,
+        rep,
+        freq,
+        pres,
+        prompt,
+        prompt_stride,
+        counts,
+        counts_stride,
+        vocab_size,
+        BLOCK_SIZE=_SUBMAX_BLOCK,
+        SUB_SIZE=_SUBMAX_SUB,
+        HAS_PENALTIES=penalties is not None,
+        num_warps=4,
+    )
+    return apply_spec_top_k_top_p(
+        out,
+        expanded_idx_mapping,
+        top_k,
+        top_p,
+        max_top_k,
+        use_top_p,
+        prepared_submax=submax,
+    )

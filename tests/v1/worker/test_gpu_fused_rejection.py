@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The fused rejection sampler against the unfused chain it replaces:
-fp32 copy -> penalties -> temperature -> spec top-k/top-p -> rejection_sample.
-"""
+"""Compact rejection, fused preparation and sparse verification semantics."""
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 import torch
 
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.penalties import apply_penalties
-from vllm.v1.worker.gpu.sample.spec_topk_topp import apply_spec_top_k_top_p
+from vllm.v1.worker.gpu.sample.spec_topk_topp import (
+    apply_spec_top_k_top_p,
+    prepare_spec_top_k_top_p,
+)
 from vllm.v1.worker.gpu.spec_decode.fused_rejection import (
     fused_rejection_sample,
     select_survivors,
@@ -398,3 +400,444 @@ def test_fused_dispatch_predicate():
             s.thinking_budget_state.enabled = True
             s.thinking_budget_state.use_thinking_budget[2] = True
         assert s.fused_spec_sampling_params(batch) is None, case
+
+
+@pytest.mark.parametrize("penalties", [False, True])
+@pytest.mark.parametrize("tied", [False, True])
+def test_preparation_canvas_matches_separate_passes(penalties: bool, tied: bool):
+    torch.manual_seed(17)
+    rows = [10, 4, 1, 2]
+    logits = _request_logits(rows, 50003, 2.5)
+    if tied:
+        logits = (logits.float() * 2).round().bfloat16()
+    b = _make_batch(
+        logits,
+        rows,
+        top_k=[64, 7, 20, 1],
+        top_p=[0.95, 0.7, 1.0, 0.8],
+        temperature=[1.0, 0.0, 0.7, 1.3],
+        penalties=penalties,
+        seed=19,
+    )
+    original = logits.clone()
+    prepared = prepare_spec_top_k_top_p(
+        logits,
+        b.expanded_idx_mapping,
+        b.input_ids[b.logits_indices],
+        b.expanded_local_pos,
+        b.temperature,
+        b.top_k,
+        b.top_p,
+        b.penalties,
+        b.max_top_k,
+        b.use_top_p,
+    )
+    ref = _unfused_canvas(b)
+    assert torch.equal(prepared.view(torch.int32), ref.view(torch.int32))
+    assert torch.equal(logits, original)
+
+
+def _runtime_sampler(b: Batch, logprobs_mode="raw_logprobs", watermark=False):
+    """Real sampler state with the same permuted persistent slots as Batch."""
+    from types import SimpleNamespace
+
+    from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.states import RequestState
+
+    req = RequestState(
+        b.temperature.numel(),
+        64,
+        b.input_ids.numel(),
+        STEPS,
+        b.logits.shape[1],
+        torch.device(DEVICE),
+    )
+    kwargs = dict(
+        max_num_reqs=b.temperature.numel(),
+        vocab_size=b.logits.shape[1],
+        device=torch.device(DEVICE),
+        req_states=req,
+        logprobs_mode=logprobs_mode,
+        num_speculative_tokens=STEPS,
+    )
+    if watermark:
+        sampler = GPUWatermarkSampler(
+            SimpleNamespace(context_width=2), deduplicate_contexts="none", **kwargs
+        )
+    else:
+        sampler = Sampler(**kwargs)
+    states = sampler.sampling_states
+    for name in ("temperature", "top_k", "top_p", "seeds"):
+        getattr(states, name).np[:] = getattr(b, name).cpu().numpy()
+    states.min_p.np.fill(0)
+    states.params.sync()
+    req.prompt_len.np.fill(0)
+    req.prefill_len.np[:] = b.prefill_len.cpu().numpy()
+    req.lens.sync()
+    req.total_len.gpu.zero_()
+    req.all_token_ids.gpu.zero_()
+    sampler.needs_logits_processing.fill(True)
+    if b.penalties is not None:
+        penalties = sampler.penalties_state
+        for name, value in zip(
+            ("repetition_penalty", "frequency_penalty", "presence_penalty"),
+            b.penalties[:3],
+        ):
+            getattr(penalties, name).np[:] = value.cpu().numpy()
+        penalties.params.sync()
+        penalties.use_penalty[:] = (
+            ((b.penalties[0] != 1) | (b.penalties[1] != 0) | (b.penalties[2] != 0))
+            .cpu()
+            .numpy()
+        )
+        penalties.prompt_bin_mask.copy_(b.penalties[3])
+        penalties.output_bin_counts.copy_(b.penalties[4])
+    return sampler
+
+
+def _input_batch(b: Batch):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        input_ids=b.input_ids,
+        positions=b.positions,
+        logits_indices=b.logits_indices,
+        num_reqs=b.idx_mapping.numel(),
+        idx_mapping=b.idx_mapping,
+        idx_mapping_np=b.idx_mapping.cpu().numpy(),
+        cu_num_logits=b.cu_num_logits,
+        cu_num_logits_np=b.cu_num_logits.cpu().numpy(),
+        seq_lens=b.seq_lens,
+        expanded_idx_mapping=b.expanded_idx_mapping,
+        expanded_local_pos=b.expanded_local_pos,
+    )
+
+
+def _assert_outputs_equal(actual, expected):
+    assert torch.equal(actual.num_sampled, expected.num_sampled)
+    assert torch.equal(actual.num_rejected, expected.num_rejected)
+    for row, count in enumerate(actual.num_sampled.tolist()):
+        assert torch.equal(
+            actual.sampled_token_ids[row, :count],
+            expected.sampled_token_ids[row, :count],
+        )
+    actual_lp, expected_lp = actual.logprobs_tensors, expected.logprobs_tensors
+    assert (actual_lp is None) == (expected_lp is None)
+    if actual_lp is not None:
+        assert torch.equal(actual_lp.logprob_token_ids, expected_lp.logprob_token_ids)
+        assert torch.equal(actual_lp.logprobs, expected_lp.logprobs)
+        assert torch.equal(
+            actual_lp.selected_token_ranks, expected_lp.selected_token_ranks
+        )
+        assert actual_lp.cu_num_generated_tokens == expected_lp.cu_num_generated_tokens
+        if actual_lp.cu_num_generated_tokens_tensor is not None:
+            assert torch.equal(
+                actual_lp.cu_num_generated_tokens_tensor,
+                expected_lp.cu_num_generated_tokens_tensor,
+            )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "raw_logprobs",
+        "processed_logprobs",
+        "draft",
+        "block",
+        "synthetic",
+        "watermark",
+        "adaptive",
+    ],
+)
+def test_refused_compact_batches_use_fused_preparation(monkeypatch, case):
+    from types import SimpleNamespace
+
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_SPLIT_ROW_TOPK", True)
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_FUSED_PREP", True)
+    monkeypatch.setattr(envs, "VLLM_FUSED_REJECTION_SAMPLER", True)
+    monkeypatch.setattr(envs, "VLLM_SPARSE_VERIFY_SAMPLING", True)
+    torch.manual_seed(23)
+    rows = [4, 4, 2, 1, 4, 4]
+    b = _make_batch(
+        _request_logits(rows, 50003, 2.5),
+        rows,
+        top_k=[7, 12, 3, 1, 7, 12],
+        top_p=[0.9, 1.0, 0.7, 1.0, 0.8, 0.95],
+        temperature=(
+            [1.0, 0.0, 1.0, 1.0, 1.0, 0.0]
+            if case == "raw_logprobs"
+            else [1.0] * len(rows)
+        ),
+        penalties=True,
+        seed=29,
+    )
+    mode = case if case.endswith("logprobs") else "raw_logprobs"
+    sampler = _runtime_sampler(b, mode, watermark=case == "watermark")
+    logprobs = 3 if case.endswith("logprobs") or case == "adaptive" else -1
+    sampler.sampling_states.num_logprobs.fill(logprobs)
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=STEPS,
+        enable_adaptive_verification=case == "adaptive",
+        rejection_sample_method="block" if case == "block" else "standard",
+    )
+    rs = RejectionSampler(
+        sampler,
+        spec_config,
+        torch.device(DEVICE),
+        watermark_key=1234567 if case == "watermark" else None,
+    )
+    if case == "synthetic":
+        rs.synthetic_conditional_rates = torch.tensor([0.8, 0.5, 0.2], device=DEVICE)
+    draft = None
+    if case == "draft":
+        draft = torch.randn(
+            b.temperature.numel(), STEPS, b.logits.shape[1], device=DEVICE
+        )
+    batch = _input_batch(b)
+    if case == "adaptive":
+        # Simulate an already compacted batch: the device boundaries, not this
+        # stale host layout, govern rejection and returned logprob boundaries.
+        batch.cu_num_logits_np = batch.cu_num_logits_np + np.arange(len(rows) + 1)
+    original = b.logits.clone()
+    actual = rs(b.logits, batch, draft)
+    sampler.sampling_states.use_fused_prep = False
+    expected = rs(b.logits, batch, draft)
+    _assert_outputs_equal(actual, expected)
+    assert torch.equal(b.logits, original)
+
+
+@pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "raw_logits"])
+@pytest.mark.parametrize("use_fp64", [False, True])
+def test_sparse_raw_scores_and_rng_match_dense(monkeypatch, logprobs_mode, use_fp64):
+    from types import SimpleNamespace
+
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs_module
+
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_SPLIT_ROW_TOPK", True)
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_FUSED_PREP", True)
+    monkeypatch.setattr(envs, "VLLM_FUSED_REJECTION_SAMPLER", True)
+    monkeypatch.setattr(envs, "VLLM_SPARSE_VERIFY_SAMPLING", True)
+    torch.manual_seed(31)
+    rows = [4, 4, 1, 2, 4, 4]
+    b = _make_batch(
+        _request_logits(rows, 50003, 2.5),
+        rows,
+        top_k=[12, 7, 1, 3, 12, 7],
+        top_p=[0.95, 0.8, 1.0, 0.9, 1.0, 0.95],
+        temperature=[1.0] * len(rows),
+        penalties=True,
+        seed=37,
+        chunked=[False, False, True, False, False, False],
+    )
+    sampler = _runtime_sampler(b, logprobs_mode)
+    sampler.use_fp64_gumbel = use_fp64
+    sampler.sampling_states.num_logprobs.fill(3)
+    rs = rs_module.RejectionSampler(
+        sampler,
+        SimpleNamespace(
+            num_speculative_tokens=STEPS,
+            enable_adaptive_verification=False,
+            rejection_sample_method="standard",
+        ),
+        torch.device(DEVICE),
+    )
+    original = b.logits.clone()
+    actual = rs(b.logits, _input_batch(b))
+    rs.use_sparse = False
+    expected = rs(b.logits, _input_batch(b))
+    _assert_outputs_equal(actual, expected)
+    assert torch.equal(b.logits, original)
+    # Repeat to catch uninitialized dead-chunk/scalar reads and stateful RNG.
+    rs.use_sparse = True
+    repeated = rs(b.logits, _input_batch(b))
+    _assert_outputs_equal(repeated, expected)
+
+
+@pytest.mark.parametrize(
+    "split,fused,sparse",
+    [
+        (True, True, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+        (True, False, True),
+        (False, True, True),
+        (False, False, True),
+        (True, True, True),
+    ],
+)
+def test_split_disable_overrides_compact_toggle(monkeypatch, split, fused, sparse):
+    from types import SimpleNamespace
+
+    import vllm.envs as envs
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as rs_module
+
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_SPLIT_ROW_TOPK", split)
+    monkeypatch.setattr(envs, "VLLM_SAMPLER_FUSED_PREP", True)
+    monkeypatch.setattr(envs, "VLLM_FUSED_REJECTION_SAMPLER", fused)
+    monkeypatch.setattr(envs, "VLLM_SPARSE_VERIFY_SAMPLING", sparse)
+    torch.manual_seed(41)
+    rows = [4, 1, 2]
+    b = _make_batch(
+        _request_logits(rows, 3000, 2.5),
+        rows,
+        top_k=[1] * 3,
+        top_p=[1.0] * 3,
+        temperature=[1.0] * 3,
+        penalties=False,
+        seed=43,
+    )
+    sampler = _runtime_sampler(b)
+    rs = rs_module.RejectionSampler(
+        sampler,
+        SimpleNamespace(
+            num_speculative_tokens=STEPS,
+            enable_adaptive_verification=False,
+            rejection_sample_method="standard",
+        ),
+        torch.device(DEVICE),
+    )
+    batch = _input_batch(b)
+    params = (b.max_top_k, b.use_top_p, False)
+    assert rs._fused_spec_params(batch, None, -1) == (
+        params if split and fused else None
+    )
+    assert rs._sparse_spec_params(b.logits, batch, None, b.logits.shape[0], -1) == (
+        params if split and sparse else None
+    )
+    actual = rs(b.logits, _input_batch(b))
+    rs.use_fused = False
+    rs.use_sparse = False
+    sampler.sampling_states.use_fused_prep = False
+    sampler.sampling_states.use_split_row_top_k = False
+    expected = rs(b.logits, _input_batch(b))
+    _assert_outputs_equal(actual, expected)
+
+
+def test_probabilistic_draft_distribution_after_fused_preparation():
+    """The output marginal is p, not the draft q or a one-hot approximation."""
+    torch.manual_seed(47)
+    n, vocab = 4096, 4
+    p = torch.tensor([0.1, 0.2, 0.3, 0.4], device=DEVICE)
+    q = torch.tensor([0.4, 0.3, 0.2, 0.1], device=DEVICE)
+    logits = p.log().expand(n * 2, vocab).contiguous()
+    idx = torch.arange(n, device=DEVICE, dtype=torch.int32)
+    expanded = idx.repeat_interleave(2)
+    local_pos = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32).repeat(n)
+    draft_sampled = torch.zeros(n * 2, device=DEVICE, dtype=torch.int64)
+    draft_sampled[1::2] = torch.multinomial(q.expand(n, -1), 1).squeeze(1)
+    pos = torch.arange(n * 2, device=DEVICE, dtype=torch.int64)
+    cu = torch.arange(0, n * 2 + 1, 2, device=DEVICE, dtype=torch.int32)
+    temp = torch.ones(n, device=DEVICE)
+    seeds = torch.arange(n, device=DEVICE, dtype=torch.int64) * 100003 + 53
+    top_k = torch.full((n,), vocab, device=DEVICE, dtype=torch.int32)
+    top_p = torch.ones(n, device=DEVICE)
+    prepared = prepare_spec_top_k_top_p(
+        logits,
+        expanded,
+        draft_sampled,
+        local_pos,
+        temp,
+        top_k,
+        top_p,
+        None,
+        vocab,
+        False,
+    )
+    draft_logits = q.log().expand(n, 1, vocab).contiguous()
+    sampled, counts = rejection_sample(
+        prepared,
+        draft_logits,
+        draft_sampled,
+        cu,
+        pos,
+        idx,
+        expanded,
+        local_pos,
+        temp,
+        seeds,
+        1,
+    )
+    ref_sampled, ref_counts = rejection_sample(
+        logits,
+        draft_logits,
+        draft_sampled,
+        cu,
+        pos,
+        idx,
+        expanded,
+        local_pos,
+        temp,
+        seeds,
+        1,
+    )
+    assert torch.equal(counts, ref_counts)
+    assert torch.equal(sampled[:, 0], ref_sampled[:, 0])
+    empirical = torch.bincount(sampled[:, 0], minlength=vocab).float() / n
+    torch.testing.assert_close(empirical, p, rtol=0, atol=0.03)
+
+
+@pytest.mark.parametrize("use_fp64", [False, True])
+def test_sparse_ties_and_dead_chunks_match_dense(use_fp64):
+    from vllm.v1.worker.gpu.sample.sparse_verify import sparse_rejection_sample
+
+    torch.manual_seed(59)
+    vocab = 50003
+    base = torch.zeros(4, vocab, device=DEVICE)
+    base[1] = (torch.randn(vocab, device=DEVICE) * 2).round()
+    base[2:] = float("-inf")
+    base[2, [1, 1023, 8192, 49000]] = torch.tensor([1.0, 2.0, 3.0, 4.0], device=DEVICE)
+    rows = [4] * 4
+    b = _make_batch(
+        base.repeat_interleave(4, dim=0),
+        rows,
+        top_k=[64, 20, 20, 7],
+        top_p=[0.9, 0.95, 0.9, 1.0],
+        temperature=[1.0] * 4,
+        penalties=False,
+        seed=61,
+    )
+    draft = b.input_ids[b.logits_indices]
+    pos = b.positions[b.logits_indices]
+    actual, actual_counts = sparse_rejection_sample(
+        b.logits,
+        b.input_ids,
+        b.logits_indices,
+        draft,
+        pos,
+        b.cu_num_logits,
+        b.idx_mapping,
+        b.expanded_idx_mapping,
+        b.expanded_local_pos,
+        b.temperature,
+        b.seeds,
+        b.top_k,
+        b.top_p,
+        None,
+        b.max_top_k,
+        b.use_top_p,
+        STEPS,
+        use_fp64=use_fp64,
+    )
+    expected, expected_counts = rejection_sample(
+        _unfused_canvas(b),
+        None,
+        draft,
+        b.cu_num_logits,
+        pos,
+        b.idx_mapping,
+        b.expanded_idx_mapping,
+        b.expanded_local_pos,
+        b.temperature,
+        b.seeds,
+        STEPS,
+        use_fp64=use_fp64,
+    )
+    assert torch.equal(actual_counts, expected_counts)
+    for row, count in enumerate(actual_counts.tolist()):
+        assert torch.equal(actual[row, :count], expected[row, :count])

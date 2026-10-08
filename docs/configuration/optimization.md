@@ -486,6 +486,10 @@ backend when a shape, layout, sampling mode, or platform is unsupported.
 | `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
 | `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
 | `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
+| `VLLM_SAMPLER_SPLIT_ROW_TOPK` | `1` | Enables eligible split-row top-k paths. Setting `0` also disables compact rejection, fused preparation, and sparse verification. |
+| `VLLM_FUSED_REJECTION_SAMPLER` | `1` | Prefers compact fused rejection when eligible. Setting `0` leaves separately enabled preparation/sparse fallbacks available. |
+| `VLLM_SAMPLER_FUSED_PREP` | `1` | Fuses copy, penalties, and temperature with split-row top-k on supported rejection fallbacks. |
+| `VLLM_SPARSE_VERIFY_SAMPLING` | `0` | Sparse standard one-hot verification, including raw logprobs/logits; compact rejection remains preferred when eligible. |
 | `VLLM_KV_COW_ONE_LAUNCH` | `1` | Copies eligible disjoint cache rows across storages in one launch. |
 | `VLLM_FUSED_KV_BLOCK_COPY` | `1` | Direct per-storage fallback when the one-launch plan is unavailable. Set both copy controls to `0` for gather/scatter. |
 
@@ -506,6 +510,16 @@ layer-outer regions. Both direct paths require unique destinations disjoint from
 sources; overlapping physical rows and subword layouts retain gather/scatter.
 The index upload is shared across storages, and warmup covers the direct kernel's
 alignment specializations.
+
+### Draft and Sampling Limits
+
+Fused sampling preparation preserves full processed-logit consumers and supports
+eligible logprob, probabilistic-draft, block, synthetic, watermark, and adaptive
+fallbacks. Other active logits transformations can still require ordinary
+preparation. Sparse verification requires temperatures exactly `1`, one-hot
+drafts, standard verification, and no processed-score consumer or
+watermark/adaptive mode. It preserves the dense path's reduction geometry and
+request/position/token-keyed RNG.
 
 ### Rubin FlashInfer Source Compatibility
 
@@ -528,7 +542,8 @@ python -m pytest -q tests/test_envs.py \
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
   tests/kernels/test_lowm_bf16_gemm.py \
   tests/kernels/mamba/test_gdn_fused_conv_prep.py \
-  tests/v1/worker/test_kv_cow_copy.py
+  tests/v1/worker/test_kv_cow_copy.py \
+  tests/v1/worker/test_gpu_fused_rejection.py
 ```
 
 Native SM100/SM103/SM107 cases skip on other GPUs. Overlay compatibility tests in

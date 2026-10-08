@@ -23,6 +23,7 @@ class SamplingStates:
     def __init__(self, max_num_reqs: int, vocab_size: int, device: torch.device):
         self.max_num_reqs = max_num_reqs
         self.use_split_row_top_k = envs.VLLM_SAMPLER_SPLIT_ROW_TOPK
+        self.use_fused_prep = envs.VLLM_SAMPLER_FUSED_PREP
         self.vocab_size = vocab_size
 
         # Device-resident, so that the sampling kernels (and the drafter graphs)

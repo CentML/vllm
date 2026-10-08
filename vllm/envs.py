@@ -280,6 +280,8 @@ if TYPE_CHECKING:
     VLLM_SAMPLER_SPLIT_ROW_TOPK: bool = True
     VLLM_DRAFT_SPLIT_ROW_ARGMAX: bool = True
     VLLM_FUSED_REJECTION_SAMPLER: bool = True
+    VLLM_SAMPLER_FUSED_PREP: bool = True
+    VLLM_SPARSE_VERIFY_SAMPLING: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -2016,6 +2018,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FUSED_REJECTION_SAMPLER": lambda: bool(
         int(os.getenv("VLLM_FUSED_REJECTION_SAMPLER", "1"))
     ),
+    # Fuse logits preparation into split-row top-k on rejection fallbacks.
+    # SPLIT_ROW_TOPK=0 also disables this path.
+    "VLLM_SAMPLER_FUSED_PREP": lambda: bool(
+        int(os.getenv("VLLM_SAMPLER_FUSED_PREP", "1"))
+    ),
+    # Opt-in sparse verification, including raw-logprob output. Requires
+    # SPLIT_ROW_TOPK=1; compact fused rejection remains preferred when eligible.
+    "VLLM_SPARSE_VERIFY_SAMPLING": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_VERIFY_SAMPLING", "0"))
+    ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
         os.getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "480")
@@ -2526,6 +2538,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SAMPLER_SPLIT_ROW_TOPK",
         "VLLM_DRAFT_SPLIT_ROW_ARGMAX",
         "VLLM_FUSED_REJECTION_SAMPLER",
+        "VLLM_SAMPLER_FUSED_PREP",
+        "VLLM_SPARSE_VERIFY_SAMPLING",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives

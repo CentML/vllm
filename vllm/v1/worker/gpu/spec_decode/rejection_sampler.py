@@ -21,17 +21,16 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.sparse_verify import sparse_rejection_sample
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.fused_rejection import fused_rejection_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
 
-# Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
-# TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
-# per vocab block on load and apply ops like temperature and gumbel, so folding
-# sampling-param application into those kernels would remove this buffer and
-# its traffic entirely.
+# Bound the dense fp32 canvas used by preparation/verification fallbacks.
+# Compact rejection avoids it; sparse verification only initializes live
+# chunks, but still reserves its address range within the same memory limit.
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
 
@@ -127,6 +126,7 @@ class RejectionSampler:
         self.sampler = sampler
         self.watermark_key = watermark_key
         self.use_fused = envs.VLLM_FUSED_REJECTION_SAMPLER
+        self.use_sparse = envs.VLLM_SPARSE_VERIFY_SAMPLING
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
@@ -360,12 +360,44 @@ class RejectionSampler:
         """
         if (
             not self.use_fused
+            or not self.sampler.sampling_states.use_split_row_top_k
             or draft_logits is not None
             or self.synthetic_conditional_rates is not None
             or self.use_block_verification
             or self.watermark_key is not None
             or self.enable_adaptive_verification
             or max_num_logprobs != NO_LOGPROBS
+        ):
+            return None
+        return self.sampler.fused_spec_sampling_params(input_batch.idx_mapping_np)
+
+    def _sparse_spec_params(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        max_chunk_logits: int,
+        max_num_logprobs: int,
+    ) -> tuple[int, bool, bool] | None:
+        """Sparse canvas consumers must never read uninitialized dead chunks."""
+        states = self.sampler.sampling_states
+        if (
+            not self.use_sparse
+            or not states.use_split_row_top_k
+            or not states.use_fused_prep
+            or not logits.is_cuda
+            or logits.stride(1) != 1
+            or draft_logits is not None
+            or self.synthetic_conditional_rates is not None
+            or self.use_block_verification
+            or self.watermark_key is not None
+            or self.enable_adaptive_verification
+            or logits.shape[0] > max_chunk_logits
+            or (
+                max_num_logprobs != NO_LOGPROBS
+                and self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            )
+            or np.any(states.temperature.np[input_batch.idx_mapping_np] != 1.0)
         ):
             return None
         return self.sampler.fused_spec_sampling_params(input_batch.idx_mapping_np)
@@ -432,9 +464,68 @@ class RejectionSampler:
         )
 
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+        sparse = self._sparse_spec_params(
+            logits, input_batch, draft_logits, chunk_logit_limit, max_num_logprobs
+        )
+        num_rejected: torch.Tensor | None
+        if sparse is not None:
+            max_top_k, use_top_p, use_penalties = sparse
+            states = self.sampler.sampling_states
+            penalties = self.sampler.penalties_state
+            sampled, num_sampled = sparse_rejection_sample(
+                logits,
+                input_batch.input_ids,
+                input_batch.logits_indices,
+                draft_sampled,
+                pos,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                input_batch.expanded_idx_mapping,
+                input_batch.expanded_local_pos,
+                states.temperature.gpu,
+                states.seeds.gpu,
+                states.top_k.gpu,
+                states.top_p.gpu,
+                (
+                    penalties.repetition_penalty.gpu,
+                    penalties.frequency_penalty.gpu,
+                    penalties.presence_penalty.gpu,
+                    penalties.prompt_bin_mask,
+                    penalties.output_bin_counts,
+                )
+                if use_penalties
+                else None,
+                max_top_k,
+                use_top_p,
+                self.num_speculative_steps,
+                use_fp64=self.sampler.use_fp64_gumbel,
+            )
+            logprobs_tensors = self._get_logprobs_tensors(
+                sampled,
+                num_sampled,
+                logits,
+                input_batch.cu_num_logits,
+                input_batch.cu_num_logits_np,
+                max_num_logprobs,
+            )
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.sampler.req_states.prefill_len.gpu,
+            )
+            return SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=logprobs_tensors,
+                num_nans=num_nans,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
+
         # Fold get_num_sampled_and_rejected into the last rejection kernel when
         # one chunk covers the batch and no logprobs read the raw num_sampled.
-        num_rejected: torch.Tensor | None = None
+        num_rejected = None
         if max_num_logprobs == NO_LOGPROBS and logits.shape[0] <= chunk_logit_limit:
             num_rejected = torch.empty(
                 input_batch.num_reqs, dtype=torch.int32, device=logits.device
