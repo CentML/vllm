@@ -486,9 +486,9 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 else torch.ones_like(self._g1_alphas) / self.quant_config.a2_scale
             )
 
-        # VLLM_MOE_DECODE_MAX_TOKENS > 0: decode calls (1 <= T <= it) of this MXFP8
-        # configuration run the single-launch kernel of moe_decode_cuda (built and
-        # its workspace allocated here, before any graph capture).
+        # VLLM_MOE_DECODE_MAX_TOKENS > 0: decode calls (MIN_TOKENS <= T <= MAX_TOKENS)
+        # of this MXFP8 configuration run the single-launch kernel of moe_decode_cuda
+        # (built here, before any graph capture).
         self._moe_decode = None
         if self._moe_decode_config_ok():
             from vllm.model_executor.layers.fused_moe import moe_decode_cuda
@@ -536,7 +536,10 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
 
         num_tokens = hidden_states.shape[0]
         if not (
-            0 < num_tokens <= min(moe_decode_cuda.MAX_TOKENS, moe_decode_cuda.MAXT)
+            self._moe_decode is not None
+            and moe_decode_cuda.MIN_TOKENS
+            <= num_tokens
+            <= min(moe_decode_cuda.MAX_TOKENS, moe_decode_cuda.MAXT)
             and self.moe_config.should_defer_moe_finalize(num_tokens)
             and expert_map is None
             and e_score_correction_bias is None
@@ -551,7 +554,6 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
             and a1q_scale.numel() == num_tokens * (moe_decode_cuda.H // 32)
         ):
             return None
-        assert self._moe_decode is not None
         rows, weights, idx = self._moe_decode(
             router_logits,
             hidden_states,

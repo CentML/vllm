@@ -17,29 +17,38 @@ whole experts (distinct experts ascending = slots; cluster c takes slots c,
 c + #clusters, ...); CTA rank r of the cluster owns the intermediate slice
 [r * 512 / C, (r + 1) * 512 / C) and the output rows [r * 2048 / C, ...):
 
-1. Before ``griddepcontrol.wait``: barriers, TMEM allocation.
+1. Before ``griddepcontrol.wait``: barriers, TMEM allocation, tensor-map prefetch.
 2. Every CTA: routing (top-8 of the bf16/fp32 logits, ties to the lower expert,
    fp32 softmax over the 8 = trtllm-gen Renormalize), the slot list, and all T
    activation rows as the MMA B operand (128B-swizzled K-major, N = 8/16/32
-   columns >= T) plus their E8M0 scales (128x4 chunks).
+   columns >= T) plus their E8M0 scales (128x4 chunks). Then
+   ``griddepcontrol.launch_dependents``.
 3. Warp 4 streams the CTA's weight tiles (128 shuffled rows x 128 B, 2-D TMA
    with 128B swizzle, + the matching 512-B scale chunk) through a ring of SMEM
    stages: per expert the 8/C FC1 tiles (gate and up rows of 64 intermediate
-   columns each, full K = 2048), then the 16/C FC2 tiles (full K = 512).
-4. Warp 5 issues ``tcgen05.mma.kind::mxf8f6f4.block_scale`` (swap-AB: M = 128
-   weight rows, N = tokens, K = 32 per instruction, accumulators in TMEM, scales
-   in TMEM via ``tcgen05.cp``), in K order (= the chain's accumulation order).
+   columns each, full K = 2048) and the 16/C FC2 tiles (full K = 512). For
+   N <= 16 the order is skewed, FC1(j + 1) before FC2(j), which hides the FC1 ->
+   FC2 exchange of clusters with several experts.
+4. Warp 6 (SF helper) waits for the ring stages, copies their scales to TMEM
+   (``tcgen05.cp``), prepares each FC2's B-operand scales and signals the issuer
+   once per 2 stages. Warp 5 (one thread) only issues
+   ``tcgen05.mma.kind::mxf8f6f4.block_scale`` (swap-AB: M = 128 weight rows,
+   N = tokens, K = 32 per instruction, accumulators in TMEM) in K order (= the
+   chain's accumulation order) and the ring commits.
 5. Warps 0-3 (FC1 epilogue): TMEM -> SwiGLU (gate/up rows pair up across lanes
    l and l ^ 8 of the shuffle) -> MXFP8 requant (trtllm-gen's rule: E8M0 =
    exponent(amax) - 8, saturating E4M3) -> ``st.async`` of the quantized slice
    and its scales into the FC2 B operand of every CTA of the cluster (DSMEM,
    complete_tx on the receiver's barrier: no fences, no global round trip).
-   FC2 epilogue: TMEM -> BF16 rows of the expert's routes.
+   FC2 epilogue: TMEM -> BF16 rows of the expert's routes (N <= 16: staged in
+   SMEM, one bulk copy per route).
 
-No global scratch, counters or flags; ``griddepcontrol.launch_dependents`` at the end.
+No global scratch, counters or flags.
 
-Env: ``VLLM_MOE_DECODE_MAX_TOKENS`` (default 0 = off): use this kernel for
-MXFP8 trtllm MoE calls with 1 <= T <= this (max 32) that would defer finalize.
+Env: ``VLLM_MOE_DECODE_MAX_TOKENS`` (default 0 = off) / ``VLLM_MOE_DECODE_MIN_TOKENS``
+(default 1): use this kernel for MXFP8 trtllm MoE calls with MIN <= T <= MAX (MAX <= 32)
+that would defer finalize. VR microbench (40-layer graphs, cluster 8): it beats the chain
+at T = 2..6 (T = 6 correlated routing by 1.3-1.9 us/layer) and loses at T = 1 and T >= 12.
 """
 
 import hashlib
@@ -51,16 +60,17 @@ _ext: list = []
 _instances: dict = {}  # device index -> MoeDecode | None (build failed)
 
 MAX_TOKENS = int(os.environ.get("VLLM_MOE_DECODE_MAX_TOKENS", "0"))
+MIN_TOKENS = max(1, int(os.environ.get("VLLM_MOE_DECODE_MIN_TOKENS", "1")))
 # SwiGLU-output requant: 1 (default) = trtllm-gen's E8M0 = exponent(amax) - 8 with a saturating
 # E4M3 cast (VR probe: 1e-6 relL2 to the chain's GEMM2 rows); 0 = OCP ceil(log2(amax / 448)).
 QMODE = int(os.environ.get("VLLM_MOE_DECODE_QMODE", "1"))
 # CTAs per expert (cluster size): 4 or 8.
 CLUSTER = int(os.environ.get("VLLM_MOE_DECODE_CLUSTER", "8"))
-# Weight ring stages of 16.5 KB (0 = as many as fit).
+# Weight ring stages of 33 KB (0 = as many as fit).
 STAGES = int(os.environ.get("VLLM_MOE_DECODE_STAGES", "0"))
 # Persistent clusters (0 = as many as can be co-resident).
 CLUSTERS = int(os.environ.get("VLLM_MOE_DECODE_CLUSTERS", "0"))
-# Build macros "K=V+K=V" (MDC_FAST_EXP, MDC_DEBUG).
+# Build macros "K=V+K=V" (MDC_FAST_EXP, MDC_DEBUG, MDC_EARLY_PDL).
 TUNE = os.environ.get("VLLM_MOE_DECODE_TUNE", "")
 
 _SOURCE = r"""
@@ -79,36 +89,49 @@ _SOURCE = r"""
 #ifndef MDC_FAST_EXP
 #define MDC_FAST_EXP 0
 #endif
+#ifndef MDC_EARLY_PDL
+#define MDC_EARLY_PDL 1   // griddepcontrol.launch_dependents right after routing (else at the end)
+#endif
 
 namespace mdc {
 constexpr int E = 256, TOPK = 8, H = 2048, I = 512;
 constexpr int KB1 = H / 32, KB2 = I / 32;    // E8M0 blocks per row: FC1 64, FC2 16
 constexpr int KC1 = H / 128, KC2 = I / 128;  // 128-B (SW128 atom) K chunks: FC1 16, FC2 4
 constexpr int MAXT = 32, MAXR = MAXT * TOPK;
-constexpr int NW = 8, NTHR = NW * 32;        // warps 0-3 epilogue, 4 TMA producer, 5 MMA, 6-7 setup only
-constexpr int WPROD = 4, WMMA = 5;
+constexpr int MAXJ = 64;                     // experts per cluster (needs >= 4 clusters)
+constexpr int NW = 8, NTHR = NW * 32;        // warps 0-3 epilogue, 4 TMA producer, 5 MMA issuer, 6 SF helper
+constexpr int WPROD = 4, WMMA = 5, WHLP = 6;
 constexpr int SFCH = 512;                    // 128x4 E8M0 chunk (128 rows x 4 K blocks)
 constexpr int KSTG = 2;                      // 128-B K chunks per ring stage: one mbarrier wait per 4*KSTG MMAs
 constexpr int ACH = 128 * 128;               // one TMA box: 128 weight rows x one 128-B K chunk
 constexpr int ASTG = KSTG * ACH;             // weight bytes per stage
 constexpr int SFSTG = KSTG * SFCH;           // weight scale bytes per stage
 constexpr int MAXST = 16;
+constexpr int KGRP = 2;                      // ring stages per readiness signal to the MMA issuer
+constexpr int NGRP = 16;                     // readiness barriers (ring)
 constexpr int HDR = 4096;
 constexpr int TMEM_COLS = 512;
 constexpr int NPROF = 32;
 
+// Skewed order FC1(j + 1) before FC2(j) (hides the FC1 -> FC2 exchange of multi-expert clusters): 2 FC1
+// accumulators, 3 FC2 B operands (a push of expert j + 1 into a peer follows the peer's FC2(j - 2) completion).
+__host__ __device__ constexpr bool skew(int N) { return N <= 16; }
+__host__ __device__ constexpr int na1(int N) { return skew(N) ? 2 : 1; }
+__host__ __device__ constexpr int nb2(int N) { return skew(N) ? 3 : 2; }
+__host__ __device__ constexpr bool ostage(int N) { return N <= 16; }   // FC2 output staged + bulk-stored
 // SMEM layout (offsets from the 1 KB aligned base)
 __host__ __device__ constexpr int off_b1() { return HDR; }                                // [KC1][N x 128 B] SW128
 __host__ __device__ constexpr int off_sfb1(int N) { return HDR + N * H; }                 // [KC1][512]
-__host__ __device__ constexpr int off_b2(int N) { return off_sfb1(N) + KC1 * SFCH; }      // [2][KC2][N x 128 B]
-__host__ __device__ constexpr int off_sfb2(int N) { return off_b2(N) + 2 * N * I; }       // [2][KC2][512]
-__host__ __device__ constexpr int off_sfs(int N) { return off_sfb2(N) + 2 * KC2 * SFCH; } // [2][C][N] u32
-__host__ __device__ constexpr int off_act(int C, int N) { return off_sfs(N) + 2 * C * N * 4; }   // [8/C][N][64] f32
-__host__ __device__ constexpr int off_sfa(int C, int N) { return off_act(C, N) + (8 / C) * N * 64 * 4; }  // [ns][SFSTG]
+__host__ __device__ constexpr int off_b2(int N) { return off_sfb1(N) + KC1 * SFCH; }      // [nb2][KC2][N x 128 B]
+__host__ __device__ constexpr int off_sfb2(int N) { return off_b2(N) + nb2(N) * N * I; }  // [2][KC2][512]
+__host__ __device__ constexpr int off_sfs(int N) { return off_sfb2(N) + 2 * KC2 * SFCH; } // [nb2][C][N] u32
+__host__ __device__ constexpr int off_act(int C, int N) { return off_sfs(N) + nb2(N) * C * N * 4; }   // [8/C][N][64] f32
+__host__ __device__ constexpr int off_out(int C, int N) { return off_act(C, N) + (8 / C) * N * 64 * 4; }  // [N][H/C] bf16
+__host__ __device__ constexpr int off_sfa(int C, int N) { return off_out(C, N) + (ostage(N) ? N * (H / C) * 2 : 0); }  // [ns][SFSTG]
 __host__ __device__ constexpr int off_a(int C, int N, int ns) { return (off_sfa(C, N) + ns * SFSTG + 1023) & ~1023; }
 __host__ __device__ constexpr int smem_total(int C, int N, int ns) { return off_a(C, N, ns) + ns * ASTG + 1024; }
-// TMEM columns
-__host__ __device__ constexpr int tm_acc2(int C, int N) { return (8 / C) * N; }
+// TMEM columns: [na1][8/C][N] FC1 acc | [2][16/C][N] FC2 acc | SFB1 | [2] SFB2 | [ns] SFA
+__host__ __device__ constexpr int tm_acc2(int C, int N) { return na1(N) * (8 / C) * N; }
 __host__ __device__ constexpr int tm_sfb1(int C, int N) { return tm_acc2(C, N) + 2 * (16 / C) * N; }
 __host__ __device__ constexpr int tm_sfb2(int C, int N) { return tm_sfb1(C, N) + KC1 * 4; }
 __host__ __device__ constexpr int tm_sfa(int C, int N) { return tm_sfb2(C, N) + 2 * KC2 * 4; }
@@ -117,7 +140,6 @@ struct Params {
   CUtensorMap tm13, tm2;                     // u8 [E*2I, H] / [E*H, I], box 128 B x 128 rows, 128B swizzle
   const void* logits;
   const uint8_t* x; const uint8_t* xs;
-  const uint8_t* w13; const uint8_t* w2;     // for L2 prefetches (TMA reads go through the maps)
   const uint8_t* s13; const uint8_t* s2;
   __nv_bfloat16* out; __nv_bfloat16* topk_w; int32_t* topk_ids;
   long long* prof;                           // optional [grid][NPROF] %globaltimer stamps (microbench)
@@ -127,11 +149,12 @@ struct Params {
 };
 
 struct Hdr {
-  unsigned long long full[MAXST], empty[MAXST];
-  unsigned long long acc1_full, acc2_full[2], acc2_empty[2], b2full[2];
+  unsigned long long full[MAXST], empty[MAXST], grp[NGRP];
+  unsigned long long acc1_full[2], acc1_empty[2], acc2_full[2], acc2_empty[2], b2full[3];
   uint32_t tmem;
   uint32_t tokmask[E];                       // per expert: tokens that selected it
   int16_t route_e[MAXR];                     // expert of route t * TOPK + k
+  int16_t cexp[MAXJ];                        // this cluster's experts in order (producer warp only)
 };
 
 __device__ __forceinline__ uint32_t su32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -187,6 +210,13 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
   asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                :: "r"(dst), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(bar) : "memory");
 }
+__device__ __forceinline__ void bulk_s2g(void* dst, uint32_t src, uint32_t bytes) {
+  asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+               :: "l"(dst), "r"(src), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void bulk_commit() { asm volatile("cp.async.bulk.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void bulk_wait_read() { asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory"); }
+__device__ __forceinline__ void bulk_wait_all() { asm volatile("cp.async.bulk.wait_group 0;" ::: "memory"); }
 __device__ __forceinline__ uint32_t mapa(uint32_t a, uint32_t rank) {
   uint32_t r; asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank)); return r;
 }
@@ -290,38 +320,28 @@ __device__ __forceinline__ int slot_expert(const uint32_t* tokmask, int s, int l
   }
   return -1;
 }
-__device__ __forceinline__ void l2_prefetch(const void* p, uint32_t bytes) {
-  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(p), "r"(bytes) : "memory");
+// Experts of cluster cid (slots cid, cid + ncl, ... below the number of distinct experts); whole warp.
+__device__ __forceinline__ int cluster_experts(const uint32_t* tokmask, int cid, int ncl, int lane) {
+  int d = 0;
+#pragma unroll
+  for (int g = 0; g < E / 32; ++g) d += __popc(__ballot_sync(0xffffffffu, tokmask[g * 32 + lane] != 0));
+  return d > cid ? (d - 1 - cid) / ncl + 1 : 0;
 }
-// L2 prefetch of the weight tiles (and their scale chunks) CTA `rank` of a cluster reads for expert e.
-template <int F1, int F2>
-__device__ __forceinline__ void prefetch_tiles(const Params& p, int e, uint32_t rank) {
+// k of route (token n, expert e)
+__device__ __forceinline__ int route_k(const int16_t* route_e, int n, int e) {
+  int k = 0;
 #pragma unroll
-  for (int f = 0; f < F1; ++f) {
-    const int t1 = (int)rank * F1 + f;
-    const uint8_t* w = p.w13 + ((size_t)e * (2 * I) + t1 * 128) * H;
-#pragma unroll
-    for (int c = 0; c < 4; ++c) l2_prefetch(w + c * 32 * H, 32 * H);
-    l2_prefetch(p.s13 + (size_t)e * (2 * I * KB1) + t1 * (KB1 / 4) * SFCH, (KB1 / 4) * SFCH);
-  }
-#pragma unroll
-  for (int f = 0; f < F2; ++f) {
-    const int t2 = (int)rank * F2 + f;
-    l2_prefetch(p.w2 + ((size_t)e * H + t2 * 128) * I, 128 * I);
-    l2_prefetch(p.s2 + (size_t)e * (H * KB2) + t2 * (KB2 / 4) * SFCH, (KB2 / 4) * SFCH);
-  }
+  for (int kk = 0; kk < TOPK; ++kk) if (route_e[n * TOPK + kk] == e) k = kk;
+  return k;
 }
-
 // One ring stage on the issuing thread: KSTG K chunks (each 128 weight rows x 128 B in a 128B-swizzled box at
-// a_st + q * ACH, its 512-B scale chunk at sfa_smem + q * SFCH -> TMEM sfa_tm + 4q) against the B operand chunks at
-// b0 + q * N * 128 (scales in TMEM at sfb0 + 4q); `first` starts the accumulator. 4 MMAs (K = 32 each) per chunk,
-// in K order.
+// a_st + q * ACH, its scales already in TMEM at sfa_tm + 4q, copied there by the SF helper warp) against the B
+// operand chunks at b0 + q * N * 128 (scales in TMEM at sfb0 + 4q); `first` starts the accumulator. 4 MMAs
+// (K = 32 each) per chunk, in K order.
 template <int N>
-__device__ __forceinline__ void mma_stage(uint32_t d, uint32_t a_st, uint32_t sfa_smem, uint32_t sfa_tm, uint32_t b0,
-                                          uint32_t sfb0, bool first) {
+__device__ __forceinline__ void mma_stage(uint32_t d, uint32_t a_st, uint32_t sfa_tm, uint32_t b0, uint32_t sfb0,
+                                          bool first) {
   constexpr uint32_t IDESC = (1u << 23) | (8u << 24) | ((uint32_t)(N >> 3) << 17);   // E4M3 x E4M3, E8M0, M128, K-major
-#pragma unroll
-  for (int q = 0; q < KSTG; ++q) tc_cp(sfa_tm + 4 * q, sf_desc(sfa_smem + q * SFCH));
 #pragma unroll
   for (int q = 0; q < KSTG; ++q) {
     const uint64_t ad = sw128_desc(a_st + q * ACH);
@@ -336,10 +356,14 @@ __device__ __forceinline__ void mma_stage(uint32_t d, uint32_t a_st, uint32_t sf
 template <int C, int N, bool kF32Logits>
 __global__ void __launch_bounds__(NTHR, 1) moe_tc_kernel(const __grid_constant__ Params p) {
   constexpr int F1 = 8 / C, F2 = 16 / C;                 // FC1 / FC2 M tiles per CTA
+  constexpr int NA1 = na1(N), NB2 = nb2(N), LAG = skew(N) ? 1 : 0;
+  constexpr int S1 = F1 * (KC1 / KSTG), S2 = F2 * (KC2 / KSTG);   // ring stages per expert: FC1 / FC2
+  static_assert(S1 % KGRP == 0 && S2 % KGRP == 0, "groups must not straddle GEMMs");
   constexpr uint32_t B2TX = N * (I + 4 * C);             // bytes every CTA receives per expert
   constexpr int TACC2 = tm_acc2(C, N), TSFB1 = tm_sfb1(C, N), TSFB2 = tm_sfb2(C, N), TSFA = tm_sfa(C, N);
   constexpr int OB1 = off_b1(), OSFB1 = off_sfb1(N), OB2 = off_b2(N), OSFB2 = off_sfb2(N), OSFS = off_sfs(N);
-  constexpr int OACT = off_act(C, N), OSFA = off_sfa(C, N);
+  constexpr int OACT = off_act(C, N), OSTO = off_out(C, N), OSFA = off_sfa(C, N);
+  constexpr bool OSTAGE = ostage(N);
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   uint8_t* smem = smem_raw + ((1024 - (su32(smem_raw) & 1023)) & 1023);
   Hdr& h = *reinterpret_cast<Hdr*>(smem);
@@ -357,17 +381,23 @@ __global__ void __launch_bounds__(NTHR, 1) moe_tc_kernel(const __grid_constant__
 
   if (tid == 0) {
     for (int i = 0; i < ns; ++i) { mbar_init(bar(h.full[i]), 1); mbar_init(bar(h.empty[i]), 1); }
-    mbar_init(bar(h.acc1_full), 1);
+    for (int g = 0; g < NGRP; ++g) mbar_init(bar(h.grp[g]), 2);   // helper: tcgen05.commit + release arrive
     for (int b = 0; b < 2; ++b) {
+      mbar_init(bar(h.acc1_full[b]), 1);
+      mbar_init(bar(h.acc1_empty[b]), 4);
       mbar_init(bar(h.acc2_full[b]), 1);
       mbar_init(bar(h.acc2_empty[b]), 4);
-      mbar_init(bar(h.b2full[b]), 1);
     }
+    for (int b = 0; b < 3; ++b) mbar_init(bar(h.b2full[b]), 1);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   if (warp == WMMA) {
     asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(su32(&h.tmem)), "r"(TMEM_COLS));
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+  }
+  if (warp == WPROD && lane == 0) {   // the weights never come from the predecessor: fetch their descriptors now
+    asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(&p.tm13)) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"(reinterpret_cast<uint64_t>(&p.tm2)) : "memory");
   }
   for (int i = tid; i < E; i += NTHR) h.tokmask[i] = 0;
   tc_fence_before();
@@ -492,273 +522,368 @@ __global__ void __launch_bounds__(NTHR, 1) moe_tc_kernel(const __grid_constant__
   asm volatile("cp.async.wait_all;" ::: "memory");
   fence_proxy_async();   // B1 / SFB1 (cp.async / generic stores) -> tensor core
   __syncthreads();       // routing (tokmask, route_e) and B1 / SFB1 complete
+#if MDC_EARLY_PDL
+  // Dependents may take the SMs this grid leaves free (their griddepcontrol.wait still waits for completion).
+  if (tid == 0) asm volatile("griddepcontrol.launch_dependents;");
+#endif
   const uint32_t tm0 = h.tmem;
   if (prof && tid == 0) prof[1] = gtime();
+  // Experts j = 0 .. J - 1 of this cluster in the step order k = 0 .. J - 1 + LAG: step k = FC1(k) (k < J), then
+  // FC2(k - LAG) (k >= LAG). Every role (TMA, SF helper, MMA, epilogue) walks the same steps.
 
   if (warp == WPROD) {
-    // ---- weight producer: per expert the FC1 tiles (K chunk inner), then the FC2 tiles ----
-    int i = 0;
-    for (int j = 0;; ++j) {
-      const int e = slot_expert(h.tokmask, (int)(cid + j * ncl), lane);
-      if (e < 0) break;
-      const int enext = slot_expert(h.tokmask, (int)(cid + (j + 1) * ncl), lane);
-      if (lane == 0) {
-        // L2 prefetch (fire and forget) of this CTA's tiles of the next expert once the ring is full (prefetching
-        // the current expert too floods DRAM ahead of the ring's own loads: iteration 1, first stage +1.3 us).
-        bool pf = false;
-        auto prefetch = [&]() {
-          if (pf) return;
-          pf = true;
-          if (enext >= 0) prefetch_tiles<F1, F2>(p, enext, rank);
-        };
-        for (int f = 0; f < F1; ++f) {
-          const int t1 = rank * F1 + f;
-          for (int kc = 0; kc < KC1; kc += KSTG, ++i) {
-            const int st = i % ns;
-            if (i >= ns) {
-              prefetch();
-              mbar_wait_sleep(bar(h.empty[st]), ((i / ns) & 1) ^ 1, 32, 1);
-            }
-            mbar_expect_tx(bar(h.full[st]), ASTG + SFSTG);
+    // ---- weight producer: per step the FC1 tiles of expert k (K chunk inner), then the FC2 tiles of k - LAG.
+    //      No L2 prefetch: any prefetch depth (8/16/32 stages beyond the ring) and the old next-expert prefetch
+    //      were slower on VR (714415: T=6 C8 15.90 us without, 17.48 / 18.36 / 18.52 with). ----
+    const int J = cluster_experts(h.tokmask, (int)cid, (int)ncl, lane);
+    {
+      // this cluster's experts -> h.cexp (producer-private): slot s of the distinct experts, s = cid + j * ncl
+      int base = 0;
+#pragma unroll 1
+      for (int g = 0; g < E / 32; ++g) {
+        const uint32_t sel = __ballot_sync(0xffffffffu, h.tokmask[g * 32 + lane] != 0);
+        if ((sel >> lane) & 1u) {
+          const int s = base + __popc(sel & ((1u << lane) - 1u)) - (int)cid;
+          if (s >= 0 && s % (int)ncl == 0) h.cexp[s / (int)ncl] = (int16_t)(g * 32 + lane);
+        }
+        base += __popc(sel);
+      }
+      __syncwarp();
+    }
+    if (lane == 0 && J > 0) {
+      // cursor over the stage sequence: (step k, part 0 = FC1(k) / 1 = FC2(k - LAG), stage s of the part)
+      struct Cur { int k, part, s; };
+      auto valid = [&](const Cur& c) { return c.k < J + LAG; };
+      auto fix = [&](Cur& c) {
+        while (valid(c) && !(c.part == 0 ? c.k < J : c.k >= LAG)) {
+          if (c.part == 0) c.part = 1; else { c.part = 0; ++c.k; }
+        }
+      };
+      auto adv = [&](Cur& c) {
+        if (++c.s < (c.part ? S2 : S1)) return;
+        c.s = 0;
+        if (c.part == 0) c.part = 1; else { c.part = 0; ++c.k; }
+        fix(c);
+      };
+      // box coordinates (x, y) in the part's tensor map and the stage's scale chunks
+      auto where = [&](const Cur& c, int& x, int& y, const uint8_t*& sf) {
+        if (c.part == 0) {
+          const int e = h.cexp[c.k], f = c.s / (KC1 / KSTG), kc = (c.s % (KC1 / KSTG)) * KSTG, t1 = rank * F1 + f;
+          x = kc * 128; y = e * (2 * I) + t1 * 128;
+          sf = p.s13 + (size_t)e * (2 * I * KB1) + (t1 * (KB1 / 4) + kc) * SFCH;
+        } else {
+          const int e = h.cexp[c.k - LAG], f = c.s / (KC2 / KSTG), kc = (c.s % (KC2 / KSTG)) * KSTG, t2 = rank * F2 + f;
+          x = kc * 128; y = e * H + t2 * 128;
+          sf = p.s2 + (size_t)e * (H * KB2) + (t2 * (KB2 / 4) + kc) * SFCH;
+        }
+      };
+      Cur ld{0, 0, 0};
+      fix(ld);
+      for (int i = 0; valid(ld); ++i, adv(ld)) {
+        const int st = i % ns;
+        if (i >= ns) mbar_wait_sleep(bar(h.empty[st]), ((i / ns) & 1) ^ 1, 32, 1);
+        mbar_expect_tx(bar(h.full[st]), ASTG + SFSTG);
+        int x, y;
+        const uint8_t* sf;
+        where(ld, x, y, sf);
+        const CUtensorMap* map = ld.part ? &p.tm2 : &p.tm13;
 #pragma unroll
-            for (int q = 0; q < KSTG; ++q)
-              tma2d(a_base + st * ASTG + q * ACH, &p.tm13, (kc + q) * 128, e * (2 * I) + t1 * 128, bar(h.full[st]));
-            bulk_g2s(sb + OSFA + st * SFSTG, p.s13 + (size_t)e * (2 * I * KB1) + (t1 * (KB1 / 4) + kc) * SFCH, SFSTG,
-                     bar(h.full[st]));
+        for (int q = 0; q < KSTG; ++q) tma2d(a_base + st * ASTG + q * ACH, map, x + q * 128, y, bar(h.full[st]));
+        bulk_g2s(sb + OSFA + st * SFSTG, sf, SFSTG, bar(h.full[st]));
+      }
+    }
+    __syncwarp();
+  } else if (warp == WHLP) {
+    // ---- SF helper: everything the MMA issuer would otherwise wait for. Per group of KGRP ring stages: the full
+    //      waits, the weight scales -> TMEM (tcgen05.cp), then tcgen05.commit + a release arrive on grp[] (the
+    //      issuer's only wait). Before a GEMM's first group: its accumulator is free (acc*_empty) and, for FC2, the
+    //      cluster's intermediate has arrived (b2full) and its scales are assembled and copied to TMEM. ----
+    const int J = cluster_experts(h.tokmask, (int)cid, (int)ncl, lane);
+    int st = 0, ph = 0, gc = 0;   // lane 0
+    auto groups = [&](int nst) {
+      for (int s = 0; s < nst; s += KGRP) {
+#pragma unroll
+        for (int g = 0; g < KGRP; ++g) {
+          mbar_wait(bar(h.full[st]), ph, 3);   // one spinning thread (the issuer's own waits are gone)
+          if (prof && gc == 0 && g == 0) prof[2] = gtime();
+          tc_fence_after();
+#pragma unroll
+          for (int q = 0; q < KSTG; ++q)
+            tc_cp(tm0 + TSFA + 4 * (KSTG * st + q), sf_desc(sb + OSFA + st * SFSTG + q * SFCH));
+          ph ^= (st + 1 == ns);
+          st = (st + 1 == ns) ? 0 : st + 1;
+        }
+        tc_commit(bar(h.grp[gc % NGRP]));
+        mbar_arrive(bar(h.grp[gc % NGRP]));
+        ++gc;
+      }
+    };
+    if (J > 0 && lane == 0) {
+#pragma unroll 1
+      for (int g = 0; g < KC1; ++g) tc_cp(tm0 + TSFB1 + 4 * g, sf_desc(sb + OSFB1 + g * SFCH));
+    }
+    for (int k = 0; k < J + LAG; ++k) {
+      if (k < J && lane == 0) {
+        mbar_expect_tx(bar(h.b2full[k % NB2]), B2TX);   // the phase of expert k - NB2 completed (waited below)
+        if (k >= NA1) mbar_wait_sleep(bar(h.acc1_empty[k % NA1]), ((k / NA1) - 1) & 1, 20, 9);
+        groups(S1);
+      }
+      if (k >= LAG) {
+        const int j = k - LAG, b = j % NB2;
+        if (lane == 0 && j >= 2) mbar_wait_sleep(bar(h.acc2_empty[j & 1]), ((j >> 1) - 1) & 1, 20, 4);
+        mbar_wait(bar(h.b2full[b]), (j / NB2) & 1, 5);
+        if (prof && lane == 0) prof[4] = gtime();
+        tc_fence_after();
+        fence_proxy_async();
+        if (lane < N) {
+          const uint32_t* sfs = reinterpret_cast<const uint32_t*>(smem + OSFS) + b * C * N;
+#pragma unroll
+          for (int g = 0; g < KC2; ++g) {
+            uint32_t w;
+            if constexpr (C == 4) {
+              w = sfs[g * N + lane];
+            } else {
+              w = (sfs[(2 * g) * N + lane] & 0xFFFFu) | (sfs[(2 * g + 1) * N + lane] << 16);
+            }
+            *reinterpret_cast<uint32_t*>(smem + OSFB2 + ((j & 1) * KC2 + g) * SFCH + lane * 16) = w;
           }
         }
-        for (int f = 0; f < F2; ++f) {
-          const int t2 = rank * F2 + f;
-          for (int kc = 0; kc < KC2; kc += KSTG, ++i) {
-            const int st = i % ns;
-            if (i >= ns) {
-              prefetch();
-              mbar_wait_sleep(bar(h.empty[st]), ((i / ns) & 1) ^ 1, 32, 2);
-            }
-            mbar_expect_tx(bar(h.full[st]), ASTG + SFSTG);
+        fence_proxy_async();
+        __syncwarp();
+        if (lane == 0) {
 #pragma unroll
-            for (int q = 0; q < KSTG; ++q)
-              tma2d(a_base + st * ASTG + q * ACH, &p.tm2, (kc + q) * 128, e * H + t2 * 128, bar(h.full[st]));
-            bulk_g2s(sb + OSFA + st * SFSTG, p.s2 + (size_t)e * (H * KB2) + (t2 * (KB2 / 4) + kc) * SFCH, SFSTG,
-                     bar(h.full[st]));
-          }
+          for (int g = 0; g < KC2; ++g)
+            tc_cp(tm0 + TSFB2 + ((j & 1) * KC2 + g) * 4, sf_desc(sb + OSFB2 + ((j & 1) * KC2 + g) * SFCH));
+          groups(S2);
         }
-        prefetch();
       }
       __syncwarp();
     }
   } else if (warp == WMMA) {
-    // ---- MMA issuer ----
+    // ---- MMA issuer: lane 0 alone; per group one wait, then MMAs and per-stage ring commits only (VR probes:
+    //      every mbarrier wait costs ~75 ns in the issue stream even when complete, a tcgen05.cp ~24 ns) ----
+    const int J = cluster_experts(h.tokmask, (int)cid, (int)ncl, lane);
     if (lane == 0) {
+      int st = 0, gc = 0;
+      for (int k = 0; k < J + LAG; ++k) {
+        if (k < J) {
+          const uint32_t d = tm0 + (k % NA1) * (F1 * N);
 #pragma unroll 1
-      for (int g = 0; g < KC1; ++g) tc_cp(tm0 + TSFB1 + 4 * g, sf_desc(sb + OSFB1 + g * SFCH));
-    }
-    // The per-stage issue loops run in lane 0 alone: warp-wide control flow per stage (all-lane barrier waits,
-    // __syncwarp, lane-0 branches) costs ~2x per MMA at these tiny N (VR probes 714151/714192).
-    int st = 0, ph = 0;   // ring position (lane 0)
-    int j = 0;
-    for (;; ++j) {
-      if (slot_expert(h.tokmask, (int)(cid + j * ncl), lane) < 0) break;
-      const int buf = j & 1;
-      if (lane == 0) {
-        mbar_expect_tx(bar(h.b2full[buf]), B2TX);
-        if (prof && j == 0) {
-          mbar_wait(bar(h.full[0]), 0, 3);
-          prof[2] = gtime();
-        }
-#pragma unroll 1
-        for (int s1 = 0; s1 < F1 * (KC1 / KSTG); ++s1) {
-          const int f = s1 / (KC1 / KSTG), kc = (s1 % (KC1 / KSTG)) * KSTG;
-          mbar_wait(bar(h.full[st]), ph, 3);
-          mma_stage<N>(tm0 + f * N, a_base + st * ASTG, sb + OSFA + st * SFSTG, tm0 + TSFA + 4 * KSTG * st,
-                       sb + OB1 + kc * (N * 128), tm0 + TSFB1 + 4 * kc, kc == 0);
-          tc_commit(bar(h.empty[st]));
-          ph ^= (st + 1 == ns);
-          st = (st + 1 == ns) ? 0 : st + 1;
-        }
-        tc_commit(bar(h.acc1_full));
-        if (prof) prof[3] = gtime();
-      }
-      __syncwarp();
-      // FC2: the intermediate of all C slices (pushed by the cluster) is the B operand
-      if (j >= 2) mbar_wait(bar(h.acc2_empty[buf]), ((j >> 1) - 1) & 1, 4);
-      mbar_wait(bar(h.b2full[buf]), (j >> 1) & 1, 5);
-      if (prof && lane == 0) prof[4] = gtime();
-      tc_fence_after();
-      fence_proxy_async();
-      if (lane < N) {
-        const uint32_t* sfs = reinterpret_cast<const uint32_t*>(smem + OSFS) + buf * C * N;
+          for (int s = 0; s < S1; s += KGRP) {
+            mbar_wait(bar(h.grp[gc % NGRP]), (gc / NGRP) & 1, 6);
+            tc_fence_after();
+            ++gc;
 #pragma unroll
-        for (int g = 0; g < KC2; ++g) {
-          uint32_t w;
-          if constexpr (C == 4) {
-            w = sfs[g * N + lane];
-          } else {
-            w = (sfs[(2 * g) * N + lane] & 0xFFFFu) | (sfs[(2 * g + 1) * N + lane] << 16);
+            for (int g = 0; g < KGRP; ++g) {
+              const int s1 = s + g, f = s1 / (KC1 / KSTG), kc = (s1 % (KC1 / KSTG)) * KSTG;
+              mma_stage<N>(d + f * N, a_base + st * ASTG, tm0 + TSFA + 4 * KSTG * st, sb + OB1 + kc * (N * 128),
+                           tm0 + TSFB1 + 4 * kc, kc == 0);
+              tc_commit(bar(h.empty[st]));
+              st = (st + 1 == ns) ? 0 : st + 1;
+            }
           }
-          *reinterpret_cast<uint32_t*>(smem + OSFB2 + (buf * KC2 + g) * SFCH + lane * 16) = w;
+          tc_commit(bar(h.acc1_full[k % NA1]));
+          if (prof) prof[3] = gtime();
         }
-      }
-      fence_proxy_async();
-      __syncwarp();
-      if (lane == 0) {
-#pragma unroll
-        for (int g = 0; g < KC2; ++g)
-          tc_cp(tm0 + TSFB2 + (buf * KC2 + g) * 4, sf_desc(sb + OSFB2 + (buf * KC2 + g) * SFCH));
-        const uint32_t bbase = sb + OB2 + buf * (N * I);
-        const uint32_t sfb0 = tm0 + TSFB2 + buf * KC2 * 4;
-        const uint32_t d0 = tm0 + TACC2 + buf * F2 * N;
+        if (k >= LAG) {
+          const int j = k - LAG;
+          const uint32_t bbase = sb + OB2 + (j % NB2) * (N * I);
+          const uint32_t sfb0 = tm0 + TSFB2 + (j & 1) * KC2 * 4;
+          const uint32_t d0 = tm0 + TACC2 + (j & 1) * F2 * N;
 #pragma unroll 1
-        for (int s2 = 0; s2 < F2 * (KC2 / KSTG); ++s2) {
-          const int f = s2 / (KC2 / KSTG), kc = (s2 % (KC2 / KSTG)) * KSTG;
-          mbar_wait(bar(h.full[st]), ph, 6);
-          mma_stage<N>(d0 + f * N, a_base + st * ASTG, sb + OSFA + st * SFSTG, tm0 + TSFA + 4 * KSTG * st,
-                       bbase + kc * (N * 128), sfb0 + kc * 4, kc == 0);
-          tc_commit(bar(h.empty[st]));
-          ph ^= (st + 1 == ns);
-          st = (st + 1 == ns) ? 0 : st + 1;
+          for (int s = 0; s < S2; s += KGRP) {
+            mbar_wait(bar(h.grp[gc % NGRP]), (gc / NGRP) & 1, 6);
+            tc_fence_after();
+            ++gc;
+#pragma unroll
+            for (int g = 0; g < KGRP; ++g) {
+              const int s2 = s + g, f = s2 / (KC2 / KSTG), kc = (s2 % (KC2 / KSTG)) * KSTG;
+              mma_stage<N>(d0 + f * N, a_base + st * ASTG, tm0 + TSFA + 4 * KSTG * st, bbase + kc * (N * 128),
+                           sfb0 + kc * 4, kc == 0);
+              tc_commit(bar(h.empty[st]));
+              st = (st + 1 == ns) ? 0 : st + 1;
+            }
+          }
+          tc_commit(bar(h.acc2_full[j & 1]));
         }
-        tc_commit(bar(h.acc2_full[buf]));
       }
-      __syncwarp();
+      if (prof) prof[8] = J;
     }
-    if (prof && lane == 0) prof[8] = j;
+    __syncwarp();
   } else if (warp < 4) {
     // ---- epilogue warps (TMEM lane quadrant = warp) ----
     cluster_wait();
+    const int J = cluster_experts(h.tokmask, (int)cid, (int)ncl, lane);
     const uint32_t tl = tm0 + ((uint32_t)(warp * 32) << 16);
     const bool isg = (lane & 8) != 0;                                          // gate row (else up)
     const int il = 16 * warp + ((lane & 7) << 1) + ((lane >> 4) & 1);         // intermediate column in the tile
     float* act = reinterpret_cast<float*>(smem + OACT);
     long long tw_acc1 = 0;
-    for (int j = 0;; ++j) {
-      const int buf = j & 1;
-      const int e = slot_expert(h.tokmask, (int)(cid + j * ncl), lane);
-      if (e < 0) break;
-      const uint32_t mask = h.tokmask[e];
-      {
-        const long long t0 = prof ? gtime() : 0;
-        mbar_wait_sleep(bar(h.acc1_full), j & 1, 128, 7);
-        if (prof) tw_acc1 += gtime() - t0;
-      }
-      tc_fence_after();
-      named_bar(1, 128);   // the previous expert's quantize pass is done with act[]
-#pragma unroll
-      for (int f = 0; f < F1; ++f) {
-        float v[N];
-        tmem_ld<N>(tl + f * N, v);
-        tmem_wait_ld();
-        if (p.dbg && j == 0) {
-#pragma unroll
-          for (int c = 0; c < N; ++c) p.dbg[((size_t)blockIdx.x * (F1 + F2) * 128 + f * 128 + warp * 32 + lane) * 32 + c] = v[c];
+    for (int k = 0; k < J + LAG; ++k) {
+      if (k < J) {
+        // FC1 epilogue of expert k: SwiGLU, requant, push to the cluster
+        const int a1 = k % NA1, buf = k % NB2;
+        {
+          const long long t0 = prof ? gtime() : 0;
+          mbar_wait_sleep(bar(h.acc1_full[a1]), (k / NA1) & 1, 32, 7);
+          if (prof) tw_acc1 += gtime() - t0;
         }
+        tc_fence_after();
+        named_bar(1, 128);   // the previous expert's quantize pass is done with act[]
 #pragma unroll
-        for (int c = 0; c < N / 2; ++c) {
-          // lanes l / l ^ 8 hold gate / up of the same column: each computes half of the token columns
-          const float send = isg ? v[c + N / 2] : v[c];
-          const float recv = __shfl_xor_sync(0xffffffffu, send, 8);
-          const float g = isg ? v[c] : recv;
-          const float u = isg ? recv : v[c + N / 2];
-          const int col = isg ? c : c + N / 2;
+        for (int f = 0; f < F1; ++f) {
+          float v[N];
+          tmem_ld<N>(tl + (a1 * F1 + f) * N, v);
+          tmem_wait_ld();
+          if (p.dbg && k == 0) {
+#pragma unroll
+            for (int c = 0; c < N; ++c) p.dbg[((size_t)blockIdx.x * (F1 + F2) * 128 + f * 128 + warp * 32 + lane) * 32 + c] = v[c];
+          }
+#pragma unroll
+          for (int c = 0; c < N / 2; ++c) {
+            // lanes l / l ^ 8 hold gate / up of the same column: each computes half of the token columns
+            const float send = isg ? v[c + N / 2] : v[c];
+            const float recv = __shfl_xor_sync(0xffffffffu, send, 8);
+            const float g = isg ? v[c] : recv;
+            const float u = isg ? recv : v[c + N / 2];
+            const int col = isg ? c : c + N / 2;
 #if MDC_FAST_EXP
-          const float sg = g / (1.f + __expf(-g));
+            const float sg = g / (1.f + __expf(-g));
 #else
-          const float sg = g / (1.f + expf(-g));
+            const float sg = g / (1.f + expf(-g));
 #endif
-          act[(f * N + col) * 64 + il] = sg * u;
+            act[(f * N + col) * 64 + il] = sg * u;
+          }
         }
+        tc_fence_before();
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bar(h.acc1_empty[a1]));
+        named_bar(1, 128);
+        // MXFP8 requant: item = (token n, tile f, 32-block b, half hh) = 16 values -> 16 B of every CTA's FC2 B operand
+        constexpr int G = F1 * 4, NIT = N * G;   // NIT is a multiple of 32: warp-uniform loop
+        const uint32_t b2bar = bar(h.b2full[buf]);
+        for (int it = tid; it < NIT; it += 128) {
+          const int n = it / G, r = it % G, f = r >> 2, b = (r >> 1) & 1, hh = r & 1;
+          const float4* src = reinterpret_cast<const float4*>(act + (f * N + n) * 64 + b * 32 + hh * 16);
+          float a[16];
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const float4 v4 = src[q];
+            a[4 * q] = v4.x; a[4 * q + 1] = v4.y; a[4 * q + 2] = v4.z; a[4 * q + 3] = v4.w;
+          }
+          float amax = 0.f;
+#pragma unroll
+          for (int c = 0; c < 16; ++c) amax = fmaxf(amax, fabsf(a[c]));
+          amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+          int ex;
+          if (p.qmode == 1) {
+            ex = (int)((__float_as_uint(amax) >> 23) & 0xFF) - 8;
+          } else {
+            const uint32_t bits = __float_as_uint(fmaxf(amax / 448.f, 1.17549435e-38f));
+            ex = (int)((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
+          }
+          ex = min(max(ex, 1), 253);
+          const float inv = __uint_as_float((uint32_t)(254 - ex) << 23);
+          uint32_t q[4];
+#pragma unroll
+          for (int w = 0; w < 4; ++w) {
+            uint16_t lo, hi;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(a[4 * w + 1] * inv), "f"(a[4 * w] * inv));
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(a[4 * w + 3] * inv), "f"(a[4 * w + 2] * inv));
+            q[w] = (uint32_t)lo | ((uint32_t)hi << 16);
+          }
+          // scale word of (sender rank, token n): byte f * 2 + b, gathered from the hh == 0 lanes of the group
+          uint32_t word = 0;
+#pragma unroll
+          for (int jj = 0; jj < 2 * F1; ++jj)
+            word |= (uint32_t)__shfl_sync(0xffffffffu, ex, (lane & ~(G - 1)) + 2 * jj) << (8 * jj);
+          const int i0 = ((int)rank * F1 + f) * 64 + b * 32 + hh * 16;
+          const int kc = i0 >> 7, un = (i0 & 127) >> 4;
+          const uint32_t off = OB2 + buf * (N * I) + kc * (N * 128) + (n >> 3) * 1024 + (n & 7) * 128 + ((un ^ (n & 7)) << 4);
+          const uint32_t soff = OSFS + ((buf * C + rank) * N + n) * 4;
+#pragma unroll
+          for (int d = 0; d < C; ++d) {
+            const uint32_t rb = mapa(b2bar, d);
+            st_async_v4(mapa(sb + off, d), q, rb);
+            if ((lane & (G - 1)) == 0) st_async_b32(mapa(sb + soff, d), word, rb);
+          }
+        }
+        if (prof && tid == 0) prof[5] = gtime();
       }
-      named_bar(1, 128);
-      // MXFP8 requant: item = (token n, tile f, 32-block b, half hh) = 16 values -> 16 B of every CTA's FC2 B operand
-      constexpr int G = F1 * 4, NIT = N * G;   // NIT is a multiple of 32: warp-uniform loop
-      const uint32_t b2bar = bar(h.b2full[buf]);
-      for (int it = tid; it < NIT; it += 128) {
-        const int n = it / G, r = it % G, f = r >> 2, b = (r >> 1) & 1, hh = r & 1;
-        const float4* src = reinterpret_cast<const float4*>(act + (f * N + n) * 64 + b * 32 + hh * 16);
-        float a[16];
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          const float4 v4 = src[q];
-          a[4 * q] = v4.x; a[4 * q + 1] = v4.y; a[4 * q + 2] = v4.z; a[4 * q + 3] = v4.w;
+      if (k >= LAG) {
+        // FC2 epilogue of expert j: BF16 rows of its routes. N <= 16: staged in SMEM ([N][H / C], this CTA's
+        // contiguous output columns) and written with one bulk copy per route (per-lane 2-byte stores cost
+        // ~1 us per expert at C4 under the weight stream: 714415 NOSTORE probe).
+        const int j = k - LAG;
+        const int e = slot_expert(h.tokmask, (int)(cid + j * ncl), lane);
+        const uint32_t mask = h.tokmask[e];
+        if constexpr (OSTAGE) {
+          if (j > 0) {
+            if (tid == 0) bulk_wait_read();   // the previous expert's bulk stores are done reading the staging
+            named_bar(1, 128);
+          }
         }
-        float amax = 0.f;
+        mbar_wait_sleep(bar(h.acc2_full[j & 1]), (j >> 1) & 1, 32, 8);
+        tc_fence_after();
+        if (prof && tid == 0) prof[6] = gtime();
 #pragma unroll
-        for (int c = 0; c < 16; ++c) amax = fmaxf(amax, fabsf(a[c]));
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-        int ex;
-        if (p.qmode == 1) {
-          ex = (int)((__float_as_uint(amax) >> 23) & 0xFF) - 8;
-        } else {
-          const uint32_t bits = __float_as_uint(fmaxf(amax / 448.f, 1.17549435e-38f));
-          ex = (int)((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
+        for (int f = 0; f < F2; ++f) {
+          const int ol = f * 128 + unshuffle32(warp * 32 + lane);   // output column - rank * (H / C)
+          float v[N];
+          tmem_ld<N>(tl + TACC2 + ((j & 1) * F2 + f) * N, v);
+          tmem_wait_ld();
+          if (p.dbg && j == 0) {
+#pragma unroll
+            for (int c = 0; c < N; ++c)
+              p.dbg[((size_t)blockIdx.x * (F1 + F2) * 128 + (F1 + f) * 128 + warp * 32 + lane) * 32 + c] = v[c];
+          }
+#pragma unroll
+          for (int n = 0; n < N; ++n) {
+            if ((mask >> n) & 1u) {
+              if constexpr (OSTAGE) {
+                reinterpret_cast<__nv_bfloat16*>(smem + OSTO)[n * (H / C) + ol] = __float2bfloat16_rn(v[n]);
+              } else {
+                p.out[(size_t)(n * TOPK + route_k(h.route_e, n, e)) * H + rank * (H / C) + ol] = __float2bfloat16_rn(v[n]);
+              }
+            }
+          }
         }
-        ex = min(max(ex, 1), 253);
-        const float inv = __uint_as_float((uint32_t)(254 - ex) << 23);
-        uint32_t q[4];
-#pragma unroll
-        for (int w = 0; w < 4; ++w) {
-          uint16_t lo, hi;
-          asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(a[4 * w + 1] * inv), "f"(a[4 * w] * inv));
-          asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(a[4 * w + 3] * inv), "f"(a[4 * w + 2] * inv));
-          q[w] = (uint32_t)lo | ((uint32_t)hi << 16);
-        }
-        // scale word of (sender rank, token n): byte f * 2 + b, gathered from the hh == 0 lanes of the group
-        uint32_t word = 0;
-#pragma unroll
-        for (int jj = 0; jj < 2 * F1; ++jj)
-          word |= (uint32_t)__shfl_sync(0xffffffffu, ex, (lane & ~(G - 1)) + 2 * jj) << (8 * jj);
-        const int i0 = ((int)rank * F1 + f) * 64 + b * 32 + hh * 16;
-        const int kc = i0 >> 7, un = (i0 & 127) >> 4;
-        const uint32_t off = OB2 + buf * (N * I) + kc * (N * 128) + (n >> 3) * 1024 + (n & 7) * 128 + ((un ^ (n & 7)) << 4);
-        const uint32_t soff = OSFS + ((buf * C + rank) * N + n) * 4;
-#pragma unroll
-        for (int d = 0; d < C; ++d) {
-          const uint32_t rb = mapa(b2bar, d);
-          st_async_v4(mapa(sb + off, d), q, rb);
-          if ((lane & (G - 1)) == 0) st_async_b32(mapa(sb + soff, d), word, rb);
-        }
-      }
-      if (prof && tid == 0) prof[5] = gtime();
-      // FC2 epilogue: BF16 rows of this expert's routes
-      mbar_wait_sleep(bar(h.acc2_full[buf]), (j >> 1) & 1, 64, 8);
-      tc_fence_after();
-      if (prof && tid == 0) prof[6] = gtime();
-#pragma unroll
-      for (int f = 0; f < F2; ++f) {
-        const int o = unshuffle32(((int)rank * F2 + f) * 128 + warp * 32 + lane);
-        float v[N];
-        tmem_ld<N>(tl + TACC2 + (buf * F2 + f) * N, v);
-        tmem_wait_ld();
-        if (p.dbg && j == 0) {
-#pragma unroll
-          for (int c = 0; c < N; ++c)
-            p.dbg[((size_t)blockIdx.x * (F1 + F2) * 128 + (F1 + f) * 128 + warp * 32 + lane) * 32 + c] = v[c];
-        }
-#pragma unroll
-        for (int n = 0; n < N; ++n) {
-          if ((mask >> n) & 1u) {
-            const int16_t* re = h.route_e + n * TOPK;
-            int k = 0;
-#pragma unroll
-            for (int kk = 0; kk < TOPK; ++kk) if (re[kk] == e) k = kk;
-            p.out[(size_t)(n * TOPK + k) * H + o] = __float2bfloat16_rn(v[n]);
+        if constexpr (OSTAGE) fence_proxy_async();   // staging (generic stores) -> bulk copies
+        tc_fence_before();
+        __syncwarp();
+        if (lane == 0) mbar_arrive(bar(h.acc2_empty[j & 1]));
+        if constexpr (OSTAGE) {
+          named_bar(1, 128);
+          if (tid == 0) {
+            for (int n = 0; n < N; ++n) {
+              if ((mask >> n) & 1u)
+                bulk_s2g(p.out + (size_t)(n * TOPK + route_k(h.route_e, n, e)) * H + rank * (H / C),
+                         sb + OSTO + n * (H / C) * 2, (H / C) * 2);
+            }
+            bulk_commit();
           }
         }
       }
-      tc_fence_before();
-      __syncwarp();
-      if (lane == 0) mbar_arrive(bar(h.acc2_empty[buf]));
     }
-    if (prof && tid == 0) prof[11] = tw_acc1;
+    if constexpr (OSTAGE) {
+      if (tid == 0) bulk_wait_all();   // output written before the CTA exits
+    }
+    if (prof && tid == 0) {
+      prof[9] = gtime();
+      prof[11] = tw_acc1;
+    }
   }
   __syncthreads();
+  if (prof && tid == 0) prof[10] = gtime();
   if (warp >= 4) cluster_wait();
   if (warp == WMMA) {
     tc_fence_after();
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tm0), "r"(TMEM_COLS));
   }
   if (prof && tid == 0) prof[7] = gtime();
+#if !MDC_EARLY_PDL
   asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 static CUtensorMap make_map(const void* base, uint64_t rows, uint64_t rowbytes) {
@@ -882,7 +1007,7 @@ void run(at::Tensor logits, at::Tensor x, at::Tensor xs, at::Tensor w13, at::Ten
   p.tm2 = cached_map(w2.data_ptr(), (uint64_t)E * H, I);
   p.logits = logits.data_ptr();
   p.x = (const uint8_t*)x.data_ptr(); p.xs = (const uint8_t*)xs.data_ptr();
-  p.w13 = (const uint8_t*)w13.data_ptr(); p.w2 = (const uint8_t*)w2.data_ptr();
+  TORCH_CHECK((E + nclusters - 1) / nclusters <= MAXJ, "too few clusters");
   p.s13 = (const uint8_t*)s13.data_ptr(); p.s2 = (const uint8_t*)s2.data_ptr();
   p.out = (__nv_bfloat16*)out.data_ptr(); p.topk_w = (__nv_bfloat16*)topk_w.data_ptr();
   p.topk_ids = topk_ids.has_value() ? (int32_t*)topk_ids->data_ptr() : nullptr;
@@ -926,7 +1051,7 @@ def tuned_source(tune: str) -> str:
     defines = ""
     for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         key, val = item.split("=")
-        assert key in ("FAST_EXP", "DEBUG"), key
+        assert key in ("FAST_EXP", "DEBUG", "EARLY_PDL"), key
         defines += f"#define MDC_{key} {int(val)}\n"
     return defines + _SOURCE
 
@@ -1113,8 +1238,9 @@ def get(device_index: int) -> "MoeDecode | None":
             _instances[device_index] = MoeDecode(torch.device("cuda", device_index))
             inst = _instances[device_index]
             logger.info(
-                "MoE decode: single-launch tcgen05 kernel for T <= %d "
+                "MoE decode: single-launch tcgen05 kernel for %d <= T <= %d "
                 "(cluster %d, qmode %d, tune '%s').",
+                MIN_TOKENS,
                 min(MAX_TOKENS, MAXT),
                 inst.cluster,
                 QMODE,
