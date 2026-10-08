@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -359,6 +360,11 @@ class Scheduler(SchedulerInterface):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        # Opt-in: keep replay/extension stops beside a valid internal export
+        # even without copy-initial (sibling reuse over TTFT).
+        self.mamba_prefill_checkpoint_reuse_stops = (
+            envs.VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS
+        )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -489,6 +495,19 @@ class Scheduler(SchedulerInterface):
             if use_internal_checkpoint and last_cache_position == checkpoint_position
             else last_cache_position
         )
+        # Without the copy-initial capability, a valid internal export makes
+        # one chunk to the prefill end correct: the validity check never lets
+        # it alias a block-aligned (shareable) initial column, and the manager
+        # hashes no boundary the chunk runs through. The stops above would only
+        # add full-block states for siblings with a shorter shared prefix or a
+        # block-aligned resend, at the cost of up to two prefill steps, so
+        # they are opt-in (VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS).
+        if (
+            use_internal_checkpoint
+            and not self.mamba_prefill_checkpoint_copies_initial_block
+            and not self.mamba_prefill_checkpoint_reuse_stops
+        ):
+            replay_stop = extension_stop = 0
         # A warm request need not re-align if all reusable boundaries are
         # behind it (or covered by the export). Re-aligning there can destroy
         # a valid private-initial-block export by turning it into a shared,

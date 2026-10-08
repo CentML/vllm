@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD: int = 8192
     VLLM_GDN_PREFILL_CHECKPOINT: bool = False
+    VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS: bool = False
     VLLM_GDN_VSPLIT_CG0SPLIT: bool = False
     VLLM_GDN_VSPLIT_C1REORDER: bool = False
     VLLM_GDN_FI_VSPLIT_V1: bool = False
@@ -1266,6 +1267,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the prefill into an extra chunk that ends at the checkpoint.
     "VLLM_GDN_PREFILL_CHECKPOINT": lambda: bool(
         int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT", "0"))
+    ),
+    # With VLLM_GDN_PREFILL_CHECKPOINT and no copy-initial capability (Mamba
+    # prefill lookahead <= 1), a prefill whose tail export is valid runs to
+    # its end in one chunk. 1 also stops it at the block-aligned replay and
+    # extension boundaries, so siblings with a shorter shared prefix can reuse
+    # those full-block states, at the cost of up to two extra prefill steps.
+    "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS": lambda: bool(
+        int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS", "0"))
     ),
     # V-split GDN chunked-prefill kernel (third_party/flashinfer_gdn_vsplit),
     # launches with an initial state only. CG0SPLIT: v_split=2 launches run the
@@ -2647,6 +2656,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_GDN_VSPLIT_CG0SPLIT",
         "VLLM_GDN_VSPLIT_C1REORDER",
         "VLLM_GDN_FI_VSPLIT_V1",
+        # Scheduler chunking policy; not part of traced graphs.
+        "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS",
         # Kernel choice inside the attention op (KF decode attention);
         # not part of traced graphs.
         "VLLM_KF_DECODE_ATTN",

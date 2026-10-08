@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
+from vllm import envs
 from vllm.distributed.kv_events import BlockRemoved
 from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import cdiv
@@ -48,6 +49,7 @@ NUM_MAMBA_GROUPS = 3
 TOKEN_BUDGET = 32768
 PIN = "VLLM_MAMBA_PIN_OWN_CKPT"
 DROP_SUPERSEDED = "VLLM_MAMBA_DROP_SUPERSEDED_STATE"
+REUSE_STOPS = "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS"
 
 P_LEN = 32202
 # P's replay boundary: block-floored prompt end, minus the eagle-dropped block.
@@ -140,6 +142,9 @@ def _split(
             _mamba_managers(manager)[
                 0
             ].kv_cache_spec.prefill_checkpoint_copies_initial_block
+        ),
+        mamba_prefill_checkpoint_reuse_stops=(
+            envs.VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS
         ),
         num_prefill_lookahead=manager.coordinator.num_reprefillable_tokens + 1,
         mamba_partial_cache_hit=manager.coordinator.enable_partial_hash_hits,
@@ -365,18 +370,49 @@ def _tokens(rng: random.Random, n: int) -> list[int]:
     return [rng.randrange(150_000) for _ in range(n)]
 
 
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
 @pytest.mark.parametrize(
     "consumer_after_materialization", [False, True], ids=["co_batched", "post_export"]
 )
 @pytest.mark.parametrize(
-    "x_len",
-    # Includes scratch windows straddling the replay column and ending below it.
-    [4000, 5000, 7000, 9000, 13000, 14000],
+    ("x_len", "p_chunk_ends", "p_chunk_ends_reuse_stops"),
+    [
+        # P's first chunk reaches the replay boundary itself.
+        (4000, [REPLAY_BOUNDARY, P_LEN], [REPLAY_BOUNDARY, P_LEN]),
+        # Co-batched prefill in (4480, 13184]: by default P's first chunk
+        # stops short and its speculative window covers the replay column.
+        # Reuse stops also split X at its own replay boundary.
+        (5000, [REPLAY_BOUNDARY - BLOCK, P_LEN], [REPLAY_BOUNDARY, P_LEN]),
+        (7000, [REPLAY_BOUNDARY - 2 * BLOCK, P_LEN], [REPLAY_BOUNDARY, P_LEN]),
+        (
+            9000,
+            [REPLAY_BOUNDARY - 3 * BLOCK, P_LEN],
+            [REPLAY_BOUNDARY - BLOCK, REPLAY_BOUNDARY, P_LEN],
+        ),
+        (
+            13000,
+            [REPLAY_BOUNDARY - 4 * BLOCK, P_LEN],
+            [REPLAY_BOUNDARY - 2 * BLOCK, REPLAY_BOUNDARY, P_LEN],
+        ),
+        # The speculative window ends below the replay-boundary column.
+        (
+            14000,
+            [REPLAY_BOUNDARY - 5 * BLOCK, P_LEN],
+            [REPLAY_BOUNDARY - 3 * BLOCK, REPLAY_BOUNDARY, P_LEN],
+        ),
+    ],
 )
 def test_checkpointed_chunk_skips_stale_speculative_block(
-    manager: KVCacheManager, x_len: int, consumer_after_materialization: bool
+    manager: KVCacheManager,
+    monkeypatch: pytest.MonkeyPatch,
+    x_len: int,
+    p_chunk_ends: list[int],
+    p_chunk_ends_reuse_stops: list[int],
+    consumer_after_materialization: bool,
+    reuse_stops: bool,
 ) -> None:
     """A co-batched request fragments P's budget; S shares 32,131 tokens."""
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
     rng = random.Random(0)
     p_ids = _tokens(rng, P_LEN)
     prompts = {
@@ -394,29 +430,44 @@ def test_checkpointed_chunk_skips_stale_speculative_block(
         arrival_step={"S": 5} if consumer_after_materialization else {},
     )
 
-    # Budget fragmentation must not lose P's reusable replay state, whether
-    # earlier chunks stopped before it or speculative scratch occupied its slot.
-    assert REPLAY_BOUNDARY in trace.chunk_ends["P"]
+    # By default P's final chunk runs through the replay column with the
+    # internal export and must not publish that column's stale scratch state.
+    # Opt-in reuse stops keep the replay state despite budget fragmentation.
+    assert trace.chunk_ends["P"] == (
+        p_chunk_ends_reuse_stops if reuse_stops else p_chunk_ends
+    )
     if consumer_after_materialization:
-        assert trace.hits["S"][0] == REPLAY_BOUNDARY
+        # S is shorter than P's tail checkpoint (32160): only a materialized
+        # replay state serves it.
+        assert trace.hits["S"][0] == (
+            REPLAY_BOUNDARY if REPLAY_BOUNDARY in trace.chunk_ends["P"] else 0
+        )
     _check_cached_states_and_free(manager, trace)
 
 
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
 @pytest.mark.parametrize(
     "consumer_after_materialization", [False, True], ids=["co_batched", "post_export"]
 )
 def test_checkpointed_chunk_skips_sub_block_hit_copy(
-    manager: KVCacheManager, consumer_after_materialization: bool
+    manager: KVCacheManager,
+    monkeypatch: pytest.MonkeyPatch,
+    consumer_after_materialization: bool,
+    reuse_stops: bool,
 ) -> None:
     """A partial-hit CoW block must become a real boundary state before reuse.
 
-    S2 restores P@32160, then materializes its replay state at 32640 instead
-    of publishing the untouched private initial block under that boundary.
+    S2 restores P@32160. By default it runs to its end with the internal
+    export and must not publish the untouched private initial block under
+    boundary 32640, so S3 falls back to P@32160. With reuse stops S2
+    materializes its replay state at 32640, which S3 then reuses.
     """
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
     rng = random.Random(1)
     p_ids = _tokens(rng, P_LEN)
     s2_ids = p_ids + _tokens(rng, 2700)
-    prompts = {"P": p_ids, "S2": s2_ids, "S3": s2_ids[:34840] + _tokens(rng, 1000)}
+    s3_ids = s2_ids[:34840] + _tokens(rng, 1000)
+    prompts = {"P": p_ids, "S2": s2_ids, "S3": s3_ids}
     trace = _run(
         manager,
         prompts,
@@ -427,13 +478,32 @@ def test_checkpointed_chunk_skips_sub_block_hit_copy(
     )
 
     p_checkpoint = (P_LEN // HASH - 1) * HASH  # 32160
-    if consumer_after_materialization:
+    if not reuse_stops:
+        assert trace.chunk_ends["P"] == [P_LEN]
         assert trace.hits["S2"][0] == p_checkpoint
-    assert 15 * BLOCK in trace.chunk_ends["S2"]
-    assert trace.hits["S3"][0] == 15 * BLOCK
+        assert trace.chunk_ends["S2"] == [len(s2_ids)]
+        assert trace.hits["S3"][0] == p_checkpoint
+        assert trace.chunk_ends["S3"] == [15 * BLOCK, len(s3_ids)]
+    else:
+        assert trace.chunk_ends["P"] == [REPLAY_BOUNDARY, P_LEN]
+        if consumer_after_materialization:
+            assert trace.hits["S2"][0] == p_checkpoint
+            assert trace.chunk_ends["S2"] == [15 * BLOCK, len(s2_ids)]
+        else:
+            # Admitted beside P, before any of P's states exist.
+            assert trace.hits["S2"][0] == 0
+            assert trace.chunk_ends["S2"] == [
+                2 * BLOCK,
+                12 * BLOCK,
+                15 * BLOCK,
+                len(s2_ids),
+            ]
+        assert trace.hits["S3"][0] == 15 * BLOCK
+        assert trace.chunk_ends["S3"] == [len(s3_ids)]
     _check_cached_states_and_free(manager, trace)
 
 
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
 @pytest.mark.parametrize("retention", [None, 0, BLOCK, 2 * BLOCK])
 @pytest.mark.parametrize("pin", [False, True])
 @pytest.mark.parametrize(
@@ -444,15 +514,20 @@ def test_replay_boundary_and_tail_survive_sibling_reuse(
     retention: int | None,
     pin: bool,
     seed_live: bool | None,
+    reuse_stops: bool,
 ) -> None:
-    """Both state@4352 and state@4992 remain reusable, including warm CoW.
+    """The tail state@4992 stays reusable, including after a warm CoW start.
 
-    The final checkpoint column aliases the block-aligned state@4352 here.
-    Keeping that shared state intentionally costs a separate tail-boundary
-    step rather than overwriting it with the internal tail export.
+    By default P runs to its end in one chunk: cold, its export column is
+    above any initial state; warm, it reuses its private CoW copy of seed's
+    state@4000. State@4352 is then never materialized, so S (sharing 4400)
+    falls back to a shorter hit. With reuse stops P also keeps state@4352;
+    its final checkpoint column then aliases that block-aligned state, so
+    keeping it costs a separate tail-boundary step.
     """
     monkeypatch.setenv(PIN, str(int(pin)))
     monkeypatch.setenv(DROP_SUPERSEDED, str(int(pin)))
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
     manager = _make_manager(num_spec=0, eagle_drop=False, retention_interval=retention)
     rng = random.Random(9)
     p_ids = _tokens(rng, 5000)
@@ -470,6 +545,9 @@ def test_replay_boundary_and_tail_survive_sibling_reuse(
         arrival_step=arrival,
     )
     if seed_live is not None:
+        assert trace.chunk_ends["seed"] == (
+            [BLOCK, 4000, 4002] if reuse_stops else [4002]
+        )
         assert trace.hits["P"][0] == 4000
         # Preserving P's initial state must not mutate seed's shared checkpoint.
         for block_id, _ in trace.hits["P"][1]:
@@ -480,7 +558,12 @@ def test_replay_boundary_and_tail_survive_sibling_reuse(
                 4000,
                 trace.requests["P"],
             )
-    assert trace.hits["S"][0] == 2 * BLOCK
+    if reuse_stops:
+        assert trace.chunk_ends["P"] == [2 * BLOCK, 4992, 5000]
+        assert trace.hits["S"][0] == 2 * BLOCK
+    else:
+        assert trace.chunk_ends["P"] == [5000]
+        assert trace.hits["S"][0] == (0 if seed_live is None else 4000)
     assert trace.hits["T"][0] == 4992
     if pin:
         for mgr in _mamba_managers(manager):
@@ -490,10 +573,15 @@ def test_replay_boundary_and_tail_survive_sibling_reuse(
     _check_cached_states_and_free(manager, trace)
 
 
-def test_eagle_keeps_replay_boundary_and_internal_tail_export(
-    manager: KVCacheManager,
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
+def test_eagle_internal_tail_export_and_opt_in_replay_boundary(
+    manager: KVCacheManager, monkeypatch: pytest.MonkeyPatch, reuse_stops: bool
 ) -> None:
-    """Eagle's dropped full block and hash unit remain distinct checkpoints."""
+    """Eagle's dropped full block and hash unit are distinct checkpoints.
+
+    The tail export is always reusable; the replay state only with reuse stops.
+    """
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
     rng = random.Random(10)
     p_ids = _tokens(rng, 8000)
     trace = _run(
@@ -506,20 +594,44 @@ def test_eagle_keeps_replay_boundary_and_internal_tail_export(
         free_done=set(),
         arrival_step={"S": 4, "T": 8},
     )
-    assert trace.hits["S"][0] == 2 * BLOCK
+    if reuse_stops:
+        assert trace.chunk_ends["P"] == [2 * BLOCK, 8000]
+        assert trace.hits["S"][0] == 2 * BLOCK
+    else:
+        assert trace.chunk_ends["P"] == [8000]
+        assert trace.hits["S"][0] == 0
     # 8000 is hash-aligned: recompute its last token, then drop Eagle's unit.
     assert trace.hits["T"][0] == 7936
-    assert trace.chunk_ends["P"] == [2 * BLOCK, 8000]
     _check_cached_states_and_free(manager, trace)
 
 
-@pytest.mark.parametrize("eagle_drop", [False, True])
-@pytest.mark.parametrize("delta", [-1, 0, 1])
-def test_block_aligned_prompt_keeps_resend_and_extension_states(
-    monkeypatch: pytest.MonkeyPatch, eagle_drop: bool, delta: int
+@pytest.mark.parametrize("reuse_stops", [False, True], ids=["one_chunk", "reuse_stops"])
+@pytest.mark.parametrize(
+    ("eagle_drop", "delta", "chunk_ends_reuse_stops"),
+    [
+        (False, -1, [BLOCK, 4320, 2 * BLOCK - 1]),
+        (False, 0, [BLOCK, 4320, 2 * BLOCK]),
+        (False, 1, [2 * BLOCK + 1]),
+        (True, -1, [BLOCK, 3 * BLOCK - 1]),
+        (True, 0, [BLOCK, 2 * BLOCK, 6464, 3 * BLOCK]),
+        (True, 1, [2 * BLOCK, 3 * BLOCK + 1]),
+    ],
+)
+def test_block_aligned_prompt_resend_and_extension_states(
+    monkeypatch: pytest.MonkeyPatch,
+    eagle_drop: bool,
+    delta: int,
+    chunk_ends_reuse_stops: list[int],
+    reuse_stops: bool,
 ) -> None:
+    """The tail export is always cached with the state its hash claims.
+
+    Reuse stops also keep the resend (replay) and extension states; by
+    default one chunk materializes and hashes neither.
+    """
     monkeypatch.setenv(PIN, "1")
     monkeypatch.setenv(DROP_SUPERSEDED, "1")
+    monkeypatch.setenv(REUSE_STOPS, str(int(reuse_stops)))
     manager = _make_manager(
         num_spec=NUM_SPEC if eagle_drop else 0,
         eagle_drop=eagle_drop,
@@ -537,10 +649,16 @@ def test_block_aligned_prompt_keeps_resend_and_extension_states(
     if eagle_drop and delta == 0:
         # The extension drops from the exact prompt end, unlike the resend.
         positions.add(prompt_len - BLOCK)
+    assert trace.chunk_ends["P"] == (
+        chunk_ends_reuse_stops if reuse_stops else [prompt_len]
+    )
     for position in positions:
         blocks = manager.block_pool.get_cached_block(
             request.block_hashes[position // HASH - 1], _mamba_gids(manager)
         )
+        if not reuse_stops and position != tail:
+            assert blocks is None, f"unmaterialized checkpoint at {position}"
+            continue
         assert blocks is not None, f"missing reusable checkpoint at {position}"
         for block in blocks:
             _assert_holds_state(

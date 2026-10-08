@@ -134,6 +134,7 @@ def _split(
     max_num_scheduled_tokens: int = 16384,
     checkpoint_alignment: int | None = 16,
     reuse_initial_block: bool = False,
+    reuse_stops: bool = False,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -154,34 +155,41 @@ def _split(
         ),
         mamba_prefill_checkpoint_reuses_initial_block=reuse_initial_block,
         mamba_prefill_checkpoint_copies_initial_block=False,
+        mamba_prefill_checkpoint_reuse_stops=reuse_stops,
     )
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
+    ("prompt_len", "num_new_tokens", "use_eagle", "expected", "expected_reuse_stops"),
     [
-        (2002, 2002, False, MAMBA_BLOCK_SIZE),
-        (3602, 2000, False, MAMBA_BLOCK_SIZE),
-        (3602, 3602, True, MAMBA_BLOCK_SIZE),
-        (2002, 2002, True, 2002),
-        (3602, 512, True, 0),
-        (3602, 1700, True, MAMBA_BLOCK_SIZE),
+        # A valid internal export finishes the prompt in one chunk by default;
+        # opt-in reuse stops end the first chunk at the replay boundary.
+        (2002, 2002, False, 2002, MAMBA_BLOCK_SIZE),
+        (3602, 2000, False, MAMBA_BLOCK_SIZE, MAMBA_BLOCK_SIZE),
+        (3602, 3602, True, 3602, MAMBA_BLOCK_SIZE),
+        (2002, 2002, True, 2002, 2002),
+        (3602, 512, True, 0, 0),
+        (3602, 1700, True, MAMBA_BLOCK_SIZE, MAMBA_BLOCK_SIZE),
     ],
 )
+@pytest.mark.parametrize("reuse_stops", [False, True])
 def test_internal_checkpoint_split(
-    prompt_len: int, num_new_tokens: int, use_eagle: bool, expected: int
+    prompt_len: int,
+    num_new_tokens: int,
+    use_eagle: bool,
+    expected: int,
+    expected_reuse_stops: int,
+    reuse_stops: bool,
 ) -> None:
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    assert (
-        _split(
-            request,
-            num_new_tokens,
-            use_eagle=use_eagle,
-            num_prefill_checkpoint_blocks=1,
-        )
-        == expected
-    )
+    assert _split(
+        request,
+        num_new_tokens,
+        use_eagle=use_eagle,
+        num_prefill_checkpoint_blocks=1,
+        reuse_stops=reuse_stops,
+    ) == (expected_reuse_stops if reuse_stops else expected)
 
 
 @pytest.mark.parametrize("use_eagle", [False, True])
@@ -254,39 +262,47 @@ def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
         == MAMBA_BLOCK_SIZE - resume_at % MAMBA_BLOCK_SIZE
     )
 
-    # GDN can export the tail in a private initial block, but that must not
-    # replace the reusable full-block state at the warm replay boundary.
-    assert (
-        _split(
-            request,
-            prompt_len - resume_at,
-            use_eagle=False,
-            partial_hit=True,
-            num_prefill_checkpoint_blocks=1,
-            checkpoint_alignment=1,
-            reuse_initial_block=True,
+    # GDN can export the tail in a private initial block, so by default one
+    # forward runs to the end. Opt-in reuse stops first materialize the
+    # full-block state at the warm replay boundary.
+    for reuse_stops, expected in (
+        (False, prompt_len - resume_at),
+        (True, 2 * MAMBA_BLOCK_SIZE - resume_at),
+    ):
+        assert (
+            _split(
+                request,
+                prompt_len - resume_at,
+                use_eagle=False,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=1,
+                checkpoint_alignment=1,
+                reuse_initial_block=True,
+                reuse_stops=reuse_stops,
+            )
+            == expected
         )
-        == 2 * MAMBA_BLOCK_SIZE - resume_at
-    )
     # A block-aligned resume whose checkpoint column is the initial-state one
-    # holds the (shared) boundary state there, so it keeps stopping at the
-    # prompt's partial-tail boundary.
+    # holds the (shared) boundary state there, so in either mode it keeps
+    # stopping at the prompt's partial-tail boundary.
     short_len = 3000
     (short,) = create_requests(1, num_tokens=short_len, block_size=ATTN_BLOCK_SIZE)
     short.num_computed_tokens = MAMBA_BLOCK_SIZE
     tail = short_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
-    assert (
-        _split(
-            short,
-            short_len - MAMBA_BLOCK_SIZE,
-            use_eagle=False,
-            partial_hit=True,
-            num_prefill_checkpoint_blocks=1,
-            checkpoint_alignment=1,
-            reuse_initial_block=True,
+    for reuse_stops in (False, True):
+        assert (
+            _split(
+                short,
+                short_len - MAMBA_BLOCK_SIZE,
+                use_eagle=False,
+                partial_hit=True,
+                num_prefill_checkpoint_blocks=1,
+                checkpoint_alignment=1,
+                reuse_initial_block=True,
+                reuse_stops=reuse_stops,
+            )
+            == tail - MAMBA_BLOCK_SIZE
         )
-        == tail - MAMBA_BLOCK_SIZE
-    )
 
 
 def test_disabling_eagle_block_drop_keeps_the_trailing_cache_boundary() -> None:
