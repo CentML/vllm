@@ -58,7 +58,6 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.gdn_fused_conv_prep import (
-    FUSED_CONV_MAX_SEQS,
     FUSED_CONV_TILE_LONG,
     FUSED_CONV_TILE_SHORT,
     GDN_CONV_CUDA,
@@ -496,7 +495,7 @@ def _fused_conv_prep_applies(layer, attn_metadata: GDNAttentionMetadata) -> bool
     """Whether ``layer._forward_core`` runs the prefill rows' conv1d and
     post-conv prep in one gdn_fused_conv_prep launch (the same condition as
     its ``fused_conv_prep``: prefill rows without peeled-off non-spec decodes,
-    FlashInfer exp(g), no conv bias, few sequences).
+    FlashInfer exp(g), no conv bias, any sequence count).
     """
     non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
     return (
@@ -508,7 +507,6 @@ def _fused_conv_prep_applies(layer, attn_metadata: GDNAttentionMetadata) -> bool
         and layer.chunk_gated_delta_rule.expects_exp_g
         and layer.conv1d.bias is None
         and non_spec_query_start_loc is not None
-        and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
     )
 
 
@@ -903,7 +901,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
         # Decode-size BA GEMM: one kernel instead of cuBLAS split-K + reduce
-        # (SM107 only; no-op elsewhere).
+        # (SM107; SM100/SM103 with VLLM_LOWM_BF16_GEMM_SM100=1; no-op elsewhere).
         ba_lowm = maybe_use_lowm_bf16_gemm(self.in_proj_ba)
         # in_proj_ba only reads the layer input, so it runs on the aux stream
         # concurrently with the in_proj_qkvz GEMM (which leaves SMs idle at
@@ -1861,33 +1859,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             T = min(FLA_CHUNK_SIZE, qkv_or_qkvz.shape[0])
             conv_dim = qkv_or_qkvz.shape[-1] - v_dim
             conv_state = torch.zeros(
-                2, *self.get_state_shape()[0], device=device, dtype=dtype
+                66, *self.get_state_shape()[0], device=device, dtype=dtype
             )
             if not is_conv_state_dim_first():
                 conv_state = conv_state.transpose(-1, -2)
             ba = torch.zeros(T, 2 * num_v_heads, device=device, dtype=dtype)
             if GDN_CONV_CUDA and current_platform.is_device_capability_family(100):
                 enable_cuda_kernel()
-            # tile=None: the CUDA kernel once enabled.
-            for tile in (FUSED_CONV_TILE_SHORT, FUSED_CONV_TILE_LONG, None):
-                gdn_fused_conv_prep(
-                    x=qkv_or_qkvz[:T, :conv_dim],
-                    conv_weights=self.conv1d.weight.view(
-                        self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-                    ),
-                    conv_state=conv_state,
-                    cache_indices=torch.ones(1, device=device, dtype=torch.int32),
-                    has_initial_state=torch.ones(1, device=device, dtype=torch.bool),
-                    cu_seqlens=torch.tensor([0, T], device=device, dtype=torch.int32),
-                    a=ba[:, num_v_heads:],
-                    b=ba[:, :num_v_heads],
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    num_k_heads=num_k_heads,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    tile=tile,
+            # Warm both metadata paths with one real sequence and empty tails.
+            # tile=None also warms the CUDA kernel once enabled.
+            for num_seqs in (1, 65):
+                cache_indices = torch.arange(
+                    1, num_seqs + 1, device=device, dtype=torch.int32
                 )
+                initial_state = torch.ones(num_seqs, device=device, dtype=torch.bool)
+                cu_seqlens = torch.tensor(
+                    [0] + [T] * num_seqs, device=device, dtype=torch.int32
+                )
+                for tile in (FUSED_CONV_TILE_SHORT, FUSED_CONV_TILE_LONG, None):
+                    gdn_fused_conv_prep(
+                        x=qkv_or_qkvz[:T, :conv_dim],
+                        conv_weights=self.conv1d.weight.view(
+                            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+                        ),
+                        conv_state=conv_state,
+                        cache_indices=cache_indices,
+                        has_initial_state=initial_state,
+                        cu_seqlens=cu_seqlens,
+                        a=ba[:, num_v_heads:],
+                        b=ba[:, :num_v_heads],
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        num_k_heads=num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        tile=tile,
+                    )
             del conv_state, ba
 
         torch.accelerator.empty_cache()
@@ -2272,7 +2279,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.chunk_gated_delta_rule.expects_exp_g
             and self.conv1d.bias is None
             and non_spec_query_start_loc is not None
-            and non_spec_query_start_loc.shape[0] - 1 <= FUSED_CONV_MAX_SEQS
         )
         if (
             attn_metadata.num_prefills > 0

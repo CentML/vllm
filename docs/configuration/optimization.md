@@ -481,7 +481,31 @@ backend when a shape, layout, sampling mode, or platform is unsupported.
 
 | Control | Default | Behavior |
 | --- | --- | --- |
+| `VLLM_LOWM_BF16_GEMM` | `1` | TinyGEMM for eligible small BF16 projections and measured larger-M plans on SM107. SM100 and SM103 additionally require `VLLM_LOWM_BF16_GEMM_SM100=1`. |
+| `VLLM_LOWM_BF16_GEMM_PDL` | `0` | Programmatic dependent launch for TinyGEMM. Availability is checked and warmed before capture. |
+| `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
+| `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
 | `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
+| `VLLM_KV_COW_ONE_LAUNCH` | `1` | Copies eligible disjoint cache rows across storages in one launch. |
+| `VLLM_FUSED_KV_BLOCK_COPY` | `1` | Direct per-storage fallback when the one-launch plan is unavailable. Set both copy controls to `0` for gather/scatter. |
+
+### GEMM and Copy Boundaries
+
+Generic TinyGEMM covers `1 <= M <= 64`, positive `N % 16 == 0`, and
+`K % 64 == 0`, including TP-sharded `N=32`, on SM107 by default and on SM100
+and SM103 with `VLLM_LOWM_BF16_GEMM_SM100=1`. SM107 retains its larger measured
+windows for the router, GDN BA projection, and shared-expert gate. Inputs,
+weights, and destinations must satisfy the backend's dtype, device, contiguity,
+and alignment requirements. Unsupported cases retain the baseline without a
+hidden layout-copy conversion. TinyGEMM and row-dot accumulation can differ in
+the last BF16 bit from the baseline GEMM.
+
+The one-launch CoW plan requires its existing 16-byte alignment proof. The
+per-storage fallback accepts safe dense 4-byte-aligned rows, including mixed-page
+layer-outer regions. Both direct paths require unique destinations disjoint from
+sources; overlapping physical rows and subword layouts retain gather/scatter.
+The index upload is shared across storages, and warmup covers the direct kernel's
+alignment specializations.
 
 ### Rubin FlashInfer Source Compatibility
 
@@ -498,10 +522,17 @@ parent compatibility is not a new native-SM107 weight-prefetch implementation.
 Use a built development environment and the normal test dependencies:
 
 ```bash
-python -m pytest -q tests/test_envs.py
+python -m pytest -q tests/test_envs.py \
+  tests/kernels/test_lowm_bf16_gemm_optin.py
+
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/kernels/test_lowm_bf16_gemm.py \
+  tests/kernels/mamba/test_gdn_fused_conv_prep.py \
+  tests/v1/worker/test_kv_cow_copy.py
 ```
 
-Overlay compatibility tests in
+Native SM100/SM103/SM107 cases skip on other GPUs. Overlay compatibility tests in
 `tests/tools/test_lcd_pdl_overlay.py` accept the real pinned source fixtures via
 `VLLM_TEST_FLASHINFER_SOURCES` and the Rubin CuTe DSL dependencies; the fixtures
-are checked against the installer's source hashes.
+are checked against the installer's source hashes. Numerical/kernel checks do not
+replace a full MLPerf accuracy and throughput run on the target hardware.

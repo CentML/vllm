@@ -273,6 +273,7 @@ if TYPE_CHECKING:
         | None
     ) = None
     VLLM_KV_COW_ONE_LAUNCH: bool = True
+    VLLM_FUSED_KV_BLOCK_COPY: bool = True
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
@@ -331,6 +332,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
     VLLM_MOE_PDL_FC: bool = False
     VLLM_LOWM_BF16_GEMM: bool = True
+    VLLM_LOWM_BF16_GEMM_PDL: bool = False
+    VLLM_LOWM_BF16_GEMM_SM100: bool = False
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
@@ -1973,6 +1976,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KV_COW_ONE_LAUNCH": lambda: bool(
         int(os.getenv("VLLM_KV_COW_ONE_LAUNCH", "1"))
     ),
+    # Direct per-storage row copies when the one-launch plan is unavailable.
+    # Set both copy flags to 0 to use the gather/scatter baseline.
+    "VLLM_FUSED_KV_BLOCK_COPY": lambda: bool(
+        int(os.getenv("VLLM_FUSED_KV_BLOCK_COPY", "1"))
+    ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
     # - DS: (dim, state_len) — TP-sharded dim on dim1,
@@ -2251,10 +2259,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE": lambda: os.getenv(
         "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE", ""
     ),
-    # SM107 only: run the small unquantized BF16 decode projections (MoE router,
-    # GDN in_proj_ba, shared_expert_gate) through single-kernel low-M GEMMs.
+    # Small unquantized BF16 projections use TinyGEMM on SM107, and on
+    # SM100/SM103 with VLLM_LOWM_BF16_GEMM_SM100=1. SM107 also has measured
+    # larger-M plans and a shared-gate rowdot kernel.
     # Set to 0 to keep the default unquantized GEMM.
     "VLLM_LOWM_BF16_GEMM": lambda: bool(int(os.getenv("VLLM_LOWM_BF16_GEMM", "1"))),
+    # Opt-in programmatic dependent launch for the TinyGEMM backend.
+    "VLLM_LOWM_BF16_GEMM_PDL": lambda: bool(
+        int(os.getenv("VLLM_LOWM_BF16_GEMM_PDL", "0"))
+    ),
+    # Opt SM100/SM103 into TinyGEMM for the same small BF16 projections.
+    # Requires VLLM_LOWM_BF16_GEMM=1. Changes the traced op, so it is hashed.
+    "VLLM_LOWM_BF16_GEMM_SM100": lambda: bool(
+        int(os.getenv("VLLM_LOWM_BF16_GEMM_SM100", "0"))
+    ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
@@ -2551,8 +2569,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
         "VLLM_FLASHINFER_MXFP8_K64_MIN_M",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        # Launch choice inside the low-M GEMM custom op.
+        "VLLM_LOWM_BF16_GEMM_PDL",
         # Worker-side KV block copy path; not part of traced graphs.
         "VLLM_KV_COW_ONE_LAUNCH",
+        "VLLM_FUSED_KV_BLOCK_COPY",
         # Variants of the custom-op GDN prefill kernel; not part of traced graphs.
         "VLLM_GDN_VSPLIT_CG0SPLIT",
         "VLLM_GDN_VSPLIT_C1REORDER",

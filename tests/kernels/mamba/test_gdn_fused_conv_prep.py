@@ -44,23 +44,39 @@ def kernel(request, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "seqlens",
+    "seqlens, metadata_offset",
     [
-        [3000],
-        [5, 2, 1, 700, 64, 3],  # sequences shorter than the conv window
-        [1] * 40 + [3000],  # decode rows folded into the prefill block
-        [33] * 64,  # the most sequences one launch takes
+        ([3000], 0),
+        ([5, 2, 1, 700, 64, 3], 0),  # shorter than the conv window
+        ([1] * 40 + [3000], 0),  # decode rows folded into the prefill block
+        ([33] * 64, 0),  # single metadata tile
+        ([33] * 65, 0),  # a second tile with one valid metadata lane
+        ([129] * 65, 0),  # large-batch scan with the long token tile
+        ([33] * 128, 0),  # two complete metadata tiles
+        ([1, 2, 3, 15, 16, 17, 33] * 36 + [1, 2, 3, 16, 700], 0),
+        ([1] * 5 + [2, 3, 33] * 20, 5),  # mixed decode/prefill, spec prefix
+        ([1] * 8 + [2, 3, 33] * 40, 5),
+        ([1] * 5 + [2, 3, 33] * 84, 5),  # 257 sequences, partial fifth tile
+        ([5] + [0] * 64, 0),  # large-batch warmup with empty metadata tails
+        ([0] * 64 + [2, 3] + [0] * 62 + [33], 5),  # empty scan tile/holes
     ],
 )
 @pytest.mark.parametrize("dim_first", [False, True])
 @pytest.mark.parametrize("index_stride", [1, 7])  # block_table[:, 0] is strided
-def test_fused_conv_prep_bitwise(seqlens, dim_first, index_stride, kernel):
+def test_fused_conv_prep_bitwise(
+    seqlens, metadata_offset, dim_first, index_stride, kernel
+):
     torch.manual_seed(len(seqlens))
     n, total = len(seqlens), sum(seqlens)
     # x: q/k/v columns of the [T, DIM + HV * V] in_proj output; a/b: columns
     # of ba.
-    x = torch.randn(total, DIM + HV * V, device="cuda").to(torch.bfloat16)[:, :DIM]
-    ba = torch.randn(total, 2 * HV, device="cuda").to(torch.bfloat16)
+    # Offset views model non-spec rows after a peeled-off speculative prefix.
+    x = torch.randn(total + 2 * metadata_offset, DIM + HV * V, device="cuda").to(
+        torch.bfloat16
+    )[metadata_offset : metadata_offset + total, :DIM]
+    ba = torch.randn(total + 2 * metadata_offset, 2 * HV, device="cuda").to(
+        torch.bfloat16
+    )[metadata_offset : metadata_offset + total]
     b, a = ba[:, :HV], ba[:, HV:]
     w = (0.5 * torch.randn(DIM, WIDTH, device="cuda")).to(torch.bfloat16)
     slots = 2 * n + 1
@@ -72,13 +88,21 @@ def test_fused_conv_prep_bitwise(seqlens, dim_first, index_stride, kernel):
     def conv_state(p):
         return p if dim_first else p.transpose(-1, -2)
 
-    cu = torch.tensor(
+    # Exact-size allocations without padding exercise masked tail reads; the
+    # offset cases poison metadata outside the view to catch unmasked reads.
+    cu_storage = torch.full((n + 1 + 2 * metadata_offset,), -1000000, dtype=torch.int32)
+    cu_storage[metadata_offset : metadata_offset + n + 1] = torch.tensor(
         [0] + torch.tensor(seqlens).cumsum(0).tolist(), dtype=torch.int32
-    ).cuda()
-    table = torch.zeros(n, index_stride, dtype=torch.int32)
-    table[:, 0] = torch.randperm(slots - 1)[:n] + 1
-    cache_indices = table.cuda()[:, 0]
-    has_init = (torch.rand(n) < 0.5).cuda()
+    )
+    cu = cu_storage.cuda()[metadata_offset : metadata_offset + n + 1]
+    table = torch.full(
+        (n + 2 * metadata_offset, index_stride), -1000000, dtype=torch.int32
+    )
+    table[metadata_offset : metadata_offset + n, 0] = torch.randperm(slots - 1)[:n] + 1
+    cache_indices = table.cuda()[metadata_offset : metadata_offset + n, 0]
+    init_storage = torch.ones_like(table, dtype=torch.bool)
+    init_storage[metadata_offset : metadata_offset + n, 0] = torch.arange(n) % 3 != 0
+    has_init = init_storage.cuda()[metadata_offset : metadata_offset + n, 0]
     A_log = torch.randn(HV, device="cuda")
     dt_bias = torch.randn(HV, device="cuda")
     nums_dict, batch_ptr, offsets = compute_causal_conv1d_metadata(
@@ -93,7 +117,7 @@ def test_fused_conv_prep_bitwise(seqlens, dim_first, index_stride, kernel):
         conv_states=conv_state(pool_ref),
         query_start_loc=cu,
         cache_indices=cache_indices,
-        has_initial_state=has_init,
+        has_initial_state=has_init.contiguous(),
         activation="silu",
         metadata=types.SimpleNamespace(
             nums_dict=nums_dict, batch_ptr=batch_ptr, token_chunk_offset_ptr=offsets

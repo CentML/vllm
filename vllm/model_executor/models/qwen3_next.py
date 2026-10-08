@@ -206,7 +206,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
         # Decode-size router / shared-expert-gate GEMMs: one kernel instead of
-        # cuBLAS split-K + reduce (SM107 only; no-op elsewhere).
+        # cuBLAS split-K + reduce (SM107; SM100/SM103 with
+        # VLLM_LOWM_BF16_GEMM_SM100=1; no-op elsewhere).
         maybe_use_lowm_bf16_gemm(self.gate)
         maybe_use_lowm_bf16_gemm(self.shared_expert_gate)
 

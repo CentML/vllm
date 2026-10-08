@@ -720,24 +720,107 @@ def _copy_kv_cache_block_rows_kernel(
             tl.store(dst_row + offs, vals, mask=mask)
 
 
-def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
-    """Compile the copy-on-write kernel before serving (first use would
-    otherwise JIT inside a step).
+@triton.jit(do_not_specialize=["num_pairs"])
+def _copy_kv_cache_block_rows_per_storage_kernel(
+    base_ptr,
+    idx_ptr,  # contiguous int64 [2, num_pairs]: src blocks, then dst blocks
+    num_pairs,
+    row_elems,
+    row_stride,
+    BLOCK: tl.constexpr,
+    ITERS: tl.constexpr,
+):
+    pair = tl.program_id(0)
+    chunk = tl.program_id(1)
+    src = tl.load(idx_ptr + pair).to(tl.int64)
+    dst = tl.load(idx_ptr + num_pairs + pair).to(tl.int64)
+    src_row = base_ptr + src * row_stride
+    dst_row = base_ptr + dst * row_stride
+    start = chunk.to(tl.int64) * (BLOCK * ITERS)
+    for i in tl.static_range(ITERS):
+        offs = start + i * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < row_elems
+        vals = tl.load(src_row + offs, mask=mask)
+        tl.store(dst_row + offs, vals, mask=mask)
+
+
+def _fused_copy_kv_cache_block_rows(
+    blocks: torch.Tensor, indices: torch.Tensor
+) -> bool:
+    """Copy dense, disjoint block rows without a gather temporary.
+
+    Unlike the one-launch plan, each row only needs int32 alignment. The caller
+    must ensure unique destinations disjoint from the sources; different views
+    are copied sequentially, so they need not commute with one another.
     """
-    if device.type != "cuda" or not envs.VLLM_KV_COW_ONE_LAUNCH:
-        return
-    buf = torch.zeros(8, dtype=torch.int32, device=device)
-    table = torch.tensor([[0, 1, 1]], dtype=torch.int64, device=device)
-    indices = torch.tensor([0, 1], dtype=torch.int64, device=device)
-    _copy_kv_cache_block_rows_kernel[(1, 1, 1)](
-        buf,
-        table,
+    if not blocks.is_cuda:
+        return False
+    try:
+        # A reshape/flatten may silently copy and discard the destination writes.
+        rows = blocks.view(blocks.shape[0], -1)
+    except RuntimeError:
+        return False
+    row_bytes = rows.shape[1] * rows.element_size()
+    stride_bytes = rows.stride(0) * rows.element_size()
+    if (
+        rows.stride(1) != 1
+        or row_bytes == 0
+        or row_bytes > stride_bytes
+        or (rows.data_ptr() | row_bytes | stride_bytes) % 4
+    ):
+        return False
+    storage = rows.untyped_storage()
+    offset = rows.storage_offset() * rows.element_size() // 4
+    base = torch.empty(0, dtype=torch.int32, device=rows.device)
+    base.set_(storage, offset, (storage.nbytes() // 4 - offset,))
+    row_elems = row_bytes // 4
+    num_pairs = indices.numel() // 2
+    _copy_kv_cache_block_rows_per_storage_kernel[
+        (num_pairs, triton.cdiv(row_elems, _COW_COPY_BLOCK * _COW_COPY_ITERS))
+    ](
+        base,
         indices,
-        1,
+        num_pairs,
+        row_elems,
+        stride_bytes // 4,
         BLOCK=_COW_COPY_BLOCK,
         ITERS=_COW_COPY_ITERS,
         num_warps=4,
     )
+    return True
+
+
+def warmup_copy_kv_cache_block_rows(device: torch.device) -> None:
+    """Compile the direct copy kernels before serving."""
+    if device.type != "cuda" or not (
+        envs.VLLM_KV_COW_ONE_LAUNCH or envs.VLLM_FUSED_KV_BLOCK_COPY
+    ):
+        return
+    buf = torch.zeros(64, dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    if envs.VLLM_KV_COW_ONE_LAUNCH:
+        table = torch.tensor([[0, 1, 1]], dtype=torch.int64, device=device)
+        _copy_kv_cache_block_rows_kernel[(1, 1, 1)](
+            buf,
+            table,
+            indices,
+            1,
+            BLOCK=_COW_COPY_BLOCK,
+            ITERS=_COW_COPY_ITERS,
+            num_warps=4,
+        )
+    if envs.VLLM_FUSED_KV_BLOCK_COPY:
+        # Triton specializes each row integer's divisibility by 16, and the
+        # base pointer's alignment. Cover all four integer combinations at an
+        # aligned base and at a 4-byte offset without allocating real KV pages.
+        # Single-word rows additionally specialize the integer value 1.
+        warm_rows = ((4, 4), (4, 16), (16, 20), (16, 16), (1, 1), (1, 4), (1, 16))
+        for offset in (0, 1):
+            for row_elems, row_stride in warm_rows:
+                blocks = buf.as_strided(
+                    (2, row_elems), (row_stride, 1), storage_offset=offset
+                )
+                _fused_copy_kv_cache_block_rows(blocks, indices)
 
 
 # Row layout -> (device table, num entries, max row len16), or None when the
@@ -846,11 +929,11 @@ def copy_kv_cache_blocks_inplace(
     plan = None
     # Direct row copies equal gather-then-scatter only when destinations are
     # unique and no block is both a source and a destination.
-    if (
-        envs.VLLM_KV_COW_ONE_LAUNCH
-        and len(np.unique(dst_np)) == len(dst_np)
+    direct_copy_safe = (
+        len(np.unique(dst_np)) == len(dst_np)
         and not np.intersect1d(src_np, dst_np).size
-    ):
+    )
+    if envs.VLLM_KV_COW_ONE_LAUNCH and direct_copy_safe:
         layout = _cow_copy_rows(kv_caches, num_blocks)
         if layout is not None:
             device, anchor_storage, rows = layout
@@ -861,7 +944,9 @@ def copy_kv_cache_blocks_inplace(
                 )
             plan = _cow_copy_plans[key]
     if plan is None:
-        _copy_kv_cache_blocks_inplace_per_storage(kv_caches, num_blocks, indices_np)
+        _copy_kv_cache_blocks_inplace_per_storage(
+            kv_caches, num_blocks, indices_np, direct_copy_safe=direct_copy_safe
+        )
         return
     table, num_entries, max_len16 = plan
     anchor = torch.empty(0, dtype=torch.int32, device=device)
@@ -918,7 +1003,21 @@ def _copy_kv_cache_blocks_inplace_per_storage(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
     indices_np: np.ndarray,
+    *,
+    direct_copy_safe: bool | None = None,
 ) -> None:
+    if not len(indices_np):
+        return
+    if direct_copy_safe is None:
+        src_np, dst_np = indices_np[:, 0], indices_np[:, 1]
+        direct_copy_safe = (
+            len(np.unique(dst_np)) == len(dst_np)
+            and not np.intersect1d(src_np, dst_np).size
+        )
+    fused_ok = envs.VLLM_FUSED_KV_BLOCK_COPY and direct_copy_safe
+    # Both index rows are contiguous after one shared H2D upload. In particular,
+    # the direct path needs no per-storage src/dst .contiguous() launches.
+    indices_host = indices_np.T.copy()
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -931,9 +1030,9 @@ def _copy_kv_cache_blocks_inplace_per_storage(
         seen.add(key)
 
         if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
+            indices = async_tensor_h2d(indices_host, device=cache.device)
+            src, dst = indices.unbind(dim=0)
         assert cache.device == indices.device
-        src, dst = indices.unbind(dim=1)
 
         kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
         assert remainder == 0, (
@@ -956,7 +1055,8 @@ def _copy_kv_cache_blocks_inplace_per_storage(
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+        if not (fused_ok and _fused_copy_kv_cache_block_rows(blocks, indices)):
+            blocks[dst] = blocks[src]
 
 
 def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

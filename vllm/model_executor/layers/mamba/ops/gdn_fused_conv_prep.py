@@ -40,8 +40,9 @@ FUSED_CONV_TILE_LONG = (32, 32)
 FUSED_CONV_TILE_SHORT = (16, 16)
 FUSED_CONV_WARPS = 4
 FUSED_CONV_STAGES = 1
-# One compiled variant serves every batch with <= MAX_SEQS sequences.
-FUSED_CONV_MAX_SEQS = 64
+# Metadata scan tile. Batches up to this size keep the single-reduction path;
+# larger batches scan masked tiles without specializing on the sequence count.
+FUSED_CONV_SEQ_TILE = 64
 
 GDN_CONV_CUDA = os.environ.get("VLLM_GDN_CONV_CUDA", "1") == "1"
 _cuda_kernel_ready: list = []
@@ -237,6 +238,7 @@ def _gdn_fused_conv_prep_kernel(
     BT: tl.constexpr,
     ST: tl.constexpr,
     MAXS: tl.constexpr,
+    SCAN_SEQS: tl.constexpr,
     NSTAGES: tl.constexpr,
 ):
     """Grid (sum of per-sequence BT chunks (upper bound), 2 * H + HV).
@@ -249,19 +251,47 @@ def _gdn_fused_conv_prep_kernel(
     pid = tl.program_id(0)
     i_head = tl.program_id(1)
     si = tl.arange(0, MAXS)
-    c0 = tl.load(cu_ptr + si, mask=si < num_seqs, other=0)
-    c1 = tl.load(cu_ptr + si + 1, mask=si < num_seqs, other=0)
-    nb = tl.where(si < num_seqs, tl.cdiv(c1 - c0, BT), 0)
-    ends = tl.cumsum(nb, axis=0)
-    seq = tl.sum((ends <= pid).to(tl.int32), axis=0)
+    if SCAN_SEQS:
+        # Find the tile containing pid before reducing its sequence metadata.
+        # Keep registers/scan width bounded even for very large request batches.
+        seq_base = 0
+        chunk_base = 0
+        seq = num_seqs
+        seq_start = 0
+        seq_end = 0
+        chunk = 0
+        while (seq_base < num_seqs) & (seq == num_seqs):
+            seq_ids = seq_base + si
+            c0 = tl.load(cu_ptr + seq_ids, mask=seq_ids < num_seqs, other=0)
+            c1 = tl.load(cu_ptr + seq_ids + 1, mask=seq_ids < num_seqs, other=0)
+            nb = tl.where(seq_ids < num_seqs, tl.cdiv(c1 - c0, BT), 0)
+            ends = tl.cumsum(nb, axis=0)
+            tile_chunks = tl.sum(nb, axis=0)
+            if pid < chunk_base + tile_chunks:
+                local_pid = pid - chunk_base
+                local_seq = tl.sum((ends <= local_pid).to(tl.int32), axis=0)
+                sel = si == local_seq
+                seq = seq_base + local_seq
+                seq_start = tl.sum(tl.where(sel, c0, 0), axis=0)
+                seq_end = tl.sum(tl.where(sel, c1, 0), axis=0)
+                chunk = local_pid - tl.sum(tl.where(sel, ends - nb, 0), axis=0)
+            chunk_base += tile_chunks
+            seq_base += MAXS
+    else:
+        c0 = tl.load(cu_ptr + si, mask=si < num_seqs, other=0)
+        c1 = tl.load(cu_ptr + si + 1, mask=si < num_seqs, other=0)
+        nb = tl.where(si < num_seqs, tl.cdiv(c1 - c0, BT), 0)
+        ends = tl.cumsum(nb, axis=0)
+        seq = tl.sum((ends <= pid).to(tl.int32), axis=0)
+        sel = si == seq
+        seq_start = tl.sum(tl.where(sel, c0, 0), axis=0)
+        seq_end = tl.sum(tl.where(sel, c1, 0), axis=0)
+        chunk = pid - (
+            tl.sum(tl.where(sel, ends, 0), axis=0)
+            - tl.sum(tl.where(sel, nb, 0), axis=0)
+        )
     if seq >= num_seqs:
         return
-    sel = si == seq
-    seq_start = tl.sum(tl.where(sel, c0, 0), axis=0)
-    seq_end = tl.sum(tl.where(sel, c1, 0), axis=0)
-    chunk = pid - (
-        tl.sum(tl.where(sel, ends, 0), axis=0) - tl.sum(tl.where(sel, nb, 0), axis=0)
-    )
     slot = tl.load(cidx_ptr + seq * stride_cidx).to(tl.int64)
     use_state = tl.load(hinit_ptr + seq * stride_hinit) != 0
     chunk_start = seq_start + chunk * BT
@@ -435,8 +465,8 @@ def gdn_fused_conv_prep(
     x: [P, conv_dim] pre-conv rows (channel stride 1, any row stride).
     conv_weights: [conv_dim, width]. conv_state: [slots, conv_dim, >= width - 1]
     (any strides). cache_indices / has_initial_state: [num_seqs].
-    cu_seqlens: int32 [num_seqs + 1], relative to x row 0, num_seqs <=
-    FUSED_CONV_MAX_SEQS. a, b: [P, HV] (row-strided).
+    cu_seqlens: int32 [num_seqs + 1], relative to x row 0, with no sequence-count
+    limit. a, b: [P, HV] (row-strided).
 
     Returns q, k: [P, H, K]; v: [P, HV, V] (x dtype); exp(g), beta: [P, HV] fp32.
     ``tile`` forces the Triton kernel with that (BT, ST) (the warmup compiles
@@ -448,7 +478,6 @@ def gdn_fused_conv_prep(
     width = conv_weights.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     assert x.stride(1) == 1 and x.shape[1] == 2 * H * K + HV * V
-    assert num_seqs <= FUSED_CONV_MAX_SEQS
     assert cu_seqlens.dtype == torch.int32
     if _cuda_kernel_ready and tile is None:
         out = _cuda_kernel_ready[0](
@@ -515,7 +544,8 @@ def gdn_fused_conv_prep(
         NP2W=triton.next_power_of_2(width - 1),
         BT=BT,
         ST=ST,
-        MAXS=FUSED_CONV_MAX_SEQS,
+        MAXS=FUSED_CONV_SEQ_TILE,
+        SCAN_SEQS=num_seqs > FUSED_CONV_SEQ_TILE,
         NSTAGES=FUSED_CONV_STAGES,
         num_warps=FUSED_CONV_WARPS,
     )

@@ -1,23 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-kernel BF16 GEMMs for the small decode projections on SM107.
+"""Single-kernel BF16 GEMMs for small decode projections.
 
-At decode token counts cuBLASLt runs the unquantized Qwen3.5/3.6 MoE router
-(``M x 2048 -> 256``), ``shared_expert_gate`` (``-> 1``) and GDN ``in_proj_ba``
-(``-> 64``) as a split-K GEMM followed by a separate ``splitKreduce`` (or
-``dot_kernel`` + ``reduce_1Block``) kernel. On VR (SM107, DRAM clock locked)
-one call costs 3.5-4.3 us that way. This module replaces them, per layer, with
-one kernel each:
+FlashInfer's bias-path ``tinygemm_bf16`` (a zero bias selects TinyGEMM2)
+serves contiguous BF16 weights with N % 16 == 0 and K % 64 == 0, at
+1 <= M <= 64. This includes TP-sharded GDN ``in_proj_ba`` with N=32. SM107
+uses it by default and additionally retains its measured router and BA plans
+with larger M windows, and its shared-expert-gate row-dot plan. SM100 and
+SM103 (GB300) use TinyGEMM2 only with ``VLLM_LOWM_BF16_GEMM_SM100=1``.
+Other architectures, layouts, dtypes, and token counts keep ``F.linear``.
 
-* router / ``in_proj_ba`` (N % 16 == 0): FlashInfer ``tinygemm_bf16`` (bias
-  path, which selects the SM100-family ``tinygemm2_sm100`` kernel; the bias is
-  a zero vector), 2.1-3.2 us;
-* ``shared_expert_gate`` (N == 1): a Triton row-dot kernel, 0.9-1.5 us.
+``VLLM_LOWM_BF16_GEMM`` enables layer opt-in (on by default).
+``VLLM_LOWM_BF16_GEMM_SM100`` additionally opts SM100/SM103 in (off by
+default). ``VLLM_LOWM_BF16_GEMM_PDL`` optionally launches TinyGEMM2 with
+programmatic dependent launch (off by default). Construction probes the
+selected launch variant before profiling or graph capture. SM107 row-dot
+retains its separate ``VLLM_ROWDOT_PDL`` control.
 
-Outside the measured M range of a shape the layer falls back to ``F.linear``.
-The M dispatch happens inside a custom op, so one compiled graph serves every
-CUDA-graph capture size. Results differ from cuBLAS in the last bit for some
-elements (different fp32 summation order); accumulation stays fp32.
+M dispatch happens inside a custom op, so one compiled graph serves every
+CUDA-graph capture size. Results can differ from cuBLAS in the last BF16 bit
+due to fp32 summation order; accumulation stays fp32.
 """
 
 from __future__ import annotations
@@ -49,6 +51,65 @@ _SM107_PLANS: dict[tuple[int, int], tuple[int, str]] = {
     (64, 2048): (384, "tinygemm"),  # GDN in_proj_ba
     (1, 2048): (512, "rowdot"),  # shared_expert_gate
 }
+
+
+def _plan(n: int, k: int, device: torch.device) -> tuple[int, str] | None:
+    """Select only the architectures supported by the SM100 TinyGEMM2 kernel.
+
+    SM107 is eligible by default; SM100/SM103 require the
+    ``VLLM_LOWM_BF16_GEMM_SM100`` opt-in.
+    """
+    if device.type != "cuda" or not current_platform.is_cuda():
+        return None
+    device_id = device.index
+    if device_id is None:
+        device_id = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device_id)
+    if capability is None:
+        return None
+    cc = (capability.major, capability.minor)
+    if cc == (10, 7):
+        measured = _SM107_PLANS.get((n, k))
+        if measured is not None:
+            return measured
+    elif cc in ((10, 0), (10, 3)):
+        if not (envs.VLLM_LOWM_BF16_GEMM and envs.VLLM_LOWM_BF16_GEMM_SM100):
+            return None
+    else:
+        return None
+    if n > 0 and k > 0 and n % 16 == 0 and k % 64 == 0:
+        return 64, "tinygemm"
+    return None
+
+
+def _runtime_plan(
+    x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor
+) -> tuple[int, str] | None:
+    # Check layouts before flattening: reshape must not silently copy a
+    # strided input merely to make it eligible for the fast path.
+    if (
+        weight.ndim != 2
+        or x.ndim < 1
+        or x.shape[-1] != weight.shape[1]
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or zero_bias.dtype != torch.bfloat16
+        or x.device != weight.device
+        or zero_bias.device != weight.device
+        or zero_bias.shape != (weight.shape[0],)
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or not zero_bias.is_contiguous()
+        or x.storage_offset() % 8 != 0
+        or weight.storage_offset() % 8 != 0
+        or zero_bias.storage_offset() % 8 != 0
+    ):
+        return None
+    plan = _plan(weight.shape[0], weight.shape[1], weight.device)
+    if plan is None:
+        return None
+    m = x.numel() // weight.shape[1]
+    return plan if 0 < m <= plan[0] else None
 
 
 @triton.jit
@@ -112,18 +173,22 @@ def _tinygemm(
     weight: torch.Tensor,
     zero_bias: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    use_pdl: bool | None = None,
 ) -> torch.Tensor:
     from flashinfer.gemm.routergemm import tinygemm_bf16
 
     if out is None:
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    # Shapes and dtypes are validated when the layer opts in.
-    tinygemm_bf16(x, weight, out, bias=zero_bias, skip_check=True)
+    # Shapes, dtypes, devices, and layouts are validated by the dispatcher.
+    if use_pdl is None:
+        use_pdl = envs.VLLM_LOWM_BF16_GEMM_PDL
+    tinygemm_bf16(x, weight, out, bias=zero_bias, use_pdl=use_pdl, skip_check=True)
     return out
 
 
 @functools.cache
-def _tinygemm_available(device: torch.device) -> bool:
+def _tinygemm_available(device: torch.device, use_pdl: bool) -> bool:
     """Whether FlashInfer's ``tinygemm_bf16`` imports and runs on ``device``.
 
     One tiny call at layer construction also moves its JIT build out of
@@ -133,8 +198,8 @@ def _tinygemm_available(device: torch.device) -> bool:
         x = torch.zeros((1, 64), dtype=torch.bfloat16, device=device)
         w = torch.zeros((16, 64), dtype=torch.bfloat16, device=device)
         zero_bias = torch.zeros(16, dtype=torch.bfloat16, device=device)
-        _tinygemm(x, w, zero_bias)
-        torch.cuda.synchronize(device)
+        _tinygemm(x, w, zero_bias, use_pdl=use_pdl)
+        torch.accelerator.synchronize(device)
     except Exception as e:
         logger.warning_once(
             "FlashInfer tinygemm_bf16 unavailable on %s (%s); low-M BF16 GEMM "
@@ -149,12 +214,12 @@ def _tinygemm_available(device: torch.device) -> bool:
 def lowm_bf16_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor
 ) -> torch.Tensor:
-    n, k = weight.shape
-    x_2d = x.reshape(-1, k)
-    m = x_2d.shape[0]
-    max_m, backend = _SM107_PLANS[(n, k)]
-    if m == 0 or m > max_m or not x_2d.is_contiguous():
+    plan = _runtime_plan(x, weight, zero_bias)
+    if plan is None:
         return F.linear(x, weight)
+    n, k = weight.shape
+    _, backend = plan
+    x_2d = x.view(-1, k)
     if backend == "tinygemm":
         out = _tinygemm(x_2d, weight, zero_bias)
     else:
@@ -196,12 +261,21 @@ def lowm_bf16_gemm_out(
     instead of through the layer's ``quant_method``.
     """
     zero_bias = getattr(layer, "lowm_zero_bias", None)
-    if zero_bias is None or x.dtype != torch.bfloat16 or not x.is_contiguous():
+    if zero_bias is None or x.ndim != 2:
         return False
     weight = layer.weight
-    max_m, backend = _SM107_PLANS[tuple(weight.shape)]
+    plan = _runtime_plan(x, weight, zero_bias)
+    if plan is None:
+        return False
+    _, backend = plan
     m = x.shape[0]
-    if m == 0 or m > max_m:
+    if (
+        out.shape != (m, weight.shape[0])
+        or out.dtype != x.dtype
+        or out.device != x.device
+        or not out.is_contiguous()
+        or out.storage_offset() % 8 != 0
+    ):
         return False
     if backend == "tinygemm":
         _tinygemm(x, weight, zero_bias, out)
@@ -213,16 +287,14 @@ def lowm_bf16_gemm_out(
 def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
     """Route an unquantized bias-free BF16 linear through the low-M kernels.
 
-    Only shapes with a measured plan on SM107 opt in; everything else keeps
-    the default unquantized GEMM. Call after the layer is constructed.
+    TinyGEMM2 covers aligned shapes up to M=64 on SM107, and on SM100/SM103
+    with ``VLLM_LOWM_BF16_GEMM_SM100=1``. SM107 keeps its measured larger-M
+    plans, including shared-gate row-dot.
+    Call after the layer is constructed.
     """
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-    if not (
-        envs.VLLM_LOWM_BF16_GEMM
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((10, 7))
-    ):
+    if not envs.VLLM_LOWM_BF16_GEMM:
         return False
     quant_method = getattr(layer, "quant_method", None)
     weight = getattr(layer, "weight", None)
@@ -232,13 +304,17 @@ def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
         or weight is None
         or weight.dtype != torch.bfloat16
         or weight.dim() != 2
+        or not weight.is_contiguous()
+        or weight.storage_offset() % 8 != 0
     ):
         return False
     n, k = weight.shape
-    plan = _SM107_PLANS.get((n, k))
+    plan = _plan(n, k, weight.device)
     if plan is None:
         return False
-    if plan[1] == "tinygemm" and not _tinygemm_available(weight.device):
+    if plan[1] == "tinygemm" and not _tinygemm_available(
+        weight.device, envs.VLLM_LOWM_BF16_GEMM_PDL
+    ):
         return False
     layer.register_buffer(
         "lowm_zero_bias",

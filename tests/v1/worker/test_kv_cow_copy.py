@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""One-launch copy-on-write block copy vs the per-storage gather/scatter path."""
+"""Bitwise copy-on-write parity across GPU block-copy layouts and boundaries."""
 
 import numpy as np
 import pytest
@@ -13,11 +13,17 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheLayout, MambaSp
 from vllm.v1.worker import utils as worker_utils
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="the one-launch copy is a GPU kernel"
+    not current_platform.is_cuda(), reason="direct block copies are GPU kernels"
 )
 
 NUM_BLOCKS = 24
 NUM_LAYERS = 3
+
+
+@pytest.fixture(autouse=True)
+def _enable_copy_paths(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_COW_ONE_LAUNCH", "1")
+    monkeypatch.setenv("VLLM_FUSED_KV_BLOCK_COPY", "1")
 
 
 def _hybrid_views(
@@ -41,20 +47,50 @@ def _hybrid_views(
     return views
 
 
-def _run(make_caches, copies, expect_fused, attn_dtype=torch.bfloat16):
+def _gather_copy(caches, copies):
+    """Independent gather/scatter oracle, including whole-storage ownership."""
+    src, dst = torch.tensor(copies, dtype=torch.int64, device="cuda").T
+    seen_views, seen_storages = set(), set()
+    for cache in caches:
+        if cache.data_ptr() in seen_views:
+            continue
+        seen_views.add(cache.data_ptr())
+        kernel_blocks_per_block = cache.shape[0] // NUM_BLOCKS
+        storage = cache.untyped_storage()
+        block_stride = cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+        if storage.nbytes() == NUM_BLOCKS * block_stride:
+            if storage.data_ptr() in seen_storages:
+                continue
+            seen_storages.add(storage.data_ptr())
+            blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
+            blocks.set_(storage)
+            blocks = blocks.view(NUM_BLOCKS, -1)
+        else:
+            blocks = cache.unflatten(0, (NUM_BLOCKS, kernel_blocks_per_block))
+        blocks[dst] = blocks[src]
+
+
+def _run(
+    make_caches,
+    copies,
+    attn_dtype=torch.bfloat16,
+    *,
+    raw_bytes=None,
+):
     raw = torch.randint(
-        -128, 127, (_raw_bytes(attn_dtype),), dtype=torch.int8, device="cuda"
+        -128,
+        127,
+        (raw_bytes if raw_bytes is not None else _raw_bytes(attn_dtype),),
+        dtype=torch.int8,
+        device="cuda",
     )
-    ref_raw = raw.clone()
     worker_utils._cow_copy_plans.clear()
+    ref_raw = raw.clone()
     worker_utils.copy_kv_cache_blocks_inplace(make_caches(raw), NUM_BLOCKS, copies)
-    assert any(p is not None for p in worker_utils._cow_copy_plans.values()) == (
-        expect_fused
-    )
-    worker_utils._copy_kv_cache_blocks_inplace_per_storage(
-        make_caches(ref_raw), NUM_BLOCKS, np.array(copies, dtype=np.int64)
-    )
+    _gather_copy(make_caches(ref_raw), copies)
     torch.accelerator.synchronize()
+    # Comparing the entire allocation also checks every untouched block, page
+    # gap, and sentinel byte, not just the destination views.
     assert torch.equal(raw, ref_raw)
     return raw
 
@@ -82,7 +118,7 @@ def test_hybrid_attention_and_state_views(layout, attn_dtype, num_pairs, ssm_dty
     def make(raw):
         return _hybrid_views(raw, layout, attn_dtype, 128, None, ssm_dtype)
 
-    _run(make, _copies(num_pairs, seed=num_pairs), True, attn_dtype)
+    _run(make, _copies(num_pairs, seed=num_pairs), attn_dtype)
 
 
 @pytest.mark.parametrize("layout", [KVCacheLayout.LBHNC, KVCacheLayout.LBNHC])
@@ -90,7 +126,7 @@ def test_block_size_128_split_into_kernel_blocks(layout):
     def make(raw):
         return _hybrid_views(raw, layout, torch.float8_e4m3fn, 128, 64)
 
-    _run(make, _copies(9), True, torch.float8_e4m3fn)
+    _run(make, _copies(9), torch.float8_e4m3fn)
 
 
 def test_raw_storage_entry_with_views():
@@ -101,14 +137,14 @@ def test_raw_storage_entry_with_views():
             raw, KVCacheLayout.BLHNC, torch.float8_e4m3fn, 128, None
         )
 
-    _run(make, _copies(5), True, torch.float8_e4m3fn)
+    _run(make, _copies(5), torch.float8_e4m3fn)
 
 
 def test_head_split_layout_falls_back():
     def make(raw):
         return _hybrid_views(raw, KVCacheLayout.LHBNC, torch.bfloat16, 128, None)
 
-    _run(make, _copies(4), expect_fused=False)
+    _run(make, _copies(4))
 
 
 @pytest.mark.parametrize(
@@ -124,22 +160,28 @@ def test_overlapping_pairs_keep_gather_then_scatter(copies):
     def make(raw):
         return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None)
 
-    _run(make, copies, expect_fused=False)
+    _run(make, copies)
 
 
-def test_disabled_uses_per_storage_path(monkeypatch):
+@pytest.mark.parametrize("fused", [False, True])
+def test_disabled_one_launch_keeps_safe_per_storage_copy(monkeypatch, fused):
     monkeypatch.setenv("VLLM_KV_COW_ONE_LAUNCH", "0")
+    monkeypatch.setenv("VLLM_FUSED_KV_BLOCK_COPY", str(int(fused)))
+    row_bytes = 32
 
     def make(raw):
-        return _hybrid_views(raw, KVCacheLayout.LBHNC, torch.bfloat16, 128, None)
+        return _layer_outer_regions(raw, [row_bytes] * NUM_LAYERS)
 
-    _run(make, _copies(5), expect_fused=False)
-    assert not worker_utils._cow_copy_plans
+    _run(
+        make,
+        _copies(5),
+        raw_bytes=NUM_BLOCKS * NUM_LAYERS * row_bytes + 16,
+    )
 
 
 def test_cached_plan_does_not_keep_kv_cache_alive():
     torch.accelerator.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = torch.accelerator.memory_allocated()
     raw = torch.zeros(_raw_bytes(torch.bfloat16), dtype=torch.int8, device="cuda")
     worker_utils._cow_copy_plans.clear()
     worker_utils.copy_kv_cache_blocks_inplace(
@@ -147,8 +189,108 @@ def test_cached_plan_does_not_keep_kv_cache_alive():
         NUM_BLOCKS,
         _copies(3),
     )
-    assert any(p is not None for p in worker_utils._cow_copy_plans.values())
     torch.accelerator.synchronize()
     del raw
     # Only the small per-layout tables stay allocated.
-    assert torch.cuda.memory_allocated() - before < _raw_bytes(torch.bfloat16)
+    assert torch.accelerator.memory_allocated() - before < _raw_bytes(torch.bfloat16)
+
+
+def _layer_outer_regions(raw, row_bytes, offset=0):
+    views = []
+    for size in row_bytes:
+        end = offset + NUM_BLOCKS * size
+        views.append(raw[offset:end].view(NUM_BLOCKS, size))
+        offset = end
+    return views
+
+
+@pytest.mark.parametrize("row_bytes", [4, 12, 20, 28])
+@pytest.mark.parametrize("offset", [0, 4])
+def test_four_byte_aligned_rows_copy_exactly(row_bytes, offset):
+    def make(raw):
+        return _layer_outer_regions(raw, [row_bytes] * NUM_LAYERS, offset)
+
+    _run(
+        make,
+        _copies(7),
+        raw_bytes=offset + NUM_BLOCKS * NUM_LAYERS * row_bytes + 12,
+    )
+
+
+@pytest.mark.parametrize("row_bytes", [[16, 32, 64], [64, 16, 32]])
+def test_mixed_page_layer_outer_regions_copy_exactly(row_bytes):
+    # Each region is disjoint, but the block strides differ. They need not
+    # satisfy the stricter slot proof used by the one-launch plan.
+    def make(raw):
+        return _layer_outer_regions(raw, row_bytes)
+
+    _run(
+        make,
+        _copies(6),
+        raw_bytes=NUM_BLOCKS * sum(row_bytes) + 16,
+    )
+
+
+@pytest.mark.parametrize(
+    "copies",
+    [
+        [KVCacheBlockCopy(1, 2), KVCacheBlockCopy(2, 3)],
+        [KVCacheBlockCopy(1, 5), KVCacheBlockCopy(1, 5)],
+        [KVCacheBlockCopy(1, 1), KVCacheBlockCopy(2, 3)],
+    ],
+)
+def test_pair_conflicts_preserve_gather_scatter_semantics(copies):
+    def make(raw):
+        return [raw.view(NUM_BLOCKS, 32)]
+
+    _run(
+        make,
+        copies,
+        raw_bytes=NUM_BLOCKS * 32,
+    )
+
+
+def test_overlapping_physical_rows_keep_gather_then_scatter():
+    def make(raw):
+        return [raw.as_strided((NUM_BLOCKS, 8), (4, 1))]
+
+    raw = torch.randint(
+        -128,
+        127,
+        ((NUM_BLOCKS - 1) * 4 + 8,),
+        dtype=torch.int8,
+        device="cuda",
+    )
+    before = raw.clone()
+    indices = torch.tensor([[1], [2]], dtype=torch.int64, device="cuda")
+    assert not worker_utils._fused_copy_kv_cache_block_rows(make(raw)[0], indices)
+    torch.accelerator.synchronize()
+    assert torch.equal(raw, before)
+
+    _run(
+        make,
+        [KVCacheBlockCopy(1, 2)],
+        raw_bytes=(NUM_BLOCKS - 1) * 4 + 8,
+    )
+
+
+@pytest.mark.parametrize("row_bytes", [3, 5, 7])
+def test_subword_rows_keep_gather_then_scatter(row_bytes):
+    def make(raw):
+        return [raw.view(NUM_BLOCKS, row_bytes)]
+
+    _run(
+        make,
+        _copies(3),
+        raw_bytes=NUM_BLOCKS * row_bytes,
+    )
+
+
+@pytest.mark.parametrize(
+    "layout", [KVCacheLayout.LBHNC, KVCacheLayout.LBNHC, KVCacheLayout.BLHNC]
+)
+def test_supported_hybrid_layouts_copy_exactly(layout):
+    def make(raw):
+        return _hybrid_views(raw, layout, torch.bfloat16, 128, None)
+
+    _run(make, _copies(5))
