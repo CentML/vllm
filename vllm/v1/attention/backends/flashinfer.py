@@ -91,6 +91,7 @@ from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
 from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
     trtllm_batch_context_with_kv_cache as routed_trtllm_batch_context_with_kv_cache,
 )
+from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as _prefill_routing
 from vllm.v1.attention.ops.kf_decode_attn.runtime import MAXP as KF_DECODE_MAXP
 from vllm.v1.attention.ops.kf_decode_attn.runtime import (
     get_runtime as get_kf_decode_runtime,
@@ -117,6 +118,7 @@ FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
+_PRE107_STEP = [0]
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
@@ -298,8 +300,7 @@ def trtllm_gen_prefill_sm_count(
 
     A single request must be prefix-dominated (cached prefix >= 8x the chunk): its
     synthetic grid showed the generation kernel losing on causal-heavy chunks.
-    Multi-request launches have no such guard; on 160 C512 PMU32LL + PI3 launches the
-    guard only kept launches whose short-prefix rows are cheap on the context kernel.
+    Multi-request launches have no such guard.
     """
     if len(query_lens) == 1 and seq_lens[0] - query_lens[0] < 8 * query_lens[0]:
         return None
@@ -969,6 +970,9 @@ class TRTLLMPrefill:
     gen_sm_count: int | None = None
     """If set, run the prefill on the trtllm-gen generation kernel with this
     ``sm_count`` (see ``trtllm_gen_prefill_sm_count``) instead of the context kernel."""
+
+    pre107_host: Any = None
+    """PRE107: (step key, host prefill q lens, host prefill kv lens upper bound) or None."""
 
     kf: KfPrefillPlan | None = None
     """If set, run the prefill on the Kernel Factory kernel with this step's work
@@ -2114,7 +2118,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_sms=self.trtllm_gen_prefill_num_sms,
                         workspace_bytes=envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
                     )
+                pre107_host = None
+                if _prefill_routing._PRE107:
+                    # PRE107 (opt-in): host lengths for the pre1 planner; exact only on prefilling rows (seq_lens_ub).
+                    # NOTE qwen-v2: the routing module is not called on SM107 (self._prefill_gen_routing), so this is
+                    # inert there until pre1 is ported as a KF-style peer (patches/pre107/design/qwen-v2-port.md).
+                    if seq_lens_ub is not None:
+                        _PRE107_STEP[0] += 1
+                        pre107_host = (
+                            _PRE107_STEP[0],
+                            query_lens_prefill_cpu.tolist(),
+                            seq_lens_ub[prefill_start:num_reqs].tolist(),
+                        )
+                    else:
+                        _prefill_routing._pre107["no_host"] = (
+                            _prefill_routing._pre107.get("no_host", 0) + 1
+                        )
                 attn_metadata.prefill = TRTLLMPrefill(
+                    pre107_host=pre107_host,
                     block_tables=block_table_tensor[prefill_start:],
                     seq_lens=prefill_seq_lens,
                     cum_seq_lens_q=qo_indptr_prefill_gpu,
@@ -3633,6 +3654,8 @@ class FlashInferImpl(AttentionImpl):
                         if self._prefill_gen_routing
                         else trtllm_batch_context_with_kv_cache
                     )
+                    if attn_metadata.prefill.pre107_host is not None:
+                        _prefill_routing.pre107_set_step(*attn_metadata.prefill.pre107_host)
                     trtllm_prefill(
                         query=prefill_query,
                         kv_cache=mock_kv_cache,
