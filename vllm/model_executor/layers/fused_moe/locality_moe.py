@@ -178,6 +178,8 @@ class LayerWeights:
     s13: torch.Tensor  # w13 scales (domain-major localized copy or production)
     s2: torch.Tensor
     sf_dmajor: bool
+    # diagnostics: pre-blocked (w13, w2) copies read with 1-D bulk copies
+    blk: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 # ---------------------------------------------------------------- runtime
@@ -278,6 +280,8 @@ class LocalityMoE:
             dbg,
             pdl,
             lw.sf_dmajor,
+            lw.blk[0] if lw.blk else None,
+            lw.blk[1] if lw.blk else None,
         )
         return out, ew, self.idx[: T * TOPK].view(T, TOPK)
 
@@ -392,6 +396,7 @@ struct Params {
   int nd0, nd1;
   int sf_dmajor;                      // scales: 0 = production expert-major, 1 = domain-major localized copy
   u64* dbg;                           // optional per-CTA stamps [grid][4]: start, producer past wait, end, smid|dom|rank
+  const uint8_t* blk13; const uint8_t* blk2;   // optional (diagnostics): pre-blocked weight copies, see issue_stage
 };
 // scale block of expert e: expert-major (production tensors) or domain-major (localized copy: domain d's 128 experts,
 // local index k, at slot d * 128 + k, so each domain's scales fill whole 2 MiB chunks of that domain)
@@ -565,12 +570,22 @@ __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, c
 }
 
 // ------------------------------------------------------------------ k_moe
+// blk != nullptr: diagnostics only, weights from a pre-swizzled copy with contiguous 16 KB K128 blocks per
+// (expert, row block) (1-D bulk copies, the feasibility microbench's layout) instead of the production tensors.
 __device__ __forceinline__ void issue_stage(uint32_t sA, uint32_t sSFA, uint32_t bar, const CUtensorMap* tm, const uint8_t* sf,
-                                            int row0, int kb) {
+                                            int row0, int kb, const uint8_t* blk) {
   mbar_expect(bar, A_ST + SF_ST);
+  if (blk) {
+    bulk_load(sA, blk + (size_t)kb * KB_BYTES, A_ST, bar);
+  } else {
 #pragma unroll
-  for (int g = 0; g < KSB; g++) tma_2d(sA + g * KB_BYTES, tm, (kb + g) * 128, row0, bar);
+    for (int g = 0; g < KSB; g++) tma_2d(sA + g * KB_BYTES, tm, (kb + g) * 128, row0, bar);
+  }
   bulk_load(sSFA, sf + kb * SF_ATOM, SF_ST, bar);
+}
+__device__ __forceinline__ const uint8_t* blk_unit(const Params& p, int kind, int e, int rb) {
+  if (!p.blk13) return nullptr;
+  return kind ? p.blk2 + ((size_t)e * 16 + rb) * FC2_NKB * KB_BYTES : p.blk13 + ((size_t)e * 8 + rb) * FC1_NKB * KB_BYTES;
 }
 
 __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUtensorMap tm13, const __grid_constant__ CUtensorMap tm2,
@@ -628,7 +643,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
       asm volatile("prefetch.tensormap [%0];" :: "l"((u64)&tm2) : "memory");
       for (int s = 0; s < S; s++)
         issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), &tm13,
-                    p.w13sf + (size_t)sf_slot(e0, p.sf_dmajor) * W13SF_E + rb0 * FC1_NKB * SF_ATOM, e0 * 2 * I + rb0 * 128, KSB * s);
+                    p.w13sf + (size_t)sf_slot(e0, p.sf_dmajor) * W13SF_E + rb0 * FC1_NKB * SF_ATOM, e0 * 2 * I + rb0 * 128, KSB * s,
+                    blk_unit(p, 0, e0, rb0));
     }
     griddep_wait();
     if (p.dbg && lane == 0) p.dbg[blockIdx.x * 4 + 1] = gtime();
@@ -685,10 +701,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
         const size_t es = (size_t)sf_slot(e, p.sf_dmajor);
         const uint8_t* sf = kind ? p.w2sf + es * W2SF_E + rb * FC2_NKB * SF_ATOM : p.w13sf + es * W13SF_E + rb * FC1_NKB * SF_ATOM;
         const int row0 = kind ? e * H + rb * 128 : e * 2 * I + rb * 128;
+        const uint8_t* blk = blk_unit(p, kind, e, rb);
         for (int kb = f->kb0; kb < nkb; kb += KSB, k++) {
           const int s = k % S;
           if (k >= (uint32_t)S) mbar_wait(sa(&empty[s]), ((k / S) - 1) & 1);
-          issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), tm, sf, row0, kb);
+          issue_stage(sa(sA + s * A_ST), sa(sSFA + s * SF_ST), sa(&full[s]), tm, sf, row0, kb, blk);
         }
         if (pub < nmine + 1) pub_next();
       }
@@ -990,7 +1007,8 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
 
 void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, torch::Tensor x, torch::Tensor xsf,
                 torch::Tensor inter, torch::Tensor intersf, torch::Tensor out, torch::Tensor plan, torch::Tensor state,
-                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl, bool sf_dmajor) {
+                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl, bool sf_dmajor,
+                std::optional<torch::Tensor> blk13, std::optional<torch::Tensor> blk2) {
   TORCH_CHECK(tmaps.device().is_cpu() && tmaps.numel() == 2 * (int64_t)sizeof(CUtensorMap));
   TORCH_CHECK(x.is_contiguous() && x.size(1) == H && xsf.is_contiguous() && xsf.numel() == x.size(0) * (H / 32));
   TORCH_CHECK(out.is_contiguous() && out.size(0) == x.size(0) * TOPK && out.size(1) == H && out.dtype() == torch::kBFloat16);
@@ -1001,6 +1019,8 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   memcpy(m, tmaps.data_ptr(), sizeof(m));
   Params prm;
   prm.sf_dmajor = sf_dmajor ? 1 : 0;
+  prm.blk13 = blk13.has_value() ? (const uint8_t*)blk13->data_ptr() : nullptr;
+  prm.blk2 = blk2.has_value() ? (const uint8_t*)blk2->data_ptr() : nullptr;
   prm.w13sf = (const uint8_t*)w13sf.data_ptr(); prm.w2sf = (const uint8_t*)w2sf.data_ptr();
   prm.x = (const uint8_t*)x.data_ptr(); prm.xsf = (const uint8_t*)xsf.data_ptr();
   prm.inter = (uint8_t*)inter.data_ptr(); prm.intersf = (uint8_t*)intersf.data_ptr();
