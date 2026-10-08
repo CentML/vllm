@@ -79,6 +79,10 @@ class Mxfp8OnlineLinearMethod(OnlineLinearBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
+        if getattr(layer, "_w4a8_stash", False):
+            from vllm.model_executor.layers.fused_moe.w4a8 import stash_shared
+
+            stash_shared(layer)
 
         weight_fp8, weight_scale = mxfp8_e4m3_quantize(layer.weight.contiguous())
 
@@ -248,8 +252,13 @@ class Mxfp8OnlineMoEMethod(OnlineMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
-        w13, w13_scale = self._quantize_mxfp8_moe_weight(layer.w13_weight)
-        w2, w2_scale = self._quantize_mxfp8_moe_weight(layer.w2_weight)
+        if hasattr(layer, "_w4a8_name"):
+            from vllm.model_executor.layers.fused_moe.w4a8 import quantize_routed
+
+            w13, w2, w13_scale, w2_scale = quantize_routed(self, layer)
+        else:
+            w13, w13_scale = self._quantize_mxfp8_moe_weight(layer.w13_weight)
+            w2, w2_scale = self._quantize_mxfp8_moe_weight(layer.w2_weight)
 
         self._setup_kernel(
             layer,
