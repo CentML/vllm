@@ -23,6 +23,7 @@ extend the MXFP8 head to C512 draft batches (M 64-128: 47-51 us vs 85 us BF16).
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.locality.mxgemm import DomainMxGemm
 
 # Largest draft row count served by the MXFP8 GEMM (Nsight A/B on SM107);
 # VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M raises it (use with the warmup autotune).
@@ -76,6 +80,9 @@ direct_register_custom_op(
 class Mxfp8DraftLmHead(torch.nn.Module):
     """Holds the MXFP8 weight copy; the BF16 head stays the source of truth."""
 
+    weight_q_t: torch.Tensor
+    weight_scale: torch.Tensor
+
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         n, k = weight.shape
@@ -89,39 +96,56 @@ class Mxfp8DraftLmHead(torch.nn.Module):
         self.register_buffer(
             "weight_scale", weight_scale.contiguous(), persistent=False
         )
-        # VLLM_LOCALITY_LM_HEAD (draft): domain-aware kernel for M <= loc_max_m
-        self.loc_gemm = None
+        # VLLM_LOCALITY_LM_HEAD (draft): domain-local tcgen05 kernel for M <= loc_max_m
+        self.loc_gemm: DomainMxGemm | None = None
         self.loc_max_m = 0
+        self.loc_pdl = False
 
     def enable_locality(
-        self, topo, weight: torch.Tensor, max_m: int, cfg: int | None
-    ) -> bool:
-        """Move the e4m3 weight to a 2 MiB-interleaved localized range (the
-        FlashInfer fallback reads it there too) and serve M <= max_m rows with
-        ``locality.DomainGemm`` (plain [N, K/32] scales, one copy per domain)."""
+        self, topo, weight: torch.Tensor, max_m: int, pdl: bool
+    ) -> str | None:
+        """Move the e4m3 weight to a 2 MiB-interleaved localized range and
+        serve M <= max_m rows with ``locality.mxgemm.DomainMxGemm``. The
+        FlashInfer fallback (larger M) reads the localized weight and the
+        domain-0 copy of the scales; the cudaMalloc originals are released.
+        Returns None, or why the head was left alone.
+        """
+        from vllm.model_executor.layers.locality import mxgemm
         from vllm.model_executor.layers.locality.memory import localize
-        from vllm.model_executor.layers.locality.skinny import FP8_MAX_M, DomainGemm
 
+        if not mxgemm.supported():
+            return "the MXFP8 domain kernel needs SM107"
         n, k = weight.shape
-        weight_q, scale_plain = mxfp8_e4m3_quantize(weight.contiguous())
+        if k != mxgemm.K_DIM or n % 128:
+            return f"needs a [N % 128 == 0, {mxgemm.K_DIM}] head, got {(n, k)}"
+        weight_q, _ = mxfp8_e4m3_quantize(weight.contiguous())
         if not torch.equal(weight_q.t(), self.weight_q_t):
-            # the head was built from a different (MTP checkpoint) weight
-            return False
+            return (
+                "the MXFP8 copy differs from the shared lm_head (MTP checkpoint head)"
+            )
         loc = localize(weight_q.view(torch.uint8), "interleave")
         del weight_q
-        self.weight_q_t = loc.tensor.view(self.weight_q_t.dtype).t()
-        self.loc_gemm = DomainGemm(
-            topo, loc, scale=scale_plain.view(n, k // MXFP8_BLOCK_SIZE), cfg=cfg
+        self.loc_gemm = mxgemm.DomainMxGemm(
+            topo, loc, self.weight_scale, max_m=min(max_m, mxgemm.MAX_M)
         )
-        self.loc_max_m = min(max_m, FP8_MAX_M)
-        return True
+        self.weight_q_t = loc.tensor.view(self.weight_q_t.dtype).t()
+        self.weight_scale = self.loc_gemm.sfa[0]
+        self.loc_max_m = self.loc_gemm.max_m
+        self.loc_pdl = pdl
+        return None
 
     def forward(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if self.loc_gemm is not None:
             x_2d = x.reshape(-1, x.shape[-1])
             m = x_2d.shape[0]
-            if 0 < m <= self.loc_max_m and x_2d.stride(-1) == 1:
-                return self.loc_gemm(x_2d).view(*x.shape[:-1], self.loc_gemm.n)
+            if (
+                0 < m <= self.loc_max_m
+                and x_2d.stride(-1) == 1
+                and x_2d.stride(0) % 8 == 0
+                and x_2d.data_ptr() % 16 == 0
+            ):
+                out = self.loc_gemm(x_2d, pdl=self.loc_pdl)
+                return out.view(*x.shape[:-1], self.loc_gemm.n)
         return torch.ops.vllm.mtp_draft_logits_mxfp8(
             x, weight, self.weight_q_t, self.weight_scale
         )
