@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn import gdn_prefill_census
+from vllm.v1.attention.backends import gdn_zero_draft
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
     GDN_HOST_TRIM2,
@@ -658,7 +659,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         query_start_loc_cpu = m.query_start_loc_cpu
         spec_sequence_masks_cpu: torch.Tensor | None = None
         num_spec_decodes = 0
-        if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
+        if (
+            self.use_spec_decode
+            and num_decode_draft_tokens_cpu is not None
+            and gdn_zero_draft.ZERO_DRAFT_AS_SPEC
+        ):
+            # Zero-draft decode rows stay on the spec path (T = 1): it reads the state at
+            # num_accepted - 1 (see gdn_zero_draft). No all-zero-draft collapse to non-spec.
+            spec_sequence_masks_cpu = gdn_zero_draft.spec_row_mask(
+                query_start_loc_cpu[1:] - query_start_loc_cpu[:-1],
+                m.seq_lens_cpu_upper_bound,
+                num_decode_draft_tokens_cpu[: query_start_loc_cpu.shape[0] - 1],
+            )
+            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+            if num_spec_decodes == 0:
+                spec_sequence_masks_cpu = None
+        elif self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             if (
@@ -761,6 +777,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
+        if gdn_zero_draft.R4_COUNT and self.use_spec_decode:
+            gdn_zero_draft.count(m, num_decode_draft_tokens_cpu, num_accepted_tokens)
         if fused_decode is None:
             split = self._split_batch(m, num_decode_draft_tokens_cpu)
         else:

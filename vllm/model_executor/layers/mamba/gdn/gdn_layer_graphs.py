@@ -440,9 +440,14 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
     from vllm.model_executor.layers.mamba.ops import gdn_conv_cuda, gdn_mtp_cuda
     from vllm.model_executor.layers.mamba.ops import gdn_fused_conv_prep as gfcp
 
+    from vllm.model_executor.layers.mamba.ops import gdn_ucache
+
     T = core_attn_out.size(0)
     if T > T_MAX:
         return "tokens"
+    if gdn_ucache.STEP.band:
+        # U-cache steps keep the eager GDN core: the graphs replay gdn_mtp_cuda.
+        return "ucache"
     if md.num_prefills <= 0:
         return "no_prefill"
     if md.num_decodes != 0:
@@ -909,6 +914,11 @@ def _check(
     outs = (mixed_qkvz, core_attn_out, out_q, out_scale)
     pre = [t.clone() for t in outs]
     pre_conv, pre_ssm = conv[slots].clone(), ssm[slots].clone()
+    from vllm.model_executor.layers.mamba.ops import gdn_ucache
+
+    # U-cache rings / cursors / tags / active bits (none are touched on graph-eligible steps,
+    # which are never u-cache steps; snapshot anyway so a replay can never leak ring state into the eager re-run)
+    uc_snap = gdn_ucache.snapshot([layer])
     graph.replay()
     got = [t.clone() for t in outs]
     got_conv, got_ssm = conv[slots].clone(), ssm[slots].clone()
@@ -916,6 +926,7 @@ def _check(
         t.copy_(p)
     conv[slots] = pre_conv
     ssm[slots] = pre_ssm
+    gdn_ucache.restore(uc_snap)
     _BYPASS[0] = True
     try:
         layer._forward_core_fused_norm_packed(

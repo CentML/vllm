@@ -901,6 +901,35 @@ def _cow_copy_plan_cached(
     return entry[0], kv_caches[0].untyped_storage(), entry[1]
 
 
+def widest_alias_views(
+    kv_caches: Iterable[torch.Tensor], num_blocks: int
+) -> list[torch.Tensor]:
+    """One view per distinct (device, data_ptr): the one spanning the most bytes
+    of one scheduler block, in first-seen order.
+
+    Hybrid models alias attention
+    and Mamba/GDN layer slots from the same byte offset. A Mamba/GDN view spans
+    only its state payload, and GDN views precede attention views in the V2
+    runner's kv_caches order, so first-seen dedup by data_ptr copied only the
+    payload prefix of every attention page on a partial-hit copy-on-write. The
+    widest view copies the whole page: same bytes, exact.
+    """
+    best: dict[tuple[torch.device, int], tuple[int, int, torch.Tensor]] = {}
+    for i, cache in enumerate(kv_caches):
+        key = (cache.device, cache.data_ptr())
+        kernel_blocks_per_block = max(1, cache.shape[0] // max(1, num_blocks))
+        one = cache[:kernel_blocks_per_block]
+        span = (
+            sum((d - 1) * st for d, st in zip(one.shape, one.stride())) + 1
+        ) * cache.element_size()
+        prev = best.get(key)
+        if prev is None:
+            best[key] = (span, i, cache)
+        elif span > prev[0]:
+            best[key] = (span, prev[1], cache)
+    return [v[2] for v in sorted(best.values(), key=lambda t: t[1])]
+
+
 def _cow_copy_rows(kv_caches: Iterable[torch.Tensor], num_blocks: int) -> tuple | None:
     """Scheduler-block rows exactly as the per-storage path copies them: one
     (storage, row address of block 0, row bytes, block stride bytes) per
@@ -910,7 +939,7 @@ def _cow_copy_rows(kv_caches: Iterable[torch.Tensor], num_blocks: int) -> tuple 
     rows_out: set[tuple[int, int, int, int]] = set()
     seen: set[int] = set()
     anchor = None
-    for cache in kv_caches:
+    for cache in widest_alias_views(kv_caches, num_blocks):
         if cache.data_ptr() in seen:
             continue
         seen.add(cache.data_ptr())
@@ -1096,7 +1125,7 @@ def _copy_kv_cache_blocks_inplace_per_storage(
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
+    for cache in widest_alias_views(kv_caches, num_blocks):
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
         # once. data_ptr distinguishes per-layer views of a shared allocation.
         key = (cache.device, cache.data_ptr())
