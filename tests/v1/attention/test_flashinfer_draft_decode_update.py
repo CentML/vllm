@@ -373,3 +373,191 @@ def test_fused_draft_decode_graph_matches_per_step_builds(
 
     assert torch.equal(actual[:, : batch.num_reqs], expected[:, : batch.num_reqs])
     assert torch.equal(kv_cache, expected_kv_cache)
+
+
+@pytest.mark.skipif(
+    not supports_trtllm_attention(is_prefill=False),
+    reason="Needs the FlashInfer XQA or trtllm-gen decode kernel.",
+)
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "dtype", "disable_q_quant"),
+    [
+        ("auto", torch.float16, True),
+        ("auto", torch.bfloat16, True),
+        ("fp8", torch.float16, True),
+        ("fp8", torch.bfloat16, True),
+        ("fp8", torch.bfloat16, False),
+    ],
+)
+@pytest.mark.parametrize("query_lens", [(3, 3), (3, 9), (7, 9)])
+@torch.inference_mode()
+def test_draft_prefill_sampled_rows_and_all_prompt_kv(
+    monkeypatch, kv_cache_dtype, dtype, disable_q_quant, query_lens
+):
+    """Rejected draft tails must not extend sampled attention's causal KV span.
+
+    Exercise decode-only, mixed and prefill-only metadata with the real KV
+    writer and attention kernels, including non-unit FP8 scales. Unsupported
+    native-prefill-only platforms keep the full attention output unchanged.
+    """
+    monkeypatch.setattr(
+        flashinfer_backend, "get_per_layer_parameters", _per_layer_parameters
+    )
+    torch.manual_seed(17)
+    device = torch.device("cuda:0")
+    config, cache_spec = _make_config(kv_cache_dtype)
+    config.model_config.dtype = dtype
+    config.attention_config.disable_flashinfer_q_quantization = disable_q_quant
+    if kv_cache_dtype == "auto":
+        cache_spec = dataclasses.replace(cache_spec, dtype=dtype)
+    with set_current_vllm_config(config):
+        builder = FlashInferMetadataBuilder(cache_spec, [LAYER_NAME], config, device)
+        builder.reorder_batch_threshold = 3
+        impl = FlashInferImpl(
+            num_heads=NUM_Q_HEADS,
+            head_size=HEAD_SIZE,
+            scale=HEAD_SIZE**-0.5,
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+    layer = _Layer(device)
+    if kv_cache_dtype == "fp8":
+        for name, scale in [("q", 0.25), ("k", 0.125), ("v", 0.25)]:
+            setattr(layer, f"_{name}_scale", torch.tensor(scale, device=device))
+            setattr(layer, f"_{name}_scale_float", scale)
+    context_lens = [15, 40]
+    num_tokens = sum(query_lens)
+    boundaries = [0, query_lens[0], num_tokens]
+    qsl_cpu = torch.tensor(boundaries, dtype=torch.int32)
+    seq_lens_cpu = torch.tensor(
+        [c + q for c, q in zip(context_lens, query_lens)], dtype=torch.int32
+    )
+    # Block zero is the engine's null block; assign distinct non-null pages.
+    block_tables = torch.arange(1, 17, dtype=torch.int32, device=device).view(2, 8)
+    positions = torch.cat(
+        [
+            torch.arange(c, c + q, device=device)
+            for c, q in zip(context_lens, query_lens)
+        ]
+    )
+    slots = torch.cat(
+        [
+            block_tables[i, positions[boundaries[i] : boundaries[i + 1]] // BLOCK_SIZE]
+            * BLOCK_SIZE
+            + positions[boundaries[i] : boundaries[i + 1]] % BLOCK_SIZE
+            for i in range(2)
+        ]
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl_cpu.to(device),
+        query_start_loc_cpu=qsl_cpu,
+        seq_lens=seq_lens_cpu.to(device),
+        seq_lens_cpu_upper_bound=seq_lens_cpu,
+        num_reqs=2,
+        num_actual_tokens=num_tokens,
+        max_query_len=max(query_lens),
+        max_seq_len=int(seq_lens_cpu.max()),
+        block_table_tensor=block_tables,
+        slot_mapping=slots,
+        causal=True,
+    )
+    metadata = builder.build(0, common)
+    query = (
+        torch.randn(num_tokens, NUM_Q_HEADS, HEAD_SIZE, dtype=dtype, device=device)
+        * 0.2
+    )
+    key = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_SIZE, dtype=dtype, device=device)
+    value = torch.randn_like(key)
+    cache = torch.randn(
+        NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE, 2 * HEAD_SIZE, device=device
+    ).to(torch.float8_e4m3fn if kv_cache_dtype == "fp8" else dtype)
+    if kv_cache_dtype == "fp8":
+        cache = cache.view(torch.uint8)
+    initial_cache = cache.clone()
+    expected = torch.empty_like(query)
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+    impl.forward(layer, query, key, value, cache, metadata, expected)
+    expected_cache = cache.clone()
+
+    # Both requests rejected two rows: sample earlier than the query chunk's
+    # end even for the 3-token request assigned to the decode bucket.
+    rows = torch.tensor(
+        [boundaries[1] - 3, boundaries[2] - 3], dtype=torch.int64, device=device
+    )
+    from vllm.v1.attention.backends.flashinfer import DraftPrefillPruning
+
+    impl.draft_prefill_pruning = DraftPrefillPruning(
+        rows, (positions[rows] + 1).to(torch.int32), block_tables, common.max_seq_len
+    )
+    actual = torch.full_like(expected, float("nan"))
+    cache.copy_(initial_cache)
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+    impl.forward(layer, query, key, value, cache, metadata, actual)
+    torch.testing.assert_close(actual[rows], expected[rows], atol=0.025, rtol=0.025)
+    assert torch.equal(cache, expected_cache)
+
+    # Check every scheduled row, not just those read by sampled attention.
+    logical_cache = (
+        cache.view(torch.float8_e4m3fn) if kv_cache_dtype == "fp8" else cache
+    )
+
+    # Independent FP32 oracle consumes the written cache with physical scales,
+    # not the unquantized K/V inputs or either backend's fused scale product.
+    # This detects a regular-prefill Q scale accidentally applied to 16-bit Q.
+    def sampled_oracle(use_decode_dtype: bool) -> torch.Tensor:
+        outputs = []
+        for req, row in enumerate(rows.tolist()):
+            length = int(positions[row]) + 1
+            pages = block_tables[req, : (length + BLOCK_SIZE - 1) // BLOCK_SIZE].long()
+            paged = logical_cache[pages].float().permute(1, 0, 2, 3)
+            tokens = paged.reshape(NUM_KV_HEADS, -1, 2 * HEAD_SIZE)[:, :length]
+            k, v = tokens.split(HEAD_SIZE, dim=-1)
+            if kv_cache_dtype == "fp8":
+                k = k * layer._k_scale_float
+                v = v * layer._v_scale_float
+            k = k.repeat_interleave(NUM_Q_HEADS // NUM_KV_HEADS, dim=0)
+            v = v.repeat_interleave(NUM_Q_HEADS // NUM_KV_HEADS, dim=0)
+            q = query[row].float()
+            q_dtype = (
+                metadata.q_data_type_decode
+                if use_decode_dtype or req < metadata.num_decodes
+                else metadata.q_data_type_prefill
+            )
+            if q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                q = (q / layer._q_scale_float).to(
+                    q_dtype
+                ).float() * layer._q_scale_float
+            probabilities = (
+                torch.einsum("hd,hsd->hs", q, k) * HEAD_SIZE**-0.5
+            ).softmax(dim=-1)
+            outputs.append(torch.einsum("hs,hsd->hd", probabilities, v))
+        return torch.stack(outputs)
+
+    torch.testing.assert_close(
+        expected[rows].float(), sampled_oracle(False), atol=0.025, rtol=0.025
+    )
+    can_prune = isinstance(
+        metadata.decode, flashinfer_backend.FlashInferTrtllmAPIDecode
+    ) or (
+        isinstance(metadata.prefill, flashinfer_backend.TRTLLMPrefill)
+        and current_platform.is_device_capability_family(100)
+    )
+    torch.testing.assert_close(
+        actual[rows].float(), sampled_oracle(can_prune), atol=0.025, rtol=0.025
+    )
+    written = logical_cache[slots // BLOCK_SIZE, :, slots % BLOCK_SIZE]
+    expected_key, expected_value = key, value
+    if kv_cache_dtype == "fp8":
+        expected_key = (key.float() / layer._k_scale_float).to(torch.float8_e4m3fn)
+        expected_value = (value.float() / layer._v_scale_float).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(written[..., :HEAD_SIZE].float(), expected_key.float())
+    torch.testing.assert_close(written[..., HEAD_SIZE:].float(), expected_value.float())
+
+    unsampled = torch.ones(num_tokens, dtype=torch.bool, device=device)
+    unsampled[rows] = False
+    if can_prune:
+        assert torch.count_nonzero(actual[unsampled]) == 0
+    else:
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

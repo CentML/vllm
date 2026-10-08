@@ -485,6 +485,7 @@ backend when a shape, layout, sampling mode, or platform is unsupported.
 | `VLLM_LOWM_BF16_GEMM_PDL` | `0` | Programmatic dependent launch for TinyGEMM. Availability is checked and warmed before capture. |
 | `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
 | `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
+| `VLLM_MTP_DRAFT_PREFILL_PRUNE` | `0` | Attention computes sampled draft-prefill rows across decode and prefill buckets after writing every scheduled KV row. |
 | `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
 | `VLLM_SAMPLER_SPLIT_ROW_TOPK` | `1` | Enables eligible split-row top-k paths. Setting `0` also disables compact rejection, fused preparation, and sparse verification. |
 | `VLLM_FUSED_REJECTION_SAMPLER` | `1` | Prefers compact fused rejection when eligible. Setting `0` leaves separately enabled preparation/sparse fallbacks available. |
@@ -513,7 +514,10 @@ alignment specializations.
 
 ### Draft and Sampling Limits
 
-A prefill/capture fallback that requires KV
+Draft attention pruning retains single-attention-layer and distributed-layout
+safety gates. Eligible FP16/BF16 outputs and BF16-query/FP8-KV generation use the
+ordinary decode interface and query-dtype-aware scales. Generation pruning does
+not duplicate the full KV cache. A prefill/capture fallback that requires KV
 dequantization limits its table to the needed context width and clears stale
 per-request tail page IDs.
 
@@ -548,7 +552,8 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
   tests/kernels/test_lowm_bf16_gemm.py \
   tests/kernels/mamba/test_gdn_fused_conv_prep.py \
   tests/v1/worker/test_kv_cow_copy.py \
-  tests/v1/worker/test_gpu_fused_rejection.py
+  tests/v1/worker/test_gpu_fused_rejection.py \
+  tests/v1/attention/test_flashinfer_draft_decode_update.py
 ```
 
 Native SM100/SM103/SM107 cases skip on other GPUs. Overlay compatibility tests in

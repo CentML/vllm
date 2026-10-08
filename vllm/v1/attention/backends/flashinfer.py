@@ -901,6 +901,20 @@ class FlashInferBackend(AttentionBackend):
 
 
 @dataclass
+class DraftPrefillPruning:
+    """Request-local sampled rows for one eager/piecewise MTP prefill.
+
+    KV writes remain a separate all-token operation. These inputs are scoped
+    to the prefill forward, never reused by subsequent autoregressive steps.
+    """
+
+    rows: torch.Tensor
+    seq_lens: torch.Tensor
+    block_tables: torch.Tensor
+    max_seq_len: int
+
+
+@dataclass
 class FIPrefill:
     """Metadata for the native FlashInfer prefill pathway (non-TRTLLM)."""
 
@@ -2445,6 +2459,7 @@ class FlashInferImpl(AttentionImpl):
         # VLLM_MTP_DRAFT_PREFILL_PRUNE=1: its last_token_indices buffer, the rows
         # the draft prefill samples (see _draft_prefill_last_rows). None: off.
         self.draft_prefill_last_token_indices: torch.Tensor | None = None
+        self.draft_prefill_pruning: DraftPrefillPruning | None = None
         self._draft_prefill_prune_checks_left = envs.VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK
         # Kernel Factory prefill kernel: per-layer debug comparisons left
         # (VLLM_KF_PREFILL_ATTN_CHECK) and the per-call guard that disables it while a
@@ -2558,10 +2573,100 @@ class FlashInferImpl(AttentionImpl):
             ),
         )
 
+    def _draft_prefill_attention(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        metadata: "FlashInferMetadata",
+        output: torch.Tensor,
+    ) -> bool:
+        """Compute sampled rows across both backend buckets, after all KV writes."""
+        pruning = self.draft_prefill_pruning
+        if (
+            pruning is None
+            or not metadata.causal
+            or metadata.use_cascade
+            or self.dcp_world_size != 1
+            or self.is_kvcache_nvfp4
+            or output.dtype not in (torch.float16, torch.bfloat16)
+            or self.o_sf_scale is not None
+            or self.logits_soft_cap
+            or not self.supports_xqa_or_trtllm_gen_decode
+        ):
+            return False
+        decode = metadata.decode
+        if isinstance(decode, FlashInferTrtllmAPIDecode):
+            kernel = decode.kernel
+        elif isinstance(metadata.prefill, TRTLLMPrefill):
+            kernel = FlashInferDecodeKernel.TRTLLM_GEN
+        else:
+            return False
+        layout = get_flashinfer_layout_string(self.kv_cache_layout)
+        if kernel == FlashInferDecodeKernel.TRTLLM_GEN and (
+            layout != "HND" or not current_platform.is_device_capability_family(100)
+        ):
+            return False
+        rows = pruning.rows
+        q = self.maybe_quant_query(
+            query.index_select(0, rows), metadata.q_data_type_decode, layer._q_scale
+        )
+        q = canonicalize_singleton_dim_strides(q.contiguous())
+        block_tables = pruning.block_tables
+        # Use the same raw-cache decode interface as ordinary draft decode.
+        # BF16/E4M3 selects native transformed-K/V cubins in FlashInfer; generic
+        # mixed precision uses its ungrouped GQA-generation selection.
+        bmm1_scale = self.get_xqa_bmm1_scale(layer, q.dtype)
+        bmm2_scale = self.bmm2_scale
+        out_rows = torch.empty(q.shape, dtype=output.dtype, device=output.device)
+        workspace = _get_trtllm_workspace_buffer()
+        if kernel == FlashInferDecodeKernel.XQA:
+            flashinfer_xqa_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache_tuple,
+                workspace_buffer=workspace,
+                block_tables=block_tables,
+                seq_lens=pruning.seq_lens,
+                max_seq_len=pruning.max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=self.window_left,
+                sinks=self.sinks,
+                out=out_rows,
+                kv_layout=layout,
+                q_len_per_req=1,
+            )
+        else:
+            sm_count, counter = self._trtllm_gen_decode_launch_config(
+                rows.numel(), 1, pruning.max_seq_len, q, workspace
+            )
+            with _flashinfer_decode_sm_count(sm_count):
+                trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache_tuple,
+                    workspace_buffer=workspace,
+                    block_tables=block_tables,
+                    seq_lens=pruning.seq_lens,
+                    max_seq_len=pruning.max_seq_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=self.window_left,
+                    sinks=self.sinks,
+                    out=out_rows,
+                    kv_layout=layout,
+                    backend="trtllm-gen",
+                    q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=counter,
+                )
+        out = output.view(-1, self.num_heads, self.head_size)
+        out.zero_()
+        out.index_copy_(0, rows, out_rows)
+        return True
+
     def _draft_prefill_last_rows(
         self,
         prefill_query: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         workspace_buffer: torch.Tensor,
         prefill: "TRTLLMPrefill",
         last_token_indices: torch.Tensor,
@@ -2569,6 +2674,10 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens: int,
         num_prefills: int,
         out: torch.Tensor,
+        *,
+        block_tables: torch.Tensor | None = None,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
     ) -> torch.Tensor:
         """Prefill attention of an MTP draft layer, sampled row of each request
         only.
@@ -2607,11 +2716,13 @@ class FlashInferImpl(AttentionImpl):
                 query=query_rows,
                 kv_cache=kv_cache,
                 workspace_buffer=workspace_buffer,
-                block_tables=prefill.block_tables,
+                block_tables=(
+                    prefill.block_tables if block_tables is None else block_tables
+                ),
                 seq_lens=kv_lens,
                 max_seq_len=prefill.max_seq_len,
-                bmm1_scale=self.bmm1_scale,
-                bmm2_scale=self.bmm2_scale,
+                bmm1_scale=self.bmm1_scale if bmm1_scale is None else bmm1_scale,
+                bmm2_scale=self.bmm2_scale if bmm2_scale is None else bmm2_scale,
                 window_left=self.window_left,
                 sinks=self.sinks,
                 out=out_rows,
@@ -3189,6 +3300,41 @@ class FlashInferImpl(AttentionImpl):
             assert self.o_sf_scale is None
             assert output.dtype != FP4_DTYPE
 
+        if (
+            self.draft_prefill_pruning is not None
+            and output_scale is None
+            and self._draft_prefill_attention(
+                layer, query, kv_cache_tuple, attn_metadata, output
+            )
+        ):
+            if self._draft_prefill_prune_checks_left > 0:
+                pruning = self.draft_prefill_pruning
+                assert pruning is not None
+                last_indices = self.draft_prefill_last_token_indices
+                self.draft_prefill_pruning = None
+                self.draft_prefill_last_token_indices = None
+                self._draft_prefill_prune_checks_left -= 1
+                ref = torch.empty_like(output_padded)
+                try:
+                    self.forward(
+                        layer, query_padded, key, value, kv_cache, attn_metadata, ref
+                    )
+                finally:
+                    self.draft_prefill_pruning = pruning
+                    self.draft_prefill_last_token_indices = last_indices
+                ref_rows = ref.view(-1, self.num_heads, self.head_size)[pruning.rows]
+                out_rows = output.view(-1, self.num_heads, self.head_size)[pruning.rows]
+                logger.info(
+                    "draft prefill pruning check: requests=%d decodes=%d "
+                    "prefills=%d max_abs=%.3e ref_max=%.3e",
+                    pruning.rows.numel(),
+                    attn_metadata.num_decodes,
+                    attn_metadata.num_prefills,
+                    float((ref_rows.float() - out_rows.float()).abs().max()),
+                    float(ref_rows.float().abs().max()),
+                )
+            return output_padded
+
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
         if num_prefill_tokens > 0:
@@ -3396,14 +3542,17 @@ class FlashInferImpl(AttentionImpl):
                 if (
                     self.draft_prefill_last_token_indices is not None
                     and isinstance(out, torch.Tensor)
-                    and out.dtype == torch.bfloat16
-                    and mock_kv_cache is kv_cache_tuple
+                    and out.dtype in (torch.bfloat16, torch.float16)
+                    and not self.is_kvcache_nvfp4
+                    and not use_dcp
+                    and self.supports_xqa_or_trtllm_gen_decode
+                    and current_platform.is_device_capability_family(100)
                 ):
                     # MTP draft layer: only each prefill request's sampled row
                     # needs attention (see _draft_prefill_last_rows).
                     rows = self._draft_prefill_last_rows(
                         prefill_query,
-                        kv_cache_tuple,
+                        mock_kv_cache,
                         workspace_buffer,
                         attn_metadata.prefill,
                         self.draft_prefill_last_token_indices,
@@ -3411,6 +3560,9 @@ class FlashInferImpl(AttentionImpl):
                         attn_metadata.num_decode_tokens,
                         attn_metadata.num_prefills,
                         out,
+                        block_tables=mock_block_table,
+                        bmm1_scale=prefill_bmm1_scale,
+                        bmm2_scale=prefill_bmm2_scale,
                     )
                     if self._draft_prefill_prune_checks_left > 0:
                         self._check_draft_prefill_last_rows(

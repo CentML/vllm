@@ -2,17 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 
 from vllm import envs
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.flashinfer import FlashInferImpl
 
 logger = init_logger(__name__)
 
@@ -47,12 +52,14 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        self._draft_prefill_prune_layer: Attention | None = None
+        self._draft_prefill_prune_group_id: int | None = None
         if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
             # Under prefill context parallelism the draft prefill is re-laid
             # out, so last_token_indices does not index the attention's rows.
             # The PCP manager is attached after model load; read the config.
             pcp = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
-            _enable_draft_prefill_prune(
+            self._draft_prefill_prune_layer = _enable_draft_prefill_prune(
                 draft_model, None if pcp else self.last_token_indices
             )
         if MTP_DRAFT_PREFILL_ROWS:
@@ -68,6 +75,75 @@ class MTPSpeculator(AutoRegressiveSpeculator):
                     type(draft_model).__name__,
                 )
         return draft_model
+
+    def _prefill(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
+        layer = self._draft_prefill_prune_layer
+        impl = cast("FlashInferImpl", layer.impl) if layer is not None else None
+        saved_indices = (
+            impl.draft_prefill_last_token_indices if impl is not None else None
+        )
+        if impl is not None and self.pcp_manager is not None:
+            impl.draft_prefill_last_token_indices = None
+        if (
+            layer is not None
+            and impl is not None
+            and num_reqs > 0
+            and attn_metadata is not None
+            and self.pcp_manager is None
+            and cudagraph_runtime_mode != CUDAGraphMode.FULL
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from vllm.v1.attention.backends.flashinfer import DraftPrefillPruning
+
+            # Resolve the actual draft layer's cache group, not the target's
+            # first group (Qwen's target has both linear and full attention).
+            group_id = self._draft_prefill_prune_group_id
+            if group_id is None:
+                group_id = next(
+                    (
+                        i
+                        for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                        if layer.layer_name in group.layer_names
+                    ),
+                    -1,
+                )
+                self._draft_prefill_prune_group_id = group_id
+            if group_id >= 0:
+                rows = self.last_token_indices[:num_reqs]
+                impl.draft_prefill_pruning = DraftPrefillPruning(
+                    rows=rows,
+                    seq_lens=(self.input_buffers.positions[rows] + 1).to(torch.int32),
+                    block_tables=self.block_tables.input_block_tables[group_id][
+                        :num_reqs
+                    ],
+                    max_seq_len=self.draft_max_seq_len,
+                )
+            else:
+                # Do not use the bucket-local fallback with an unknown group.
+                impl.draft_prefill_last_token_indices = None
+        try:
+            super()._prefill(
+                num_reqs,
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+                mm_inputs,
+            )
+        finally:
+            if impl is not None:
+                impl.draft_prefill_pruning = None
+                impl.draft_prefill_last_token_indices = saved_indices
 
     def on_prefill_begin(self, num_reqs: int) -> None:
         # Step 0 computes its own top-k. Unconditional, so a step that died
@@ -95,9 +171,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
 
 def _enable_draft_prefill_prune(
     draft_model: nn.Module, last_token_indices: torch.Tensor | None
-) -> None:
-    """Let the draft attention layer compute prefill attention only for each
-    prefill request's sampled row (FlashInferImpl._draft_prefill_last_rows).
+) -> Attention | None:
+    """Enable sampled-row attention for a single safe MTP draft layer.
 
     ``last_token_indices`` is the speculator's persistent buffer of those rows,
     written before every draft prefill; None keeps pruning off. The draft
@@ -111,7 +186,7 @@ def _enable_draft_prefill_prune(
             "MTP draft prefill attention pruning off: not supported with prefill "
             "context parallelism"
         )
-        return
+        return None
     layers = [m for m in draft_model.modules() if isinstance(m, Attention)]
     if len(layers) != 1 or not hasattr(
         layers[0].impl, "draft_prefill_last_token_indices"
@@ -121,6 +196,7 @@ def _enable_draft_prefill_prune(
             "draft attention layer, got %s",
             [(m.layer_name, type(m.impl).__name__) for m in layers],
         )
-        return
+        return None
     layers[0].impl.draft_prefill_last_token_indices = last_token_indices
     logger.info("MTP draft prefill attention pruning on for %s", layers[0].layer_name)
+    return layers[0]
