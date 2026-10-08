@@ -151,6 +151,18 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        # The pinned SM107 subclass uses the CuTe DSL NamedBarrier API while
+        # this SM100 kernel continues to use the corresponding barrier ids.
+        # This is the complete parent change in FlashInfer's SM107 backport
+        # (2b16e3c765fd4bf79339a4b2536a2de68a9c85ee); keep both interfaces.
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=self.epilog_sync_bar_id,
+            num_threads=32 * len(self.epilog_warp_id),
+        )
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=self.tmem_ptr_sync_bar_id,
+            num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
+        )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS

@@ -2655,11 +2655,15 @@ def compile_factors() -> dict[str, object]:
     # the non-default value, so caches built without the knob stay valid.
     # VLLM_GDN_BA_LATE_JOIN=1: QwenGatedDeltaNetAttention.forward_cuda passes
     # the aux-stream BA GEMM input (ba_src) to the fused GDN core op.
+    # VLLM_MTP_DRAFT_PREFILL_ROWS=1: the MTP draft forward gathers sampled
+    # rows after attention, changing the compiled graph's inputs and outputs.
     # (The other os.environ kernel knobs act inside custom ops or the runner,
     # not in the traced forward: VLLM_GDN_MIXED_FORK, VLLM_ROWDOT_PDL,
     # VLLM_GDN_MTP_CUDA_PDL, VLLM_GDN_MTP_CUDA_TUNE, VLLM_GDN_HOST_TRIM2,
     # VLLM_GDN_FUSED_DECODE_MAX_TOKENS, VLLM_STAGED_WRITE_CHUNKED.)
     if os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1":
         factors["VLLM_GDN_BA_LATE_JOIN"] = "1"
+    if os.environ.get("VLLM_MTP_DRAFT_PREFILL_ROWS", "0") == "1":
+        factors["VLLM_MTP_DRAFT_PREFILL_ROWS"] = "1"
 
     return factors

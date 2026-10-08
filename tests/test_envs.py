@@ -43,6 +43,22 @@ def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     assert "VLLM_API_KEY" not in envs.compile_factors()
 
 
+def test_draft_prefill_rows_separates_compile_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.config.utils import hash_factors
+
+    monkeypatch.delenv("VLLM_MTP_DRAFT_PREFILL_ROWS", raising=False)
+    default_key = hash_factors(envs.compile_factors())
+
+    monkeypatch.setenv("VLLM_MTP_DRAFT_PREFILL_ROWS", "0")
+    assert hash_factors(envs.compile_factors()) == default_key
+
+    monkeypatch.setenv("VLLM_MTP_DRAFT_PREFILL_ROWS", "1")
+    pruned_key = hash_factors(envs.compile_factors())
+    assert pruned_key != default_key
+
+
 def test_p2p_side_channel_defaults_and_override(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_HOST", raising=False)
     monkeypatch.delenv("VLLM_P2P_SIDE_CHANNEL_PORT", raising=False)

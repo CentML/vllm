@@ -2,10 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in PDL weight prefetch for FlashInfer's CuTe-DSL dense MXFP8 GEMMs.
 
-The overlay modules are FlashInfer 0.6.18.post1's stock CuTe-DSL dense GEMM
-sources with the changes listed below.
+The persistent overlay supports both FlashInfer 0.6.18.post1's stock source
+and the SM107 backport installed by ``tools/install_flashinfer_sm107.py``.
+Those approved parents differ only by two NamedBarrier attributes required
+by the Rubin subclass; the overlay retains them without changing the SM100
+kernel. The split-K overlay retains its stock 0.6.18.post1 base.
+The native SM107 subclass overrides its kernel: this supplies its compatible
+parent interface, not weight-prefetch or early-trigger changes to that kernel.
 
-At decode sizes every dense MXFP8 linear (in_proj_qkvz, out_proj, qkv_proj,
+On the SM100/SM103 paths, every dense MXFP8 linear at decode sizes
+(in_proj_qkvz, out_proj, qkv_proj,
 o_proj, shared expert, MTP layer, MXFP8 draft lm_head) runs FlashInfer's
 ``Sm100BlockScaledPersistentDenseGemmKernel`` or
 ``Sm100BlockScaledSplitKGemmKernel``. They are launched with programmatic
@@ -51,14 +57,16 @@ _MAP = {
         "fi_dense_blockscaled_gemm_sm100_splitk.py"
     ),
 }
-# sha256 of the stock FlashInfer 0.6.18.post1 file each overlay is derived
-# from.
+# The pinned SM107 parent differs from stock only by the NamedBarrier objects
+# retained in the shared persistent overlay. Accept no other source revisions.
+# Backport: flashinfer-ai/flashinfer@2b16e3c765fd4bf79339a4b2536a2de68a9c85ee.
 _BASE_SHA = {
     "flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100": (
-        "aad93031b1145c43195d1af2cbeb310c91df5c000310df26dfea768be949f705"
+        "aad93031b1145c43195d1af2cbeb310c91df5c000310df26dfea768be949f705",
+        "64b83236fa69202c97e015fedf298fe5abdbf3f464609fb44a5e7a92158dd79b",
     ),
     "flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk": (
-        "ca08b62a377b43aaeea30ec2b7a24b92515f72e3b48f5398e9af9b4c360edc9e"
+        "ca08b62a377b43aaeea30ec2b7a24b92515f72e3b48f5398e9af9b4c360edc9e",
     ),
 }
 SKIPPED: list = []
@@ -81,10 +89,11 @@ def _base_ok(fullname, path) -> bool:
     except Exception as e:  # noqa: BLE001 - cannot prove the base: do not overlay
         _log(f"NOT overlaying {fullname}: cannot hash the original module ({e!r})")
         return False
-    if got != want:
+    if got not in want:
         _log(
             f"NOT overlaying {fullname}: original {spec.origin} sha256 "
-            f"{got[:16]} != expected base {want[:16]}"
+            f"{got[:16]} not in approved bases "
+            f"{', '.join(digest[:16] for digest in want)}"
         )
         return False
     return True

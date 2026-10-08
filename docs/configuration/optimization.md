@@ -472,3 +472,36 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+## Qwen MLPerf Runner Optimizations
+
+The Qwen MLPerf integration in this fork uses the following controls. Sampling
+controls apply to the V2 GPU model runner. Eligibility checks retain the ordinary
+backend when a shape, layout, sampling mode, or platform is unsupported.
+
+| Control | Default | Behavior |
+| --- | --- | --- |
+| `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
+
+### Rubin FlashInfer Source Compatibility
+
+`tools/install_flashinfer_sm107.py` installs a matched parent/subclass pair for
+the pinned Rubin dependencies. The persistent GEMM overlay accepts both the
+stock FlashInfer 0.6.18.post1 parent and that exact installer-patched parent,
+retaining the NamedBarrier interface required by SM107. Default source validation
+still rejects other revisions; do not disable it to force an unapproved source.
+The split-K overlay is unchanged. SM107 overrides the persistent kernel, so
+parent compatibility is not a new native-SM107 weight-prefetch implementation.
+
+### Targeted Verification
+
+Use a built development environment and the normal test dependencies:
+
+```bash
+python -m pytest -q tests/test_envs.py
+```
+
+Overlay compatibility tests in
+`tests/tools/test_lcd_pdl_overlay.py` accept the real pinned source fixtures via
+`VLLM_TEST_FLASHINFER_SOURCES` and the Rubin CuTe DSL dependencies; the fixtures
+are checked against the installer's source hashes.

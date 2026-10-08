@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Backport FlashInfer's SM107 wheel import and CuTe DSL 4.8 compatibility fixes."""
+"""Install the pinned SM107 wheel-import and CuTe DSL 4.8 compatibility fixes.
+
+The parent and subclass are a matched source pair. The persistent LCD PDL
+overlay accepts this exact parent as well as stock 0.6.18.post1 and retains
+the NamedBarrier attributes needed by the SM107 subclass. Keep the checksum
+guard: another upstream parent revision is not an approved overlay base.
+"""
 
 import hashlib
 import importlib.metadata
