@@ -37,6 +37,7 @@ can differ in the last fp32 bits.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_logits, tl_rand32
 from vllm.v1.worker.gpu.sample.spec_topk_topp import (
     MAX_TOP_K,
@@ -107,7 +108,11 @@ def _penalized_submax_kernel(
     BLOCK_SIZE: tl.constexpr,
     SUB_SIZE: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -221,7 +226,11 @@ def _select_survivors_kernel(
     GROUP: tl.constexpr,
     HAS_PENALTIES: tl.constexpr,
     TOP_P: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
     top_k = tl.load(top_k_ptr + req_state_idx)
@@ -369,7 +378,11 @@ def _compact_rejection_kernel(
     logits_indices_ptr,
     KP: tl.constexpr,
     USE_FP64: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
     start = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
@@ -560,6 +573,8 @@ def select_survivors(
         BLOCK_SIZE=_BLOCK_SIZE,
         SUB_SIZE=_SUB_SIZE,
         HAS_PENALTIES=has_penalties,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
         num_warps=_SUBMAX_WARPS,
     )
     _select_survivors_kernel[(num_logits,)](
@@ -593,6 +608,8 @@ def select_survivors(
         GROUP=_GROUP if _GROUP and padded_num_sub // _GROUP >= kp else 0,
         HAS_PENALTIES=has_penalties,
         TOP_P=use_top_p,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
         num_warps=_SELECT_WARPS,
     )
     return surv_val, surv_idx, num_surv, lse
@@ -676,6 +693,8 @@ def fused_rejection_sample(
         logits_indices,
         KP=surv_val.shape[1],
         USE_FP64=use_fp64,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
         num_warps=1,
     )
     return sampled, num_sampled, num_rejected

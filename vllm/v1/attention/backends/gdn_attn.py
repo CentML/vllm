@@ -35,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -1596,6 +1597,8 @@ class GDNFusedDecodeStep:
             MAMBA_BLOCK_SIZE=fusion.mamba_block_size,
             NULL_ID=NULL_BLOCK_ID,
             BLOCK_SIZE=1024,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         return True
 
@@ -1719,7 +1722,11 @@ def _gdn_decode_metadata_kernel(
     MAMBA_BLOCK_SIZE: tl.constexpr,
     NULL_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # Writes what GDNAttentionMetadataBuilder.build() copies and fills into the
     # persistent buffers of one builder per program, for a batch whose first
     # num_spec_decodes rows are spec decodes (SPEC) or whose rows are all

@@ -15,6 +15,7 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
@@ -782,7 +783,11 @@ def _prepare_prefill_inputs_kernel(
     seq_lens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
@@ -881,6 +886,8 @@ def prepare_prefill_inputs(
         input_batch.seq_lens,
         max_num_reqs,
         BLOCK_SIZE=1024,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
     return last_token_indices
 
@@ -900,7 +907,11 @@ def _prepare_decode_inputs_kernel(
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
     if req_idx == num_reqs:
@@ -965,6 +976,8 @@ def prepare_decode_inputs(
         max_num_reqs,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
 
 
@@ -987,7 +1000,11 @@ def _update_draft_inputs_kernel(
     num_speculative_steps,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
 
     # Write the sampled draft token into self.draft_tokens[req_idx, step].
@@ -1072,4 +1089,6 @@ def update_draft_inputs(
         num_speculative_steps,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )

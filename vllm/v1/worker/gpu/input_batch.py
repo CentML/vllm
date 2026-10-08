@@ -11,6 +11,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
@@ -115,6 +116,8 @@ class BatchIndexUploader:
             num_padding_tokens,
             HAS_IS_PADDING=is_padding is not None,
             BLOCK_SIZE=block_size,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         event.record()
         return idx_mapping, cu_num_logits
@@ -141,7 +144,11 @@ def _upload_batch_indices_kernel(
     num_padding_tokens,
     HAS_IS_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_req = offs < num_reqs
     req_state_idx = tl.load(staged_idx_mapping_ptr + offs, mask=is_req)
@@ -466,7 +473,11 @@ def _prepare_pos_seq_lens_kernel(
     num_computed_tokens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_id = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
     if req_id == num_reqs:
@@ -512,6 +523,8 @@ def prepare_pos_seq_lens(
         num_computed_tokens,
         seq_lens.shape[0],
         BLOCK_SIZE=1024,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
 
 
@@ -529,7 +542,11 @@ def _combine_sampled_and_draft_tokens_kernel(
     logits_indices_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
 
@@ -617,6 +634,8 @@ def combine_sampled_and_draft_tokens(
         BLOCK_SIZE=triton.next_power_of_2(
             num_speculative_steps + num_new_sampled_tokens
         ),
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
     return logits_indices
 
@@ -687,7 +706,11 @@ def _post_update_kernel(
     total_len_ptr,
     # Optional [max_num_reqs] mamba num_accepted_tokens.
     num_accepted_ptr=None,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
     if req_state_idx < 0:
@@ -780,6 +803,8 @@ def post_update(
         all_token_ids.stride(0),
         total_len,
         num_accepted,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
         num_warps=1,
     )
 
@@ -823,7 +848,11 @@ def _expand_idx_mapping_kernel(
     expanded_local_pos_ptr,
     cu_num_logits_ptr,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
@@ -853,5 +882,7 @@ def expand_idx_mapping(
         expanded_local_pos,
         cu_num_logits,
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
     return expanded_idx_mapping, expanded_local_pos

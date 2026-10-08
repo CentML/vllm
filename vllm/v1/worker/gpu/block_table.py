@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 
 # Up to this many programs per KV-cache group pad the slot mappings (1024
 # tokens each per iteration) instead of one serial loop; same writes.
@@ -212,6 +213,8 @@ class BlockTables:
             self.num_blocks.gpu.stride(0),
             num_reqs,
             BLOCK_SIZE=1024,  # type: ignore
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
 
@@ -262,6 +265,8 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
             NUM_PAD_PROGRAMS=num_pad_programs,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -287,7 +292,11 @@ def _gather_block_tables_kernel(
     num_blocks_stride,
     num_reqs,  # actual number of requests (for padding)
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -337,7 +346,11 @@ def _compute_slot_mappings_kernel(
     TRITON_BLOCK_SIZE: tl.constexpr,
     # The last NUM_PAD_PROGRAMS programs along axis 1 pad; the rest are requests.
     NUM_PAD_PROGRAMS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)

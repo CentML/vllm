@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
@@ -418,6 +419,7 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
@@ -430,6 +432,9 @@ def postprocess_mamba_fused_kernel(
     The kernel indexes directly into pre-flattened metadata arrays using
     program_id(1). The grid dimensions encode the total state count.
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -516,6 +521,7 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -529,6 +535,9 @@ def preprocess_mamba_align_fused_kernel(
          when a block boundary is crossed (so the migrated state, now at the
          start of the new block, is read with the neutral bias).
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_reqs
     req_indices = tl.load(idx_mapping_ptr + offsets, mask=mask, other=0)
@@ -576,6 +585,7 @@ def precopy_mamba_align_fused_kernel(
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -591,6 +601,9 @@ def precopy_mamba_align_fused_kernel(
     batch-to-state idx_mapping; V1 already stores the staged arrays in batch
     order and uses HAS_IDX_MAPPING=False.
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -1480,6 +1493,8 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
 
     def run_fused_postprocess_align(
@@ -1548,6 +1563,8 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
 
 

@@ -11,6 +11,7 @@ from vllm.model_executor.models.interfaces import SupportsMRoPE
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 
 
 class RopeState:
@@ -179,6 +180,8 @@ class RopeState:
             BLOCK_SIZE=1024,
             NUM_DIMS=self.num_dims,
             USE_LINEAR_PREFILL=self.linear_prefill_positions,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
 
 
@@ -228,7 +231,11 @@ def _prepare_rope_positions_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUM_DIMS: tl.constexpr,
     USE_LINEAR_PREFILL: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
 
