@@ -7,7 +7,7 @@ serves contiguous BF16 weights with N % 16 == 0 and K % 64 == 0, at
 1 <= M <= 64. This includes TP-sharded GDN ``in_proj_ba`` with N=32. SM107
 uses it by default and additionally retains its measured router and BA plans
 with larger M windows, and its shared-expert-gate row-dot plan. SM100 and
-SM103 (GB300) use TinyGEMM2 only with ``VLLM_LOWM_BF16_GEMM_SM100=1``.
+SM103 use TinyGEMM2 only with ``VLLM_LOWM_BF16_GEMM_SM100=1``.
 Other architectures, layouts, dtypes, and token counts keep ``F.linear``.
 
 ``VLLM_LOWM_BF16_GEMM`` enables layer opt-in (on by default).
@@ -44,8 +44,15 @@ logger = init_logger(__name__)
 # down_proj GEMM); results are unchanged. Off by default.
 ROWDOT_PDL = os.environ.get("VLLM_ROWDOT_PDL", "0") == "1"
 
-# (N, K) -> (largest M served, backend). Measured on VR-288GB (SM107) with the
-# DRAM clock locked at 4752 MHz; above the bound cuBLAS is as fast or faster.
+# Optional positive M cap intersects each existing shape bound.
+
+
+
+
+LOWM_MAX_M = int(os.environ.get("VLLM_LOWM_BF16_GEMM_MAX_M", "0") or 0)
+
+# (N, K) -> (largest M served, backend), using the existing SM107 plans.
+
 _SM107_PLANS: dict[tuple[int, int], tuple[int, str]] = {
     (256, 2048): (208, "tinygemm"),  # MoE router (target and MTP layers)
     (64, 2048): (384, "tinygemm"),  # GDN in_proj_ba
@@ -109,7 +116,8 @@ def _runtime_plan(
     if plan is None:
         return None
     m = x.numel() // weight.shape[1]
-    return plan if 0 < m <= plan[0] else None
+    bound = min(plan[0], LOWM_MAX_M) if LOWM_MAX_M > 0 else plan[0]
+    return plan if 0 < m <= bound else None
 
 
 @triton.jit
@@ -323,6 +331,10 @@ def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
     )
     quant_method._gemm_impl = _lowm_gemm
     logger.info_once(
-        "Using low-M BF16 GEMM (%s, M <= %d) for N=%d, K=%d.", plan[1], plan[0], n, k
+        "Using low-M BF16 GEMM (%s, M <= %d) for N=%d, K=%d.",
+        plan[1],
+        min(plan[0], LOWM_MAX_M) if LOWM_MAX_M > 0 else plan[0],
+        n,
+        k,
     )
     return True
