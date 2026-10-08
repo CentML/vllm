@@ -101,34 +101,28 @@ class Mxfp8DraftLmHead(torch.nn.Module):
         self.loc_max_m = 0
         self.loc_pdl = False
 
-    def enable_locality(
-        self, topo, weight: torch.Tensor, max_m: int, pdl: bool
-    ) -> str | None:
+    def enable_locality(self, topo, max_m: int, pdl: bool) -> str | None:
         """Move the e4m3 weight to a 2 MiB-interleaved localized range and
-        serve M <= max_m rows with ``locality.mxgemm.DomainMxGemm``. The
-        FlashInfer fallback (larger M) reads the localized weight and the
-        domain-0 copy of the scales; the cudaMalloc originals are released.
-        Returns None, or why the head was left alone.
+        serve M <= max_m rows with ``locality.mxgemm.DomainMxGemm`` (same
+        e4m3 values and scales as the FlashInfer path). The FlashInfer
+        fallback (larger M) reads the localized weight and the domain-0 copy
+        of the scales; the cudaMalloc originals are released. Returns None, or
+        why the head was left alone.
         """
         from vllm.model_executor.layers.locality import mxgemm
         from vllm.model_executor.layers.locality.memory import localize
 
         if not mxgemm.supported():
             return "the MXFP8 domain kernel needs SM107"
-        n, k = weight.shape
+        k, n = self.weight_q_t.shape
         if k != mxgemm.K_DIM or n % 128:
             return f"needs a [N % 128 == 0, {mxgemm.K_DIM}] head, got {(n, k)}"
-        weight_q, _ = mxfp8_e4m3_quantize(weight.contiguous())
-        if not torch.equal(weight_q.t(), self.weight_q_t):
-            return (
-                "the MXFP8 copy differs from the shared lm_head (MTP checkpoint head)"
-            )
+        weight_q = self.weight_q_t.t()  # the contiguous [N, K] e4m3 copy
         loc = localize(weight_q.view(torch.uint8), "interleave")
-        del weight_q
         self.loc_gemm = mxgemm.DomainMxGemm(
             topo, loc, self.weight_scale, max_m=min(max_m, mxgemm.MAX_M)
         )
-        self.weight_q_t = loc.tensor.view(self.weight_q_t.dtype).t()
+        self.weight_q_t = loc.tensor.view(weight_q.dtype).t()
         self.weight_scale = self.loc_gemm.sfa[0]
         self.loc_max_m = self.loc_gemm.max_m
         self.loc_pdl = pdl

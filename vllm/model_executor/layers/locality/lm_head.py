@@ -176,9 +176,7 @@ def _enable_draft(drafter_model: torch.nn.Module, topo) -> None:
         head = getattr(module, "draft_lm_head_mxfp8", None)
         if not isinstance(head, Mxfp8DraftLmHead):
             continue
-        reason = head.enable_locality(
-            topo, module.lm_head.weight, DRAFT_MAX_M, DRAFT_PDL
-        )
+        reason = head.enable_locality(topo, DRAFT_MAX_M, DRAFT_PDL)
         if reason is not None or head.loc_gemm is None:
             logger.warning(
                 "VLLM_LOCALITY_LM_HEAD draft head not localized: %s.", reason
