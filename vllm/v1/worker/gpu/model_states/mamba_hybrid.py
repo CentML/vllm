@@ -12,7 +12,9 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
+from vllm.model_executor.layers.mamba.ops import gdn_ucache
 from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     GDNDecodeMetadataFusion,
     GDNFusedDecodeStep,
@@ -138,6 +140,8 @@ class MambaHybridModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        # U-cache: the slot's ring belongs to the previous request.
+        gdn_ucache.reset_slot(req_index)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
@@ -245,6 +249,7 @@ class MambaHybridModelState(DefaultModelState):
             GLUE_PDL=glue_pdl(),
             launch_pdl=glue_pdl(),
         )
+        # (u-cache: run_fused_precopy folds the active slots' rings first, gdn_ucache.fold_r1)
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -374,7 +379,58 @@ class MambaHybridModelState(DefaultModelState):
                 attn_groups,
                 for_capture=for_capture,
             )
+        if gdn_ucache.ENABLED:
+            if self._align_mode:
+                # binds the u-cache fold table and tag tables (KV cache bound; never
+                # under capture) before the first u-cache decode can run
+                mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+                self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+            self._gdn_ucache_step(
+                input_batch, cudagraph_mode, attn_metadata, num_reqs, for_capture
+            )
         return attn_metadata
+
+    def _gdn_ucache_step(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        attn_metadata: Any,
+        num_reqs: int,
+        for_capture: bool,
+    ) -> None:
+        """U-cache band of this step (also for CUDA-graph
+        capture, so a FULL graph and the prepass agree), the spec rows'
+        request-state slots, and the band-transition prepass (real steps,
+        after the align precopy, before the forward; outside the graphs).
+        """
+        md = None
+        mds = attn_metadata if isinstance(attn_metadata, dict) else {}
+        for m in mds.values():
+            if isinstance(m, GDNAttentionMetadata):
+                md = m
+                break
+        if md is None:
+            gdn_ucache.set_step(False, True)
+            return
+        k = self.vllm_config.num_speculative_tokens
+        nspec = int(md.num_spec_decodes)
+        # A FULL graph is captured / replayed at the padded row count.
+        rows = num_reqs if cudagraph_mode == CUDAGraphMode.FULL else nspec
+        uniform = int(md.num_spec_decode_tokens) == nspec * (1 + k)
+        gdn_ucache.set_step(
+            nspec > 0 and rows >= gdn_ucache.MIN_ROWS, uniform or for_capture
+        )
+        if for_capture:
+            return
+        # spec rows lead the batch; only real rows have a request-state slot
+        nreal = min(nspec, input_batch.num_reqs)
+        gdn_ucache.fill_slots(input_batch.idx_mapping, nreal)
+        gdn_ucache.prepass(
+            nreal,
+            input_batch.idx_mapping,
+            input_batch.seq_lens,
+            self.num_accepted_tokens_gpu,
+        )
 
     def _gather_num_accepted_tokens(
         self, input_batch: InputBatch, num_reqs: int

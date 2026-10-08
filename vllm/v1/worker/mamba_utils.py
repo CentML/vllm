@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops import gdn_ucache
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncsByType,
     get_conv_copy_spec,
@@ -420,6 +421,10 @@ def postprocess_mamba_fused_kernel(
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
     GLUE_PDL: tl.constexpr = False,
+    # U-cache (VLLM_GDN_DECODE_UCACHE): skip the temporal copy of request slots whose GDN state is
+    # in the u-cache layout (active[req] != 0); gdn_ucache.fold_r2 wrote it. Conv copies are unchanged.
+    uc_active_ptr=None,
+    UC_SKIP: tl.constexpr = False,
 ):
     """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
@@ -484,6 +489,10 @@ def postprocess_mamba_fused_kernel(
     # Skip no-op self-copy.
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
+    if UC_SKIP:
+        if tl.load(state_conv_widths_ptr + state_idx) == 0:
+            if tl.load(uc_active_ptr + req_idx) != 0:
+                return
 
     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
@@ -586,6 +595,9 @@ def precopy_mamba_align_fused_kernel(
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
     GLUE_PDL: tl.constexpr = False,
+    # U-cache: see postprocess_mamba_fused_kernel (gdn_ucache.fold_r1 wrote the temporal state).
+    uc_active_ptr=None,
+    UC_SKIP: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -625,6 +637,10 @@ def precopy_mamba_align_fused_kernel(
         return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
+    if UC_SKIP:
+        if tl.load(state_conv_widths_ptr + state_idx) == 0:
+            if tl.load(uc_active_ptr + req_idx) != 0:
+                return
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
@@ -1266,6 +1282,8 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
 
         self.is_initialized = True
+        # The u-cache fold table (same block tables and group order).
+        gdn_ucache.bind_worker(self, kv_cache_config, forward_context)
 
     def compute_aligned_state_indices(
         self,
@@ -1461,6 +1479,10 @@ class MambaSpecDecodeGPUContext:
         """
         if num_reqs == 0 or not self.is_initialized:
             return
+        # U-cache slots first: fold(checkpoint, n = acc) into the new block (temporal state).
+        gdn_ucache.fold_r1(
+            num_reqs, state_idx_gpu, src_col_gpu, token_bias_gpu, idx_mapping
+        )
         if self.compact_work is not None:
             self._run_compact_copies(
                 num_reqs,
@@ -1494,6 +1516,8 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             GLUE_PDL=glue_pdl(),
+            uc_active_ptr=gdn_ucache.active_or_dummy(state_idx_gpu.device),
+            UC_SKIP=gdn_ucache.ENABLED,
             launch_pdl=glue_pdl(),
         )
 
@@ -1518,6 +1542,15 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
 
+        # U-cache slots first (reads num_accepted before the
+        # in-place reset below): fold(checkpoint, n = bias + 1) into the boundary block
+        gdn_ucache.fold_r2(
+            num_reqs,
+            num_accepted_tokens_gpu,
+            state_idx_gpu,
+            new_num_computed_tokens_gpu,
+            idx_mapping,
+        )
         # V2 reads non-contiguous idx_mapping positions, so snapshot the whole
         # decision buffer rather than only [:num_reqs].
         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
@@ -1564,6 +1597,8 @@ class MambaSpecDecodeGPUContext:
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             GLUE_PDL=glue_pdl(),
+            uc_active_ptr=gdn_ucache.active_or_dummy(state_idx_gpu.device),
+            UC_SKIP=gdn_ucache.ENABLED,
             launch_pdl=glue_pdl(),
         )
 

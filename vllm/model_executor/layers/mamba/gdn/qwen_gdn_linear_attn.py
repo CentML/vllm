@@ -58,6 +58,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
+from vllm.model_executor.layers.mamba.ops import gdn_ucache
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -1190,6 +1191,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "GDN spec-decode core in one launch for decode batches of <= %d "
                 "requests",
                 GDN_FUSED_DECODE_MAX_REQUESTS,
+            )
+
+        if gdn_ucache.ENABLED:
+            # U-cache GDN decode: allocate the layer's rings before KV-cache profiling.
+            gdn_ucache.register_layer(
+                self,
+                self.num_k_heads // self.tp_size,
+                self.num_v_heads // self.tp_size,
+                get_current_vllm_config(),
             )
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -3078,6 +3088,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_slots = state_indices[:num_requests]
             cu_seqlens = cu_seqlens[: num_requests + 1]
             accepted = num_accepted_tokens[:num_requests]
+        if gdn_ucache.STEP.band and num_requests > 0:
+            # High band (>= VLLM_GDN_UCACHE_MIN_ROWS spec rows, decided per step in
+            # MambaHybridModelState.prepare_attn): u-cache recurrence + gated norm (checkpoint in column 0 +
+            # per-request ring; float-order vs gdn_mtp_cuda). out_proj's MXFP8 quant stays a separate launch.
+            gdn_ucache.decode(
+                self,
+                mixed_qkv,
+                a,
+                b,
+                state_slots,
+                cu_seqlens,
+                accepted,
+                self.kv_cache[1],
+                output_gate,
+                self.norm.weight,
+                core_attn_out,
+                self.head_k_dim**-0.5,
+                self.layer_norm_epsilon,
+                self.norm.activation == "sigmoid",
+            )
+            return SpecCoreOut.NORMED
         if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS:
             gdn_mtp_recurrence(
                 mixed_qkv,
@@ -3385,6 +3416,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if (
                 quantize
                 and self._fused_decode_counters is not None
+                and not gdn_ucache.STEP.band
                 and attn_metadata.num_spec_decodes <= GDN_FUSED_DECODE_MAX_REQUESTS
                 and attn_metadata.spec_state_indices_tensor is not None
                 and attn_metadata.spec_state_indices_tensor.size(1)
