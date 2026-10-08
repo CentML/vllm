@@ -258,7 +258,22 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             return
         graphs = one_graph.DraftOneGraphs(self)
         graphs.capture(target_tokens_padded)
-        self._one_graphs = graphs if graphs.graphs else None
+        if not graphs.graphs:
+            return
+        self._one_graphs = graphs
+        # Compile the COPY_REJECTED variant of _copy_idx_mapping_kernel now
+        # (same argument dtypes as InputBatch: int64 idx_mapping, int32
+        # num_rejected); every propose() launches it from here on, so it must
+        # not JIT during inference.
+        self._copy_request_inputs(
+            1,
+            torch.zeros(1, dtype=torch.int64, device=self.device),
+            self.temperature,
+            self.seeds,
+            num_rejected=graphs.num_rejected[:1],
+            num_rejected_out=graphs.num_rejected,
+        )
+        torch.accelerator.synchronize()
 
     @torch.inference_mode()
     def propose(
