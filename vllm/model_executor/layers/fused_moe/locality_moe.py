@@ -192,16 +192,22 @@ class LocalityMoE:
         w13_sf: torch.Tensor,
         w2_sf: torch.Tensor,
         topk: tuple[torch.Tensor, torch.Tensor] | None = None,
+        dbg: torch.Tensor | None = None,
+        pdl: bool = True,
     ):
         """Returns (gemm2_permuted [T*8, H] bf16, expert_weights [T, 8] bf16,
-        expanded_idx_to_permuted_idx [T, 8] int32).
+        expanded_idx_to_permuted_idx [T, 8] int32). ``dbg`` (int64 [nsm, 4])
+        receives per-CTA %globaltimer stamps; ``pdl=False`` launches both
+        kernels without programmatic dependent launch (diagnostics).
         """
         T = x.shape[0]
         assert 0 < T <= MAX_TOKENS
         topk_ids, topk_w = self.route(router_logits) if topk is None else topk
         ew = torch.empty(T, TOPK, dtype=torch.bfloat16, device=x.device)
         out = torch.empty(T * TOPK, HID, dtype=torch.bfloat16, device=x.device)
-        self.ext.plan_launch(topk_ids, topk_w, ew, self.plan, T, self.nd[0], self.nd[1])
+        self.ext.plan_launch(
+            topk_ids, topk_w, ew, self.plan, T, self.nd[0], self.nd[1], pdl
+        )
         self.ext.moe_launch(
             tmaps,
             w13_sf,
@@ -217,6 +223,8 @@ class LocalityMoE:
             self.nd[0],
             self.nd[1],
             self.nsm,
+            dbg,
+            pdl,
         )
         return out, ew, self.idx[: T * TOPK].view(T, TOPK)
 
@@ -319,6 +327,7 @@ struct alignas(16) GRec { int e, sub, ntok, slot0; short j[32]; int gid, pad0, p
 struct Plan {
   int ng[2], nfc1[2];                 // groups per domain; dynamic FC1 list length per domain
   int nslots, T, pad0, pad1;
+  u64 ts[8];                          // k_plan %globaltimer stamps (diagnostics)
   short k2g[2][128];                  // domain-local expert -> its first group (-1: idle)
   short fc1list[2][GMAX * 8];         // dynamic FC1 units: g * 8 + rb (wave-0 units excluded)
   GRec grec[2][GMAX];
@@ -330,6 +339,7 @@ struct Params {
   uint8_t* inter; uint8_t* intersf; __nv_bfloat16* out;
   const Plan* plan; State* st; const signed char* smdom;
   int nd0, nd1;
+  u64* dbg;                           // optional per-CTA stamps [grid][4]: start, producer past wait, end, smid|dom|rank
 };
 
 #define RTC(x) do { cudaError_t e_ = (x); TORCH_CHECK(e_ == cudaSuccess, #x " failed: ", cudaGetErrorString(e_)); } while (0)
@@ -337,6 +347,7 @@ struct Params {
 
 // ------------------------------------------------------------------ PTX helpers
 __device__ __forceinline__ unsigned get_smid() { unsigned r; asm volatile("mov.u32 %0, %%smid;" : "=r"(r)); return r; }
+__device__ __forceinline__ u64 gtime() { u64 r; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(r)); return r; }
 __device__ __forceinline__ uint32_t sa(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void griddep_launch() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
@@ -412,6 +423,7 @@ __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, c
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   griddep_wait();
   griddep_launch();                   // k_moe may start its weight prefetch now; it waits for this grid before reading pl
+  if (tid == 0) pl->ts[0] = gtime();
   const int N = T * TOPK;
   for (int i = tid; i < N; i += 1024) { sid[i] = (short)ids[i]; ew[i] = __float2bfloat16(tw[i]); }
   for (int i = tid; i < 32 * E; i += 1024) (&wc[0][0])[i] = 0;
@@ -436,7 +448,7 @@ __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, c
     int ba = 0, bb = 0;
     for (int x = 0; x < w; x++) { ba += ws[0][x]; bb += ws[1][x]; }
     eoff[tid] = ba + a - c; soff[tid] = bb + b - c8;
-    if (tid == E - 1) { pl->nslots = bb + b; pl->T = T; }
+    if (tid == E - 1) { pl->nslots = bb + b; pl->T = T; pl->ts[1] = gtime(); }
   }
   __syncthreads();
   for (int it = 0; it < CH; it += 32) {
@@ -449,6 +461,7 @@ __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, c
     __syncwarp();
   }
   __syncthreads();
+  if (tid == 0) pl->ts[2] = gtime();
   if (tid < 2 * 128) {
     const int d = tid >> 7, k = tid & 127, e = expert_of(d, k);
     const int c = cnt[e], nsub = (c + 31) >> 5, nd = d ? n1 : n0;
@@ -472,6 +485,8 @@ __global__ void __launch_bounds__(1024, 1) k_plan(const int* __restrict__ ids, c
       for (int rb = 0; rb < 8; rb++) if (!(s == 0 && 8 * k + rb < nd)) pl->fc1list[d][f++] = (short)(g * 8 + rb);
     }
   }
+  __syncthreads();
+  if (tid == 0) pl->ts[3] = gtime();
 }
 
 // ------------------------------------------------------------------ k_moe
@@ -502,6 +517,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
   __nv_bfloat16* sstage = (__nv_bfloat16*)(ssched + SCHED_MAX + 4);   // FC2 epilogue: [16 tokens][128 ch] bf16
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const u64 t_start = gtime();
   if (tid == 0) {
     // Rank in this SM's domain; if the domain already has all its ranks (an SM ran a second CTA because another kernel
     // held an SM), take a rank of the other domain, so every rank is served exactly once.
@@ -540,6 +556,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
                     e0 * 2 * I + rb0 * 128, KSB * s);
     }
     griddep_wait();
+    if (p.dbg && lane == 0) p.dbg[blockIdx.x * 4 + 1] = gtime();
     const Plan* pl = p.plan;
     int nmine = 0;
     if (live) {
@@ -816,6 +833,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) k_moe(const __grid_constant__ CUt
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem), "r"(TMEM_COLS) : "memory");
   }
   if (tid == 0) {
+    if (p.dbg) {
+      p.dbg[blockIdx.x * 4 + 0] = t_start; p.dbg[blockIdx.x * 4 + 2] = gtime();
+      p.dbg[blockIdx.x * 4 + 3] = (u64)get_smid() | ((u64)d << 16) | ((u64)rank << 24);
+    }
     // the last CTA resets the ranks and FC1 counters for the next call (every other CTA is past all its reads)
     __threadfence();
     const unsigned old = atomicAdd(&p.st->done, 1u);
@@ -870,21 +891,21 @@ torch::Tensor tensor_maps(torch::Tensor w13, torch::Tensor w2) {
   return t;
 }
 
-static cudaLaunchAttribute pdl_attr() {
+static cudaLaunchAttribute pdl_attr(bool pdl) {
   cudaLaunchAttribute a; memset(&a, 0, sizeof(a));
   a.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  a.val.programmaticStreamSerializationAllowed = 1;
+  a.val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
   return a;
 }
 
-void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::Tensor plan, int64_t T, int64_t n0, int64_t n1) {
+void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::Tensor plan, int64_t T, int64_t n0, int64_t n1, bool pdl) {
   TORCH_CHECK(T > 0 && T <= TMAX && ids.dtype() == torch::kInt32 && tw.dtype() == torch::kFloat32 && ew.dtype() == torch::kBFloat16);
   TORCH_CHECK(ids.is_contiguous() && tw.is_contiguous() && ew.is_contiguous() && plan.numel() >= (int64_t)sizeof(Plan));
   c10::cuda::CUDAGuard guard(ids.device());
   cudaLaunchConfig_t cfg; memset(&cfg, 0, sizeof(cfg));
   cfg.gridDim = dim3(1); cfg.blockDim = dim3(1024); cfg.dynamicSmemBytes = 0;
   cfg.stream = at::cuda::getCurrentCUDAStream().stream();
-  cudaLaunchAttribute at[1] = {pdl_attr()};
+  cudaLaunchAttribute at[1] = {pdl_attr(pdl)};
   cfg.attrs = at; cfg.numAttrs = 1;
   RTC(cudaLaunchKernelEx(&cfg, k_plan, (const int*)ids.data_ptr(), (const float*)tw.data_ptr(), (__nv_bfloat16*)ew.data_ptr(),
                          (Plan*)plan.data_ptr(), (int)T, (int)n0, (int)n1));
@@ -892,7 +913,7 @@ void plan_launch(torch::Tensor ids, torch::Tensor tw, torch::Tensor ew, torch::T
 
 void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, torch::Tensor x, torch::Tensor xsf,
                 torch::Tensor inter, torch::Tensor intersf, torch::Tensor out, torch::Tensor plan, torch::Tensor state,
-                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm) {
+                torch::Tensor smdom, int64_t n0, int64_t n1, int64_t nsm, std::optional<torch::Tensor> dbg, bool pdl) {
   TORCH_CHECK(tmaps.device().is_cpu() && tmaps.numel() == 2 * (int64_t)sizeof(CUtensorMap));
   TORCH_CHECK(x.is_contiguous() && x.size(1) == H && xsf.is_contiguous() && xsf.numel() == x.size(0) * (H / 32));
   TORCH_CHECK(out.is_contiguous() && out.size(0) == x.size(0) * TOPK && out.size(1) == H && out.dtype() == torch::kBFloat16);
@@ -907,10 +928,12 @@ void moe_launch(torch::Tensor tmaps, torch::Tensor w13sf, torch::Tensor w2sf, to
   prm.inter = (uint8_t*)inter.data_ptr(); prm.intersf = (uint8_t*)intersf.data_ptr();
   prm.out = (__nv_bfloat16*)out.data_ptr(); prm.plan = (const Plan*)plan.data_ptr(); prm.st = (State*)state.data_ptr();
   prm.smdom = (const signed char*)smdom.data_ptr(); prm.nd0 = (int)n0; prm.nd1 = (int)n1;
+  prm.dbg = dbg.has_value() ? (u64*)dbg->data_ptr() : nullptr;
+  TORCH_CHECK(!dbg.has_value() || dbg->numel() * dbg->element_size() >= nsm * 32);
   cudaLaunchConfig_t cfg; memset(&cfg, 0, sizeof(cfg));
   cfg.gridDim = dim3((unsigned)nsm); cfg.blockDim = dim3(NTHREADS); cfg.dynamicSmemBytes = SMEM_BYTES;
   cfg.stream = at::cuda::getCurrentCUDAStream().stream();
-  cudaLaunchAttribute at[1] = {pdl_attr()};
+  cudaLaunchAttribute at[1] = {pdl_attr(pdl)};
   cfg.attrs = at; cfg.numAttrs = 1;
   RTC(cudaLaunchKernelEx(&cfg, k_moe, m[0], m[1], prm));
 }
