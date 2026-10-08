@@ -259,33 +259,31 @@ class GDNSharedBuild:
 
 class LazyConv1dMetadata:
     """VLLM_GDN_HOST_TRIM2: compute_causal_conv1d_metadata of the step, built
-    on the first call and kept on ``shared`` for every GDN group. Only
+    on the first call and kept on this instance, which every GDN group of the
+    step shares through ``GDNSharedBuild.conv1d_metadata_fn``. Only
     causal_conv1d_fn reads it, which the fused conv-prep path never calls.
     Two instances are equal when they build the same metadata.
+
+    It must not reference the GDNSharedBuild that holds it: that cycle is
+    freed only by the cyclic GC, and gc.freeze() on admission
+    (VLLM_GC_FREEZE_ADMIT) would leak the step's device tensors with it.
     """
 
-    __slots__ = ("shared", "query_start_loc_cpu", "device")
+    __slots__ = ("query_start_loc_cpu", "device", "metadata")
     __hash__ = None  # type: ignore[assignment]
 
-    def __init__(
-        self,
-        shared: GDNSharedBuild,
-        query_start_loc_cpu: torch.Tensor,
-        device: torch.device,
-    ) -> None:
-        self.shared = shared
+    def __init__(self, query_start_loc_cpu: torch.Tensor, device: torch.device) -> None:
         self.query_start_loc_cpu = query_start_loc_cpu
         self.device = device
+        # (nums_dict, batch_ptr, token_chunk_offset_ptr) once built.
+        self.metadata: tuple | None = None
 
     def __call__(self) -> tuple:
-        shared = self.shared
-        if shared.batch_ptr is None:
-            shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    self.query_start_loc_cpu, device=self.device
-                )
+        if self.metadata is None:
+            self.metadata = compute_causal_conv1d_metadata(
+                self.query_start_loc_cpu, device=self.device
             )
-        return shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr
+        return self.metadata
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -1181,7 +1179,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         shared.has_initial_state = has_initial_state
         if GDN_HOST_TRIM2:
             shared.conv1d_metadata_fn = LazyConv1dMetadata(
-                shared, non_spec_query_start_loc_cpu, query_start_loc.device
+                non_spec_query_start_loc_cpu, query_start_loc.device
             )
         else:
             shared.nums_dict, shared.batch_ptr, shared.token_chunk_offset_ptr = (
