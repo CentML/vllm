@@ -287,9 +287,11 @@ def test_routing_equals_production(layer, T: int, case: str):
 @pytest.mark.parametrize("T", [17, 64, 208, 209, 370, 512])
 def test_dense_router(layer, T: int):
     xb, wr, xq, xsf, lp, own, (g2, ew, idx, ids, _, _) = _run(layer, T, "dense")
-    # bf16 logits within one bf16 step of production's (different fp32 order)
+    # bf16 logits within one bf16 step of production's, plus fp32 summation-order
+    # slack where the dot product cancels (cuBLAS above T = 208)
     mag = torch.maximum(own.float().abs(), lp.float().abs())
-    assert bool(((own.float() - lp.float()).abs() <= mag * 2.0**-7 + 1e-6).all())
+    slack = (xb.float().abs() @ wr.float().abs().t()) * 2.0**-16
+    assert bool(((own.float() - lp.float()).abs() <= mag * 2.0**-7 + slack).all())
     assert torch.equal(ids, _select(own))
     _, tw, _ = _trt(layer["prod"], own, xq, xsf)
     assert torch.equal(ew.view(torch.int16), tw.view(torch.int16))
