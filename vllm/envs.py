@@ -1057,17 +1057,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Guards against sample-rate forgery where an attacker inflates
     # the header sample rate to bypass the duration guard while the
     # actual frame count still causes a multi-GiB allocation.
-    # Default is 256 MiB (sufficient for 600s mono 48 kHz float32).
     "VLLM_MAX_AUDIO_DECODE_BYTES": lambda: int(
         os.getenv("VLLM_MAX_AUDIO_DECODE_BYTES", "268435456")
     ),
     # Maximum bytes a client-supplied embedding payload (`prompt_embeds`,
     # `image_embeds`, `audio_embeds`, `video_embeds`) may allocate once it is
     # densified. A sparse tensor carries its own declared shape, so a payload
-    # of a few hundred bytes can expand into hundreds of GiB. The limit is
-    # checked before `to_dense()` so the memory is never allocated. Set to 0
-    # to disable. Default is 2 GiB, which covers a 128K-token float32
-    # embedding at hidden_size 4096.
+    # can expand substantially. The limit is checked before `to_dense()` so
+    # the memory is never allocated. Set to 0 to disable.
     "VLLM_MAX_EMBED_DECODE_BYTES": lambda: int(
         os.getenv("VLLM_MAX_EMBED_DECODE_BYTES", "2147483648")
     ),
@@ -1359,8 +1356,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   1 = always single-pass: one kernel launch, no workspace,
     #       may be preferred for low-concurrency decode workloads
     #   2 = always multi-pass: can be faster for MoE-heavy models
-    #       (e.g., +2-5% on Qwen3-Next, +1.5% on DeepSeek-V3 at TP4,
-    #       see PR #39177 for benchmarks)
     "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY": lambda: int(
         os.getenv("VLLM_ROCM_AITER_MOE_DISPATCH_POLICY", "0")
     ),
@@ -1939,6 +1934,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
     ),
+    # Optional locality/decode configuration; tuning keys do not activate features.
+    "VLLM_LOCALITY_SPLIT": lambda: os.getenv("VLLM_LOCALITY_SPLIT", "0") == "1",
+    "VLLM_LOCALITY_SPLIT_ALLOC": lambda: os.getenv("VLLM_LOCALITY_SPLIT_ALLOC", "chunks"),
+    "VLLM_LOCALITY_BUILD_DIR": lambda: os.getenv("VLLM_LOCALITY_BUILD_DIR") or None,
+    "VLLM_LOCALITY_DOMAIN_WEIGHTS": lambda: os.getenv("VLLM_LOCALITY_DOMAIN_WEIGHTS", "1,1"),
+    "VLLM_LOCALITY_MIN_MEMCLK": lambda: int(os.getenv("VLLM_LOCALITY_MIN_MEMCLK", "3600")),
+    "VLLM_DP2G_HITLOG": lambda: os.getenv("VLLM_DP2G_HITLOG", "0") == "1",
+    "VLLM_LOCALITY_LM_HEAD": lambda: os.getenv("VLLM_LOCALITY_LM_HEAD", "0"),
+    "VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M": lambda: int(os.getenv("VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M", "16")),
+    "VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M": lambda: int(os.getenv("VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M", "32")),
+    "VLLM_LOCALITY_LM_HEAD_PDL": lambda: os.getenv("VLLM_LOCALITY_LM_HEAD_PDL", "1") == "1",
+    "VLLM_LOCALITY_LM_HEAD_CFG16": lambda: int(os.getenv("VLLM_LOCALITY_LM_HEAD_CFG16", "0")),
     # Kernel Factory paged-FP8 decode attention (v1/attention/ops/kf_decode_attn):
     # replaces the trtllm-gen decode kernel on SM107 (FP8 Q/KV, head_dim 256, 16 q /
     # 2 kv heads, page 128, BF16 out) for uniform decode batches (MTP verify, draft
@@ -2349,7 +2356,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
     # tokens the FP8 main GEMM has idle SMs to share with the bf16 aux GEMMs
-    # and overlap is a 5-45% win; above it the FP8 GEMM saturates the device
+    # and may benefit from overlap; above it the FP8 GEMM saturates the device
     # and the cross-stream sync becomes pure overhead. Set to 0 to disable
     # the multi-stream path entirely. See #PR 41526 for the empirical result
     # for the default value of 1024 tokens.
