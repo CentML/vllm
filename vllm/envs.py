@@ -341,6 +341,12 @@ if TYPE_CHECKING:
     VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
     VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
     VLLM_MOE_PDL_FC: bool = False
+    W4FQ: str = "off"
+    W4REAL: bool = False
+    W4FQ_GAIN: str = "off"
+    W4FQ_SHARED: bool = True
+    W4FQ_MTP: bool = True
+    W4FQ_STRICT: bool = True
     VLLM_LOWM_BF16_GEMM: bool = True
     VLLM_LOWM_BF16_GEMM_PDL: bool = False
     VLLM_LOWM_BF16_GEMM_SM100: bool = False
@@ -2325,6 +2331,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (flashinfer_exact_routing). Ignored when VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
     # > 0 or GS2_ROUTE_PREBUILT is set.
     "VLLM_MOE_PDL_FC": lambda: os.getenv("VLLM_MOE_PDL_FC", "0") == "1",
+    # Experimental Qwen W4A8 experts. Coverage/verification keys do not
+    # enable the feature: W4FQ and W4FQ_GAIN remain off by default.
+    "W4FQ": lambda: os.getenv("W4FQ", "off").strip().lower(),
+    "W4REAL": lambda: os.getenv("W4REAL", "0") == "1",
+    "W4FQ_GAIN": lambda: os.getenv("W4FQ_GAIN", "off").strip().lower(),
+    "W4FQ_SHARED": lambda: os.getenv("W4FQ_SHARED", "1") == "1",
+    "W4FQ_MTP": lambda: os.getenv("W4FQ_MTP", "1") == "1",
+    "W4FQ_STRICT": lambda: os.getenv("W4FQ_STRICT", "1") == "1",
     # Persistent directory for the JIT-built exact-routing FlashInfer MoE module
     # (GS2_ROUTE, flashinfer_exact_routing), keyed by a hash of its build
     # inputs; ignored with GS2_ROUTE_PREBUILT. Empty = no cache.

@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -142,6 +143,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
+        self._w4a8_enabled = False
+        if envs.W4FQ != "off" or envs.W4REAL or envs.W4FQ_GAIN != "off":
+            from vllm.model_executor.layers.fused_moe.w4a8 import enabled_for
+
+            self._w4a8_enabled = enabled_for(prefix)
 
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -154,7 +160,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # Resolve shared-expert fusion first (when enabled, TP alignment constraint no
         # longer applies)
         self.is_fused_shared_expert_enabled = False
-        if config.shared_expert_intermediate_size > 0:
+        if config.shared_expert_intermediate_size > 0 and not self._w4a8_enabled:
             self.is_fused_shared_expert_enabled = resolve_layer_fused_shared_expert(
                 quant_config,
                 prefix,
@@ -250,6 +256,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.shared_expert is None
             else None,
         )
+        if self._w4a8_enabled:
+            from vllm.model_executor.layers.fused_moe.w4a8 import configure
+
+            configure(self, prefix)
 
         # The decoder layer may hand the MoE input pre-quantized to MXFP8 by
         # the post-attention norm (MLPerf submission path; specialized for
@@ -274,6 +284,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if self._w4a8_enabled:
+            if quantized_input is not None:
+                raise ValueError("W4A8 consumes BF16 input, not the shared dual layout")
+            return torch.ops.w4a8.fold_moe(
+                hidden_states, self.experts._encode_layer_name()
+            ).view(orig_shape)
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)

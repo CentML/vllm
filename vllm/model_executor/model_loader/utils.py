@@ -156,6 +156,10 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+    if envs.W4FQ != "off" or envs.W4REAL or envs.W4FQ_GAIN != "off":
+        from vllm.model_executor.layers.fused_moe.w4a8 import fold_model
+
+        fold_model(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
