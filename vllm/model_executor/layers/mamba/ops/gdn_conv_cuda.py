@@ -5,9 +5,8 @@
 
 Same contract and bitwise-identical outputs (q/k/v, exp(g), beta, conv state) as the
 Triton kernel in gdn_fused_conv_prep.py, i.e. as causal_conv1d_fn + fused_post_conv_prep:
-every floating-point instruction mirrors the Triton PTX (see the source header). Faster
-than the Triton kernel on VR (16-byte vector accesses, a register rolling window over the
-taps; 3584 tokens: 20.4 vs 32.4 us per layer).
+every floating-point instruction mirrors the Triton PTX (see the source header).
+Uses vector accesses and a register rolling window over the taps.
 
 The CUDA source is kept in this module (``_SOURCE``) so the package ships only Python;
 ``load()`` writes it into the build directory and builds it with
@@ -97,10 +96,18 @@ def gdn_conv_cuda_prep(
     head_k_dim: int,
     head_v_dim: int,
     out: tuple[torch.Tensor, ...] | None = None,
+    *,
+    pdl: bool = False,
 ):
     """gdn_fused_conv_prep on the CUDA kernel; None if the kernel's layout
     contract (bf16, head dims 128, width 4, 16-byte aligned rows) is not met.
     ``out``: (q, k, v, g, beta) buffers to write instead of allocating them.
+    g/beta must be float32 [P, HV], either contiguous token-major or matching
+    head-major views with strides (1, Tcap), Tcap >= P. With no ``out``,
+    VLLM_GDN_VSPLIT_HEAD_MAJOR selects padded head-major gates. Unsupported
+    output buffers return None before launch.
+    ``pdl`` enables the producer's early trigger; the caller must pair it with
+    an adjacent, dependency-waiting PDL consumer on the same stream.
     Call ``load()`` first (the warmup does).
     """
     H, K, V = num_k_heads, head_k_dim, head_v_dim
@@ -109,14 +116,39 @@ def gdn_conv_cuda_prep(
         return None
     P = x.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
+    gb_ts = 0
     if out is not None:
+        if len(out) != 5 or not all(isinstance(t, torch.Tensor) for t in out):
+            return None
         q, k, v, g, beta = out
     else:
         q = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
         k = torch.empty(P, H, K, dtype=x.dtype, device=x.device)
         v = torch.empty(P, HV, V, dtype=x.dtype, device=x.device)
-        g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
-        beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+        if envs.VLLM_GDN_VSPLIT_HEAD_MAJOR:
+            gb_ts = max(64, ((P + 63) // 64) * 64)
+            g = torch.empty(HV, gb_ts, dtype=torch.float32, device=x.device)[:, :P].t()
+            beta = torch.empty(HV, gb_ts, dtype=torch.float32, device=x.device)[:, :P].t()
+        else:
+            g = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+            beta = torch.empty(P, HV, dtype=torch.float32, device=x.device)
+    if out is not None:
+        if (
+            g.shape != (P, HV)
+            or beta.shape != (P, HV)
+            or g.dtype != torch.float32
+            or beta.dtype != torch.float32
+            or g.device != x.device
+            or beta.device != x.device
+            or g.stride() != beta.stride()
+        ):
+            return None
+        if g.is_contiguous() and beta.is_contiguous():
+            pass
+        elif g.stride(0) == 1 and g.stride(1) >= max(P, 1):
+            gb_ts = g.stride(1)
+        else:
+            return None
     # Tokens per half-warp: 4 (32-token CTAs) for short sequences, else 8.
     tph = 4 if 1024 * max(num_seqs, 1) > P else 8
     if GDN_HOST_TRIM:
@@ -148,6 +180,8 @@ def gdn_conv_cuda_prep(
         H,
         tph,
         0,
+        gb_ts=gb_ts,
+        pdl=int(pdl),
     )
     if not ok:
         return None
@@ -333,6 +367,9 @@ struct Params {
   const void* a_log; int a_log_bf16; const void* dtb; int dtb_bf16;
   uint16_t* q; uint16_t* k; uint16_t* v; float* g; float* beta;
   int H, HV;
+  // Head-major g/beta use [HV][gb_ts] storage, viewed as [P, HV].
+  int64_t gb_ts;
+  int pdl;
 };
 
 __device__ __forceinline__ float ld_param_f(const void* p, int is_bf16, int i) {
@@ -342,6 +379,9 @@ __device__ __forceinline__ float ld_param_f(const void* p, int is_bf16, int i) {
 // RV: in-thread l2 reduction tree variant (0: fma on the first pair, 1: fma on the second pair).
 template <int TPH, int RV>
 __global__ void __launch_bounds__(128) conv_post_kernel(const Params p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (p.pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   constexpr int BT = TPH * 8;
   const int tid = threadIdx.x, lane = tid & 31, l16 = tid & 15, hw = tid >> 4;
   const int grp = blockIdx.y;  // 0..H-1 q, H..2H-1 k, 2H..2H+HV-1 v
@@ -555,8 +595,13 @@ __global__ void __launch_bounds__(128) conv_post_kernel(const Params p) {
       const float eA = fex2(fmul(A_log, __uint_as_float(0x3FB8AA3Bu)));
       const float gv = tri_expf(fmul(sp, -eA));
       const float be = fdivf(1.0f, fadd(fex2(fmul(bv, __uint_as_float(0xBFB8AA3Bu))), 1.0f));
-      p.g[(int64_t)t * p.HV + hv] = gv;
-      p.beta[(int64_t)t * p.HV + hv] = be;
+      if (p.gb_ts) {
+        p.g[(int64_t)hv * p.gb_ts + t] = gv;
+        p.beta[(int64_t)hv * p.gb_ts + t] = be;
+      } else {
+        p.g[(int64_t)t * p.HV + hv] = gv;
+        p.beta[(int64_t)t * p.HV + hv] = be;
+      }
     }
   }
 
@@ -584,7 +629,7 @@ __global__ void __launch_bounds__(128) conv_post_kernel(const Params p) {
 bool run(torch::Tensor x, torch::Tensor w, torch::Tensor cs, torch::Tensor cidx, torch::Tensor hinit,
          torch::Tensor cu, int64_t num_seqs, torch::Tensor a, torch::Tensor b, torch::Tensor A_log,
          torch::Tensor dt_bias, torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
-         torch::Tensor beta, int64_t H, int64_t tph, int64_t rv) {
+         torch::Tensor beta, int64_t H, int64_t tph, int64_t rv, int64_t gb_ts = 0, int64_t pdl = 0) {
   const int64_t P = x.size(0);
   const int HV = (int)A_log.size(0);
   if (x.scalar_type() != at::kBFloat16 || w.scalar_type() != at::kBFloat16 || cs.scalar_type() != at::kBFloat16) return false;
@@ -597,6 +642,24 @@ bool run(torch::Tensor x, torch::Tensor w, torch::Tensor cs, torch::Tensor cidx,
   if (cidx.scalar_type() != at::kInt && cidx.scalar_type() != at::kLong) return false;
   if (cs.stride(1) == 1 && ((cs.stride(0) % 8) != 0 || (cs.stride(2) % 8) != 0 ||
                             (reinterpret_cast<uintptr_t>(cs.data_ptr()) % 16) != 0)) return false;
+  // Validate caller-owned outputs before writing either outputs or conv state.
+  for (const auto* tp : {&q, &k, &v}) {
+    const auto& t = *tp;
+    const int64_t heads = tp == &v ? HV : H;
+    if (t.scalar_type() != at::kBFloat16 || t.device() != x.device() || !t.is_cuda() ||
+        t.dim() != 3 || t.size(0) != P || t.size(1) != heads || t.size(2) != 128 ||
+        !t.is_contiguous() || (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16) != 0) return false;
+  }
+  if (gb_ts < 0 || (gb_ts && gb_ts < P)) return false;
+  for (const auto* tp : {&g, &beta}) {
+    const auto& t = *tp;
+    if (t.scalar_type() != at::kFloat || t.device() != x.device() || !t.is_cuda() ||
+        t.dim() != 2 || t.size(0) != P || t.size(1) != HV) return false;
+    if (gb_ts) {
+      if (t.stride(0) != 1 || t.stride(1) != gb_ts) return false;
+    } else if (!t.is_contiguous()) return false;
+  }
+  if (g.strides() != beta.strides()) return false;
   if (P == 0 || num_seqs == 0) return true;
   Params p;
   p.x = (const uint16_t*)x.data_ptr(); p.sx = x.stride(0);
@@ -612,6 +675,7 @@ bool run(torch::Tensor x, torch::Tensor w, torch::Tensor cs, torch::Tensor cidx,
   p.q = (uint16_t*)q.data_ptr(); p.k = (uint16_t*)k.data_ptr(); p.v = (uint16_t*)v.data_ptr();
   p.g = (float*)g.data_ptr(); p.beta = (float*)beta.data_ptr();
   p.H = (int)H; p.HV = HV;
+  p.gb_ts = gb_ts; p.pdl = (int)pdl;
   const c10::cuda::CUDAGuard guard(x.device());
   auto stream = c10::cuda::getCurrentCUDAStream();
   const int BT = (int)tph * 8;
@@ -630,7 +694,13 @@ bool run(torch::Tensor x, torch::Tensor w, torch::Tensor cs, torch::Tensor cidx,
 }  // namespace gk2
 
 #ifndef GK2_KERNEL_ONLY
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &gk2::run); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &gk2::run, pybind11::arg("x"), pybind11::arg("w"), pybind11::arg("cs"), pybind11::arg("cidx"),
+        pybind11::arg("hinit"), pybind11::arg("cu"), pybind11::arg("num_seqs"), pybind11::arg("a"), pybind11::arg("b"),
+        pybind11::arg("A_log"), pybind11::arg("dt_bias"), pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("g"), pybind11::arg("beta"), pybind11::arg("H"), pybind11::arg("tph"), pybind11::arg("rv"),
+        pybind11::arg("gb_ts") = 0, pybind11::arg("pdl") = 0);
+}
 #else
 template __global__ void gk2::conv_post_kernel<8, 0>(const gk2::Params);
 #endif

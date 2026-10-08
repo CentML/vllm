@@ -33,6 +33,24 @@ Dispatch (fi_chunk_gated_delta_rule in qwen_gdn_linear_attn.py, non-CP state-poo
                                         len); "n<=3" = split iff num_seqs <= 3.
 Steps the rule leaves at v_split=1 run the stock FlashInfer call
 (VLLM_GDN_FI_VSPLIT_V1=1: this package's kernel at v_split=1).
+
+Optional memory/scheduling variants (all independently default OFF):
+  VLLM_GDN_VSPLIT_STAGED_STORE=1       bf16 indexed v_split=2 final state via SMEM
+  VLLM_GDN_VSPLIT_STAGED_LOAD=1        initial state via SMEM (requires staged store)
+  VLLM_GDN_VSPLIT_VEC_STATE=1          aligned bf16 v_split=1 vector state traffic
+  VLLM_GDN_VSPLIT_EARLY_RELINQUISH=1   release the TMEM allocation permit early
+  VLLM_GDN_VSPLIT_HEAD_MAJOR=1         CUDA conv allocates head-major g/beta;
+                                     explicit caller buffers retain their layout
+  VLLM_GDN_VSPLIT_PDL=1                adjacent conv/chunk edge in layer graphs only
+
+These variants retain the arithmetic and state conversions (EXACT design);
+bitwise output and complete-state comparison against frozen qwen-v2 is required
+on the target GPU before adoption. State transport falls back to stock for
+unsupported tile strides, alignment or dtype. VEC_STATE does not change route
+selection: VLLM_GDN_FI_VSPLIT_V1=1 is needed for serving's v_split=1 steps.
+Head-major gates are made contiguous on the FlashInfer/CP fallback. PDL is not
+inferred on the eager path: recurrent/zeroing kernels may intervene there.
+No device-nb, step-plan or prebuilt-descriptor implementation is reintroduced.
 """
 import os
 
