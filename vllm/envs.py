@@ -1934,7 +1934,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
     ),
-    # Optional locality/decode configuration; tuning keys do not activate features.
+    # Opt-in DEC107 attention and die-local KV placement. Tuning defaults are
+    # inert until the corresponding master switch / explicit cache dtype is set.
+    "DEC107_DECODE": lambda: os.getenv("DEC107_DECODE", "0").strip() == "1",
+    "DEC107_LOCAL": lambda: os.getenv("DEC107_LOCAL", "0").strip() == "1",
+    "DEC107_MXK": lambda: os.getenv("DEC107_MXK", "0").strip() == "1",
+    "DEC107_DECODE_QLENS": lambda: os.getenv("DEC107_DECODE_QLENS", "1,2,3,4"),
+    "DEC107_DECODE_MAX_B": lambda: int(os.getenv("DEC107_DECODE_MAX_B", "1024")),
+    "DEC107_DECODE_MIN_B": lambda: int(os.getenv("DEC107_DECODE_MIN_B", "1")),
+    "DEC107_LOCAL_PPD": lambda: os.getenv("DEC107_LOCAL_PPD", "auto").strip(),
+    "DEC107_CUBIN": lambda: os.getenv("DEC107_CUBIN", ""),
+    "DEC107_KV_CACHE_DTYPE": lambda: os.getenv("DEC107_KV_CACHE_DTYPE", "").strip(),
+    "DEC107_MXK_HADAMARD": lambda: os.getenv("DEC107_MXK_HADAMARD", "1").strip() == "1",
+    "DEC107_SM_DOMAIN_FORCE": lambda: os.getenv("DEC107_SM_DOMAIN_FORCE", ""),
+    "DEC107_NO_ORPHAN_ATTRIB": lambda: "DEC107_NO_ORPHAN_ATTRIB" in os.environ,
+    "DEC107_KVDUMP": lambda: os.getenv("DEC107_KVDUMP", ""),
+    "DEC107_KVDUMP_MAX": lambda: int(os.getenv("DEC107_KVDUMP_MAX", "24")),
+    "DEC107_KVDUMP_LAYERS": lambda: int(os.getenv("DEC107_KVDUMP_LAYERS", "3")),
+    "DEC107_KVDUMP_MIN_T": lambda: int(os.getenv("DEC107_KVDUMP_MIN_T", "2048")),
+    "DEC107_KVDUMP_DELAY_S": lambda: float(os.getenv("DEC107_KVDUMP_DELAY_S", "1500")),
+    "DEC107_KVDUMP_EVERY": lambda: int(os.getenv("DEC107_KVDUMP_EVERY", "7")),
     "VLLM_LOCALITY_SPLIT": lambda: os.getenv("VLLM_LOCALITY_SPLIT", "0") == "1",
     "VLLM_LOCALITY_SPLIT_ALLOC": lambda: os.getenv("VLLM_LOCALITY_SPLIT_ALLOC", "chunks"),
     "VLLM_LOCALITY_BUILD_DIR": lambda: os.getenv("VLLM_LOCALITY_BUILD_DIR") or None,

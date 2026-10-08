@@ -81,6 +81,11 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops import (
+    dec107_decode,
+    dec107_kvdump,
+    dec107_mxk,
+)
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -743,6 +748,11 @@ class FlashInferBackend(AttentionBackend):
         """NVFP4 stores K and V as separate per-head slots of packed fp4 data
         plus fp8 block scales.
         """
+        if spec.state_content_bytes is None and spec.kv_quant_mode.is_mxk:
+            # dec107 MXFP4-K / FP8-V: one opaque 392-B slot per (kv head, token); the page is region-major
+            # [K data | K scales | V] (dec107_mxk.py), always read through a page-flat byte view.
+            assert spec.head_size == 256 and spec.head_size_v == 256, "mxfp4k_fp8v needs head_size 256"
+            return replace(spec, num_head_slots=spec.num_kv_heads, state_content_bytes=128 + 8 + 256)
         if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
             return spec
         hs_k = nvfp4_kv_cache_full_dim(spec.head_size)
@@ -764,10 +774,15 @@ class FlashInferBackend(AttentionBackend):
         "fp8_e5m2",
         "nvfp4",
         "nvfp4_4over6",
+        "mxfp4k_fp8v",
     ]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # MXFP4-K byte pages have a fixed P32 writer and reader. Letting the
+        # generic chooser pick P64/P128 changes their layout, not just routing.
+        if envs.DEC107_DECODE and envs.DEC107_MXK:
+            return [32]
         # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
         # on Blackwell); advertise them only when usable so selection never
         # picks a large kernel block we cannot serve.
@@ -837,11 +852,20 @@ class FlashInferBackend(AttentionBackend):
             return torch.float8_e5m2
         elif kv_cache_dtype.startswith("nvfp4"):
             return torch.uint8
+        elif kv_cache_dtype == "mxfp4k_fp8v":
+            # prefill runs on pages dequantized to FP8 (dec107_mxk.mxk_pages_to_fp8)
+            return torch.float8_e4m3fn
         else:
             raise ValueError(f"Unrecognized dtype: {kv_cache_dtype}")
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype == "mxfp4k_fp8v":
+            # decode: dec107 MXFP4-K kernel (sm_107a, tcgen05 kind::mxf8f6f4); prefill: trtllm-gen on FP8 pages
+            return (
+                current_platform.is_device_capability_family(100)
+                and supports_trtllm_attention(is_prefill=True)
+            )
         if kv_cache_dtype is not None and kv_cache_dtype.startswith("nvfp4"):
             return (
                 current_platform.is_device_capability_family(100)
@@ -1017,6 +1041,9 @@ class FlashInferTrtllmAPIDecode:
     """Query tokens per request (uniform; graph-padded rows have none) for the
     Kernel Factory decode kernel."""
 
+    mxk_nreq: int | None = None
+    """dec107 MXFP4-K: requests with q_len_per_req tokens (the rest are zero-length CUDA-graph padding)."""
+
 
 @dataclass
 class FlashInferMetadata:
@@ -1156,6 +1183,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # Cannot use self.kv_cache_spec.dtype here because kv_cache_spec
             # storage dtype may not be the same as the op dtype (uint8 vs fp8_e4m3)
             self.is_kvcache_nvfp4 = self.cache_dtype.startswith("nvfp4")
+            self.is_kvcache_mxk = self.cache_dtype == "mxfp4k_fp8v"
+            if self.is_kvcache_mxk and not (dec107_decode.ENABLED and dec107_decode.MX):
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4k_fp8v needs the dec107 MXFP4-K decode kernel "
+                    "(DEC107_DECODE=1 DEC107_MXK=1); trtllm-gen cannot read MXFP4-K pages."
+                )
             if self.is_kvcache_nvfp4:
                 if (
                     force_use_trtllm_attention() is False
@@ -1177,6 +1210,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         else:
             self.cache_dtype = "auto"
             self.is_kvcache_nvfp4 = False
+            self.is_kvcache_mxk = False
             assert self.kv_cache_spec.dtype == self.model_config.dtype
             self.kv_cache_dtype = self.kv_cache_spec.dtype
 
@@ -1281,6 +1315,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Adaptive verification trims drafts on device, so decode query lengths
         # must come from the device qo_indptr; only trtllm-gen supports that
         # (the selector already rejects the other configurations).
+        if getattr(self, "is_kvcache_mxk", False) and speculative_config is not None and getattr(
+                speculative_config, "enable_adaptive_verification", False):
+            raise ValueError("mxfp4k_fp8v does not support adaptive (varlen) verification decode")
         self.use_trtllm_gen_varlen_decode = (
             speculative_config is not None
             and speculative_config.enable_adaptive_verification
@@ -1420,7 +1457,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ) or current_platform.is_device_capability_family(100):
                 return FlashInferBackend.get_dtype_for_flashinfer(cache_dtype)
             return self.model_config.dtype
-        if cache_dtype.startswith("nvfp4"):
+        if cache_dtype.startswith("nvfp4") or cache_dtype == "mxfp4k_fp8v":
             return FlashInferBackend.get_dtype_for_flashinfer("fp8_e4m3")
         return self.kv_cache_spec.dtype
 
@@ -1471,10 +1508,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             else:
                 # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
                 # scale with the prefill chunk and query-head footprint, NOT
-                # context length. The fixed ~394 MiB default is too small for
-                # wide-head models at the default 8192-token chunk on some
-                # archs (e.g. sm_120), where FlashInfer hard-errors instead of
-                # growing. Size to the batch's head footprint; never shrink
+                # context length. A fixed default can be too small for
+                # wide-head models, where FlashInfer may hard-error instead
+                # of growing. Size to the batch's head footprint; never shrink
                 # below the configured default.
                 est = (
                     self.max_num_batched_tokens
@@ -2244,6 +2280,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     if max_q_upper > 1:
                         q_len_per_req = max_q_upper
                         q_cu_seq_lens = qo_indptr[: num_decodes + 1]
+                mxk_nreq = None
+                if getattr(self, "is_kvcache_mxk", False) and q_cu_seq_lens is not None:
+                    # dec107 MXFP4-K decode needs a uniform q_len: accept only [q]*k + [0]*(n-k) (CUDA-graph padding)
+                    _ql = (qo_indptr_cpu[1 : num_decodes + 1] - qo_indptr_cpu[:num_decodes]).tolist()
+                    _k = 0
+                    while _k < len(_ql) and _ql[_k] == q_len_per_req:
+                        _k += 1
+                    if any(x != 0 for x in _ql[_k:]):
+                        raise RuntimeError(f"dec107 fail-closed: ragged MXFP4-K decode q_lens {_ql[:16]}...")
+                    q_cu_seq_lens, mxk_nreq = None, _k
                 attn_metadata.decode = FlashInferTrtllmAPIDecode(
                     kernel=self.flashinfer_trtllm_api_decode_kernel,
                     block_tables=block_table_tensor[:num_decodes],
@@ -2252,6 +2298,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     q_len_per_req=q_len_per_req,
                     q_cu_seq_lens=q_cu_seq_lens,
                     mask=decode_mask,
+                    mxk_nreq=mxk_nreq,
                     dcp_query_start_loc=(
                         qo_indptr[: num_decodes + 1] if self.use_dcp else None
                     ),
@@ -2358,6 +2405,57 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return False
 
 
+# ---- dec107 MXFP4-K fail-closed guard: no FlashInfer attention entry point may ever see an MXFP4-K cache ----
+_MXK_IN_USE = [False]
+
+
+def _mxk_kv_tensors(args, kwargs):
+    kv = kwargs.get("kv_cache", args[1] if len(args) > 1 else None)
+    if isinstance(kv, (tuple, list)):
+        return [t for t in kv if isinstance(t, torch.Tensor)]
+    return [kv] if isinstance(kv, torch.Tensor) else []
+
+
+def _mxk_guard(fn, name):
+    def wrapped(*args, **kwargs):
+        if _MXK_IN_USE[0] and any(t.dtype == torch.uint8 for t in _mxk_kv_tensors(args, kwargs)):
+            raise RuntimeError(f"dec107 fail-closed: FlashInfer {name} reached with an MXFP4-K (uint8) KV cache; "
+                               "every MXFP4-K attention call must go through dec107 (decode) or the FP8 dequant "
+                               "(prefill)")
+        return fn(*args, **kwargs)
+    wrapped.__wrapped__ = fn
+    return wrapped
+
+
+def _mxk_install_guards() -> None:
+    """Called once when an mxfp4k_fp8v impl is created: wraps the FI trtllm-gen / XQA decode and context entry
+    points used anywhere in vLLM (this module, flashinfer_prefill_gen_routing, and the flashinfer
+    modules themselves)."""
+    if _MXK_IN_USE[0]:
+        return
+    _MXK_IN_USE[0] = True
+    g = globals()
+    for n in ("trtllm_batch_decode_with_kv_cache", "trtllm_batch_context_with_kv_cache",
+              "routed_trtllm_batch_context_with_kv_cache", "flashinfer_xqa_batch_decode_with_kv_cache"):
+        if n in g and not hasattr(g[n], "__wrapped__"):
+            g[n] = _mxk_guard(g[n], n)
+    try:
+        from vllm.v1.attention.ops import flashinfer_prefill_gen_routing as _pgr
+        for n in ("trtllm_batch_context_with_kv_cache",):
+            f = getattr(_pgr, n, None)
+            if f is not None and not hasattr(f, "__wrapped__"):
+                setattr(_pgr, n, _mxk_guard(f, "routed trtllm context"))
+    except ImportError:
+        pass
+    import flashinfer.decode as _fd
+    import flashinfer.prefill as _fp
+    for mod, n in ((_fd, "trtllm_batch_decode_with_kv_cache"), (_fp, "trtllm_batch_context_with_kv_cache")):
+        f = getattr(mod, n, None)
+        if f is not None and not hasattr(f, "__wrapped__"):
+            setattr(mod, n, _mxk_guard(f, f"flashinfer.{n}"))
+    logger.info("dec107: MXFP4-K fail-closed guard installed on FlashInfer trtllm-gen / XQA entry points")
+
+
 class FlashInferImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
@@ -2392,7 +2490,13 @@ class FlashInferImpl(AttentionImpl):
         )
         self.cache_dtype = kv_cache_dtype
         self.is_kvcache_nvfp4 = kv_cache_dtype.startswith("nvfp4")
+        self.is_kvcache_mxk = kv_cache_dtype == "mxfp4k_fp8v"
+        if self.is_kvcache_mxk:
+            _mxk_install_guards()
         self.kv_cache_dtype = "nvfp4" if self.is_kvcache_nvfp4 else kv_cache_dtype
+        self.page_size_kv = 32   # dec107 MXFP4-K pages are fixed at 32 tokens
+        if dec107_decode.ENABLED:
+            logger.info_once("DEC107 kv_cache_dtype=%s", kv_cache_dtype)
         self.fp4_data_dim = head_size // 2 if self.is_kvcache_nvfp4 else 0
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
@@ -2499,6 +2603,10 @@ class FlashInferImpl(AttentionImpl):
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
 
+        # dec107: load the kernel + allocate its counters / partials before KV-cache memory profiling.
+        if dec107_decode.ENABLED:
+            dec107_decode.preallocate(torch.device("cuda", torch.cuda.current_device()))
+
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
         assert self.cache_config is not None
@@ -2573,6 +2681,12 @@ class FlashInferImpl(AttentionImpl):
             ),
         )
 
+    def _mxk_pages(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        """Page-flat byte view [num_pages, Hkv * 32 * 392] of the dec107 MXFP4-K / FP8-V cache."""
+        return torch.as_strided(
+            kv_cache, (kv_cache.size(0), dec107_mxk.page_bytes(self.num_kv_heads)),
+            (kv_cache.stride(0), 1), kv_cache.storage_offset())
+
     def _draft_prefill_attention(
         self,
         layer: torch.nn.Module,
@@ -2613,6 +2727,22 @@ class FlashInferImpl(AttentionImpl):
         )
         q = canonicalize_singleton_dim_strides(q.contiguous())
         block_tables = pruning.block_tables
+        if self.is_kvcache_mxk:
+            # dec107 MXFP4-K: the sampled rows go through the dec107 MXFP4-K kernel (q already rotated + FP8)
+            if not (self.window_left < 0 and self.sinks is None):
+                raise RuntimeError("dec107 fail-closed: MXFP4-K draft pruning with a window / sinks")
+            if output.dtype != torch.bfloat16:
+                return False
+            out_rows = torch.empty(q.shape, dtype=output.dtype, device=output.device)
+            dec107_decode.run_mx(
+                q, self._mxk_pages(kv_cache_tuple), self.num_kv_heads,
+                block_tables.to(torch.int32).contiguous(), pruning.seq_lens.contiguous(),
+                self.bmm1_scale / layer._k_scale_float, self.bmm2_scale, out_rows, 1, pruning=True,
+            )
+            out = output.view(-1, self.num_heads, self.head_size)
+            out.zero_()
+            out.index_copy_(0, rows, out_rows)
+            return True
         # Use the same raw-cache decode interface as ordinary draft decode.
         # BF16/E4M3 selects native transformed-K/V cubins in FlashInfer; generic
         # mixed precision uses its ungrouped GQA-generation selection.
@@ -3166,6 +3296,12 @@ class FlashInferImpl(AttentionImpl):
         decode_with_xqa = decode_kernel == FlashInferDecodeKernel.XQA
         decode_with_trtllm_gen = decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
         decode_with_flashinfer_trtllm_api = decode_with_xqa or decode_with_trtllm_gen
+        if self.is_kvcache_mxk:   # explicit raises (asserts vanish under python -O)
+            if not (attn_metadata.num_decode_tokens == 0 or decode_with_trtllm_gen):
+                raise RuntimeError("dec107 fail-closed: mxfp4k_fp8v decode must use the trtllm-gen call site "
+                                   "(dec107 MXFP4-K kernel); set VLLM_USE_TRTLLM_ATTENTION=1")
+            if not (attn_metadata.num_prefills == 0 or prefill_use_trtllm):
+                raise RuntimeError("dec107 fail-closed: mxfp4k_fp8v prefill must use the trtllm-gen path (FP8 pages)")
 
         # The attn+quant fusion happens when output_scale is provided.
         if output_scale is None:
@@ -3214,6 +3350,8 @@ class FlashInferImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        if dec107_kvdump.ENABLED and key is not None:
+            dec107_kvdump.maybe_dump(layer, query, key, value, attn_metadata)
 
         # FlashInfer treats uint8 KV cache as NVFP4. vLLM stores FP8 KV cache
         # as uint8 bytes, so pass FP8 caches with their logical dtype.
@@ -3236,6 +3374,8 @@ class FlashInferImpl(AttentionImpl):
 
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
+            if self.is_kvcache_mxk:
+                raise RuntimeError("dec107 fail-closed: cascade attention with an MXFP4-K cache")
             assert attn_metadata.cascade_wrapper is not None
             stride_order = self.kv_cache_layout.layer_view_order
             if self.is_kvcache_nvfp4:
@@ -3290,6 +3430,10 @@ class FlashInferImpl(AttentionImpl):
             v_data, v_sf = nvfp4_split_data_scale(kv_cache_tuple[1])
             nvfp4_kv_data = (k_data, v_data)
             nvfp4_kv_block_scales = (k_sf, v_sf)
+        elif self.is_kvcache_mxk:
+            # page-flat byte view [num_pages, Hkv * 32 * 392] of the dec107 MXFP4-K / FP8-V cache (HND, dense pages)
+            mxk_pages = self._mxk_pages(kv_cache)
+            kv_cache_tuple = None
         else:
             kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
@@ -3304,7 +3448,7 @@ class FlashInferImpl(AttentionImpl):
             self.draft_prefill_pruning is not None
             and output_scale is None
             and self._draft_prefill_attention(
-                layer, query, kv_cache_tuple, attn_metadata, output
+                layer, query, kv_cache if self.is_kvcache_mxk else kv_cache_tuple, attn_metadata, output
             )
         ):
             if self._draft_prefill_prune_checks_left > 0:
@@ -3494,6 +3638,23 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = nvfp4_kv_data
                     mock_block_table = block_tables_prefill
                     prefill_kv_block_scales = nvfp4_kv_block_scales
+                elif self.is_kvcache_mxk:
+                    # dec107 MXFP4-K: dequantize every page the prefill block table lists into a temporary FP8 cache
+                    # (K stays Hadamard-rotated; the attention layer rotates Q) and remap the table to it.
+                    if attn_metadata.q_data_type_prefill != FP8_DTYPE:
+                        raise RuntimeError("dec107 fail-closed: mxfp4k_fp8v requires FP8 queries for prefill")
+                    # only the pages each request uses (ceil(seq_len / page)); unused table columns may hold stale ids
+                    _bt = block_tables_prefill
+                    _npg = (seq_lens_prefill.to(torch.int64) + self.page_size_kv - 1) // self.page_size_kv
+                    _valid = torch.arange(_bt.size(1), device=_bt.device)[None, :] < _npg[:, None]
+                    _pages = _bt[_valid]
+                    _tmp = dec107_mxk.mxk_pages_to_fp8(
+                        mxk_pages, _pages, self.num_kv_heads, layer._k_scale_float)
+                    dec107_decode.count("mxk_dequant")
+                    mock_kv_cache = (_tmp[..., :hs], _tmp[..., hs:])
+                    mock_block_table = torch.where(
+                        _valid, torch.cumsum(_valid.reshape(-1).to(torch.int32), 0).view_as(_bt) - 1,
+                        torch.zeros((), dtype=torch.int32, device=_bt.device)).to(_bt.dtype).contiguous()
                 elif (
                     attn_metadata.q_data_type_prefill != FP8_DTYPE
                     and self.kv_cache_dtype.startswith("fp8")
@@ -3911,7 +4072,45 @@ class FlashInferImpl(AttentionImpl):
                             multi_ctas_kv_counter_buffer=counter_buffer,
                         )
 
-                if (
+                _bmm1_dec = (
+                    self.get_xqa_bmm1_scale(layer, decode_query.dtype)
+                    if dec107_decode.ENABLED else None
+                )
+                if self.is_kvcache_mxk:
+                    # dec107 MXFP4-K pages: only the dec107 MXFP4-K kernel can read them (no FI / KF fallback)
+                    _qlen = trt_decode.q_len_per_req
+                    if not (not use_dcp and _qlen is not None and _qlen >= 1 and q_cu_seq_lens is None):
+                        raise RuntimeError("dec107 fail-closed: MXFP4-K decode needs uniform q_len and no DCP")
+                    if not (self.window_left < 0 and self.sinks is None):
+                        raise RuntimeError("dec107 fail-closed: MXFP4-K decode does not support windows / sinks")
+                    _nr = trt_decode.mxk_nreq
+                    _nr = block_tables_decode.size(0) if _nr is None else _nr
+                    if _nr > 0:
+                        dec107_decode.run_mx(
+                            decode_query[: _nr * _qlen].contiguous(), mxk_pages, self.num_kv_heads,
+                            block_tables_decode[:_nr].contiguous(), seq_lens_decode[:_nr].contiguous(),
+                            self.bmm1_scale / layer._k_scale_float, self.bmm2_scale, out[: _nr * _qlen], _qlen,
+                        )
+                elif (
+                    dec107_decode.ENABLED
+                    and not self.is_kvcache_nvfp4
+                    and not use_dcp
+                    and not needs_fp8_out
+                    and max_q_len is None
+                    and isinstance(_bmm1_dec, float)
+                    and dec107_decode.supports(
+                        decode_query, kv_cache_tuple[0], kv_cache_tuple[1], out, block_tables_decode,
+                        q_len_per_req, self.window_left, self.sinks, self.need_to_return_lse_for_decode,
+                        _bmm1_dec, self.bmm2_scale,
+                    )
+                ):
+                    # dec107: sm_107a-native FP8 decode (DEC107_DECODE=1; DEC107_DECODE_MIN_B gates the low band,
+                    # where KF decode / trtllm-gen keep the calls)
+                    dec107_decode.run(
+                        decode_query, kv_cache_tuple[0], kv_cache_tuple[1], block_tables_decode, seq_lens_decode,
+                        _bmm1_dec, self.bmm2_scale, out, q_len_per_req,
+                    )
+                elif (
                     attn_metadata.decode.kf_block_tables is not None
                     and not use_dcp
                     and not needs_fp8_out
@@ -3954,6 +4153,8 @@ class FlashInferImpl(AttentionImpl):
         """The ``[blocks, block_size, heads, dim]`` k and v views of this layer's
         cache that ``do_kv_cache_update`` writes.
         """
+        if self.is_kvcache_mxk:
+            raise RuntimeError("dec107 fail-closed: MXFP4-K cache has no FP8 k/v write views")
         if self.is_kvcache_nvfp4:
             # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
             #                            (B, N, H, full_dim));
@@ -3978,6 +4179,13 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            if self.is_kvcache_mxk:
+                pages = torch.as_strided(
+                    kv_cache, (kv_cache.size(0), dec107_mxk.page_bytes(self.num_kv_heads)),
+                    (kv_cache.stride(0), 1), kv_cache.storage_offset())
+                dec107_mxk.mxk_cache_write(key, value, pages, slot_mapping, layer._v_scale_float,
+                                           hadamard_k=dec107_mxk.HADAMARD)
+                return
             k_cache, v_cache = self.kv_cache_write_views(kv_cache)
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
