@@ -10,7 +10,9 @@
   ``CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN``), placement verified with
   ``CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL``.
 - ``skinny.DomainGemm``: one-launch, graph-safe, %smid-routed skinny GEMM
-  (BF16 M <= 32, MXFP8 M <= 64) that reads only domain-local weight bytes.
+  (BF16, M <= 32) that reads only domain-local weight bytes.
+- ``mxgemm.DomainMxGemm``: the MXFP8 (tcgen05 block-scaled, SM107) domain-local
+  skinny GEMM of the draft lm_head.
 - ``_ext.load().green_streams(dev)``: a persistent green context + stream per
   domain (100 + 100 SMs on VR200) for fork/join dispatch.
 - ``lm_head``: the ``VLLM_LOCALITY_LM_HEAD`` integration (vLLM-specific).
