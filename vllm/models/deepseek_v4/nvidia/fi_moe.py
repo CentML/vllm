@@ -9,14 +9,20 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
+from vllm.models.deepseek_v4.nvidia.model import (
+    DeepseekV4MegaMoEExperts,
+    _use_sequence_parallel,
+)
 from vllm.utils.flashinfer_moe_ep import (
+    NVFP4_CKPT_MEGAKERNELS,
+    SM107_MEGAKERNELS,
     build_fi_mega_layer,
     ensure_fi_moe_ep_runtime,
-    fi_moe_ep_backend_spec,
     make_fi_moe_ep_bootstrap,
     mega_moe_weight_pack_from_params,
+    resolve_fi_megakernel,
 )
 
 if TYPE_CHECKING:
@@ -25,7 +31,40 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MLP
 
+logger = init_logger(__name__)
+
 _MOE_SKIP_PADDING: bool | None = None
+_SM107_LOGGED: set[tuple] = set()
+
+# Smallest capacity profile of the SM107 workspace ladder.
+_SM107_MIN_CAPACITY = 128
+
+
+def sm107_max_tokens_per_rank(max_num_tokens: int, sp_size: int = 1) -> int:
+    """Largest token count one rank can hand the SM107 megakernel: the step's
+    ``max_num_batched_tokens`` split over the sequence-parallel group
+    (``ceil(mnbt / sp)``; SP shards are equal, padded to a multiple of sp)."""
+    if max_num_tokens <= 0:
+        raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
+    sp = max(int(sp_size), 1)
+    return -(-int(max_num_tokens) // sp)
+
+
+def sm107_capacity_profiles(max_num_tokens: int, sp_size: int = 1) -> list[int]:
+    """Workspace capacity ladder (tokens per rank) for the SM107 megakernel.
+
+    Powers of two from 128 below the per-rank maximum ``cap = ceil(
+    max_num_tokens / sp)``, plus ``cap``. The ladder stops at ``cap``: under
+    sequence parallelism (e.g. TEP2 with mnbt 32768) a ``max_num_tokens``
+    profile could never be selected and would only waste symmetric memory.
+    """
+    cap = sm107_max_tokens_per_rank(max_num_tokens, sp_size)
+    caps: set[int] = {cap}
+    profile = _SM107_MIN_CAPACITY
+    while profile < cap:
+        caps.add(profile)
+        profile *= 2
+    return sorted(caps)
 
 
 def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
@@ -126,8 +165,58 @@ def nvfp4_prequant_pack_and_alphas(
     return pack, fc1_alpha, fc2_alpha
 
 
+def sm107_nvfp4_epilogue_scalars(
+    gate_s2: torch.Tensor,
+    w2_weight_scale_2: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+    *,
+    input_norm_const: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-local-expert ``(fc1_alpha, fc2_alpha, fc1_norm_const)`` for SM107.
+
+    TRT-LLM convention: the in-kernel FC1-output -> FC2-input NVFP4 requant is
+    normalised by the checkpoint's calibrated ``fc1_norm_const = 1 /
+    w2.input_scale`` and FC2's accumulator scale absorbs it, ``fc2_alpha =
+    w2.weight_scale_2 * w2.input_scale``. With the default unit norm const the
+    FC1-output block scales (amax/6) of small-activation layers underflow E4M3
+    (layer-6 ``w2.input_scale`` is ~1e-4). ``fc1_alpha`` divides out the
+    global scale the bf16 activations were quantized with
+    (``input_norm_const``). ``gate_s2`` is the gate ``weight_scale_2`` after
+    the up/gate ratio fold.
+    """
+    s13 = gate_s2.float().reshape(-1)
+    s2 = w2_weight_scale_2.float().reshape(-1)
+    in2 = w2_input_scale.float().reshape(-1)
+    if s13.shape != s2.shape or s2.shape != in2.shape:
+        raise ValueError(
+            "per-expert NVFP4 scalars must all have shape [E_local]: got "
+            f"{tuple(s13.shape)}, {tuple(s2.shape)}, {tuple(in2.shape)}"
+        )
+    if not bool(torch.isfinite(in2).all()) or bool((in2 <= 0).any()):
+        raise ValueError(
+            "NVFP4 MegaMoE needs positive, finite w2.input_scale for every "
+            "local expert (fc1_norm_const = 1 / w2.input_scale)."
+        )
+    if input_norm_const <= 0 or input_norm_const != input_norm_const:
+        raise ValueError(f"input_norm_const must be positive, got {input_norm_const}")
+    fc1_alpha = (s13 / float(input_norm_const)).contiguous()
+    fc1_norm_const = (1.0 / in2).contiguous()
+    fc2_alpha = (s2 * in2).contiguous()
+    return fc1_alpha, fc2_alpha, fc1_norm_const
+
+
 class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
-    """Same weight layout/loader as the native mega experts, FI compute path."""
+    """Same weight layout/loader as the native mega experts, FI compute path.
+
+    SM100/SM103: one ``max_num_tokens`` workspace and the backend's single
+    megakernel (``nvfp4_cutedsl`` / ``deep_gemm_mega``).
+
+    SM107 (Rubin): flashinfer's ``sm107_nvfp4_nvfp4_bf16_cutedsl``
+    RubinInferenceMegaMoE on the NVFP4 expert checkpoint (per-expert
+    ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const``), with one workspace per
+    capacity profile so every step runs the knobs tuned for its size.
+    Workspaces are pooled across layers by flashinfer.
+    """
 
     def __init__(
         self,
@@ -141,17 +230,29 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         self._activation_clamp = activation_clamp
         self._mega_layer: MoEEpMegaLayer | None = None
         self._fast_ctx: tuple[Any, Any, Any, int, bool] | None = None
-        self._epilogue_alphas: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._epilogue_alphas: tuple[torch.Tensor, ...] | None = None
         self._nvfp4_prequant = ckpt_uses_nvfp4_experts(vllm_config)
+        self._megakernel = resolve_fi_megakernel(
+            vllm_config.kernel_config.moe_backend,
+            nvfp4_checkpoint=self._nvfp4_prequant,
+        )
+        self._is_sm107 = self._megakernel in SM107_MEGAKERNELS
+        # SM107 capacity profiles: capacity -> (kernel, backend workspace,
+        # transformed weights). Built in finalize_weights.
+        self._profiles: dict[int, tuple[Any, Any, Any]] = {}
+        self._profile_caps: list[int] = []
+        self._ws_handles: list[Any] = []
+        parallel_config = vllm_config.parallel_config
+        self._dp_size = parallel_config.data_parallel_size
+        use_sp = _use_sequence_parallel(vllm_config)
+        tp_size = parallel_config.tensor_parallel_size
+        self._sp_size = tp_size if use_sp else 1
         if self._nvfp4_prequant:
-            megakernel = fi_moe_ep_backend_spec(
-                vllm_config.kernel_config.moe_backend
-            ).megakernel
-            if megakernel != "nvfp4_cutedsl":
+            if self._megakernel not in NVFP4_CKPT_MEGAKERNELS:
                 raise ValueError(
                     "NVFP4-quantized expert checkpoint requires "
                     "moe_backend=flashinfer_moe_ep_mega_cutedsl, got a "
-                    f"backend using megakernel {megakernel!r} "
+                    f"backend using megakernel {self._megakernel!r} "
                     "(deep_gemm consumes the MXFP4 checkpoint instead)."
                 )
             self._realloc_nvfp4_params()
@@ -179,8 +280,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         # (E, 2): column 0 = gate (w1), column 1 = up (w3).
         self.w13_weight_scale_2 = _param((n_e, 2), torch.float32)
         self.w2_weight_scale_2 = _param((n_e,), torch.float32)
-        # Loaded for completeness; unused — activation quant is dynamic
-        # (see nvfp4_prequant_pack_and_alphas).
+        # SM100 ignores the input scales (dynamic activation quant). SM107
+        # uses them: max(w13.input_scale) sets the activation quant grid and
+        # w2.input_scale the FC1-output requant norm (fc1_norm_const).
         self.w13_input_scale = _param((n_e, 2), torch.float32)
         self.w2_input_scale = _param((n_e,), torch.float32)
 
@@ -221,6 +323,149 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             return_success,
         )
 
+    # ------------------------------------------------------------------ SM107
+    @staticmethod
+    def _ep_global_max(local: torch.Tensor) -> torch.Tensor:
+        """max(local) MAX-reduced over the EP group (fp32 [1] tensor)."""
+        amax = local.float().max().reshape(1).clone()
+        from vllm.distributed import get_ep_group
+
+        ep = get_ep_group()
+        if ep.world_size > 1:
+            import torch.distributed as dist
+
+            dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=ep.device_group)
+        return amax
+
+    def _sm107_input_norm_const(self) -> float:
+        """Global scale for the in-kernel bf16 -> NVFP4 activation quant.
+
+        Tokens are quantized on their source rank and consumed on the
+        expert's rank, so the value must be identical on every EP rank:
+        1 / max(w13.input_scale) over all experts (MAX all-reduce over the
+        EP group of the local maxima), as the FusedMoE NVFP4 backends use.
+        """
+        amax = self._ep_global_max(self.w13_input_scale.data)
+        # fp32 reciprocal, exactly as the FusedMoE NVFP4 backends form
+        # a1_gscale = 1.0 / a13_scale on an fp32 tensor.
+        return float((1.0 / amax).item())
+
+    def _sm107_fc2_input_scale(self) -> torch.Tensor:
+        """Per-local-expert FC2-input (FC1-output requant) scale.
+
+        One value, max(w2.input_scale) over all experts of the layer (EP
+        all-reduce), i.e. the grid every FusedMoE NVFP4 backend in vLLM uses
+        (amax_for_moe_activation_quant), so the numerics do not depend on the
+        EP size.
+        """
+        w2_in = self.w2_input_scale.data.float()
+        return self._ep_global_max(w2_in).expand_as(w2_in).contiguous()
+
+    def _sm107_build(self) -> None:
+        # resolve_fi_megakernel admits only the NVFP4 checkpoint on SM107.
+        assert self._nvfp4_prequant
+        weights, gate_s2, _ = nvfp4_prequant_pack_and_alphas(
+            self.w13_weight.data,
+            self.w13_weight_scale.data,
+            self.w13_weight_scale_2.data,
+            self.w2_weight.data,
+            self.w2_weight_scale.data,
+            self.w2_weight_scale_2.data,
+            intermediate_size=self.intermediate_size,
+        )
+        input_norm_const = self._sm107_input_norm_const()
+        self._epilogue_alphas = sm107_nvfp4_epilogue_scalars(
+            gate_s2,
+            self.w2_weight_scale_2.data,
+            self._sm107_fc2_input_scale(),
+            input_norm_const=input_norm_const,
+        )
+        self._mega_layer = build_fi_mega_layer(
+            make_fi_moe_ep_bootstrap(),
+            vllm_config=self._vllm_config,
+            num_experts=self.num_experts,
+            max_tokens_per_rank=self.max_num_tokens,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            top_k=self.top_k,
+            activation_clamp=self._activation_clamp,
+            weights=weights,
+            megakernel=self._megakernel,
+            input_norm_const=input_norm_const,
+        )
+        del weights
+        layer = self._mega_layer
+        transformed = layer._get_transformed_weights()
+        caps = sm107_capacity_profiles(self.max_num_tokens, sp_size=self._sp_size)
+        # Collective (symmetric heap) allocations: every EP rank builds the
+        # same profiles in the same order (layers finalize in model order).
+        for cap in caps:
+            handle = layer.create_workspace(cap)
+            self._ws_handles.append(handle)
+            self._profiles[cap] = (
+                layer._kernel,
+                handle._backend_workspace,
+                transformed,
+            )
+        self._profile_caps = caps
+        log_key = (self._megakernel, self.num_experts, self.top_k, tuple(caps))
+        if log_key not in _SM107_LOGGED:  # once per distinct layer config
+            _SM107_LOGGED.add(log_key)
+            logger.info(
+                "FlashInfer SM107 MegaMoE: megakernel %s, %d of %d experts "
+                "local, I %d, top-%d, clamp %s, input_norm_const %.6g, "
+                "capacity profiles %s.",
+                self._megakernel,
+                self.num_local_experts,
+                self.num_experts,
+                self.intermediate_size,
+                self.top_k,
+                self._activation_clamp,
+                input_norm_const,
+                caps,
+            )
+
+    def _rank_consistent_num_tokens(self, num_tokens: int) -> int:
+        """Token count every EP rank agrees on for this step.
+
+        The megakernel's dispatch/combine address peer workspaces at the
+        same symmetric offsets, so all ranks must launch the same capacity
+        profile. SP ranks hold equal shards; DP ranks may differ (no DP
+        padding in eager steps), so use the step's max over DP ranks.
+        """
+        if self._dp_size <= 1:
+            return num_tokens
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        dp_metadata = (
+            get_forward_context().dp_metadata
+            if is_forward_context_available()
+            else None
+        )
+        if dp_metadata is None:
+            # No cross-rank token counts: fall back to the largest profile,
+            # which every rank selects identically. That is the per-rank cap
+            # ceil(mnbt / sp), not mnbt: the ladder stops there.
+            return sm107_max_tokens_per_rank(self.max_num_tokens, self._sp_size)
+        n_max = int(dp_metadata.num_tokens_across_dp_cpu.max())
+        if self._sp_size > 1:
+            n_max = -(-n_max // self._sp_size)
+        return max(num_tokens, n_max)
+
+    def _select_profile(self, num_tokens: int) -> tuple[Any, Any, Any]:
+        n = self._rank_consistent_num_tokens(num_tokens)
+        for cap in self._profile_caps:
+            if cap >= n:
+                return self._profiles[cap]
+        raise ValueError(
+            f"DeepSeek V4 MegaMoE got {n} tokens per rank, but the largest "
+            f"workspace profile holds {self._profile_caps[-1]}."
+        )
+
+    # ---------------------------------------------------------------- finalize
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
         # The FlashInfer megakernel has no shared-expert fusion; the caller's
         # serial shared MLP path handles shared_experts.
@@ -232,46 +477,47 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         self._check_runtime_supported()
         ensure_fi_moe_ep_runtime(self._vllm_config)
 
-        if self._nvfp4_prequant:
-            # NVFP4 checkpoint: hand the packed weights + both scale
-            # planes straight to the backend (no dequant->requant);
-            # per-expert globals become fc1/fc2 epilogue alphas staged
-            # at every forward via MoEEpTensors.
-            weights, fc1_alpha, fc2_alpha = nvfp4_prequant_pack_and_alphas(
-                self.w13_weight.data,
-                self.w13_weight_scale.data,
-                self.w13_weight_scale_2.data,
-                self.w2_weight.data,
-                self.w2_weight_scale.data,
-                self.w2_weight_scale_2.data,
-                intermediate_size=self.intermediate_size,
-            )
-            self._epilogue_alphas = (fc1_alpha, fc2_alpha)
+        if self._is_sm107:
+            self._sm107_build()
         else:
-            weights = mega_moe_weight_pack_from_params(
-                self.w13_weight,
-                self.w13_weight_scale,
-                self.w2_weight,
-                self.w2_weight_scale,
-                megakernel=fi_moe_ep_backend_spec(
-                    self._vllm_config.kernel_config.moe_backend
-                ).megakernel,
+            if self._nvfp4_prequant:
+                # NVFP4 checkpoint: hand the packed weights + both scale
+                # planes straight to the backend (no dequant->requant);
+                # per-expert globals become fc1/fc2 epilogue alphas staged
+                # at every forward via MoEEpTensors.
+                weights, fc1_alpha, fc2_alpha = nvfp4_prequant_pack_and_alphas(
+                    self.w13_weight.data,
+                    self.w13_weight_scale.data,
+                    self.w13_weight_scale_2.data,
+                    self.w2_weight.data,
+                    self.w2_weight_scale.data,
+                    self.w2_weight_scale_2.data,
+                    intermediate_size=self.intermediate_size,
+                )
+                self._epilogue_alphas = (fc1_alpha, fc2_alpha)
+            else:
+                weights = mega_moe_weight_pack_from_params(
+                    self.w13_weight,
+                    self.w13_weight_scale,
+                    self.w2_weight,
+                    self.w2_weight_scale,
+                    megakernel=self._megakernel,
+                )
+            self._mega_layer = build_fi_mega_layer(
+                make_fi_moe_ep_bootstrap(),
+                vllm_config=self._vllm_config,
+                num_experts=self.num_experts,
+                max_tokens_per_rank=self.max_num_tokens,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                top_k=self.top_k,
+                activation_clamp=self._activation_clamp,
+                weights=weights,
             )
-        self._mega_layer = build_fi_mega_layer(
-            make_fi_moe_ep_bootstrap(),
-            vllm_config=self._vllm_config,
-            num_experts=self.num_experts,
-            max_tokens_per_rank=self.max_num_tokens,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            top_k=self.top_k,
-            activation_clamp=self._activation_clamp,
-            weights=weights,
-        )
-        del weights
-        # Allocate (or attach to) the pooled workspace before first
-        # forward so warmup/capture never hits the lazy path.
-        self._mega_layer._ensure_workspace()
+            del weights
+            # Allocate (or attach to) the pooled workspace before first
+            # forward so warmup/capture never hits the lazy path.
+            self._mega_layer._ensure_workspace()
         self.w13_weight = None
         self.w13_weight_scale = None
         self.w2_weight = None
@@ -310,6 +556,18 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
     def update_expert_map(self) -> None:
         raise NotImplementedError(self._EPLB_UNSUPPORTED)
 
+    def _scalar_kwargs(self) -> dict[str, torch.Tensor | None]:
+        alphas = self._epilogue_alphas
+        if alphas is None:
+            return {}
+        out: dict[str, torch.Tensor | None] = {
+            "fc1_alpha": alphas[0],
+            "fc2_alpha": alphas[1],
+        }
+        if len(alphas) > 2:
+            out["fc1_norm_const"] = alphas[2]
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -335,14 +593,28 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             topk_ids,
             is_padding=is_padding,
         )
+        scalars = self._scalar_kwargs()
+
+        if self._is_sm107:
+            if self._mega_layer is None:
+                ensure_fi_moe_ep_runtime(self._vllm_config)
+                self.finalize_weights()
+                scalars = self._scalar_kwargs()
+            kernel, workspace, transformed = self._select_profile(num_tokens)
+            t = MoEEpTensors(
+                hidden_states=hidden_states.contiguous(),
+                topk_ids=topk_ids.contiguous(),
+                topk_weights=topk_weights.contiguous(),
+                **scalars,
+            )
+            kernel.stage_inputs(t, workspace, quantize_input=True)
+            # Zero-copy workspace [:n] view: valid under stream ordering
+            # until the next MoE layer's launch on the same profile.
+            return kernel.compute(workspace, transformed, output=None)
 
         # Fast path: after the first successful full forward the layer is
         # immutable, so skip MoEEpMegaLayer.forward()'s per-call validation
         # and go straight to the kernel backend's stage_inputs + compute.
-        alphas = self._epilogue_alphas
-        fc1_alpha = alphas[0] if alphas is not None else None
-        fc2_alpha = alphas[1] if alphas is not None else None
-
         fast = self._fast_ctx
         if fast is not None:
             kernel, workspace, transformed, hidden_size, zero_copy = fast
@@ -350,8 +622,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                fc1_alpha=fc1_alpha,
-                fc2_alpha=fc2_alpha,
+                **scalars,
             )
             kernel.stage_inputs(t, workspace, quantize_input=True)
             if zero_copy:
@@ -377,8 +648,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 hidden_states=hidden_states,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                fc1_alpha=fc1_alpha,
-                fc2_alpha=fc2_alpha,
+                **self._scalar_kwargs(),
             )
         )
         layer = self._mega_layer
