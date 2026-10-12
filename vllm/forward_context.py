@@ -202,6 +202,13 @@ class ForwardContext:
         )
 
 
+# ForwardContext.additional_kwargs key: the forward's token count is rank-local, i.e.
+# not padded to a count every DP rank agrees on (DSv4.1 bounded-replay seam graphs:
+# each rank replays the graph sized for its own replay rows). Cross-rank kernels
+# whose launch configuration must match on every rank (FlashInfer SM107 MegaMoE
+# capacity profiles) must not derive it from the local token count.
+RANK_LOCAL_BATCH = "rank_local_batch"
+
 _forward_context: ForwardContext | None = None
 
 
