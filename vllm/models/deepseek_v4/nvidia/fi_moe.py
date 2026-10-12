@@ -194,6 +194,27 @@ def resolve_mega_moe_is_padding(num_tokens: int) -> torch.Tensor | None:
     return is_padding[:num_tokens]
 
 
+_FI_PAD_MASK: bool | None = None
+
+
+def fi_stages_route_padding_mask() -> bool:
+    """flashinfer's MoEEpTensors takes ``route_padding_mask`` and masks those
+    rows inside its one-launch SM107 route staging, so no separate masking
+    kernel runs before the MegaMoE call."""
+    global _FI_PAD_MASK
+    if _FI_PAD_MASK is None:
+        try:
+            import dataclasses
+
+            from flashinfer.moe_ep import MoEEpTensors
+
+            names = {f.name for f in dataclasses.fields(MoEEpTensors)}
+            _FI_PAD_MASK = "route_padding_mask" in names
+        except Exception:
+            _FI_PAD_MASK = False
+    return _FI_PAD_MASK
+
+
 def apply_mega_moe_routing_preprocess(
     topk_ids: torch.Tensor,
     *,
@@ -767,10 +788,20 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
 
         num_tokens = hidden_states.shape[0]
         is_padding = resolve_mega_moe_is_padding(num_tokens)
-        topk_ids = apply_mega_moe_routing_preprocess(
-            topk_ids,
-            is_padding=is_padding,
-        )
+        # SM107: flashinfer masks the padding rows inside its route staging.
+        pad_kwargs: dict[str, Any] = {}
+        if (
+            self._is_sm107
+            and is_padding is not None
+            and is_padding.is_contiguous()
+            and fi_stages_route_padding_mask()
+        ):
+            pad_kwargs = {"route_padding_mask": is_padding}
+        else:
+            topk_ids = apply_mega_moe_routing_preprocess(
+                topk_ids,
+                is_padding=is_padding,
+            )
         scalars = self._scalar_kwargs()
 
         if self._is_sm107:
@@ -784,6 +815,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 topk_ids=topk_ids.contiguous(),
                 topk_weights=topk_weights.contiguous(),
                 **scalars,
+                **pad_kwargs,
             )
             kernel.stage_inputs(t, workspace, quantize_input=True)
             # Zero-copy workspace [:n] view: valid under stream ordering
