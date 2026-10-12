@@ -293,6 +293,33 @@ _AUTO_TABLE: dict[tuple[int, int], list[tuple[int, str]]] = {
         (2520, "t512x256_i256_c2x1_s0_p0"),
         (3072, "t512x256_i256_c2x1_s0_p0"),
     ],
+    # DSV4.1 shared expert gate_up / down: separate linears only when the
+    # routed experts run FlashInfer MegaMoE (DeepGEMM MegaMoE fuses them).
+    # VR200, memclk 4752, cold L2, per-M best of cute-dsl / cuBLASLt / Sm107
+    # tactics, same rule as above: 1.20-1.51x over cute-dsl at M >= 1024.
+    (4608, 5120): [
+        (256, "cublaslt"),
+        (512, "cublaslt"),
+        (640, "cublaslt"),
+        (768, "t256x192_i256_c2x1_s0_p0"),
+        (896, "t256x192_i256_c2x1_s1_p0"),
+        (1024, "t256x192_i256_c2x1_s0_p0"),
+        (1536, "t512x256_i256_c2x1_s0_p0"),
+        (3072, "t256x192_i256_c2x1_s0_p0"),
+    ],
+    (5120, 2304): [
+        (256, "cublaslt"),
+        (512, "cublaslt"),
+        (640, "cublaslt"),
+        (768, "t256x192_i256_c2x1_s0_p0"),
+        (896, "cublaslt"),
+        (1024, "cublaslt"),
+        (1536, "t256x192_i256_c2x2_s0_p0"),
+        (2048, "t512x256_i256_c2x1_s1_p0"),
+        (2304, "t256x256_i256_c2x2_s0_p0"),
+        (2520, "t256x256_i256_c2x1_s1_p0"),
+        (3072, "t256x256_i256_c4x1_s0_p0"),
+    ],
     (32768, 1280): [
         (1536, "cublaslt"),
         (1800, "t256x256_i256_c2x1_s0_p0"),
