@@ -304,9 +304,12 @@ def build_fi_mega_config(
     activation_clamp: float | None,
     megakernel: str,
     input_norm_const: float = 1.0,
+    sm107_extra: dict[str, Any] | None = None,
 ):
     """``input_norm_const``: global scale of the SM107 megakernel's in-kernel
-    BF16 -> NVFP4 activation quantization (unused by the SM100 megakernels)."""
+    BF16 -> NVFP4 activation quantization (unused by the SM100 megakernels).
+    ``sm107_extra``: extra SM107 config fields, e.g. ``max_sm_count`` (SM
+    budget of the megakernel next to a concurrent shared MLP)."""
     from flashinfer.moe_ep import MegaConfig
 
     if megakernel == SM107_NVFP4_MEGAKERNEL:
@@ -326,6 +329,7 @@ def build_fi_mega_config(
             ),
             knobs="cache",
             input_norm_const=float(input_norm_const),
+            **(sm107_extra or {}),
         )
         return MegaConfig(
             megakernel=mk,
@@ -379,6 +383,7 @@ def build_fi_mega_layer(
     weights,
     megakernel: str | None = None,
     input_norm_const: float = 1.0,
+    sm107_extra: dict[str, Any] | None = None,
 ) -> MoEEpMegaLayer:
     from flashinfer.moe_ep import FleetParams, MoEEpLayer
 
@@ -392,6 +397,7 @@ def build_fi_mega_layer(
         activation_clamp=activation_clamp,
         megakernel=megakernel,
         input_norm_const=input_norm_const,
+        sm107_extra=sm107_extra,
     )
     layer = MoEEpLayer(
         bootstrap=bootstrap,

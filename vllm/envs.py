@@ -308,6 +308,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_DSV41_MEGAMOE_SM107: bool = False
     VLLM_DSV41_MEGAMOE_PERDIE: str = "0"
+    VLLM_FI_MEGA_MOE_SHARED: Literal["separate", "overlap"] = "separate"
+    VLLM_FI_MEGA_MOE_MAX_SM_COUNT: str = "auto"
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2123,6 +2125,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights, "routed" per-die queues + die-local routed weights only (no extra memory for the shared experts).
     # Incompatible with EPLB (the localized weights are not (E, ...) tensors).
     "VLLM_DSV41_MEGAMOE_PERDIE": lambda: os.getenv("VLLM_DSV41_MEGAMOE_PERDIE", "0"),
+    # DeepSeek-V4 shared expert next to the FlashInfer SM107 MegaMoE
+    # (moe_backend flashinfer_moe_ep_mega_cutedsl; the megakernel has no
+    # shared-expert phase). "separate" (default): vLLM's MXFP8 shared MLP after
+    # the megakernel, on the same stream. "overlap": the shared MLP on a side
+    # stream, concurrent with the SM-budgeted megakernel (forked after the
+    # input staging; eager, FULL and PIECEWISE breakable CUDA graphs alike).
+    # Runs as "separate" when the shared MLP is TP-sharded (no SP, TP > 1).
+    # Needs flashinfer's SM107 phase-interleave scheduler fix.
+    "VLLM_FI_MEGA_MOE_SHARED": env_with_choices(
+        "VLLM_FI_MEGA_MOE_SHARED", "separate", ["separate", "overlap"]
+    ),
+    # SM budget of the SM107 megakernel (uniform cluster launch), leaving the
+    # remaining SMs to the concurrent shared MLP of
+    # VLLM_FI_MEGA_MOE_SHARED=overlap. "auto" (default, also an empty
+    # value): 196 SMs in overlap mode, all SMs otherwise; "0" / "none": all
+    # SMs; "<n>": n SMs.
+    "VLLM_FI_MEGA_MOE_MAX_SM_COUNT": lambda: os.getenv(
+        "VLLM_FI_MEGA_MOE_MAX_SM_COUNT", "auto"
+    ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
     # execution is not beneficial (most likely because of the input clone)

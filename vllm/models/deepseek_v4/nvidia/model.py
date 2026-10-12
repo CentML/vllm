@@ -1055,7 +1055,8 @@ class DeepseekV4MoE(nn.Module):
         # shared MLP. Sequence parallel replicates those weights while sharding
         # tokens. TP=1 is also naturally replicated. With PP+TP the shared MLP
         # remains tensor-sharded, so retain the serial path. The FlashInfer
-        # megakernel has no shared-expert fusion, so it keeps the serial path.
+        # megakernel has no shared-expert fusion: its shared MLP runs separately
+        # (serial, or overlapped on a side stream with VLLM_FI_MEGA_MOE_SHARED).
         fuse_shared_experts = bool(
             self.shared_experts is not None
             and not envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION
@@ -1214,15 +1215,31 @@ class DeepseekV4MoE(nn.Module):
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
+        # FlashInfer SM107 with VLLM_FI_MEGA_MOE_SHARED=overlap: the experts run
+        # the shared MLP on a side stream next to the megakernel and return
+        # routed + shared.
+        overlap_shared = self.shared_experts is not None and getattr(
+            self.experts, "overlaps_shared_experts", False
         )
+        if overlap_shared:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+                shared_experts=self.shared_experts,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
         if (
             self.shared_experts is not None
+            and not overlap_shared
             and not self.experts.has_fused_shared_experts
         ):
             shared_output = self.shared_experts(hidden_states)

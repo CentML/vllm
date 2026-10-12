@@ -272,7 +272,8 @@ class KernelConfig:
       requantized at load. On SM107 (Rubin) it runs flashinfer's
       RubinInferenceMegaMoE port, nvfp4 x nvfp4 on the NVFP4 expert
       checkpoint only (MXFP4 experts, e.g. a DSpark draft, use
-      deep_gemm_mega_moe)
+      deep_gemm_mega_moe); its shared expert runs serially or, with
+      VLLM_FI_MEGA_MOE_SHARED=overlap, on a side stream next to it
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels

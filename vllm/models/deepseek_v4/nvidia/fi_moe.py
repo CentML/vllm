@@ -67,6 +67,105 @@ def sm107_capacity_profiles(max_num_tokens: int, sp_size: int = 1) -> list[int]:
     return sorted(caps)
 
 
+# SM budget of the SM107 megakernel in overlap mode: the persistent kernel is
+# enqueued first and the shared MLP runs concurrently on the remaining SMs.
+# 196 of VR200's 212 SMs was the best single budget for DSv4.1 at 1260-2520
+# tokens/rank (true EP4).
+_SM107_OVERLAP_SM_BUDGET = 196
+
+
+def sm107_max_sm_count(spec: str, shared_mode: str) -> int | None:
+    """``VLLM_FI_MEGA_MOE_MAX_SM_COUNT`` -> flashinfer ``max_sm_count``.
+
+    ``auto`` (also an empty value): ``_SM107_OVERLAP_SM_BUDGET`` in overlap
+    mode, else all SMs (None). ``0`` / ``none``: all SMs. ``<n>``: n SMs."""
+    spec = (spec or "").strip().lower() or "auto"
+    if spec == "auto":
+        return _SM107_OVERLAP_SM_BUDGET if shared_mode == "overlap" else None
+    if spec in ("0", "none"):
+        return None
+    try:
+        value = int(spec)
+    except ValueError:
+        raise ValueError(
+            "VLLM_FI_MEGA_MOE_MAX_SM_COUNT must be 'auto', 'none' or an SM "
+            f"count, got {spec!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(f"max SM count must be >= 0, got {value}")
+    return value or None
+
+
+def resolve_sm107_shared_mode(
+    requested: str, *, replicated_shared: bool, has_side_stream: bool
+) -> tuple[str, str | None]:
+    """Effective ``VLLM_FI_MEGA_MOE_SHARED`` mode and the reason for a fallback.
+
+    ``overlap`` needs a replicated shared MLP (sequence parallel or TP 1, as
+    the DeepGEMM fusion): a TP-sharded one would all-reduce on the side stream
+    concurrently with the NVSHMEM megakernel. A fallback runs ``separate``,
+    with no megakernel SM budget unless ``VLLM_FI_MEGA_MOE_MAX_SM_COUNT`` is
+    an explicit count."""
+    if requested != "overlap":
+        return requested, None
+    if not replicated_shared:
+        return "separate", "the shared MLP is tensor-parallel (no SP, TP > 1)"
+    if not has_side_stream:
+        return "separate", "no CUDA side stream"
+    return "overlap", None
+
+
+# Side stream of VLLM_FI_MEGA_MOE_SHARED=overlap, private to it (not the global
+# aux_stream()): the shared MLP output is allocated here and read by the main
+# stream after the join without record_stream (which would hold the block until
+# the end of each CUDA-graph capture). Reusing that block is safe because every
+# later use of this stream first waits on a fork event recorded on the main
+# stream after the consumer.
+_SM107_SHARED_STREAM: torch.cuda.Stream | None = None
+
+
+def sm107_shared_stream() -> torch.cuda.Stream | None:
+    global _SM107_SHARED_STREAM
+    if _SM107_SHARED_STREAM is None and torch.cuda.is_available():
+        _SM107_SHARED_STREAM = torch.cuda.Stream()
+    return _SM107_SHARED_STREAM
+
+
+def sm107_compute_with_shared(
+    kernel: Any,
+    workspace: Any,
+    transformed: Any,
+    hidden_states: torch.Tensor,
+    shared_experts: nn.Module,
+    events: tuple[torch.cuda.Event, torch.cuda.Event],
+    stream: torch.cuda.Stream,
+) -> torch.Tensor:
+    """Staged megakernel on the current stream + shared MLP on ``stream``.
+
+    The fork is recorded after the input staging and the megakernel is
+    enqueued before the shared MLP, so the persistent kernel takes its
+    (VLLM_FI_MEGA_MOE_MAX_SM_COUNT-capped) SMs first and the MLP runs on the
+    rest (forking before the gate, TensorRT-LLM's order, loses the SM-budget
+    gain at true EP4). Same schedule in every graph mode: the fork and the join
+    complete inside one breakable-capture segment (neither the megakernel nor
+    the shared MLP has an eager break; a break in between would fail the
+    capture with an unjoined-stream error), like DSv4 attention's
+    execute_in_parallel."""
+    logger.info_once(
+        "FlashInfer SM107 MegaMoE: shared expert MLP overlapped on a side stream."
+    )
+    fork, join = events
+    fork.record()
+    y = kernel.compute(workspace, transformed, output=None)
+    with torch.cuda.stream(stream):
+        fork.wait()
+        shared = shared_experts(hidden_states)
+        join.record()
+    join.wait()
+    y += shared
+    return y
+
+
 def ckpt_uses_nvfp4_experts(vllm_config: VllmConfig) -> bool:
     """True when the loaded checkpoint quantizes experts with modelopt NVFP4
     (e2m1 + fp8-e4m3 per-16 block scales + per-tensor weight_scale_2), i.e.
@@ -237,16 +336,42 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             nvfp4_checkpoint=self._nvfp4_prequant,
         )
         self._is_sm107 = self._megakernel in SM107_MEGAKERNELS
+        import vllm.envs as envs
+
         # SM107 capacity profiles: capacity -> (kernel, backend workspace,
         # transformed weights). Built in finalize_weights.
         self._profiles: dict[int, tuple[Any, Any, Any]] = {}
         self._profile_caps: list[int] = []
         self._ws_handles: list[Any] = []
+        # Shared expert next to the SM107 megakernel (VLLM_FI_MEGA_MOE_SHARED):
+        # separate | overlap (side stream).
+        self._shared_mode = (
+            envs.VLLM_FI_MEGA_MOE_SHARED if self._is_sm107 else "separate"
+        )
+        self._shared_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
         parallel_config = vllm_config.parallel_config
         self._dp_size = parallel_config.data_parallel_size
         use_sp = _use_sequence_parallel(vllm_config)
         tp_size = parallel_config.tensor_parallel_size
         self._sp_size = tp_size if use_sp else 1
+        replicated_shared = use_sp or tp_size == 1
+        self._shared_stream: torch.cuda.Stream | None = (
+            sm107_shared_stream()
+            if self._shared_mode == "overlap" and replicated_shared
+            else None
+        )
+        self._shared_mode, fallback = resolve_sm107_shared_mode(
+            self._shared_mode,
+            replicated_shared=replicated_shared,
+            has_side_stream=self._shared_stream is not None,
+        )
+        if fallback is not None:
+            logger.warning_once(
+                "VLLM_FI_MEGA_MOE_SHARED=overlap runs as separate, with no "
+                "megakernel SM budget unless VLLM_FI_MEGA_MOE_MAX_SM_COUNT is "
+                "an explicit count. Reason: %s.",
+                fallback,
+            )
         if self._nvfp4_prequant:
             if self._megakernel not in NVFP4_CKPT_MEGAKERNELS:
                 raise ValueError(
@@ -256,6 +381,14 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                     "(deep_gemm consumes the MXFP4 checkpoint instead)."
                 )
             self._realloc_nvfp4_params()
+
+    # ----------------------------------------------------------- shared expert
+    @property
+    def overlaps_shared_experts(self) -> bool:
+        """VLLM_FI_MEGA_MOE_SHARED=overlap on SM107: the MoE block passes
+        ``shared_experts`` to forward(), which runs it on a side stream
+        concurrently with the (SM-budgeted) megakernel, in every graph mode."""
+        return self._is_sm107 and self._shared_mode == "overlap"
 
     def _realloc_nvfp4_params(self) -> None:
         """Swap the mx-recipe scale params for the NVFP4 checkpoint's:
@@ -362,6 +495,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         return self._ep_global_max(w2_in).expand_as(w2_in).contiguous()
 
     def _sm107_build(self) -> None:
+        import vllm.envs as envs
+
         # resolve_fi_megakernel admits only the NVFP4 checkpoint on SM107.
         assert self._nvfp4_prequant
         weights, gate_s2, _ = nvfp4_prequant_pack_and_alphas(
@@ -380,6 +515,12 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             self._sm107_fc2_input_scale(),
             input_norm_const=input_norm_const,
         )
+        sm107_extra: dict[str, Any] = {}
+        max_sm = sm107_max_sm_count(
+            envs.VLLM_FI_MEGA_MOE_MAX_SM_COUNT, self._shared_mode
+        )
+        if max_sm is not None:
+            sm107_extra["max_sm_count"] = max_sm
         self._mega_layer = build_fi_mega_layer(
             make_fi_moe_ep_bootstrap(),
             vllm_config=self._vllm_config,
@@ -392,6 +533,7 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             weights=weights,
             megakernel=self._megakernel,
             input_norm_const=input_norm_const,
+            sm107_extra=sm107_extra,
         )
         del weights
         layer = self._mega_layer
@@ -414,7 +556,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             logger.info(
                 "FlashInfer SM107 MegaMoE: megakernel %s, %d of %d experts "
                 "local, I %d, top-%d, clamp %s, input_norm_const %.6g, "
-                "capacity profiles %s.",
+                "capacity profiles %s, shared expert %s, megakernel SM "
+                "budget %s.",
                 self._megakernel,
                 self.num_local_experts,
                 self.num_experts,
@@ -423,6 +566,8 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
                 self._activation_clamp,
                 input_norm_const,
                 caps,
+                self._shared_mode,
+                sm107_extra.get("max_sm_count", "all"),
             )
 
     def _rank_consistent_num_tokens(self, num_tokens: int) -> int:
@@ -475,8 +620,9 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
 
     # ---------------------------------------------------------------- finalize
     def finalize_weights(self, shared_experts: DeepseekV4MLP | None = None) -> None:
-        # The FlashInfer megakernel has no shared-expert fusion; the caller's
-        # serial shared MLP path handles shared_experts.
+        # The FlashInfer megakernel has no shared-expert fusion; the caller
+        # runs the shared MLP (serial, or overlapped on a side stream with
+        # VLLM_FI_MEGA_MOE_SHARED=overlap on SM107).
         if self._mega_layer is not None:
             return
         if self.w13_weight is None:
@@ -576,6 +722,27 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             out["fc1_norm_const"] = alphas[2]
         return out
 
+    def _compute_with_overlapped_shared(
+        self,
+        kernel: Any,
+        workspace: Any,
+        transformed: Any,
+        hidden_states: torch.Tensor,
+        shared_experts: nn.Module,
+    ) -> torch.Tensor:
+        assert self._shared_stream is not None
+        if self._shared_events is None:
+            self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
+        return sm107_compute_with_shared(
+            kernel,
+            workspace,
+            transformed,
+            hidden_states,
+            shared_experts,
+            self._shared_events,
+            self._shared_stream,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -584,9 +751,12 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
         *,
         activation_clamp: float | None,
         fast_math: bool = True,
+        shared_experts: nn.Module | None = None,
     ) -> torch.Tensor:
         # fast_math is a native deep_gemm knob; the FI kernels have no
         # equivalent toggle, so it is accepted for signature parity only.
+        # shared_experts (SM107, VLLM_FI_MEGA_MOE_SHARED=overlap): run it on the
+        # side stream concurrently with the megakernel and return routed + shared.
         if hidden_states.shape[0] > self.max_num_tokens:
             raise ValueError(
                 f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, "
@@ -618,7 +788,11 @@ class DeepseekV4MegaMoEExpertsFI(DeepseekV4MegaMoEExperts):
             kernel.stage_inputs(t, workspace, quantize_input=True)
             # Zero-copy workspace [:n] view: valid under stream ordering
             # until the next MoE layer's launch on the same profile.
-            return kernel.compute(workspace, transformed, output=None)
+            if shared_experts is None:
+                return kernel.compute(workspace, transformed, output=None)
+            return self._compute_with_overlapped_shared(
+                kernel, workspace, transformed, hidden_states, shared_experts
+            )
 
         # Fast path: after the first successful full forward the layer is
         # immutable, so skip MoEEpMegaLayer.forward()'s per-call validation
