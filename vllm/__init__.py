@@ -6,6 +6,9 @@
 # version library first.  Such assumption is critical for some customization.
 from .version import __version__, __version_tuple__  # isort:skip
 
+# Built-in serving defaults for this branch; applied before any module reads them.
+import vllm.qwen_gb300_defaults  # noqa: F401  # isort:skip
+
 import typing
 
 # The environment variables override should be imported before any other
