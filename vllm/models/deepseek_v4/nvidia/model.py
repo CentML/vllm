@@ -31,6 +31,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_pre_tilelang,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
+from vllm.model_executor.layers.fusion.fused_act_quant import maybe_fused_act_quant
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
@@ -186,7 +187,13 @@ class DeepseekV4MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if isinstance(self.act_fn, SiluAndMulWithClamp):
+            # SwiGLU with clamp fused with the down_proj's MXFP8 input quant
+            # when VLLM_MXFP8_FUSED_SWIGLU_QUANT=1 and the down_proj consumes
+            # a pre-quantized MXFP8 activation; otherwise the plain activation.
+            x = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
