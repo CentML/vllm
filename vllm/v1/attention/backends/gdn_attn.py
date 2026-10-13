@@ -10,6 +10,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn import gdn_prefill_census
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
     GDN_HOST_TRIM2,
@@ -659,9 +660,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if (
-                num_spec_decodes == 0
-                or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+            # VLLM_GDN_MTP_DEFER_WRITES keeps spec rows without drafts on the
+            # spec path (their state is si[r, num_accepted - 1]; column 0, which
+            # the non-spec path reads, is not kept current).
+            if num_spec_decodes == 0 or (
+                not gdn_mtp_cuda.defer_armed()
+                and num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
                 == 0
             ):
                 num_spec_decodes = 0
@@ -1311,8 +1315,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
-        num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
-        assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
+        num_draft = torch.diff(m.query_start_loc_cpu).sub_(1)
+        assert num_draft.shape == num_accepted_tokens.shape
+        # One-token rows only: captured as non-spec rows (also with
+        # VLLM_GDN_MTP_DEFER_WRITES, which keeps draftless spec rows only at
+        # run time).
+        num_decode_draft_tokens_cpu = num_draft if num_draft.any() else None
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
 

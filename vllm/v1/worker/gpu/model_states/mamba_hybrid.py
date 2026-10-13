@@ -118,9 +118,14 @@ class MambaHybridModelState(DefaultModelState):
         )
         # VLLM_GDN_MTP_DEFER_WRITES: the GDN MTP verify kernel defers its state
         # snapshots to a commit after sampling (postprocess_state), run here.
+        # Not with adaptive verification: its varlen FULL decode graphs are
+        # captured with one-token rows as non-spec rows, which deferral turns
+        # into spec rows (prepare_attn).
+        spec_config = vllm_config.speculative_config
         self._gdn_defer = (
             vllm_config.num_speculative_tokens > 0
             and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and not getattr(spec_config, "enable_adaptive_verification", False)
             and gdn_mtp_cuda.defer_arm(self.device)
         )
         # GDN decode-metadata fusion per set of Mamba-family builders, keyed by
@@ -322,6 +327,10 @@ class MambaHybridModelState(DefaultModelState):
             # need the -1 sentinel rather than a raw zero draft count.
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            if num_draft_tokens_per_req is None and self._gdn_defer:
+                # No row has drafts this step: decode rows still become
+                # one-token spec rows below (GDN keeps the spec path for them).
+                num_draft_tokens_per_req = np.zeros(input_batch.num_reqs, np.int32)
             if num_draft_tokens_per_req is not None:
                 # A row is a spec-decode row only when its whole prompt is already
                 # computed, i.e. exactly one non-draft (decode) token is scheduled.
@@ -331,11 +340,12 @@ class MambaHybridModelState(DefaultModelState):
                 spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
                 if self._gdn_defer:
                     # VLLM_GDN_MTP_DEFER_WRITES: a decode row scheduled without
-                    # drafts stays a (one-token) spec row, so its SSM state comes
-                    # from si[r, num_accepted - 1] (materialized by the commit)
-                    # and its conv window is shifted by num_accepted, instead of
-                    # the non-spec path's running block column 0 (which holds
-                    # S_0 of the previous spec step at best).
+                    # drafts stays a (one-token) spec row, also when no row has
+                    # drafts, so its SSM state comes from si[r, num_accepted - 1]
+                    # (materialized by the commit) and its conv window is shifted
+                    # by num_accepted, instead of the non-spec path's running
+                    # block column 0 (which holds S_0 of the previous spec step
+                    # at best, and is not kept current by the commit).
                     spec_decode_mask |= is_decode & ~input_batch.is_prefilling_np
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1

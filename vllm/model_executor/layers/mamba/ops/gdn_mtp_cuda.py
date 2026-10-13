@@ -280,6 +280,13 @@ def defer_arm(device: torch.device) -> bool:
     return _defer.armed
 
 
+def defer_armed() -> bool:
+    """Whether deferred snapshots are armed (GDN metadata keeps draftless
+    decode rows on the spec path then).
+    """
+    return _defer.armed
+
+
 def _defer_rec(state: torch.Tensor, layer_key: object | None) -> torch.Tensor:
     """The record table of layer ``layer_key`` (a stable per-layer key, e.g.
     the layer prefix; never the state pointer, which layers of different
