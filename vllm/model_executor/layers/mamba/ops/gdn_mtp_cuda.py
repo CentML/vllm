@@ -150,7 +150,7 @@ def wy_source(tune: str, pdl: bool) -> str:
         if item == "1":
             continue
         key, val = item.split("=")
-        assert key in ("PF", "QS", "KS", "MINB"), key
+        assert key in ("PF", "QS", "KS", "MINB", "CLPC", "CST"), key
         defines += f"#define GWY_{key} {int(val)}\n"
     return defines + _WY_SOURCE
 
@@ -1699,37 +1699,58 @@ __device__ __forceinline__ int ld_idx(const void* p, int i, int is64) {
   return is64 ? static_cast<int>(static_cast<const int64_t*>(p)[i]) : static_cast<const int*>(p)[i];
 }
 
-// chain() for the first A tokens from the source state in global memory, storing
-// S_{A-1} (all S_t with `all`): the same per-element operations, so bitwise equal.
+#ifndef GWY_CLPC
+#define GWY_CLPC 8  // commit: layers per CTA
+#endif
+#ifndef GWY_CST
+#define GWY_CST 2  // commit: pipeline stages (2: 2 CTAs per SM, more: 1)
+#endif
+
+// One pipeline stage of the commit: a layer's source state (rows of 256 B,
+// unswizzled) and replay log.
+struct CStage {
+  __nv_bfloat16 st[kV * kK];
+  float dl[kMaxT][kV];
+  float k[kMaxT][kK];
+  float dec[kMaxT];
+};
+struct CSmem {
+  CStage s[GWY_CST];
+  int rec[GWY_CLPC][kRec];
+  __nv_bfloat16* state[GWY_CLPC];
+  int64_t s_slot[GWY_CLPC];
+  int list[GWY_CLPC];  // layers (of this CTA) with a record of this step
+  int cnt[kNW];
+  int row, nv;
+};
+
+// chain() for the first A tokens from the staged source state, storing S_{A-1}
+// (all S_t with `all`): the same per-element operations, so bitwise equal.
 template <int A>
-__device__ __forceinline__ void replay(const float (&dls)[kMaxT][kV], const float (&ks)[kMaxT][kK],
-                                       const float (&decs)[kMaxT], const __nv_bfloat16* src_head,
-                                       const int (&slots)[kMaxT], bool all, __nv_bfloat16* state, int64_t s_slot,
-                                       int64_t head, int warp, int lane) {
+__device__ __forceinline__ void replay(const CStage& cs, const int* slots, bool all, __nv_bfloat16* state,
+                                       int64_t s_slot, int64_t head, int warp, int lane) {
   float2 kr[A][2];
   float dd[A];
   __nv_bfloat16* dst[A];
 #pragma unroll
   for (int t = 0; t < A; ++t) {
-    const float4 k4 = *reinterpret_cast<const float4*>(&ks[t][4 * lane]);
+    const float4 k4 = *reinterpret_cast<const float4*>(&cs.k[t][4 * lane]);
     kr[t][0] = make_float2(k4.x, k4.y);
     kr[t][1] = make_float2(k4.z, k4.w);
-    dd[t] = decs[t];
+    dd[t] = cs.dec[t];
     dst[t] = (all || t == A - 1) && slots[t] > 0
                  ? state + static_cast<int64_t>(slots[t]) * s_slot + head + warp * kRW * kK + 4 * lane
                  : nullptr;
   }
-  const __nv_bfloat16* srow = src_head + warp * kRW * kK + 4 * lane;
-  uint2 w[kRW];
-#pragma unroll
-  for (int rr = 0; rr < kRW; ++rr) w[rr] = __ldcs(reinterpret_cast<const uint2*>(srow + rr * kK));
-#pragma unroll
+  const __nv_bfloat16* srow = cs.st + warp * kRW * kK + 4 * lane;
+#pragma unroll 4
   for (int rr = 0; rr < kRW; ++rr) {
-    float2 h0 = make_float2(bf_lo(w[rr].x), bf_hi(w[rr].x));
-    float2 h1 = make_float2(bf_lo(w[rr].y), bf_hi(w[rr].y));
+    const uint2 w = *reinterpret_cast<const uint2*>(srow + rr * kK);
+    float2 h0 = make_float2(bf_lo(w.x), bf_hi(w.x));
+    float2 h1 = make_float2(bf_lo(w.y), bf_hi(w.y));
 #pragma unroll
     for (int t = 0; t < A; ++t) {
-      const float dv = dls[t][warp * kRW + rr];
+      const float dv = cs.dl[t][warp * kRW + rr];
       const float2 dl2 = make_float2(dv, dv);
       const float2 d2 = make_float2(dd[t], dd[t]);
       h0 = fma2(kr[t][0], dl2, mul2(h0, d2));
@@ -1740,77 +1761,109 @@ __device__ __forceinline__ void replay(const float (&dls)[kMaxT][kV], const floa
 }
 
 template <int A = 1>
-__device__ __forceinline__ void replay_t(int a, const float (&dls)[kMaxT][kV], const float (&ks)[kMaxT][kK],
-                                         const float (&decs)[kMaxT], const __nv_bfloat16* src_head,
-                                         const int (&slots)[kMaxT], bool all, __nv_bfloat16* state, int64_t s_slot,
-                                         int64_t head, int warp, int lane) {
-  if (a == A) replay<A>(dls, ks, decs, src_head, slots, all, state, s_slot, head, warp, lane);
-  else if constexpr (A < kMaxT) replay_t<A + 1>(a, dls, ks, decs, src_head, slots, all, state, s_slot, head, warp, lane);
+__device__ __forceinline__ void replay_t(int a, const CStage& cs, const int* slots, bool all, __nv_bfloat16* state,
+                                         int64_t s_slot, int64_t head, int warp, int lane) {
+  if (a == A) replay<A>(cs, slots, all, state, s_slot, head, warp, lane);
+  else if constexpr (A < kMaxT) replay_t<A + 1>(a, cs, slots, all, state, s_slot, head, warp, lane);
 }
 
-// Grid (spec rows, HV, layers): materializes the accepted snapshot(s) of the
-// records of this step (tag == epoch) from their source state and replay log.
-__global__ void __launch_bounds__(kNT) commit_kernel(const CParams p) {
-  __shared__ float s_dl[kMaxT][kV];
-  __shared__ __align__(16) float s_k[kMaxT][kK];
-  __shared__ float s_dec[kMaxT];
-  __shared__ int s_cnt[kNW];
-  __shared__ int s_row;
-  const int r = blockIdx.x, hv = blockIdx.y, l = blockIdx.z;
+// Grid (spec rows, HV, ceil(layers / GWY_CLPC)): materializes the accepted
+// snapshot(s) of the records of this step (tag == epoch) of GWY_CLPC layers from
+// their source state and replay log, staged by a GWY_CST-stage cp.async
+// pipeline. Everything a layer reads is staged before any of its stores (the
+// source and log slots may be targets).
+__global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const CParams p, int n_layers) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  CSmem& sm = *reinterpret_cast<CSmem*>(smem_raw);
+  const int r = blockIdx.x, hv = blockIdx.y, l0 = blockIdx.z * GWY_CLPC;
+  const int nl = min(GWY_CLPC, n_layers - l0);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int* rec = p.rec + (static_cast<int64_t>(l) * p.rec_rows + r) * kRec;
-  if (__ldg(rec) != p.epoch) return;
-  const int T = __ldg(rec + 1), src = __ldg(rec + 2), log_slot = __ldg(rec + 3);
-  int slots[kMaxT];
+  for (int x = tid; x < nl * kRec; x += kNT)
+    sm.rec[x / kRec][x % kRec] = __ldg(p.rec + (static_cast<int64_t>(l0 + x / kRec) * p.rec_rows + r) * kRec + x % kRec);
+  if (tid < nl) {
+    sm.state[tid] = reinterpret_cast<__nv_bfloat16*>(p.state_ptrs[l0 + tid]);
+    sm.s_slot[tid] = p.s_slot[l0 + tid];
+  }
+  if (tid == 0) sm.row = -1;
+  __syncthreads();
+  if (tid == 0) {
+    int nv = 0;
+    for (int j = 0; j < nl; ++j)
+      if (sm.rec[j][0] == p.epoch) sm.list[nv++] = j;
+    sm.nv = nv;
+  }
+  __syncthreads();
+  const int nv = sm.nv;
+  if (nv == 0) return;
+  const int64_t head = static_cast<int64_t>(hv) * kV * kK;
+  // Stage i (always one commit group, possibly empty): layer list[i]'s source
+  // state and the T tokens of its log.
+  const auto stage = [&](int i) {
+    if (i < nv) {
+      const int j = sm.list[i];
+      CStage& cs = sm.s[i % GWY_CST];
+      const int T = min(sm.rec[j][1], kMaxT);
+      const __nv_bfloat16* sp = sm.state[j] + static_cast<int64_t>(sm.rec[j][2]) * sm.s_slot[j] + head;
+      const float* lg =
+          reinterpret_cast<const float*>(sm.state[j] + static_cast<int64_t>(sm.rec[j][3]) * sm.s_slot[j] + head);
 #pragma unroll
-  for (int t = 0; t < kMaxT; ++t) slots[t] = __ldg(rec + 4 + t);
+      for (int c = tid; c < kV * kK / 8; c += kNT) cp_async16(cs.st + 8 * c, sp + 8 * c);
+      for (int c = tid; c < T * (kV / 4); c += kNT) {
+        cp_async16(&cs.dl[0][0] + 4 * c, lg + 4 * c);
+        cp_async16(&cs.k[0][0] + 4 * c, lg + kLogK + 4 * c);
+      }
+      if (tid < kMaxT / 4) cp_async16(cs.dec + 4 * tid, lg + kLogD + 4 * tid);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  };
+#pragma unroll
+  for (int s = 0; s < GWY_CST - 1; ++s) stage(s);
 
-  // Batch row of spec row r: the r-th set entry of mask.
-  if (tid == 0) s_row = -1;
+  // Batch row of spec row r (the r-th set entry of mask), while the first
+  // stages load.
   int base = 0;
   for (int c = 0; c < p.batch; c += kNT) {
     const int i = c + tid;
     const bool m = i < p.batch && p.mask[i] != 0;
     const unsigned bal = __ballot_sync(0xffffffffu, m);
-    if (lane == 0) s_cnt[warp] = __popc(bal);
+    if (lane == 0) sm.cnt[warp] = __popc(bal);
     __syncthreads();
     int pre = base + __popc(bal & ((1u << lane) - 1u)), tot = 0;
 #pragma unroll
     for (int w = 0; w < kNW; ++w) {
-      pre += w < warp ? s_cnt[w] : 0;
-      tot += s_cnt[w];
+      pre += w < warp ? sm.cnt[w] : 0;
+      tot += sm.cnt[w];
     }
-    if (m && pre == r) s_row = i;
+    if (m && pre == r) sm.row = i;
     base += tot;
     __syncthreads();
     if (base > r) break;
   }
-  const int row = s_row;
-  if (row < 0 || row >= p.n_sampled) return;
-  const int a = max(1, min(ld_idx(p.num_sampled, row, p.ns64), T));
-  // Block-boundary step (the align postprocess copies an accepted S_t that may
-  // precede S_{a-1}): materialize every accepted snapshot.
-  bool all = false;
+  __syncthreads();
+  const int row = sm.row;
+  if (row < 0 || row >= p.n_sampled) {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    return;
+  }
+  const int sampled = ld_idx(p.num_sampled, row, p.ns64);
+  int nc = -1;
   if (p.block_size > 0) {
     const int req = p.idx_mapping != nullptr ? ld_idx(p.idx_mapping, row, p.im64) : row;
-    if (req >= 0) {
-      const int nc = p.num_computed[req];
-      all = (nc / p.block_size) * p.block_size >= nc - a + 1;
-    }
+    if (req >= 0) nc = p.num_computed[req];
   }
-  __nv_bfloat16* state = reinterpret_cast<__nv_bfloat16*>(p.state_ptrs[l]);
-  const int64_t s_slot = p.s_slot[l];
-  const int64_t head = static_cast<int64_t>(hv) * kV * kK;
-  // The whole log is staged before any store: the log slot may be a target.
-  const float* lg = reinterpret_cast<const float*>(state + static_cast<int64_t>(log_slot) * s_slot + head);
-  for (int x = tid; x < a * kV; x += kNT) {
-    s_dl[x / kV][x % kV] = __ldcs(lg + x);
-    s_k[x / kV][x % kV] = __ldcs(lg + kLogK + x);
+  for (int i = 0; i < nv; ++i) {
+    asm volatile("cp.async.wait_group %0;" ::"n"(GWY_CST - 2) : "memory");
+    // Stage i landed for every thread, and every thread is done with the
+    // buffer of stage i - 1, which stage i + GWY_CST - 1 reuses.
+    __syncthreads();
+    stage(i + GWY_CST - 1);
+    const int j = sm.list[i];
+    const int a = max(1, min(sampled, sm.rec[j][1]));
+    // Block-boundary step (the align postprocess copies an accepted S_t that
+    // may precede S_{a-1}): materialize every accepted snapshot.
+    const bool all = nc >= 0 && (nc / p.block_size) * p.block_size >= nc - a + 1;
+    replay_t(a, sm.s[i % GWY_CST], &sm.rec[j][4], all, sm.state[j], sm.s_slot[j], head, warp, lane);
   }
-  if (tid < a) s_dec[tid] = __ldcs(lg + kLogD + tid);
-  __syncthreads();
-  replay_t(a, s_dl, s_k, s_dec, state + static_cast<int64_t>(src) * s_slot + head, slots, all, state, s_slot, head,
-           warp, lane);
 }
 
 template <int TM>
@@ -1962,7 +2015,14 @@ void commit(torch::Tensor rec, torch::Tensor state_ptrs, torch::Tensor s_slot, i
   p.im64 = idx_mapping.scalar_type() == at::kLong;
   const c10::cuda::CUDAGuard guard(rec.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-  commit_kernel<<<dim3((unsigned)n_rows, (unsigned)hv, (unsigned)n_layers), kNT, 0, stream>>>(p);
+  static bool attr = false;
+  if (!attr) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(commit_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(sizeof(CSmem))));
+    attr = true;
+  }
+  const dim3 grid((unsigned)n_rows, (unsigned)hv, (unsigned)((n_layers + GWY_CLPC - 1) / GWY_CLPC));
+  commit_kernel<<<grid, kNT, sizeof(CSmem), stream>>>(p, (int)n_layers);
   C10_CUDA_CHECK(cudaGetLastError());
 }
 
