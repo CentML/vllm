@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -14,8 +15,12 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, get_group_id
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    kv_pool_stats_interval,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -201,6 +206,8 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self._pool_stats_interval = kv_pool_stats_interval() if enable_caching else 0.0
+        self._pool_stats_next = 0.0
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -950,3 +957,71 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+        if self._pool_stats_interval > 0:
+            now = time.monotonic()
+            if now >= self._pool_stats_next:
+                self._pool_stats_next = now + self._pool_stats_interval
+                self.log_pool_stats()
+
+    def log_pool_stats(self) -> None:
+        """VLLM_KV_POOL_STATS: one line of block-pool composition per group.
+
+        held: distinct blocks referenced by request block tables; free_c:
+        cached free blocks (LRU); for Mamba groups also the block-aligned share
+        of free_c. Attention: superseded tail sources still resident (flag off)
+        or dropped so far (flag on).
+        """
+        pool = self.block_pool
+        managers = self.coordinator.single_type_managers
+        num_groups = len(managers)
+        free_cached = [0] * num_groups
+        free_aligned = [0] * num_groups
+        for block in pool.blocks:
+            if block.ref_cnt != 0 or block.block_hash is None or block.is_null:
+                continue
+            gid = get_group_id(block.block_hash)
+            if gid >= num_groups:
+                continue
+            free_cached[gid] += 1
+            num_tokens = block.block_hash_num_tokens
+            if num_tokens is not None and num_tokens % managers[gid].block_size == 0:
+                free_aligned[gid] += 1
+        parts = []
+        num_running = 0
+        for gid, mgr in enumerate(managers):
+            held = {
+                b.block_id
+                for blocks in mgr.req_to_blocks.values()
+                for b in blocks
+                if not b.is_null
+            }
+            num_running = max(num_running, len(mgr.req_to_blocks))
+            part = (
+                f"g{gid}:{type(mgr).__name__[:5]} held={len(held)}"
+                f" free_c={free_cached[gid]}"
+            )
+            if isinstance(mgr, MambaManager):
+                part += (
+                    f" aligned={free_aligned[gid]}"
+                    f" pinned={len(mgr._own_pin)}"
+                    f" drop_sup={getattr(mgr, 'num_superseded_states_dropped', 0)}"
+                    f" drop_own={mgr.num_own_checkpoints_dropped}"
+                    f" sup_cow={mgr.num_superseded_cow}"
+                    f" sup_cow_dropped={mgr.num_superseded_cow_dropped}"
+                )
+            elif isinstance(mgr, FullAttentionManager) and mgr.track_superseded_tail:
+                part += (
+                    f" sup_tail={mgr.num_superseded_tails}"
+                    f" sup_tail_resident={mgr.count_resident_superseded_tails()}"
+                    f" sup_tail_dropped={mgr.num_superseded_tails_dropped}"
+                )
+            parts.append(part)
+        num_free = pool.get_num_free_blocks()
+        logger.info(
+            "kv pool stats: blocks=%d free=%d free_uncached=%d reqs=%d | %s",
+            pool.num_gpu_blocks,
+            num_free,
+            num_free - sum(free_cached),
+            num_running,
+            " | ".join(parts),
+        )
