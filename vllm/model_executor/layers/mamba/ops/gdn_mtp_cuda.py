@@ -88,6 +88,46 @@ GDN_MTP_CUDA_WY = os.environ.get("VLLM_GDN_MTP_CUDA_WY", "")
 if GDN_MTP_CUDA_WY == "0":
     GDN_MTP_CUDA_WY = ""
 GDN_MTP_CUDA_WY_MIN_REQS = int(os.environ.get("VLLM_GDN_MTP_CUDA_WY_MIN_REQS", "36"))
+# VLLM_GDN_MTP_DEFER_WRITES=1 (with VLLM_GDN_MTP_CUDA_WY; armed by the V2 model
+# runner's Mamba hybrid state, which runs the commit): calls taken by the WY
+# kernel no longer write the T per-token snapshots (5 MiB per request and layer
+# at T = 5, bf16 32 x 128 x 128) but a replay log of each head (delta_t per
+# value row, normalized k_t, d_t: fp32, ~5 KiB per head at T = 5) into one of
+# the request's own spec slots that is not the source slot, and leave the source
+# state untouched. After sampling, defer_commit() replays the accepted tokens
+# from the source state (one launch for all layers) and writes S_{acc-1}, plus
+# every accepted S_t on block-boundary steps (the align-mode postprocess copy
+# reads one of them), so every later reader (next verify step of any kernel,
+# align pre/postprocess copies) sees the same slots as with the stock writes,
+# bitwise. Per request and layer: 1 + 1 MiB read, 1 MiB written (was 1 + 5).
+# The rejected and the unread accepted columns hold stale data, as rejected ones
+# already did. Off (default): the stock snapshot writes.
+GDN_MTP_DEFER_WRITES = os.environ.get("VLLM_GDN_MTP_DEFER_WRITES", "0") == "1"
+_DEFER_MAX_LAYERS = 128  # state tensors with a record table
+_DEFER_ROWS = 1024  # requests per call with a record (more: stock writes)
+_DEFER_REC = 16  # ints per record (kRec)
+
+
+class _DeferState:
+    """Deferred-snapshot bookkeeping (VLLM_GDN_MTP_DEFER_WRITES)."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        # [_DEFER_MAX_LAYERS, _DEFER_ROWS, _DEFER_REC] int32 records per layer
+        self.rec: torch.Tensor | None = None
+        self.epoch: torch.Tensor | None = None  # [1] int32: this step's tag
+        self.empty: torch.Tensor | None = None  # int32 [0]: no deferral
+        self.host_epoch = 0
+        # state data_ptr -> layer index; per layer (data_ptr, slot stride, HV)
+        self.index: dict[int, int] = {}
+        self.layers: list[tuple[int, int, int]] = []
+        # int64 [layers] device copies of `layers` (rebuilt when it grows)
+        self.ptrs: torch.Tensor | None = None
+        self.strides: torch.Tensor | None = None
+        self.step: tuple[torch.Tensor, int] | None = None  # (spec row mask, rows)
+
+
+_defer = _DeferState()
 
 
 def tuned_source(tune: str, pdl: bool, quant: bool = False) -> str:
@@ -176,11 +216,15 @@ def enable() -> bool:
                 " with the fused out_proj MXFP8 quant" if GDN_MTP_FUSED_QUANT else "",
             )
             if GDN_MTP_CUDA_WY:
+                _defer_alloc(
+                    torch.device("cuda", torch.accelerator.current_device_index())
+                )
                 logger.info(
                     "GDN MTP decode: WY tensor-core CUDA kernel built and enabled "
-                    "(VLLM_GDN_MTP_CUDA_WY=%s) for >= %d requests.",
+                    "(VLLM_GDN_MTP_CUDA_WY=%s) for >= %d requests%s.",
                     GDN_MTP_CUDA_WY,
                     GDN_MTP_CUDA_WY_MIN_REQS,
+                    ", deferred snapshot writes" if GDN_MTP_DEFER_WRITES else "",
                 )
         except Exception:
             logger.warning(
@@ -192,6 +236,107 @@ def enable() -> bool:
 
 def ready() -> bool:
     return bool(_ext)
+
+
+def _defer_alloc(device: torch.device) -> None:
+    """The (empty) record tables; idempotent, before any graph capture."""
+    d = _defer
+    if d.empty is None:
+        d.empty = torch.empty(0, dtype=torch.int32, device=device)
+    if GDN_MTP_DEFER_WRITES and d.rec is None:
+        d.rec = torch.zeros(
+            (_DEFER_MAX_LAYERS, _DEFER_ROWS, _DEFER_REC),
+            dtype=torch.int32,
+            device=device,
+        )
+        d.epoch = torch.zeros(1, dtype=torch.int32, device=device)
+
+
+def defer_arm(device: torch.device) -> bool:
+    """Called by the model state that runs defer_begin_step()/defer_commit()
+    every step; deferral is used only once armed. Returns whether it is on.
+    """
+    if GDN_MTP_DEFER_WRITES and GDN_MTP_CUDA_WY:
+        _defer_alloc(device)
+        _defer.armed = True
+        logger.info("GDN MTP decode: deferred snapshot writes armed.")
+    return _defer.armed
+
+
+def _defer_rec(state: torch.Tensor) -> torch.Tensor:
+    """This layer's record table, or the empty tensor (stock writes)."""
+    d = _defer
+    assert d.empty is not None
+    if not d.armed or d.rec is None:
+        return d.empty
+    key = state.data_ptr()
+    idx = d.index.get(key)
+    if idx is None:
+        if len(d.layers) >= _DEFER_MAX_LAYERS or (
+            d.layers and d.layers[0][2] != state.size(1)
+        ):
+            return d.empty
+        idx = d.index[key] = len(d.layers)
+        d.layers.append((key, state.stride(0), state.size(1)))
+    return d.rec[idx]
+
+
+def defer_begin_step(spec_mask: torch.Tensor | None, num_spec: int) -> None:
+    """Start a step (before its forward; not for graph capture): the records
+    the forward writes get a new tag. ``spec_mask``: the GDN metadata's spec
+    row mask over the batch rows (spec row r = r-th set entry), ``num_spec``
+    its spec rows; None / 0: no spec rows, nothing to commit.
+    """
+    d = _defer
+    if not d.armed:
+        return
+    if spec_mask is None or num_spec <= 0:
+        d.step = None
+        return
+    assert d.epoch is not None
+    d.host_epoch = d.host_epoch % 0x7FFFFFFF + 1
+    d.epoch.fill_(d.host_epoch)
+    d.step = (spec_mask, num_spec)
+
+
+def defer_commit(
+    num_sampled: torch.Tensor | int,
+    idx_mapping: torch.Tensor,
+    num_computed: torch.Tensor | None,
+    block_size: int,
+) -> None:
+    """After sampling (before the align postprocess copy): materialize this
+    step's deferred snapshots. ``num_sampled``: per batch row (accepted = max(
+    num_sampled, 1)); ``idx_mapping``: batch row -> request state index;
+    ``num_computed``: post-step computed tokens per request state index and
+    ``block_size`` the Mamba block size (align mode; 0 otherwise).
+    """
+    d = _defer
+    step, d.step = d.step, None
+    if step is None or not d.layers:
+        return
+    if isinstance(num_sampled, int):
+        raise RuntimeError("GDN deferred snapshots: spec rows without sampling")
+    assert d.rec is not None and d.empty is not None and _wy
+    if d.ptrs is None or d.ptrs.numel() != len(d.layers):
+        device = d.rec.device
+        d.ptrs = torch.tensor([x[0] for x in d.layers], dtype=torch.int64).to(device)
+        d.strides = torch.tensor([x[1] for x in d.layers], dtype=torch.int64).to(device)
+    mask, num_spec = step
+    _wy[0].commit(
+        d.rec,
+        d.ptrs,
+        d.strides,
+        len(d.layers),
+        num_spec,
+        d.layers[0][2],
+        mask,
+        num_sampled,
+        idx_mapping,
+        num_computed if num_computed is not None and block_size > 0 else d.empty,
+        d.host_epoch,
+        block_size if num_computed is not None else 0,
+    )
 
 
 def gdn_mtp_cuda(
@@ -242,8 +387,12 @@ def gdn_mtp_cuda(
     wy = bool(_wy) and state_indices.shape[0] >= GDN_MTP_CUDA_WY_MIN_REQS
     if out_q is not None:
         return not wy and _ext[0].run_quant(*args, out_q, out_scale, *tail)
-    if wy and _wy[0].run(*args, *tail):
-        return True
+    if wy:
+        assert _defer.empty is not None
+        rec = _defer_rec(state)
+        epoch = _defer.epoch if rec.numel() else _defer.empty
+        if _wy[0].run(*args, *tail, rec, epoch):
+            return True
     return _ext[0].run(*args, *tail)
 
 
@@ -1083,7 +1232,24 @@ struct Params {
   int dtb_type;  // 0 fp32, 1 bf16, 2 fp16
   int norm_w_bf16, sigmoid_gate;
   float scale, eps;
+  // Deferred snapshots (VLLM_GDN_MTP_DEFER_WRITES): rec = this layer's [rec_rows, kRec]
+  // records, epoch = the step's tag (device); rec == nullptr: stock snapshot writes.
+  int* rec;
+  const int* epoch;
+  int rec_rows;
 };
+
+// Deferred snapshots: instead of the T snapshots S_t, a deferring CTA writes the
+// replay log of its head (delta_t per row, the normalized k_t, d_t; fp32, the
+// exact operands of chain()) into the head's region of one of the request's own
+// spec slots (the last one that is not the source slot), and CTA hv == 0 writes
+// the request's record {epoch, T, src slot, log slot, slots[0..7]}. After
+// sampling, commit_kernel replays chain() from the untouched source state for the
+// accepted tokens and writes S_{acc-1} (every accepted S_t on block-boundary
+// steps), bitwise equal to the snapshot chain() would have written.
+constexpr int kRec = 16;          // ints per record
+constexpr int kLogK = kMaxT * kV;  // float offset of k_t in the log ([T][kK]); delta_t at 0 ([T][kV])
+constexpr int kLogD = 2 * kMaxT * kV;  // float offset of d_t
 
 struct Smem {
   __nv_bfloat16 st[kV * kK];  // source state; 16-B chunks XOR-swizzled by (row & 7)
@@ -1249,14 +1415,36 @@ __global__ void __launch_bounds__(kNT, TM <= 6 ? GWY_MINB : 3) wy_kernel(const P
   const int bos = __ldg(p.cu + req);
   const int T = __ldg(p.cu + req + 1) - bos;
   const int acc = __ldg(p.acc + req);
-  if (T <= 0) return;
+  int* rec = p.rec != nullptr && req < p.rec_rows ? p.rec + static_cast<int64_t>(req) * kRec : nullptr;
+  if (T <= 0) {
+    if (rec != nullptr && hv == 0 && tid == 0) rec[0] = 0;
+    return;
+  }
   int src = 0;
 #pragma unroll
   for (int t = 0; t < TM; ++t) src = t == acc - 1 ? slots[t] : src;
   if (src <= 0 || T > TM) {
+    if (rec != nullptr && hv == 0 && tid == 0) rec[0] = 0;
     for (int x = tid; x < T * kV; x += kNT)
       p.out[(static_cast<int64_t>(bos + x / kV) * p.HV + hv) * kV + x % kV] = __float2bfloat16(0.0f);
     return;
+  }
+  // Deferred snapshots: the log goes to the last of the request's T spec slots
+  // that is not the source (none: T == 1 with the source in column 0).
+  int log_slot = 0;
+  if (rec != nullptr) {
+#pragma unroll
+    for (int t = 0; t < TM; ++t) log_slot = t < T && slots[t] > 0 && slots[t] != src ? slots[t] : log_slot;
+    if (hv == 0 && tid < kRec) {
+      int v = 0;
+      if (log_slot > 0) {
+        v = tid == 0 ? __ldg(p.epoch) : tid == 1 ? T : tid == 2 ? src : log_slot;
+#pragma unroll
+        for (int t = 0; t < TM; ++t) v = tid == 4 + t ? slots[t] : v;
+        v = tid >= 4 + TM ? 0 : v;
+      }
+      rec[tid] = v;
+    }
   }
 
   // Source state -> smem (warp w: rows [16w, 16w + 16), its own commit group).
@@ -1482,7 +1670,147 @@ __global__ void __launch_bounds__(kNT, TM <= 6 ? GWY_MINB : 3) wy_kernel(const P
                    pack_bf2(ov[2] * rstd * gact[2], ov[3] * rstd * gact[3]));
   }
 
-  chain_t<TM>(T, sm, slots, p.state, p.s_slot, head, warp, lane);
+  if (log_slot > 0) {
+    float* lg = reinterpret_cast<float*>(p.state + static_cast<int64_t>(log_slot) * p.s_slot + head);
+    for (int x = tid; x < T * kV; x += kNT) {
+      const int t = x / kV, row = x % kV;
+      __stcs(lg + x, sm.u2.dl[row / kRW][row % kRW][t]);
+      __stcs(lg + kLogK + x, sm.k[t][row]);
+    }
+    if (tid < T) __stcs(lg + kLogD + tid, sm.dec[tid]);
+  } else {
+    chain_t<TM>(T, sm, slots, p.state, p.s_slot, head, warp, lane);
+  }
+}
+
+struct CParams {
+  const int* rec;             // [layers, rec_rows, kRec]
+  const int64_t* state_ptrs;  // [layers] bf16 state base addresses
+  const int64_t* s_slot;      // [layers] slot strides (elements)
+  const uint8_t* mask;        // [batch] spec rows of the batch (spec row r = r-th set entry)
+  const void* num_sampled;    // [n_sampled] per batch row (int32 / int64)
+  const void* idx_mapping;    // [batch] batch row -> request state index (int32 / int64), or nullptr
+  const int* num_computed;    // [max_reqs] post-step computed tokens, or nullptr
+  int64_t rec_rows;
+  int batch, n_sampled, epoch, block_size, ns64, im64;
+};
+
+__device__ __forceinline__ int ld_idx(const void* p, int i, int is64) {
+  return is64 ? static_cast<int>(static_cast<const int64_t*>(p)[i]) : static_cast<const int*>(p)[i];
+}
+
+// chain() for the first A tokens from the source state in global memory, storing
+// S_{A-1} (all S_t with `all`): the same per-element operations, so bitwise equal.
+template <int A>
+__device__ __forceinline__ void replay(const float (&dls)[kMaxT][kV], const float (&ks)[kMaxT][kK],
+                                       const float (&decs)[kMaxT], const __nv_bfloat16* src_head,
+                                       const int (&slots)[kMaxT], bool all, __nv_bfloat16* state, int64_t s_slot,
+                                       int64_t head, int warp, int lane) {
+  float2 kr[A][2];
+  float dd[A];
+  __nv_bfloat16* dst[A];
+#pragma unroll
+  for (int t = 0; t < A; ++t) {
+    const float4 k4 = *reinterpret_cast<const float4*>(&ks[t][4 * lane]);
+    kr[t][0] = make_float2(k4.x, k4.y);
+    kr[t][1] = make_float2(k4.z, k4.w);
+    dd[t] = decs[t];
+    dst[t] = (all || t == A - 1) && slots[t] > 0
+                 ? state + static_cast<int64_t>(slots[t]) * s_slot + head + warp * kRW * kK + 4 * lane
+                 : nullptr;
+  }
+  const __nv_bfloat16* srow = src_head + warp * kRW * kK + 4 * lane;
+  uint2 w[kRW];
+#pragma unroll
+  for (int rr = 0; rr < kRW; ++rr) w[rr] = __ldcs(reinterpret_cast<const uint2*>(srow + rr * kK));
+#pragma unroll
+  for (int rr = 0; rr < kRW; ++rr) {
+    float2 h0 = make_float2(bf_lo(w[rr].x), bf_hi(w[rr].x));
+    float2 h1 = make_float2(bf_lo(w[rr].y), bf_hi(w[rr].y));
+#pragma unroll
+    for (int t = 0; t < A; ++t) {
+      const float dv = dls[t][warp * kRW + rr];
+      const float2 dl2 = make_float2(dv, dv);
+      const float2 d2 = make_float2(dd[t], dd[t]);
+      h0 = fma2(kr[t][0], dl2, mul2(h0, d2));
+      h1 = fma2(kr[t][1], dl2, mul2(h1, d2));
+      if (dst[t] != nullptr) __stcs(reinterpret_cast<uint2*>(dst[t] + rr * kK), make_uint2(pack_bf2(h0.x, h0.y), pack_bf2(h1.x, h1.y)));
+    }
+  }
+}
+
+template <int A = 1>
+__device__ __forceinline__ void replay_t(int a, const float (&dls)[kMaxT][kV], const float (&ks)[kMaxT][kK],
+                                         const float (&decs)[kMaxT], const __nv_bfloat16* src_head,
+                                         const int (&slots)[kMaxT], bool all, __nv_bfloat16* state, int64_t s_slot,
+                                         int64_t head, int warp, int lane) {
+  if (a == A) replay<A>(dls, ks, decs, src_head, slots, all, state, s_slot, head, warp, lane);
+  else if constexpr (A < kMaxT) replay_t<A + 1>(a, dls, ks, decs, src_head, slots, all, state, s_slot, head, warp, lane);
+}
+
+// Grid (spec rows, HV, layers): materializes the accepted snapshot(s) of the
+// records of this step (tag == epoch) from their source state and replay log.
+__global__ void __launch_bounds__(kNT) commit_kernel(const CParams p) {
+  __shared__ float s_dl[kMaxT][kV];
+  __shared__ __align__(16) float s_k[kMaxT][kK];
+  __shared__ float s_dec[kMaxT];
+  __shared__ int s_cnt[kNW];
+  __shared__ int s_row;
+  const int r = blockIdx.x, hv = blockIdx.y, l = blockIdx.z;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int* rec = p.rec + (static_cast<int64_t>(l) * p.rec_rows + r) * kRec;
+  if (__ldg(rec) != p.epoch) return;
+  const int T = __ldg(rec + 1), src = __ldg(rec + 2), log_slot = __ldg(rec + 3);
+  int slots[kMaxT];
+#pragma unroll
+  for (int t = 0; t < kMaxT; ++t) slots[t] = __ldg(rec + 4 + t);
+
+  // Batch row of spec row r: the r-th set entry of mask.
+  if (tid == 0) s_row = -1;
+  int base = 0;
+  for (int c = 0; c < p.batch; c += kNT) {
+    const int i = c + tid;
+    const bool m = i < p.batch && p.mask[i] != 0;
+    const unsigned bal = __ballot_sync(0xffffffffu, m);
+    if (lane == 0) s_cnt[warp] = __popc(bal);
+    __syncthreads();
+    int pre = base + __popc(bal & ((1u << lane) - 1u)), tot = 0;
+#pragma unroll
+    for (int w = 0; w < kNW; ++w) {
+      pre += w < warp ? s_cnt[w] : 0;
+      tot += s_cnt[w];
+    }
+    if (m && pre == r) s_row = i;
+    base += tot;
+    __syncthreads();
+    if (base > r) break;
+  }
+  const int row = s_row;
+  if (row < 0 || row >= p.n_sampled) return;
+  const int a = max(1, min(ld_idx(p.num_sampled, row, p.ns64), T));
+  // Block-boundary step (the align postprocess copies an accepted S_t that may
+  // precede S_{a-1}): materialize every accepted snapshot.
+  bool all = false;
+  if (p.block_size > 0) {
+    const int req = p.idx_mapping != nullptr ? ld_idx(p.idx_mapping, row, p.im64) : row;
+    if (req >= 0) {
+      const int nc = p.num_computed[req];
+      all = (nc / p.block_size) * p.block_size >= nc - a + 1;
+    }
+  }
+  __nv_bfloat16* state = reinterpret_cast<__nv_bfloat16*>(p.state_ptrs[l]);
+  const int64_t s_slot = p.s_slot[l];
+  const int64_t head = static_cast<int64_t>(hv) * kV * kK;
+  // The whole log is staged before any store: the log slot may be a target.
+  const float* lg = reinterpret_cast<const float*>(state + static_cast<int64_t>(log_slot) * s_slot + head);
+  for (int x = tid; x < a * kV; x += kNT) {
+    s_dl[x / kV][x % kV] = __ldcs(lg + x);
+    s_k[x / kV][x % kV] = __ldcs(lg + kLogK + x);
+  }
+  if (tid < a) s_dec[tid] = __ldcs(lg + kLogD + tid);
+  __syncthreads();
+  replay_t(a, s_dl, s_k, s_dec, state + static_cast<int64_t>(src) * s_slot + head, slots, all, state, s_slot, head,
+           warp, lane);
 }
 
 template <int TM>
@@ -1506,11 +1834,12 @@ void launch(const Params& p, dim3 grid, cudaStream_t stream) {
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, wy_kernel<TM>, p));
 }
 
-// false if the layout contract is not met (caller keeps the csrc kernel)
+// false if the layout contract is not met (caller keeps the csrc kernel).
+// rec ([rows, kRec] int32) / epoch ([1] int32) non-empty: deferred snapshots.
 bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
          torch::Tensor dt_bias, torch::Tensor si, torch::Tensor cu, torch::Tensor acc,
          torch::Tensor state, torch::Tensor gate, torch::Tensor norm_w, torch::Tensor out,
-         double scale, double eps, bool sigmoid_gate) {
+         double scale, double eps, bool sigmoid_gate, torch::Tensor rec, torch::Tensor epoch) {
   if (qkv.scalar_type() != at::kBFloat16 || a.scalar_type() != at::kBFloat16 ||
       b.scalar_type() != at::kBFloat16 || gate.scalar_type() != at::kBFloat16 ||
       out.scalar_type() != at::kBFloat16)
@@ -1582,6 +1911,13 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
   p.sigmoid_gate = sigmoid_gate;
   p.scale = (float)scale;
   p.eps = (float)eps;
+  const bool defer = rec.numel() > 0;
+  if (defer && (rec.scalar_type() != at::kInt || !rec.is_contiguous() || rec.dim() != 2 || rec.size(1) != kRec ||
+                epoch.scalar_type() != at::kInt || epoch.numel() != 1))
+    return false;
+  p.rec = defer ? (int*)rec.data_ptr() : nullptr;
+  p.epoch = defer ? (const int*)epoch.data_ptr() : nullptr;
+  p.rec_rows = defer ? (int)rec.size(0) : 0;
   const c10::cuda::CUDAGuard guard(qkv.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   const dim3 grid((unsigned)N, (unsigned)HV);
@@ -1592,8 +1928,49 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
   return true;
 }
 
+// Materialize the deferred snapshots of this step's records (tag == epoch); see
+// commit_kernel. state_ptrs / s_slot: int64 [layers] (rec: [layers, rows, kRec]).
+void commit(torch::Tensor rec, torch::Tensor state_ptrs, torch::Tensor s_slot, int64_t n_layers, int64_t n_rows,
+            int64_t hv, torch::Tensor mask, torch::Tensor num_sampled, torch::Tensor idx_mapping,
+            torch::Tensor num_computed, int64_t epoch, int64_t block_size) {
+  TORCH_CHECK(rec.scalar_type() == at::kInt && rec.is_contiguous() && rec.dim() == 3 && rec.size(2) == kRec);
+  TORCH_CHECK(state_ptrs.scalar_type() == at::kLong && s_slot.scalar_type() == at::kLong);
+  TORCH_CHECK(n_layers <= rec.size(0) && n_layers <= state_ptrs.numel() && n_layers <= s_slot.numel());
+  TORCH_CHECK(mask.element_size() == 1 && mask.is_contiguous());
+  const auto is_idx = [](const torch::Tensor& x) {
+    return (x.scalar_type() == at::kInt || x.scalar_type() == at::kLong) && x.is_contiguous();
+  };
+  TORCH_CHECK(is_idx(num_sampled));
+  TORCH_CHECK(idx_mapping.numel() == 0 || is_idx(idx_mapping));
+  TORCH_CHECK(block_size <= 0 || (num_computed.scalar_type() == at::kInt && num_computed.is_contiguous()));
+  n_rows = std::min<int64_t>(n_rows, rec.size(1));
+  if (n_layers <= 0 || n_rows <= 0 || hv <= 0) return;
+  CParams p;
+  p.rec = (const int*)rec.data_ptr();
+  p.state_ptrs = (const int64_t*)state_ptrs.data_ptr();
+  p.s_slot = (const int64_t*)s_slot.data_ptr();
+  p.mask = (const uint8_t*)mask.data_ptr();
+  p.num_sampled = num_sampled.data_ptr();
+  p.idx_mapping = idx_mapping.numel() > 0 ? idx_mapping.data_ptr() : nullptr;
+  p.num_computed = block_size > 0 ? (const int*)num_computed.data_ptr() : nullptr;
+  p.rec_rows = rec.size(1);
+  p.batch = (int)mask.numel();
+  p.n_sampled = (int)num_sampled.numel();
+  p.epoch = (int)epoch;
+  p.block_size = (int)std::max<int64_t>(block_size, 0);
+  p.ns64 = num_sampled.scalar_type() == at::kLong;
+  p.im64 = idx_mapping.scalar_type() == at::kLong;
+  const c10::cuda::CUDAGuard guard(rec.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  commit_kernel<<<dim3((unsigned)n_rows, (unsigned)hv, (unsigned)n_layers), kNT, 0, stream>>>(p);
+  C10_CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace
 }  // namespace gwy
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("run", &gwy::run); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &gwy::run);
+  m.def("commit", &gwy::commit);
+}
 """
