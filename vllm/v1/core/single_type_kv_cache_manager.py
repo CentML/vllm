@@ -88,6 +88,13 @@ _MAMBA_PIN_OWN_CKPT_ENV = "VLLM_MAMBA_PIN_OWN_CKPT"
 # checkpoint unless another request references it or it is a shared-prefix
 # junction. Any request extending this prompt resumes from the deeper one.
 _MAMBA_DROP_OWN_SUPERSEDED_ENV = "VLLM_MAMBA_DROP_OWN_SUPERSEDED"
+# Opt-in (requires VLLM_MAMBA_DROP_SUPERSEDED_STATE): also drop a superseded
+# "prev" checkpoint that the consumer resumed from through a sub-block (partial)
+# hit. The consumer then runs on a private CoW copy, so "prev" is no longer in
+# its block table and only the copy retention holds it; without this flag it
+# returns to the MRU end of the free queue with its hash, one dead block per
+# Mamba group per turn. Dropped once no request references it.
+_MAMBA_DROP_SUPERSEDED_COW_ENV = "VLLM_MAMBA_DROP_SUPERSEDED_COW"
 # Opt-in: drop the cached prompt-tail attention block of a previous turn once
 # the turn that resumed from it has registered a deeper entry on the same path.
 #
@@ -1689,6 +1696,29 @@ class MambaManager(SingleTypeKVCacheManager):
                 OrderedDict()
             )
             self.num_superseded_states_dropped = 0
+        # Superseded "prev" checkpoints that a partial (sub-block) hit copied
+        # into a private CoW block: no longer in the consumer's block table, so
+        # neither branch of _mark_superseded applies. Counted always (stats);
+        # dropped once free with VLLM_MAMBA_DROP_SUPERSEDED_COW=1.
+        # Not with copy-initial exports (multi-module MTP) or reuse stops, whose
+        # retained replay/extension boundaries can be CoW sources siblings need.
+        self.drop_superseded_cow = (
+            self.drop_superseded_state
+            and _env_on(_MAMBA_DROP_SUPERSEDED_COW_ENV)
+            and not kv_cache_spec.prefill_checkpoint_copies_initial_block
+            and not _env_on("VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS")
+        )
+        # request_id -> (CoW source block, its hash).
+        self._pending_superseded: dict[
+            str, tuple[KVCacheBlock, BlockHashWithGroupId]
+        ] = {}
+        self.num_superseded_cow = 0
+        self.num_superseded_cow_dropped = 0
+        if self.drop_superseded_cow:
+            logger.info_once(
+                "%s=1: dropping superseded Mamba checkpoints left as CoW sources.",
+                _MAMBA_DROP_SUPERSEDED_COW_ENV,
+            )
         align_caching = self.mamba_cache_mode == "align" and self.enable_caching
         self.pin_own_ckpt = align_caching and _env_on(_MAMBA_PIN_OWN_CKPT_ENV)
         self.drop_own_superseded = self.pin_own_ckpt and _env_on(
@@ -1809,8 +1839,30 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             # Still held only by the consumer; drop when it releases it.
             self._drop_on_release[block.block_id] = block_hash
-        # ref_cnt > 1: another running request also resumed from it (shared
+        elif not any(b is block for b in self.req_to_blocks.get(request_id, ())):
+            # Partial hit: the consumer resumed from a private CoW copy and the
+            # source is held only by the copy retention (or by siblings). Drop
+            # it once nobody references it.
+            self.num_superseded_cow += 1
+            if self.drop_superseded_cow:
+                self._pending_superseded[request_id] = (block, block_hash)
+        # Otherwise another running request also resumed from it (shared
         # prefix); keep it.
+
+    def _flush_pending_superseded(self, request_id: str, final: bool) -> None:
+        entry = self._pending_superseded.get(request_id)
+        if entry is None:
+            return
+        block, block_hash = entry
+        if block.block_hash != block_hash or block_hash in self._junction_hashes:
+            del self._pending_superseded[request_id]
+        elif block.ref_cnt == 0:
+            self._drop_cached_state(block)
+            self.num_superseded_cow_dropped += 1
+            del self._pending_superseded[request_id]
+        elif final:
+            # Still referenced by another request when this one finished.
+            del self._pending_superseded[request_id]
 
     def _record_junction_hashes(self, request: Request, start: int, end: int) -> None:
         junction = request.shared_prefix_boundary
@@ -2539,6 +2591,8 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
             if self.drop_superseded_state:
                 self._consumed_state.pop(request_id, None)
+                if self._pending_superseded:
+                    self._flush_pending_superseded(request_id, final=True)
                 if self._drop_on_release:
                     for block in self.req_to_blocks.get(request_id, ()):
                         if not block.is_null:
@@ -2685,6 +2739,8 @@ class MambaManager(SingleTypeKVCacheManager):
                         (request.request_id, self.kv_cache_group_id, block, position)
                     )
         if self.drop_superseded_state:
+            if self._pending_superseded:
+                self._flush_pending_superseded(request.request_id, final=False)
             self._after_cache_blocks(
                 request, num_cached_blocks_before, num_cached_blocks_after, partial_hash
             )

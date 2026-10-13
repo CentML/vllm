@@ -23,7 +23,9 @@ from tests.v1.core.test_mamba_pin_own_checkpoint import (
 )
 from tests.v1.core.test_prefix_caching import make_request
 from vllm.utils.hashing import sha256
-from vllm.v1.core.kv_cache_utils import init_none_hash
+from vllm.v1.core.kv_cache_utils import get_group_id, init_none_hash
+
+MAMBA_COW = "VLLM_MAMBA_DROP_SUPERSEDED_COW"
 
 FLAG = "VLLM_ATTN_DROP_SUPERSEDED_TAIL"
 STATS = "VLLM_KV_POOL_STATS"
@@ -90,8 +92,48 @@ def test_same_hits_with_and_without_flag(monkeypatch):
     results = []
     for flag in ("0", "1"):
         monkeypatch.setenv(FLAG, flag)
+        monkeypatch.setenv(MAMBA_COW, flag)
         results.append(_conversation(_manager(num_blocks=200, num_spec=3), 5)[0])
     assert results[0] == results[1]
+
+
+def _free_cached(manager, gid):
+    return sum(
+        1
+        for b in manager.block_pool.blocks
+        if not b.is_null
+        and b.ref_cnt == 0
+        and b.block_hash is not None
+        and get_group_id(b.block_hash) == gid
+    )
+
+
+def test_mamba_superseded_cow_source(monkeypatch):
+    """VLLM_MAMBA_DROP_SUPERSEDED_COW: a "prev" checkpoint consumed through a
+    partial hit (CoW) is dropped once free; without it, it stays cached.
+    """
+    monkeypatch.setenv(PIN, "1")
+    monkeypatch.setenv(DROP_SUPERSEDED, "1")
+    cached = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv(MAMBA_COW, flag)
+        manager = _manager(num_blocks=200, num_spec=3)
+        hits, history = _conversation(manager, 6)
+        _all_free(manager)
+        mambas = manager.coordinator.single_type_managers[1:]
+        for m in mambas:
+            assert m.num_superseded_cow >= 1
+            if flag == "1":
+                assert m.num_superseded_cow_dropped == m.num_superseded_cow
+                assert not m._pending_superseded
+            else:
+                assert m.num_superseded_cow_dropped == 0
+        cached[flag] = [_free_cached(manager, m.kv_cache_group_id) for m in mambas]
+        num_cow = mambas[0].num_superseded_cow
+        # The next turn still resumes past the latest hit.
+        req = make_request("next", history + [3] * 50, HASH, sha256)
+        assert manager.get_computed_blocks(req)[1] > hits[-1]
+    assert all(off - on == num_cow for off, on in zip(cached["0"], cached["1"]))
 
 
 def _spy_cow(attn, on_cow=None):

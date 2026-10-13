@@ -1006,6 +1006,8 @@ class KVCacheManager:
                     f" pinned={len(mgr._own_pin)}"
                     f" drop_sup={getattr(mgr, 'num_superseded_states_dropped', 0)}"
                     f" drop_own={mgr.num_own_checkpoints_dropped}"
+                    f" sup_cow={mgr.num_superseded_cow}"
+                    f" sup_cow_dropped={mgr.num_superseded_cow_dropped}"
                 )
             elif isinstance(mgr, FullAttentionManager) and mgr.track_superseded_tail:
                 part += (
