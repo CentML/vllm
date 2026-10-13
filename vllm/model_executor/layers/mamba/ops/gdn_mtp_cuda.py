@@ -103,6 +103,12 @@ GDN_MTP_CUDA_WY_MIN_REQS = int(os.environ.get("VLLM_GDN_MTP_CUDA_WY_MIN_REQS", "
 # The rejected and the unread accepted columns hold stale data, as rejected ones
 # already did. Off (default): the stock snapshot writes.
 GDN_MTP_DEFER_WRITES = os.environ.get("VLLM_GDN_MTP_DEFER_WRITES", "0") == "1"
+# VLLM_GDN_MTP_DEFER_STREAM=1 (with VLLM_GDN_MTP_DEFER_WRITES): the commit of the
+# rows that cross no block boundary runs on a side stream, overlapping the MTP
+# draft forward; the model runner joins it (defer_join) after the draft proposal,
+# before any later GPU work. Block-boundary rows are committed on the main
+# stream before the align postprocess copy reads them.
+GDN_MTP_DEFER_STREAM = os.environ.get("VLLM_GDN_MTP_DEFER_STREAM", "0") == "1"
 _DEFER_MAX_LAYERS = 128  # state tensors with a record table
 _DEFER_ROWS = 1024  # requests per call with a record (more: stock writes)
 _DEFER_REC = 16  # ints per record (kRec)
@@ -125,6 +131,12 @@ class _DeferState:
         self.ptrs: torch.Tensor | None = None
         self.strides: torch.Tensor | None = None
         self.step: tuple[torch.Tensor, int] | None = None  # (spec row mask, rows)
+        self.acc_row: torch.Tensor | None = (
+            None  # int32 [_DEFER_ROWS] (side-stream commit)
+        )
+        self.side: torch.Stream | None = None
+        # tensors the side-stream commit reads, held until defer_join()
+        self.inflight: tuple | None = None
 
 
 _defer = _DeferState()
@@ -250,6 +262,9 @@ def _defer_alloc(device: torch.device) -> None:
             device=device,
         )
         d.epoch = torch.zeros(1, dtype=torch.int32, device=device)
+        if GDN_MTP_DEFER_STREAM:
+            d.acc_row = torch.zeros(_DEFER_ROWS, dtype=torch.int32, device=device)
+            d.side = torch.Stream(device=device)
 
 
 def defer_arm(device: torch.device) -> bool:
@@ -309,8 +324,12 @@ def defer_commit(
     step's deferred snapshots. ``num_sampled``: per batch row (accepted = max(
     num_sampled, 1)); ``idx_mapping``: batch row -> request state index;
     ``num_computed``: post-step computed tokens per request state index and
-    ``block_size`` the Mamba block size (align mode; 0 otherwise).
+    ``block_size`` the Mamba block size (align mode; 0 otherwise). With
+    VLLM_GDN_MTP_DEFER_STREAM the rows without a block boundary are committed
+    on the side stream (defer_join() joins it).
     """
+    from vllm.utils.torch_utils import current_stream
+
     d = _defer
     step, d.step = d.step, None
     if step is None or not d.layers:
@@ -323,7 +342,10 @@ def defer_commit(
         d.ptrs = torch.tensor([x[0] for x in d.layers], dtype=torch.int64).to(device)
         d.strides = torch.tensor([x[1] for x in d.layers], dtype=torch.int64).to(device)
     mask, num_spec = step
-    _wy[0].commit(
+    if num_computed is None or block_size <= 0:
+        num_computed, block_size = d.empty, 0
+    main = current_stream()
+    args = (
         d.rec,
         d.ptrs,
         d.strides,
@@ -333,10 +355,40 @@ def defer_commit(
         mask,
         num_sampled,
         idx_mapping,
-        num_computed if num_computed is not None and block_size > 0 else d.empty,
+        num_computed,
         d.host_epoch,
-        block_size if num_computed is not None else 0,
+        block_size,
     )
+    if d.side is None:
+        _wy[0].commit(
+            *args, 0, d.empty, main.stream_id, main.device_index, main.device_type
+        )
+        return
+    assert d.acc_row is not None
+    defer_join()
+    _wy[0].commit(
+        *args, 1, d.acc_row, main.stream_id, main.device_index, main.device_type
+    )
+    side = d.side
+    side.wait_stream(main)
+    _wy[0].commit(
+        *args, 2, d.acc_row, side.stream_id, side.device_index, side.device_type
+    )
+    d.inflight = (mask, num_sampled, idx_mapping, num_computed)
+
+
+def defer_join() -> None:
+    """The current stream waits for the side-stream commit (no-op if none is
+    in flight); before any GPU work after the step's draft proposal.
+    """
+    d = _defer
+    if d.inflight is None:
+        return
+    from vllm.utils.torch_utils import current_stream
+
+    assert d.side is not None
+    current_stream().wait_stream(d.side)
+    d.inflight = None
 
 
 def gdn_mtp_cuda(
@@ -1693,6 +1745,10 @@ struct CParams {
   const int* num_computed;    // [max_reqs] post-step computed tokens, or nullptr
   int64_t rec_rows;
   int batch, n_sampled, epoch, block_size, ns64, im64;
+  // mode 0: every row. 1: block-boundary rows only, and acc_row[r] = accepted
+  // tokens (-1: boundary row, -2: no batch row). 2: the other rows (acc_row > 0).
+  int mode;
+  int* acc_row;  // [rec_rows] (modes 1 / 2)
 };
 
 __device__ __forceinline__ int ld_idx(const void* p, int i, int is64) {
@@ -1700,8 +1756,9 @@ __device__ __forceinline__ int ld_idx(const void* p, int i, int is64) {
 }
 
 #ifndef GWY_CLPC
-#define GWY_CLPC 8  // commit: layers per CTA
+#define GWY_CLPC 8  // commit: layers per CTA (modes 0 / 2)
 #endif
+constexpr int kCMaxL = 32;  // commit: max layers per CTA
 #ifndef GWY_CST
 #define GWY_CST 2  // commit: pipeline stages (2: 2 CTAs per SM, more: 1)
 #endif
@@ -1716,10 +1773,10 @@ struct CStage {
 };
 struct CSmem {
   CStage s[GWY_CST];
-  int rec[GWY_CLPC][kRec];
-  __nv_bfloat16* state[GWY_CLPC];
-  int64_t s_slot[GWY_CLPC];
-  int list[GWY_CLPC];  // layers (of this CTA) with a record of this step
+  int rec[kCMaxL][kRec];
+  __nv_bfloat16* state[kCMaxL];
+  int64_t s_slot[kCMaxL];
+  int list[kCMaxL];  // layers (of this CTA) with a record of this step
   int cnt[kNW];
   int row, nv;
 };
@@ -1767,16 +1824,16 @@ __device__ __forceinline__ void replay_t(int a, const CStage& cs, const int* slo
   else if constexpr (A < kMaxT) replay_t<A + 1>(a, cs, slots, all, state, s_slot, head, warp, lane);
 }
 
-// Grid (spec rows, HV, ceil(layers / GWY_CLPC)): materializes the accepted
-// snapshot(s) of the records of this step (tag == epoch) of GWY_CLPC layers from
+// Grid (spec rows, HV, ceil(layers / lpc)): materializes the accepted
+// snapshot(s) of the records of this step (tag == epoch) of lpc layers from
 // their source state and replay log, staged by a GWY_CST-stage cp.async
 // pipeline. Everything a layer reads is staged before any of its stores (the
 // source and log slots may be targets).
-__global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const CParams p, int n_layers) {
+__global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const CParams p, int n_layers, int lpc) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   CSmem& sm = *reinterpret_cast<CSmem*>(smem_raw);
-  const int r = blockIdx.x, hv = blockIdx.y, l0 = blockIdx.z * GWY_CLPC;
-  const int nl = min(GWY_CLPC, n_layers - l0);
+  const int r = blockIdx.x, hv = blockIdx.y, l0 = blockIdx.z * lpc;
+  const int nl = min(lpc, n_layers - l0);
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   for (int x = tid; x < nl * kRec; x += kNT)
     sm.rec[x / kRec][x % kRec] = __ldg(p.rec + (static_cast<int64_t>(l0 + x / kRec) * p.rec_rows + r) * kRec + x % kRec);
@@ -1794,6 +1851,54 @@ __global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const 
   }
   __syncthreads();
   const int nv = sm.nv;
+  // Batch row of spec row r: the r-th set entry of mask (every thread calls).
+  const auto find_row = [&]() {
+    int base = 0;
+    for (int c = 0; c < p.batch; c += kNT) {
+      const int i = c + tid;
+      const bool m = i < p.batch && p.mask[i] != 0;
+      const unsigned bal = __ballot_sync(0xffffffffu, m);
+      if (lane == 0) sm.cnt[warp] = __popc(bal);
+      __syncthreads();
+      int pre = base + __popc(bal & ((1u << lane) - 1u)), tot = 0;
+#pragma unroll
+      for (int w = 0; w < kNW; ++w) {
+        pre += w < warp ? sm.cnt[w] : 0;
+        tot += sm.cnt[w];
+      }
+      if (m && pre == r) sm.row = i;
+      base += tot;
+      __syncthreads();
+      if (base > r) break;
+    }
+    __syncthreads();
+    const int row = sm.row;
+    return row < p.n_sampled ? row : -1;
+  };
+  int sampled = 0, nc = -1;  // num_sampled of the row, post-step computed tokens (-1: no boundary logic)
+  const auto load_row = [&](int row) {
+    sampled = ld_idx(p.num_sampled, row, p.ns64);
+    if (p.block_size > 0) {
+      const int req = p.idx_mapping != nullptr ? ld_idx(p.idx_mapping, row, p.im64) : row;
+      if (req >= 0) nc = p.num_computed[req];
+    }
+  };
+  // Block-boundary row (the align postprocess copies an accepted S_t that may
+  // precede S_{a-1}): every accepted snapshot is materialized.
+  const auto boundary = [&](int a) { return nc >= 0 && (nc / p.block_size) * p.block_size >= nc - a + 1; };
+  if (p.mode == 1) {
+    const int row = find_row();
+    int ar = -2;
+    if (row >= 0) {
+      load_row(row);
+      ar = boundary(max(1, sampled)) ? -1 : max(1, sampled);
+    }
+    if (hv == 0 && blockIdx.z == 0 && tid == 0) p.acc_row[r] = ar;
+    if (ar != -1 || nv == 0) return;
+  } else if (p.mode == 2) {
+    sampled = p.acc_row[r];
+    if (sampled <= 0 || nv == 0) return;
+  }
   if (nv == 0) return;
   const int64_t head = static_cast<int64_t>(hv) * kV * kK;
   // Stage i (always one commit group, possibly empty): layer list[i]'s source
@@ -1818,38 +1923,14 @@ __global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const 
   };
 #pragma unroll
   for (int s = 0; s < GWY_CST - 1; ++s) stage(s);
-
-  // Batch row of spec row r (the r-th set entry of mask), while the first
-  // stages load.
-  int base = 0;
-  for (int c = 0; c < p.batch; c += kNT) {
-    const int i = c + tid;
-    const bool m = i < p.batch && p.mask[i] != 0;
-    const unsigned bal = __ballot_sync(0xffffffffu, m);
-    if (lane == 0) sm.cnt[warp] = __popc(bal);
-    __syncthreads();
-    int pre = base + __popc(bal & ((1u << lane) - 1u)), tot = 0;
-#pragma unroll
-    for (int w = 0; w < kNW; ++w) {
-      pre += w < warp ? sm.cnt[w] : 0;
-      tot += sm.cnt[w];
+  if (p.mode == 0) {
+    // the row lookup overlaps the first stages
+    const int row = find_row();
+    if (row < 0) {
+      asm volatile("cp.async.wait_group 0;" ::: "memory");
+      return;
     }
-    if (m && pre == r) sm.row = i;
-    base += tot;
-    __syncthreads();
-    if (base > r) break;
-  }
-  __syncthreads();
-  const int row = sm.row;
-  if (row < 0 || row >= p.n_sampled) {
-    asm volatile("cp.async.wait_group 0;" ::: "memory");
-    return;
-  }
-  const int sampled = ld_idx(p.num_sampled, row, p.ns64);
-  int nc = -1;
-  if (p.block_size > 0) {
-    const int req = p.idx_mapping != nullptr ? ld_idx(p.idx_mapping, row, p.im64) : row;
-    if (req >= 0) nc = p.num_computed[req];
+    load_row(row);
   }
   for (int i = 0; i < nv; ++i) {
     asm volatile("cp.async.wait_group %0;" ::"n"(GWY_CST - 2) : "memory");
@@ -1859,10 +1940,7 @@ __global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const 
     stage(i + GWY_CST - 1);
     const int j = sm.list[i];
     const int a = max(1, min(sampled, sm.rec[j][1]));
-    // Block-boundary step (the align postprocess copies an accepted S_t that
-    // may precede S_{a-1}): materialize every accepted snapshot.
-    const bool all = nc >= 0 && (nc / p.block_size) * p.block_size >= nc - a + 1;
-    replay_t(a, sm.s[i % GWY_CST], &sm.rec[j][4], all, sm.state[j], sm.s_slot[j], head, warp, lane);
+    replay_t(a, sm.s[i % GWY_CST], &sm.rec[j][4], boundary(a), sm.state[j], sm.s_slot[j], head, warp, lane);
   }
 }
 
@@ -1982,10 +2060,15 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
 }
 
 // Materialize the deferred snapshots of this step's records (tag == epoch); see
-// commit_kernel. state_ptrs / s_slot: int64 [layers] (rec: [layers, rows, kRec]).
+// commit_kernel. state_ptrs / s_slot: int64 [layers] (rec: [layers, rows, kRec]);
+// mode / acc_row: see CParams; launched on the stream (stream_id, device_index,
+// device_type) of a torch.Stream.
 void commit(torch::Tensor rec, torch::Tensor state_ptrs, torch::Tensor s_slot, int64_t n_layers, int64_t n_rows,
             int64_t hv, torch::Tensor mask, torch::Tensor num_sampled, torch::Tensor idx_mapping,
-            torch::Tensor num_computed, int64_t epoch, int64_t block_size) {
+            torch::Tensor num_computed, int64_t epoch, int64_t block_size, int64_t mode, torch::Tensor acc_row,
+            int64_t stream_id, int64_t device_index, int64_t device_type) {
+  TORCH_CHECK(mode >= 0 && mode <= 2);
+  TORCH_CHECK(mode == 0 || (acc_row.scalar_type() == at::kInt && acc_row.numel() >= rec.size(1)));
   TORCH_CHECK(rec.scalar_type() == at::kInt && rec.is_contiguous() && rec.dim() == 3 && rec.size(2) == kRec);
   TORCH_CHECK(state_ptrs.scalar_type() == at::kLong && s_slot.scalar_type() == at::kLong);
   TORCH_CHECK(n_layers <= rec.size(0) && n_layers <= state_ptrs.numel() && n_layers <= s_slot.numel());
@@ -2013,16 +2096,24 @@ void commit(torch::Tensor rec, torch::Tensor state_ptrs, torch::Tensor s_slot, i
   p.block_size = (int)std::max<int64_t>(block_size, 0);
   p.ns64 = num_sampled.scalar_type() == at::kLong;
   p.im64 = idx_mapping.scalar_type() == at::kLong;
+  p.mode = (int)mode;
+  p.acc_row = mode != 0 ? (int*)acc_row.data_ptr() : nullptr;
   const c10::cuda::CUDAGuard guard(rec.device());
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream =
+      c10::cuda::CUDAStream::unpack3(stream_id, static_cast<c10::DeviceIndex>(device_index),
+                                     static_cast<c10::DeviceType>(device_type))
+          .stream();
   static bool attr = false;
   if (!attr) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(commit_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(sizeof(CSmem))));
     attr = true;
   }
-  const dim3 grid((unsigned)n_rows, (unsigned)hv, (unsigned)((n_layers + GWY_CLPC - 1) / GWY_CLPC));
-  commit_kernel<<<grid, kNT, sizeof(CSmem), stream>>>(p, (int)n_layers);
+  // mode 1 (few boundary rows): all layers per CTA, so that most CTAs only find
+  // their row and exit
+  const int lpc = mode == 1 ? kCMaxL : std::min(GWY_CLPC, kCMaxL);
+  const dim3 grid((unsigned)n_rows, (unsigned)hv, (unsigned)((n_layers + lpc - 1) / lpc));
+  commit_kernel<<<grid, kNT, sizeof(CSmem), stream>>>(p, (int)n_layers, lpc);
   C10_CUDA_CHECK(cudaGetLastError());
 }
 

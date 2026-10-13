@@ -44,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
 from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1782,6 +1783,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        gdn_mtp_cuda.defer_join()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -2329,6 +2331,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
+
+        # VLLM_GDN_MTP_DEFER_STREAM: the side-stream GDN snapshot commit overlapped
+        # the draft proposal; later GPU work waits for it.
+        gdn_mtp_cuda.defer_join()
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
