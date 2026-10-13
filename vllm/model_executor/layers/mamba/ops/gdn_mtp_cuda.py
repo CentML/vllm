@@ -88,6 +88,16 @@ GDN_MTP_CUDA_WY = os.environ.get("VLLM_GDN_MTP_CUDA_WY", "")
 if GDN_MTP_CUDA_WY == "0":
     GDN_MTP_CUDA_WY = ""
 GDN_MTP_CUDA_WY_MIN_REQS = int(os.environ.get("VLLM_GDN_MTP_CUDA_WY_MIN_REQS", "36"))
+# VLLM_GDN_MTP_VERIFY_V2=1|2 (with VLLM_GDN_MTP_CUDA_WY): calls taken by the WY
+# kernel run its v2 (``wy2_kernel``, GWY_V2 in _WY_SOURCE): same contract,
+# records, replay logs and snapshots, every value from the same operations in
+# the same order (bitwise equal), with about half the shared-memory wavefronts
+# and instructions per (request, value head), which bound the deferred-write
+# verify. The value is the number of value heads per CTA (2: the two heads of a
+# key head share the q/k prep, the Gram and the MMA B fragments; calls whose
+# heads-per-key-head ratio it does not divide keep the WY kernel). Off ("0",
+# default): the WY kernel.
+GDN_MTP_VERIFY_V2 = int(os.environ.get("VLLM_GDN_MTP_VERIFY_V2", "0") or "0")
 # VLLM_GDN_MTP_DEFER_WRITES=1 (with VLLM_GDN_MTP_CUDA_WY; armed by the V2 model
 # runner's Mamba hybrid state, which runs the commit): calls taken by the WY
 # kernel no longer write the T per-token snapshots (5 MiB per request and layer
@@ -155,14 +165,19 @@ def tuned_source(tune: str, pdl: bool, quant: bool = False) -> str:
     return defines + source
 
 
-def wy_source(tune: str, pdl: bool) -> str:
-    """The WY kernel source with ``tune`` macros (``"1"`` or ``"K=V+..."``)."""
+def wy_source(tune: str, pdl: bool, v2: int = 0) -> str:
+    """The WY kernel source with ``tune`` macros (``"1"`` or ``"K=V+..."``);
+    ``v2`` (or a ``V2=`` item): value heads per CTA of the v2 kernel (0: off).
+    """
     defines = f"#define GWY_PDL {int(pdl)}\n"
+    if v2:
+        defines += f"#define GWY_V2 {int(v2)}\n"
     for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         if item == "1":
             continue
         key, val = item.split("=")
-        assert key in ("PF", "QS", "KS", "MINB", "CLPC", "CST"), key
+        assert key in ("PF", "QS", "KS", "MINB", "CLPC", "CST", "V2"), key
+        assert not (key == "V2" and v2), "V2 given twice"
         defines += f"#define GWY_{key} {int(val)}\n"
     return defines + _WY_SOURCE
 
@@ -176,7 +191,9 @@ def load():
     if _ext:
         return _ext[0]
     if GDN_MTP_CUDA_WY:
-        _wy.append(build(wy_source(GDN_MTP_CUDA_WY, GDN_MTP_CUDA_PDL)))
+        _wy.append(
+            build(wy_source(GDN_MTP_CUDA_WY, GDN_MTP_CUDA_PDL, GDN_MTP_VERIFY_V2))
+        )
     ext = build(tuned_source(GDN_MTP_CUDA_TUNE, GDN_MTP_CUDA_PDL, GDN_MTP_FUSED_QUANT))
     _ext.append(ext)
     return ext
@@ -233,10 +250,13 @@ def enable() -> bool:
                 )
                 logger.info(
                     "GDN MTP decode: WY tensor-core CUDA kernel built and enabled "
-                    "(VLLM_GDN_MTP_CUDA_WY=%s) for >= %d requests%s.",
+                    "(VLLM_GDN_MTP_CUDA_WY=%s) for >= %d requests%s%s.",
                     GDN_MTP_CUDA_WY,
                     GDN_MTP_CUDA_WY_MIN_REQS,
                     ", deferred snapshot writes" if GDN_MTP_DEFER_WRITES else "",
+                    f", verify v2 ({GDN_MTP_VERIFY_V2} heads per CTA)"
+                    if GDN_MTP_VERIFY_V2
+                    else "",
                 )
         except Exception:
             logger.warning(
@@ -1735,6 +1755,499 @@ __global__ void __launch_bounds__(kNT, TM <= 6 ? GWY_MINB : 3) wy_kernel(const P
   }
 }
 
+// Verify kernel v2 (GWY_V2 = NH in {1, 2}; VLLM_GDN_MTP_VERIFY_V2): the
+// contract, records, replay logs and snapshots of wy_kernel, every value from
+// the same operations in the same order (bitwise equal), with fewer
+// shared-memory wavefronts and instructions per (request, value head), which
+// bound wy_kernel once the snapshot stores are deferred (~2.8 k smem
+// wavefronts and ~8 k warp instructions per head, against ~0.6 k cycles of
+// DRAM time per head and SM):
+// - one CTA per (request, NH value heads of one key head): the q/k prep, the
+//   bf16 split tables, the Gram dots and the MMA B fragments are shared by the
+//   NH heads, and the row solve runs both heads in one pass (lane (g, tq):
+//   head tq / 2; NH = 1 duplicates tq & 1 instead). NH = 2: 2 CTAs per SM;
+// - the Gram computes the T^2 dots of the request's T tokens only (wy_kernel:
+//   all 64 of TM = 8), on k / q rows padded to kKP floats (the two groups of a
+//   quarter warp read rows of different parity: disjoint bank halves);
+// - the solve reads its coefficients as float4s ({G_t, G_t+1, d_t,
+//   b_t}; the columns W[.][t], Q[.][t] stored as rows);
+// - the replay log is written from registers (delta_t by the solve lanes, k_t
+//   and d_t by the prep warps), with no shared-memory pass;
+// - B fragments by ldmatrix.x4 (two split terms per load).
+#ifndef GWY_V2
+#define GWY_V2 0
+#endif
+#if GWY_V2
+constexpr int kNH = GWY_V2;           // value heads per CTA (one key head)
+constexpr int kKP = kK + 16;          // fp32 row stride of the k / q tables
+constexpr int kVP = kV + 16;          // bf16 row stride of the v / o tables (heads 32 B apart: other banks)
+constexpr int kNS = GWY_KS + GWY_QS;  // split tables
+static_assert(kNH == 1 || kNH == 2, "GWY_V2: 1 or 2 value heads per CTA");
+
+template <int TM>
+struct __align__(16) Smem2 {
+  __nv_bfloat16 st[kNH][kV * kK];  // source states; 16-B chunks XOR-swizzled by (row & 7)
+  union {
+    __nv_bfloat16 split[kNS * kTab];  // MMA B operand: k_t terms, then q_t terms
+    __nv_bfloat16 o[TM][kNH][kVP];    // bf16-rounded S_t q_t (after the MMA pass)
+  } u;
+  float k[TM][kKP];  // normalized keys
+  union {
+    float q[TM][kKP];                // normalized, scaled queries (Gram only)
+    float dl[kNH][kNW][kRW][kMaxT];  // delta_t per row (after the Gram; chain() rows only)
+  } u2;
+  __nv_bfloat16 v[TM][kNH][kVP];
+  float4 coef[TM][kNH];      // {G_t, G_{t+1}, d_t, b_t}
+  float Wt[TM][kNH][kMaxT];  // Wt[t][j][s] = W[s][t] = rho(s, t-1) (k_s . k_t), s < t
+  float Qt[TM][kNH][kMaxT];  // Qt[t][j][s] = Q[s][t] = rho(s, t) (k_s . q_t), s <= t
+  float dec[kNH][kMaxT];
+  float beta[kNH][kMaxT];
+};
+
+// x[s] of the 8 floats (a, b); s is a compile-time constant after unrolling.
+__device__ __forceinline__ float f8(const float4& a, const float4& b, int s) {
+  switch (s) {
+    case 0: return a.x;
+    case 1: return a.y;
+    case 2: return a.z;
+    case 3: return a.w;
+    case 4: return b.x;
+    case 5: return b.y;
+    case 6: return b.z;
+    default: return b.w;
+  }
+}
+
+// chain() of head j (same per-element operations and stores).
+template <int TM, int NT>
+__device__ __forceinline__ void chain2(const Smem2<TM>& sm, int j, const int (&slots)[TM], __nv_bfloat16* state,
+                                       int64_t s_slot, int64_t head, int warp, int lane) {
+  float2 kr[NT][2];
+  float dd[NT];
+  __nv_bfloat16* dst[NT];
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    const float4 k4 = *reinterpret_cast<const float4*>(&sm.k[t][4 * lane]);
+    kr[t][0] = make_float2(k4.x, k4.y);
+    kr[t][1] = make_float2(k4.z, k4.w);
+    dd[t] = sm.dec[j][t];
+    dst[t] = slots[t] > 0 ? state + static_cast<int64_t>(slots[t]) * s_slot + head + warp * kRW * kK + 4 * lane
+                          : nullptr;
+  }
+  const __nv_bfloat16* srow = sm.st[j] + warp * kRW * kK;
+  const int lofs = ((lane >> 1) << 3) + (lane & 1) * 4;  // chunk lane / 2, half lane % 2 (unswizzled)
+#pragma unroll
+  for (int rr = 0; rr < kRW; ++rr) {
+    const uint2 w = *reinterpret_cast<const uint2*>(srow + rr * kK + (lofs ^ ((rr & 7) << 3)));
+    float2 h0 = make_float2(bf_lo(w.x), bf_hi(w.x));
+    float2 h1 = make_float2(bf_lo(w.y), bf_hi(w.y));
+    float dv[kMaxT];
+    const float4 d0 = *reinterpret_cast<const float4*>(&sm.u2.dl[j][warp][rr][0]);
+    dv[0] = d0.x;
+    dv[1] = d0.y;
+    dv[2] = d0.z;
+    dv[3] = d0.w;
+    if constexpr (NT > 4) {
+      const float4 d1 = *reinterpret_cast<const float4*>(&sm.u2.dl[j][warp][rr][4]);
+      dv[4] = d1.x;
+      dv[5] = d1.y;
+      dv[6] = d1.z;
+      dv[7] = d1.w;
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+      const float2 dl2 = make_float2(dv[t], dv[t]);
+      const float2 d2 = make_float2(dd[t], dd[t]);
+      h0 = fma2(kr[t][0], dl2, mul2(h0, d2));
+      h1 = fma2(kr[t][1], dl2, mul2(h1, d2));
+      if (dst[t] != nullptr) __stcs(reinterpret_cast<uint2*>(dst[t] + rr * kK), make_uint2(pack_bf2(h0.x, h0.y), pack_bf2(h1.x, h1.y)));
+    }
+  }
+}
+
+template <int TM, int NT = 1>
+__device__ __forceinline__ void chain2_t(int T, const Smem2<TM>& sm, int j, const int (&slots)[TM],
+                                         __nv_bfloat16* state, int64_t s_slot, int64_t head, int warp, int lane) {
+  if (T == NT) chain2<TM, NT>(sm, j, slots, state, s_slot, head, warp, lane);
+  else if constexpr (NT < TM) chain2_t<TM, NT + 1>(T, sm, j, slots, state, s_slot, head, warp, lane);
+}
+
+// Grid (requests, HV / kNH); CTA (req, y) runs value heads hv0 .. hv0 + kNH - 1
+// (hv0 = y kNH, one key head: ratio % kNH == 0). Phases and barriers as in
+// wy_kernel.
+template <int TM>
+__global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) wy2_kernel(const Params p) {
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  Smem2<TM>& sm = *reinterpret_cast<Smem2<TM>*>(smem_raw);
+  const int req = blockIdx.x;
+  const int hv0 = blockIdx.y * kNH;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+#if GWY_PDL && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+
+  const int* si_row = p.si + req * p.si_width;
+  int slots[TM];
+#pragma unroll
+  for (int t = 0; t < TM; ++t) slots[t] = t < p.si_width ? __ldg(si_row + t) : 0;
+  const int bos = __ldg(p.cu + req);
+  const int T = __ldg(p.cu + req + 1) - bos;
+  const int acc = __ldg(p.acc + req);
+  int* rec = p.rec != nullptr && req < p.rec_rows ? p.rec + static_cast<int64_t>(req) * kRec : nullptr;
+  if (T <= 0) {
+    if (rec != nullptr && blockIdx.y == 0 && tid == 0) rec[0] = 0;
+    return;
+  }
+  int src = 0;
+#pragma unroll
+  for (int t = 0; t < TM; ++t) src = t == acc - 1 ? slots[t] : src;
+  if (src <= 0 || T > TM) {
+    if (rec != nullptr && blockIdx.y == 0 && tid == 0) rec[0] = 0;
+    for (int x = tid; x < kNH * T * kV; x += kNT) {
+      const int j = x / (T * kV), y = x - j * (T * kV);
+      p.out[(static_cast<int64_t>(bos + y / kV) * p.HV + hv0 + j) * kV + y % kV] = __float2bfloat16(0.0f);
+    }
+    return;
+  }
+  // Deferred snapshots: the log goes to the last column t >= 1 of the request's
+  // T spec slots that is not the source (none: T == 1, or T == 2 with the
+  // source in column 1: stock snapshots, so column 0 never holds a log).
+  int log_slot = 0;
+  if (rec != nullptr) {
+#pragma unroll
+    for (int t = 1; t < TM; ++t) log_slot = t < T && slots[t] > 0 && slots[t] != src ? slots[t] : log_slot;
+    if (blockIdx.y == 0 && tid < kRec) {
+      int v = 0;
+      if (log_slot > 0) {
+        v = tid == 0 ? __ldg(p.epoch) : tid == 1 ? T : tid == 2 ? src : log_slot;
+#pragma unroll
+        for (int t = 0; t < TM; ++t) v = tid == 4 + t ? slots[t] : v;
+        v = tid >= 4 + TM ? 0 : v;
+      }
+      rec[tid] = v;
+    }
+  }
+
+  // Source states -> smem (warp w: rows [16w, 16w + 16) of each head, its own commit group).
+  {
+#pragma unroll
+    for (int j = 0; j < kNH; ++j) {
+      const __nv_bfloat16* sp =
+          p.state + static_cast<int64_t>(src) * p.s_slot + static_cast<int64_t>(hv0 + j) * kV * kK;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int q = i * 32 + lane;
+        const int row = warp * kRW + (q >> 4), ch = q & 15;
+        cp_async16(&sm.st[j][row * kK + ((ch ^ (row & 7)) << 3)], sp + row * kK + ch * 8);
+      }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  }
+#if GWY_PF
+  if (warp == kNW - 1) {
+    const int f = blockIdx.x + blockIdx.y * gridDim.x + GWY_PF;
+    if (f < static_cast<int>(gridDim.x * gridDim.y)) {
+      const int freq = f % gridDim.x;
+      const int fhv = (f / gridDim.x) * kNH;
+      const int facc = __ldg(p.acc + freq);
+      const int fsrc = facc >= 1 && facc <= p.si_width ? __ldg(p.si + freq * p.si_width + facc - 1) : 0;
+      if (fsrc > 0) {
+        constexpr int kBytes = kNH * kV * kK * 2;  // the CTA's heads are contiguous
+        const char* fp = reinterpret_cast<const char*>(p.state + static_cast<int64_t>(fsrc) * p.s_slot +
+                                                       static_cast<int64_t>(fhv) * kV * kK) +
+                         lane * (kBytes / 32);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(fp), "r"(kBytes / 32) : "memory");
+      }
+    }
+  }
+#endif
+
+  // Token loads (warp t: token t, lane: dims 4 lane .. 4 lane + 3), all issued
+  // before any use; lane j < kNH also loads head hv0 + j's a, b, dt_bias, A_log.
+  const int kh = hv0 / p.ratio;
+  const int hvl = hv0 + (lane < kNH ? lane : 0);
+  uint2 qr, kr, vr[kNH], zr[kNH];
+  float wv[4];
+  __nv_bfloat16 ab, bb;
+  if (warp < T) {
+    const int64_t tok = bos + warp;
+    const __nv_bfloat16* row = p.qkv + tok * p.s_qkv;
+    qr = __ldg(reinterpret_cast<const uint2*>(row + kh * kK + 4 * lane));
+    kr = __ldg(reinterpret_cast<const uint2*>(row + p.H * kK + kh * kK + 4 * lane));
+#pragma unroll
+    for (int j = 0; j < kNH; ++j) {
+      vr[j] = __ldg(reinterpret_cast<const uint2*>(row + 2 * p.H * kK + (hv0 + j) * kV + 4 * lane));
+      zr[j] = __ldg(reinterpret_cast<const uint2*>(p.gate + tok * p.s_gate + (hv0 + j) * kV + 4 * lane));
+    }
+    if (p.norm_w_bf16) {
+      unpack4(__ldg(reinterpret_cast<const uint2*>(static_cast<const __nv_bfloat16*>(p.norm_w) + 4 * lane)), wv);
+    } else {
+      const float4 w4 = __ldg(reinterpret_cast<const float4*>(static_cast<const float*>(p.norm_w) + 4 * lane));
+      wv[0] = w4.x;
+      wv[1] = w4.y;
+      wv[2] = w4.z;
+      wv[3] = w4.w;
+    }
+    ab = p.a[tok * p.s_a + hvl];
+    bb = p.b[tok * p.s_b + hvl];
+  }
+  float dtb;
+  if (p.dtb_type == 1) dtb = __bfloat162float(static_cast<const __nv_bfloat16*>(p.dt_bias)[hvl]);
+  else if (p.dtb_type == 2) dtb = __half2float(static_cast<const __half*>(p.dt_bias)[hvl]);
+  else dtb = static_cast<const float*>(p.dt_bias)[hvl];
+  const float a_log = p.a_log[hvl];
+
+  float gact[kNH][4];  // norm weight x activated output gate (epilogue of warp t)
+  if (warp < T) {
+    const int t = warp;
+    float qv[4], kv[4];
+    unpack4(qr, qv);
+    unpack4(kr, kv);
+    float qq = 0.0f, kk = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      qq += qv[i] * qv[i];
+      kk += kv[i] * kv[i];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      qq += __shfl_xor_sync(0xffffffffu, qq, off);
+      kk += __shfl_xor_sync(0xffffffffu, kk, off);
+    }
+    const float qs = rsqrtf(qq + 1.0e-6f) * p.scale;
+    const float ks = rsqrtf(kk + 1.0e-6f);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      qv[i] *= qs;
+      kv[i] *= ks;
+    }
+#pragma unroll
+    for (int j = 0; j < kNH; ++j) {
+      float z[4];
+      unpack4(zr[j], z);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) gact[j][i] = wv[i] * (p.sigmoid_gate ? sigmoid_f(z[i]) : z[i] * sigmoid_f(z[i]));
+      *reinterpret_cast<uint2*>(&sm.v[t][j][4 * lane]) = vr[j];
+    }
+    *reinterpret_cast<float4*>(&sm.u2.q[t][4 * lane]) = make_float4(qv[0], qv[1], qv[2], qv[3]);
+    *reinterpret_cast<float4*>(&sm.k[t][4 * lane]) = make_float4(kv[0], kv[1], kv[2], kv[3]);
+    split_store4<GWY_KS>(sm.u.split, t, 4 * lane, kv);
+    split_store4<GWY_QS>(sm.u.split + GWY_KS * kTab, t, 4 * lane, qv);
+    float dec = 0.0f;
+    if (lane < kNH) {  // head hv0 + lane
+      const float g = -__expf(a_log) * softplus_f(__bfloat162float(ab) + dtb);
+      dec = __expf(g);
+      sm.dec[lane][t] = dec;
+      sm.beta[lane][t] = sigmoid_f(__bfloat162float(bb));
+    }
+    if (log_slot > 0) {  // replay log of every head: k_t (all lanes), d_t (lane j)
+#pragma unroll
+      for (int j = 0; j < kNH; ++j) {
+        float* lg = reinterpret_cast<float*>(p.state + static_cast<int64_t>(log_slot) * p.s_slot +
+                                             static_cast<int64_t>(hv0 + j) * kV * kK);
+        __stcs(reinterpret_cast<float4*>(lg + kLogK + t * kV + 4 * lane), make_float4(kv[0], kv[1], kv[2], kv[3]));
+      }
+      if (lane < kNH)
+        __stcs(reinterpret_cast<float*>(p.state + static_cast<int64_t>(log_slot) * p.s_slot +
+                                        static_cast<int64_t>(hvl) * kV * kK) +
+                   kLogD + t,
+               dec);
+    }
+  }
+  __syncthreads();  // #1: token prep
+
+  // Gram + WY coefficients: group g (4 lanes) < T^2: the k.k pairs s < t < T
+  // (g = t (t - 1) / 2 + s), then the k.q pairs s <= t < T (g - T (T - 1) / 2 =
+  // t (t + 1) / 2 + s); lane seg < kNH writes head seg's coefficient.
+  {
+    const int nkk = T * (T - 1) / 2;
+    const int npair = T * T;
+    if (warp * 8 < npair) {
+      const int grp = tid >> 2, seg = tid & 3;
+      const bool act = grp < npair;
+      int s = 0, t = 0;
+      bool isq = false;
+      if (act) {
+        if (grp < nkk) {
+          t = static_cast<int>((1.0f + sqrtf(static_cast<float>(1 + 8 * grp))) * 0.5f);
+          s = grp - t * (t - 1) / 2;
+        } else {
+          const int pq = grp - nkk;
+          t = static_cast<int>((sqrtf(static_cast<float>(1 + 8 * pq)) - 1.0f) * 0.5f);
+          s = pq - t * (t + 1) / 2;
+          isq = true;
+        }
+      }
+      const float* x = sm.k[s];
+      const float* y = isq ? sm.u2.q[t] : sm.k[t];
+      float4 a4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int c = 4 * (seg + 4 * j);
+        const float4 x4 = *reinterpret_cast<const float4*>(x + c);
+        const float4 y4 = *reinterpret_cast<const float4*>(y + c);
+        a4.x = fmaf(x4.x, y4.x, a4.x);
+        a4.y = fmaf(x4.y, y4.y, a4.y);
+        a4.z = fmaf(x4.z, y4.z, a4.z);
+        a4.w = fmaf(x4.w, y4.w, a4.w);
+      }
+      float d = (a4.x + a4.y) + (a4.z + a4.w);
+      d += __shfl_xor_sync(0xffffffffu, d, 2);
+      d += __shfl_xor_sync(0xffffffffu, d, 1);
+      if (act && seg < kNH) {
+        float rho = 1.0f;
+        const int hi = isq ? t : t - 1;
+        for (int r = s + 1; r <= hi; ++r) rho *= sm.dec[seg][r];
+        if (isq) sm.Qt[t][seg][s] = rho * d;
+        else sm.Wt[t][seg][s] = rho * d;
+      }
+    }
+    if (tid < TM * kNH) {  // G_t = d_0 ... d_{t-1} (same product order as wy_kernel's G)
+      const int t = tid / kNH, j = tid - t * kNH;
+      float g = 1.0f;
+      for (int r = 0; r < t && r < T; ++r) g *= sm.dec[j][r];
+      const float g1 = t < T ? g * sm.dec[j][t] : g;
+      sm.coef[t][j] = make_float4(g, g1, sm.dec[j][t], sm.beta[j][t]);
+    }
+  }
+
+  // S_0 k_t (columns 0..7 of ck) and S_0 q_t (cq) of this warp's 16 rows of each head.
+  float ck[kNH][4], cq[kNH][4];
+#pragma unroll
+  for (int j = 0; j < kNH; ++j) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      ck[j][i] = 0.0f;
+      cq[j][i] = 0.0f;
+    }
+  }
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncwarp();
+  {
+    const int arow = warp * kRW + (lane & 15);
+    const __nv_bfloat16* bk = sm.u.split + (lane & 7) * kPad + ((lane >> 3) & 1) * 8;
+    const __nv_bfloat16* bk4 = bk + (lane >> 4) * kTab;  // x4: lanes 16..31 address the next split term
+#pragma unroll
+    for (int kt = 0; kt < kK / 16; ++kt) {
+      uint32_t b[kNS][2];
+#pragma unroll
+      for (int s = 0; s + 1 < kNS; s += 2) {
+        uint32_t r4[4];
+        ldsm_x4(r4, bk4 + s * kTab + kt * 16);
+        b[s][0] = r4[0];
+        b[s][1] = r4[1];
+        b[s + 1][0] = r4[2];
+        b[s + 1][1] = r4[3];
+      }
+      if constexpr (kNS % 2 == 1) ldsm_x2(b[kNS - 1], bk + (kNS - 1) * kTab + kt * 16);
+#pragma unroll
+      for (int j = 0; j < kNH; ++j) {
+        uint32_t a[4];
+        ldsm_x4(a, &sm.st[j][arow * kK + (((2 * kt + (lane >> 4)) ^ (arow & 7)) << 3)]);
+#pragma unroll
+        for (int s = 0; s < GWY_KS; ++s) mma_bf16(ck[j], a, b[s]);
+#pragma unroll
+        for (int s = 0; s < GWY_QS; ++s) mma_bf16(cq[j], a, b[GWY_KS + s]);
+      }
+    }
+  }
+  __syncthreads();  // #2: coefficients; every warp is done with the split tables and q
+
+  // Row solve: lane (g, tq) owns warp row g + 8 (tq & 1) of head jl (kNH = 2:
+  // tq / 2; kNH = 1: head 0, lanes tq >= 2 duplicate tq - 2); the C fragment of
+  // column t of that row is in lane 4 g + t / 2.
+  {
+    const int g = lane >> 2, tq = lane & 3, hh = tq & 1;
+    const int jl = kNH > 1 ? tq >> 1 : 0;
+    const bool own = kNH > 1 || tq < 2;
+    const int rr = g + 8 * hh;
+    const int row = warp * kRW + rr;
+    float dl[kMaxT];
+#pragma unroll
+    for (int t = 0; t < kMaxT; ++t) dl[t] = 0.0f;
+#pragma unroll
+    for (int t = 0; t < TM; ++t) {
+      const int sl = 4 * g + (t >> 1);
+      float kx, qx;  // S_0 k_t, S_0 q_t of (row, head jl)
+      {
+        const float k0 = __shfl_sync(0xffffffffu, ck[0][t & 1], sl);
+        const float k1 = __shfl_sync(0xffffffffu, ck[0][2 + (t & 1)], sl);
+        const float q0 = __shfl_sync(0xffffffffu, cq[0][t & 1], sl);
+        const float q1 = __shfl_sync(0xffffffffu, cq[0][2 + (t & 1)], sl);
+        kx = hh ? k1 : k0;
+        qx = hh ? q1 : q0;
+        if constexpr (kNH > 1) {
+          const float k2 = __shfl_sync(0xffffffffu, ck[1][t & 1], sl);
+          const float k3 = __shfl_sync(0xffffffffu, ck[1][2 + (t & 1)], sl);
+          const float q2 = __shfl_sync(0xffffffffu, cq[1][t & 1], sl);
+          const float q3 = __shfl_sync(0xffffffffu, cq[1][2 + (t & 1)], sl);
+          if (jl) {
+            kx = hh ? k3 : k2;
+            qx = hh ? q3 : q2;
+          }
+        }
+      }
+      if (t < T) {
+        const float4 cf = sm.coef[t][jl];
+        const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 w0 = t > 0 ? *reinterpret_cast<const float4*>(&sm.Wt[t][jl][0]) : zero;
+        const float4 w1 = t > 4 ? *reinterpret_cast<const float4*>(&sm.Wt[t][jl][4]) : zero;
+        const float4 c0 = *reinterpret_cast<const float4*>(&sm.Qt[t][jl][0]);
+        const float4 c1 = t >= 4 ? *reinterpret_cast<const float4*>(&sm.Qt[t][jl][4]) : zero;
+        float hk = cf.x * kx;
+#pragma unroll
+        for (int s = 0; s < t; ++s) hk = fmaf(f8(w0, w1, s), dl[s], hk);
+        dl[t] = (__bfloat162float(sm.v[t][jl][row]) - cf.z * hk) * cf.w;
+        float o = cf.y * qx;
+#pragma unroll
+        for (int s = 0; s <= t; ++s) o = fmaf(f8(c0, c1, s), dl[s], o);
+        if (own) sm.u.o[t][jl][row] = __float2bfloat16(o);
+      }
+    }
+    if (own) {
+      if (log_slot > 0) {  // replay log: delta_t of (row, head jl)
+        float* lg = reinterpret_cast<float*>(p.state + static_cast<int64_t>(log_slot) * p.s_slot +
+                                             static_cast<int64_t>(hv0 + jl) * kV * kK);
+#pragma unroll
+        for (int t = 0; t < TM; ++t)
+          if (t < T) __stcs(lg + t * kV + row, dl[t]);
+      } else {
+        *reinterpret_cast<float4*>(&sm.u2.dl[jl][warp][rr][0]) = make_float4(dl[0], dl[1], dl[2], dl[3]);
+        if (TM > 4) *reinterpret_cast<float4*>(&sm.u2.dl[jl][warp][rr][4]) = make_float4(dl[4], dl[5], dl[6], dl[7]);
+      }
+    }
+  }
+  __syncthreads();  // #3: outputs, delta table
+
+  // Gated RMSNorm epilogue: warp t, token t, every head.
+  if (warp < T) {
+    const int t = warp;
+#pragma unroll
+    for (int j = 0; j < kNH; ++j) {
+      float ov[4];
+      unpack4(*reinterpret_cast<const uint2*>(&sm.u.o[t][j][4 * lane]), ov);
+      float ss = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) ss += ov[i] * ov[i];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+      const float rstd = rsqrtf(ss / static_cast<float>(kV) + p.eps);
+      *reinterpret_cast<uint2*>(p.out + (static_cast<int64_t>(bos + t) * p.HV + hv0 + j) * kV + 4 * lane) =
+          make_uint2(pack_bf2(ov[0] * rstd * gact[j][0], ov[1] * rstd * gact[j][1]),
+                     pack_bf2(ov[2] * rstd * gact[j][2], ov[3] * rstd * gact[j][3]));
+    }
+  }
+
+  if (log_slot == 0) {
+#pragma unroll
+    for (int j = 0; j < kNH; ++j)
+      chain2_t<TM>(T, sm, j, slots, p.state, p.s_slot, static_cast<int64_t>(hv0 + j) * kV * kK, warp, lane);
+  }
+}
+#endif  // GWY_V2
+
 struct CParams {
   const int* rec;             // [layers, rec_rows, kRec]
   const int64_t* state_ptrs;  // [layers] bf16 state base addresses
@@ -1965,6 +2478,30 @@ void launch(const Params& p, dim3 grid, cudaStream_t stream) {
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, wy_kernel<TM>, p));
 }
 
+#if GWY_V2
+// wy2_kernel<TM>: as launch(), grid (requests, HV / kNH).
+template <int TM>
+void launch2(const Params& p, dim3 grid, cudaStream_t stream) {
+  static bool attr = false;
+  if (!attr) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(wy2_kernel<TM>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(sizeof(Smem2<TM>))));
+    attr = true;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = dim3(kNT);
+  cfg.dynamicSmemBytes = sizeof(Smem2<TM>);
+  cfg.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attrs;
+  cfg.numAttrs = GWY_PDL ? 1 : 0;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, wy2_kernel<TM>, p));
+}
+#endif
+
 // false if the layout contract is not met (caller keeps the csrc kernel).
 // rec ([rows, kRec] int32) / epoch ([1] int32) non-empty: deferred snapshots.
 bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log,
@@ -2051,6 +2588,16 @@ bool run(torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_lo
   p.rec_rows = defer ? (int)rec.size(0) : 0;
   const c10::cuda::CUDAGuard guard(qkv.device());
   const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+#if GWY_V2
+  if (p.ratio % kNH == 0) {  // the CTA's kNH value heads share one key head
+    const dim3 grid2((unsigned)N, (unsigned)(HV / kNH));
+    if (p.si_width <= 4) launch2<4>(p, grid2, stream);
+    else if (p.si_width == 5) launch2<5>(p, grid2, stream);
+    else if (p.si_width == 6) launch2<6>(p, grid2, stream);
+    else launch2<8>(p, grid2, stream);
+    return true;
+  }
+#endif
   const dim3 grid((unsigned)N, (unsigned)HV);
   if (p.si_width <= 4) launch<4>(p, grid, stream);
   else if (p.si_width == 5) launch<5>(p, grid, stream);
