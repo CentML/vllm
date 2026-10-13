@@ -1879,6 +1879,15 @@ __device__ __forceinline__ void chain2(const Smem2<TM>& sm, int j, const int (&s
   }
 }
 
+// A global load issued with the other index loads: ptxas sinks an ordinary
+// load below the token-count branch, adding a dependent L2 round trip before
+// the state loads; a volatile load must execute on every path, so it stays.
+__device__ __forceinline__ int ld_early(const int* p) {
+  int v;
+  asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+
 template <int TM, int NT = 1>
 __device__ __forceinline__ void chain2_t(int T, const Smem2<TM>& sm, int j, const int (&slots)[TM],
                                          __nv_bfloat16* state, int64_t s_slot, int64_t head, int warp, int lane) {
@@ -1908,7 +1917,7 @@ __global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) w
   for (int t = 0; t < TM; ++t) slots[t] = t < p.si_width ? __ldg(si_row + t) : 0;
   const int bos = __ldg(p.cu + req);
   const int T = __ldg(p.cu + req + 1) - bos;
-  const int acc = __ldg(p.acc + req);
+  const int acc = ld_early(p.acc + req);
   int* rec = p.rec != nullptr && req < p.rec_rows ? p.rec + static_cast<int64_t>(req) * kRec : nullptr;
   if (T <= 0) {
     if (rec != nullptr && blockIdx.y == 0 && tid == 0) rec[0] = 0;
@@ -1932,16 +1941,6 @@ __global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) w
   if (rec != nullptr) {
 #pragma unroll
     for (int t = 1; t < TM; ++t) log_slot = t < T && slots[t] > 0 && slots[t] != src ? slots[t] : log_slot;
-    if (blockIdx.y == 0 && tid < kRec) {
-      int v = 0;
-      if (log_slot > 0) {
-        v = tid == 0 ? __ldg(p.epoch) : tid == 1 ? T : tid == 2 ? src : log_slot;
-#pragma unroll
-        for (int t = 0; t < TM; ++t) v = tid == 4 + t ? slots[t] : v;
-        v = tid >= 4 + TM ? 0 : v;
-      }
-      rec[tid] = v;
-    }
   }
 
   // Source states -> smem (warp w: rows [16w, 16w + 16) of each head, its own commit group).
@@ -1958,6 +1957,16 @@ __global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) w
       }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
+  }
+  if (rec != nullptr && blockIdx.y == 0 && tid < kRec) {  // the request's record (after the state loads issue)
+    int v = 0;
+    if (log_slot > 0) {
+      v = tid == 0 ? __ldg(p.epoch) : tid == 1 ? T : tid == 2 ? src : log_slot;
+#pragma unroll
+      for (int t = 0; t < TM; ++t) v = tid == 4 + t ? slots[t] : v;
+      v = tid >= 4 + TM ? 0 : v;
+    }
+    rec[tid] = v;
   }
 #if GWY_PF
   if (warp == kNW - 1) {
