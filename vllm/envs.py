@@ -245,6 +245,9 @@ if TYPE_CHECKING:
     VLLM_KF_PREFILL_ATTN_CHECK: int = 0
     VLLM_KF_PREFILL_ATTN_PRECISE: bool = False
     VLLM_KF_PREFILL_ATTN_LOG_EVERY: int = 4096
+    VLLM_ATTN_MIXED_FORK: bool = False
+    VLLM_ATTN_MIXED_FORK_KF_SMS: int = 0
+    VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM: float = 100.0
     VLLM_KF_DECODE_ATTN: bool = False
     VLLM_KF_DECODE_ATTN_MAX_BL: int = 8
     VLLM_KF_DECODE_ATTN_QLENS: str = ""
@@ -1938,6 +1941,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
         os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
+    ),
+    # Mixed (prefill + decode) batches on the KF prefill kernel: with
+    # VLLM_ATTN_MIXED_FORK=1 every full-attention layer launches its KF prefill
+    # rows on a high-priority side stream and the trtllm-gen decode rows (PDL off)
+    # on the current stream, then joins: the compute-bound prefill and the
+    # KV-read-bound decode share the GPU instead of running back to back. Both read
+    # disjoint query rows and write disjoint output rows; the KF partials live in
+    # the upper half of the trtllm workspace, the decode's in the lower half.
+    # Eager steps only (mixed steps run piecewise graphs). Same kernels and plan:
+    # bitwise. VLLM_ATTN_MIXED_FORK_KF_SMS=N (0 = every SM) plans the KF prefill
+    # of those steps for N persistent CTAs (N rounded down to even) so the decode
+    # CTAs keep the other SMs while it runs (the kernel keeps its compiled grid;
+    # the extra CTAs get empty work bins and exit). A different N changes the
+    # KF split plan: deterministic, but not bitwise to N = 0. N = -1 picks N per
+    # step from a cost model (flashinfer._attn_mixed_fork_kf_sms) in which the
+    # decode streams VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM GB/s per SM it holds.
+    "VLLM_ATTN_MIXED_FORK": lambda: bool(int(os.getenv("VLLM_ATTN_MIXED_FORK", "0"))),
+    "VLLM_ATTN_MIXED_FORK_KF_SMS": lambda: int(
+        os.getenv("VLLM_ATTN_MIXED_FORK_KF_SMS", "0")
+    ),
+    "VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM": lambda: float(
+        os.getenv("VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM", "100")
     ),
     # Kernel Factory paged-FP8 decode attention (v1/attention/ops/kf_decode_attn):
     # replaces the trtllm-gen decode kernel on SM107 (FP8 Q/KV, head_dim 256, 16 q /

@@ -208,6 +208,64 @@ _TRTLLM_GEN_PREFILL_ROWS_PER_CTA = 128
 
 trtllm_gen_prefill_counter_buffer = None
 
+# VLLM_ATTN_MIXED_FORK: high-priority side stream for the KF prefill rows plus the
+# fork/join events (one set per process; every layer joins before the next forks).
+_attn_mixed_fork_state: list[
+    tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]
+] = []
+
+
+def _attn_mixed_fork_streams() -> tuple[
+    torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event
+]:
+    if not _attn_mixed_fork_state:
+        _, high = torch.cuda.Stream.priority_range()
+        _attn_mixed_fork_state.append(
+            (torch.cuda.Stream(priority=high), torch.cuda.Event(), torch.cuda.Event())
+        )
+    return _attn_mixed_fork_state[0]
+
+
+# VLLM_ATTN_MIXED_FORK_KF_SMS=-1 cost model (per full-attention layer, us). KF prefill
+# on all SMs: base + slope x work, work = sum_rows q * (kv - q / 2) in 1e9 token^2
+# (least-squares fit over the C1024 nsys trace's KF steps, R^2 0.79). trtllm-gen
+# decode: 1 KiB of FP8 K|V per cached token at the measured 13.6 TB/s.
+_KF_FORK_US_BASE = 199.0
+_KF_FORK_US_PER_GWORK = 1729.0
+_KF_FORK_DEC_TBPS = 13.6
+
+
+def _attn_mixed_fork_kf_sms(
+    query_lens: list[int],
+    seq_lens: list[int],
+    decode_kv_tokens: int,
+    num_sms: int,
+) -> int:
+    """KF prefill SM budget of a forked mixed step (VLLM_ATTN_MIXED_FORK_KF_SMS):
+    N > 0 as given, 0 = every SM, -1 = the N (multiple of 8, >= 64) minimising the
+    modelled layer time: the KF prefill alone on N SMs (time x num_sms / N) while the
+    decode streams its KV on the other SMs at VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM
+    each (capped at the full decode rate), then the decode's rest on every SM.
+    Returns 0 when no split beats running both on every SM.
+    """
+    n = envs.VLLM_ATTN_MIXED_FORK_KF_SMS
+    if n >= 0:
+        return n
+    work = sum(q * (kv - q / 2) for q, kv in zip(query_lens, seq_lens)) / 1e9
+    tp = _KF_FORK_US_BASE + _KF_FORK_US_PER_GWORK * work
+    td = decode_kv_tokens * 1024 / (_KF_FORK_DEC_TBPS * 1e6)
+    per_sm = envs.VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM / 1e3
+    best_n, best_t = 0, tp + td
+    for cand in range(num_sms - num_sms % 8, 63, -8):
+        if cand >= num_sms:
+            continue
+        t1 = tp * num_sms / cand
+        frac = min(1.0, (num_sms - cand) * per_sm / _KF_FORK_DEC_TBPS)
+        t = t1 + max(0.0, td - t1 * frac)
+        if t < best_t:
+            best_n, best_t = cand, t
+    return best_n
+
 
 def _get_trtllm_gen_prefill_counter_buffer(sm_count: int) -> torch.Tensor:
     """Zeroed multi-CTA KV semaphores for the generation-kernel prefill (the kernel
@@ -2087,13 +2145,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # async spec decode's optimistic length. plan() keeps such
                     # steps (and any row below MIN_KV) on the production path.
                     is_prefilling = common_attn_metadata.is_prefilling
+                    kf_qls = query_lens_prefill_cpu.tolist()
+                    kf_kvs = seq_lens_ub[prefill_start:num_reqs].tolist()
+                    kf_nsm = 0
+                    if envs.VLLM_ATTN_MIXED_FORK and num_decode_tokens > 0:
+                        # Leave SMs to the concurrent decode (forked in forward()).
+                        kf_nsm = _attn_mixed_fork_kf_sms(
+                            kf_qls,
+                            kf_kvs,
+                            int(seq_lens_ub[:prefill_start].sum()),
+                            kf_rt.nsm,
+                        )
                     kf_plan = kf_rt.plan(
-                        query_lens_prefill_cpu.tolist(),
-                        seq_lens_ub[prefill_start:num_reqs].tolist(),
+                        kf_qls,
+                        kf_kvs,
                         block_table_tensor[prefill_start:num_reqs],
                         None
                         if is_prefilling is None
                         else is_prefilling[prefill_start:num_reqs].tolist(),
+                        nsm=kf_nsm,
                     )
                 # Kept even with a KF plan: a layer that cannot run KF (forward checks)
                 # then falls back to exactly the production choice.
@@ -2466,6 +2536,8 @@ class FlashInferImpl(AttentionImpl):
         # check re-runs this forward on the FlashInfer path.
         self._kf_checks_left = envs.VLLM_KF_PREFILL_ATTN_CHECK
         self._kf_off = False
+        # VLLM_ATTN_MIXED_FORK: join event of this forward's forked KF launch.
+        self._kf_join: torch.cuda.Event | None = None
         # Opt-in routing of eligible FP8 context launches to the trtllm-gen
         # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
         # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
@@ -2789,10 +2861,15 @@ class FlashInferImpl(AttentionImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         out: torch.Tensor,
+        fork: bool = False,
     ) -> bool:
         """Run this layer's prefill rows on the Kernel Factory kernel with the step's
         plan. Returns False (nothing launched) if this layer is outside the kernel's
         contract; the caller then takes the trtllm-gen path.
+
+        ``fork`` (VLLM_ATTN_MIXED_FORK, decode rows follow): launch on the
+        high-priority side stream after everything queued so far on the current
+        stream; ``_kf_fork_join`` makes the current stream wait for it.
         """
         prefill = attn_metadata.prefill
         assert isinstance(prefill, TRTLLMPrefill) and prefill.kf is not None
@@ -2819,7 +2896,7 @@ class FlashInferImpl(AttentionImpl):
         runtime = get_runtime(query.device)
         assert runtime is not None
         assert self.bmm1_scale is not None and self.bmm2_scale is not None
-        return runtime.launch(
+        args = (
             prefill.kf,
             query,
             kv_cache,
@@ -2827,6 +2904,27 @@ class FlashInferImpl(AttentionImpl):
             self.bmm1_scale,
             self.bmm2_scale,
         )
+        if not (
+            fork
+            and envs.VLLM_ATTN_MIXED_FORK
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return runtime.launch(*args)
+        side, fork_ev, join_ev = _attn_mixed_fork_streams()
+        fork_ev.record(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fork_ev.wait(side)
+            launched = runtime.launch(*args)
+            join_ev.record(side)
+        # Joined even when nothing launched (the side stream then carries no work).
+        self._kf_join = join_ev
+        return launched
+
+    def _kf_fork_join(self) -> None:
+        """VLLM_ATTN_MIXED_FORK: order the current stream after the forked KF launch."""
+        if self._kf_join is not None:
+            self._kf_join.wait(torch.cuda.current_stream())
+            self._kf_join = None
 
     def _check_kf_prefill(
         self,
@@ -3586,6 +3684,10 @@ class FlashInferImpl(AttentionImpl):
                         prefill_query,
                         kv_cache_permute,
                         out,
+                        fork=num_decode_tokens > 0
+                        and decode_with_trtllm_gen
+                        and not use_dcp
+                        and self._kf_checks_left <= 0,
                     )
                 ):
                     # Kernel Factory prefill kernel ran (see _kf_prefill).
@@ -3909,6 +4011,9 @@ class FlashInferImpl(AttentionImpl):
                             lse=lse,
                             return_lse=self.need_to_return_lse_for_decode,
                             multi_ctas_kv_counter_buffer=counter_buffer,
+                            # Forked KF prefill: no early (PDL) residency, so the
+                            # side stream's CTAs claim their SMs first.
+                            enable_pdl=False if self._kf_join is not None else None,
                         )
 
                 if (
@@ -3946,6 +4051,7 @@ class FlashInferImpl(AttentionImpl):
                     )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
+        self._kf_fork_join()
         return output_padded
 
     def kv_cache_write_views(
