@@ -688,6 +688,7 @@ def graph_core(
                 scale,
                 layer.layer_norm_epsilon,
                 layer.norm.activation,
+                layer_key=layer.prefix,
             )
             if not ok:
                 raise RuntimeError("GDN layer graphs: CUDA MTP kernel contract")

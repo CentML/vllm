@@ -3115,7 +3115,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 *args, out_q=out_q, out_scale=out_scale
             ):
                 return SpecCoreOut.QUANTIZED
-            if gdn_mtp_cuda.gdn_mtp_cuda(*args):
+            if gdn_mtp_cuda.gdn_mtp_cuda(*args, layer_key=self.prefix):
                 return SpecCoreOut.NORMED
         ops.fused_gdn_decode_post_conv_mtp(*args)
         return SpecCoreOut.NORMED
