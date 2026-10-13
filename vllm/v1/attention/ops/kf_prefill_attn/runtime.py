@@ -106,6 +106,17 @@ def reachable_variants(nops: int, precise: bool) -> list[int]:
     return sorted(out)
 
 
+def pad_bins(starts: torch.Tensor, n: int, total: int) -> int:
+    """Extend a planner start-offset table (``bins`` or ``mbin``: ``n`` entries,
+    the last one the end of the final bin) to ``total`` entries with empty bins,
+    so every CTA of a grid larger than the planned one finds no work. Returns the
+    new entry count.
+    """
+    if n < total:
+        starts[n:total] = starts[n - 1]
+    return max(n, total)
+
+
 class KfPrefillAttn:
     def __init__(self, device: torch.device, workspace: torch.Tensor):
         from vllm.third_party.kf_prefill_attn import kernel as kmod
@@ -251,6 +262,7 @@ class KfPrefillAttn:
         seq_lens: list[int],
         block_tables: torch.Tensor,
         exact_kv: list[bool] | None,
+        nsm: int = 0,
     ) -> KfPrefillPlan | None:
         """Plan one step's prefill launch; None keeps FlashInfer for this step.
         ``block_tables``: the prefill rows' ``[B, W]`` int32 block table, W <= MAXP.
@@ -263,6 +275,11 @@ class KfPrefillAttn:
         length is an async-spec decode row's optimistic upper bound (the batch
         split puts non-uniform decode rows in the prefill section): planning it
         makes the kernel attend past the row's real end (rejected-draft KV).
+
+        ``nsm`` (0 = every SM): plan the work for that many persistent CTAs
+        (rounded down to even, at least 2) while the kernel keeps its compiled grid:
+        the CTAs past the plan's grid get empty work and merge bins and exit, so
+        the SMs they would hold stay free for concurrent work (VLLM_ATTN_MIXED_FORK).
         """
         if not self.compiled:
             return None
@@ -283,8 +300,9 @@ class KfPrefillAttn:
             ev.synchronize()  # this pinned slot's H2D (RING steps ago) has finished
         hp, hb, hm, hmb = self.host[i]
         t0 = time.perf_counter()
+        plan_nsm = self.nsm if nsm <= 0 or nsm >= self.nsm else max(2, nsm - nsm % 2)
         res = self.planner.plan_into(
-            query_lens, seq_lens, self.nsm, hp, hb, hm, hmb, *self.grids
+            query_lens, seq_lens, plan_nsm, hp, hb, hm, hmb, *self.grids
         )
         t_planned = time.perf_counter()
         self.plan_us += (t_planned - t0) * 1e6
@@ -295,6 +313,9 @@ class KfPrefillAttn:
         if (precise_variant if self.force_precise else variant) not in self.compiled:
             self.stats["fallback_variant"] += 1
             return None
+        if plan_nsm < self.nsm:
+            nbins = pad_bins(hb, nbins, self.nsm + 1)
+            nmbin = pad_bins(hmb, nmbin, self.nsm + 1)
         bt = self._block_tables(block_tables)
         dp, db, dm, dmb = self.dev[i]
         dp[:nwork].copy_(hp[:nwork], non_blocking=True)
