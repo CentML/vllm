@@ -215,3 +215,40 @@ def test_sibling_hold_keeps_source(monkeypatch):
     assert not attn._cow_sources
     manager.block_pool.free_blocks(held)
     _all_free(manager)
+
+
+def test_checkpoint_export_turns_drop_cow_sources(monkeypatch):
+    """Recipe configuration (GDN tail export, block 2176, MTP k=4, one-chunk
+    prefills): every follow-up turn supersedes its prev checkpoint in the CoW
+    step, so only the CoW branch can drop it.
+    """
+    import random
+
+    from tests.v1.core import test_mamba_checkpointed_chunk_cache as chunk
+
+    hits = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv(PIN, "1")
+        monkeypatch.setenv(DROP_SUPERSEDED, "1")
+        monkeypatch.setenv(MAMBA_COW, flag)
+        monkeypatch.setenv(FLAG, flag)
+        manager = chunk._make_manager(num_spec=4)
+        rng = random.Random(1)
+        history = chunk._tokens(rng, 20000)
+        prompts, arrival = {}, {}
+        for turn in range(4):
+            prompts[f"c{turn}"] = list(history)
+            arrival[f"c{turn}"] = 3 * turn
+            history += chunk._tokens(rng, 700)
+        trace = chunk._run(
+            manager, prompts, free_done=set(prompts), arrival_step=arrival
+        )
+        hits[flag] = [trace.hits[rid][0] for rid in prompts]
+        for mgr in chunk._mamba_managers(manager):
+            assert mgr.num_superseded_cow == 3
+            assert mgr.num_superseded_cow_dropped == (3 if flag == "1" else 0)
+        attn = manager.coordinator.single_type_managers[-1]
+        assert attn.num_superseded_tails_dropped == (
+            attn.num_superseded_tails if flag == "1" else 0
+        )
+    assert hits["0"] == hits["1"] and all(h > 0 for h in hits["0"][1:])
