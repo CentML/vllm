@@ -369,6 +369,42 @@ def test_gdn_mtp_cuda_wy(H, HV, width, act, tune):
     )
 
 
+@pytest.mark.parametrize("H,HV", [(2, 4), (1, 4), (4, 4)])
+@pytest.mark.parametrize("width", [4, 5, 6, 8])
+@pytest.mark.parametrize("act", ["silu", "sigmoid"])
+@pytest.mark.parametrize("v2", [1, 2])
+@pytest.mark.parametrize("defer", [False, True])
+def test_gdn_mtp_cuda_wy_v2(H, HV, width, act, v2, defer):
+    """VLLM_GDN_MTP_VERIFY_V2 build: bitwise equal to the WY kernel in outputs,
+    every state slot (snapshots, or replay logs with deferral) and records.
+    H == HV (one value head per key head): v2 = 2 falls back to wy_kernel.
+    """
+    torch.manual_seed(width + 7 * v2)
+    _, _, _, L, args = _inputs(torch.bfloat16, H, HV, width)
+    state = args[8]
+    n = args[5].shape[0]
+    dev = state.device
+    rec_shape = (gdn_mtp_cuda._DEFER_ROWS, gdn_mtp_cuda._DEFER_REC)
+    epoch = torch.tensor([77], dtype=torch.int32, device=dev)
+    res = []
+    for v in (0, v2):
+        ext = gdn_mtp_cuda.build(gdn_mtp_cuda.wy_source("1", pdl=True, v2=v))
+        st = state.clone()
+        out = torch.full((L, HV, V), 7.0, dtype=torch.bfloat16, device=dev)
+        rec = torch.full(rec_shape, -7, dtype=torch.int32, device=dev)
+        run_args = list(args)
+        run_args[8] = st
+        if defer:
+            assert ext.run(*run_args, out, K**-0.5, EPS, act == "sigmoid", rec, epoch)
+        else:
+            assert ext.run(*run_args, out, K**-0.5, EPS, act == "sigmoid")
+        res.append((st, out, rec))
+    (s1, o1, r1), (s2, o2, r2) = res
+    assert torch.equal(o1.view(torch.int16), o2.view(torch.int16))
+    assert torch.equal(s1.view(torch.int16), s2.view(torch.int16))
+    assert torch.equal(r1[:n], r2[:n])
+
+
 def test_gdn_mtp_cuda_wy_rejects_fp32_state():
     """The WY build supports the bf16 state only: fp32 launches nothing."""
     _, _, _, L, args = _inputs(torch.float32, 2, 4, 4)
