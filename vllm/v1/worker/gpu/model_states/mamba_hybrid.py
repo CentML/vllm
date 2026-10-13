@@ -329,6 +329,14 @@ class MambaHybridModelState(DefaultModelState):
                     input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
                 )
                 spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
+                if self._gdn_defer:
+                    # VLLM_GDN_MTP_DEFER_WRITES: a decode row scheduled without
+                    # drafts stays a (one-token) spec row, so its SSM state comes
+                    # from si[r, num_accepted - 1] (materialized by the commit)
+                    # and its conv window is shifted by num_accepted, instead of
+                    # the non-spec path's running block column 0 (which holds
+                    # S_0 of the previous spec step at best).
+                    spec_decode_mask |= is_decode & ~input_batch.is_prefilling_np
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1
                 )

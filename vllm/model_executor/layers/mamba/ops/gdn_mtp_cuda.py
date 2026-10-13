@@ -124,8 +124,10 @@ class _DeferState:
         self.epoch: torch.Tensor | None = None  # [1] int32: this step's tag
         self.empty: torch.Tensor | None = None  # int32 [0]: no deferral
         self.host_epoch = 0
-        # state data_ptr -> layer index; per layer (data_ptr, slot stride, HV)
-        self.index: dict[int, int] = {}
+        # layer key -> record table index; per table (state data_ptr, slot
+        # stride, HV). Several layers share one data_ptr: the KV-cache groups
+        # alias from byte 0 and differ only in their block ids.
+        self.index: dict[object, int] = {}
         self.layers: list[tuple[int, int, int]] = []
         # int64 [layers] device copies of `layers` (rebuilt when it grows)
         self.ptrs: torch.Tensor | None = None
@@ -278,21 +280,28 @@ def defer_arm(device: torch.device) -> bool:
     return _defer.armed
 
 
-def _defer_rec(state: torch.Tensor) -> torch.Tensor:
-    """This layer's record table, or the empty tensor (stock writes)."""
+def _defer_rec(state: torch.Tensor, layer_key: object | None) -> torch.Tensor:
+    """The record table of layer ``layer_key`` (a stable per-layer key, e.g.
+    the layer prefix; never the state pointer, which layers of different
+    KV-cache groups share), or the empty tensor (stock writes).
+    """
     d = _defer
     assert d.empty is not None
-    if not d.armed or d.rec is None:
+    if not d.armed or d.rec is None or layer_key is None:
         return d.empty
-    key = state.data_ptr()
-    idx = d.index.get(key)
+    idx = d.index.get(layer_key)
     if idx is None:
         if len(d.layers) >= _DEFER_MAX_LAYERS or (
             d.layers and d.layers[0][2] != state.size(1)
         ):
             return d.empty
-        idx = d.index[key] = len(d.layers)
-        d.layers.append((key, state.stride(0), state.size(1)))
+        idx = d.index[layer_key] = len(d.layers)
+        d.layers.append((state.data_ptr(), state.stride(0), state.size(1)))
+    elif d.layers[idx][:2] != (state.data_ptr(), state.stride(0)):
+        # e.g. profiling-run caches replaced by the real ones: the commit
+        # follows the layer's current state tensor.
+        d.layers[idx] = (state.data_ptr(), state.stride(0), state.size(1))
+        d.ptrs = None
     return d.rec[idx]
 
 
@@ -409,9 +418,12 @@ def gdn_mtp_cuda(
     output_gate_activation: str,
     out_q: torch.Tensor | None = None,
     out_scale: torch.Tensor | None = None,
+    layer_key: object | None = None,
 ) -> bool:
     """Run the kernel; False (nothing launched) if the layout contract is not
     met, so the caller keeps the csrc kernel. Requires ``enable()`` first.
+    ``layer_key``: stable per-layer key (the layer prefix) for deferred
+    snapshots (VLLM_GDN_MTP_DEFER_WRITES); None: stock snapshot writes.
 
     ``out_q``/``out_scale`` (VLLM_GDN_MTP_FUSED_QUANT): write out_proj's
     MXFP8 activation into them (``[R, HV * V]`` e4m3, R >= the token rows, and
@@ -441,7 +453,7 @@ def gdn_mtp_cuda(
         return not wy and _ext[0].run_quant(*args, out_q, out_scale, *tail)
     if wy:
         assert _defer.empty is not None
-        rec = _defer_rec(state)
+        rec = _defer_rec(state, layer_key)
         epoch = _defer.epoch if rec.numel() else _defer.empty
         if _wy[0].run(*args, *tail, rec, epoch):
             return True
@@ -1481,12 +1493,14 @@ __global__ void __launch_bounds__(kNT, TM <= 6 ? GWY_MINB : 3) wy_kernel(const P
       p.out[(static_cast<int64_t>(bos + x / kV) * p.HV + hv) * kV + x % kV] = __float2bfloat16(0.0f);
     return;
   }
-  // Deferred snapshots: the log goes to the last of the request's T spec slots
-  // that is not the source (none: T == 1 with the source in column 0).
+  // Deferred snapshots: the log goes to the last of the request's spec slots
+  // 1 .. T - 1 that is not the source. Column 0 (the running block, which
+  // non-spec readers use) never holds a log; with no such slot (T == 1, or
+  // T == 2 with the source in column 1) the stock snapshots are written.
   int log_slot = 0;
   if (rec != nullptr) {
 #pragma unroll
-    for (int t = 0; t < TM; ++t) log_slot = t < T && slots[t] > 0 && slots[t] != src ? slots[t] : log_slot;
+    for (int t = 1; t < TM; ++t) log_slot = t < T && slots[t] > 0 && slots[t] != src ? slots[t] : log_slot;
     if (hv == 0 && tid < kRec) {
       int v = 0;
       if (log_slot > 0) {
@@ -2122,6 +2136,14 @@ void commit(torch::Tensor rec, torch::Tensor state_ptrs, torch::Tensor s_slot, i
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &gwy::run);
+  // Pre-deferral arity: stock snapshot writes.
+  m.def("run", [](torch::Tensor qkv, torch::Tensor a, torch::Tensor b, torch::Tensor a_log, torch::Tensor dt_bias,
+                  torch::Tensor si, torch::Tensor cu, torch::Tensor acc, torch::Tensor state, torch::Tensor gate,
+                  torch::Tensor norm_w, torch::Tensor out, double scale, double eps, bool sigmoid_gate) {
+    const torch::Tensor none = torch::empty({0}, si.options());
+    return gwy::run(qkv, a, b, a_log, dt_bias, si, cu, acc, state, gate, norm_w, out, scale, eps, sigmoid_gate, none,
+                    none);
+  });
   m.def("commit", &gwy::commit);
 }
 """
