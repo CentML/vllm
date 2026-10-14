@@ -231,6 +231,7 @@ class Gemma4MTPAttention(nn.Module):
             quant_config=quant_config,
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
+            mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
         )
 

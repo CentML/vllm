@@ -108,7 +108,7 @@ class MMPrefixAttentionRouting(CompositeAttentionRouting):
             vllm_config.compilation_config.static_forward_context.values()
         ):
             return AttentionCGSupport.NEVER
-        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return AttentionCGSupport.UNIFORM_BATCH
 
     @staticmethod
     def variant_uses_mm_prefix(variant: int) -> bool:
