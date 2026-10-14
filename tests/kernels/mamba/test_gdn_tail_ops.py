@@ -245,3 +245,23 @@ def test_zero_fresh_state_rows_skips_pad_slots() -> None:
 
     zero_fresh_state_rows(pool, indices, has_initial_state)
     assert torch.equal(buf, expected)
+
+
+@requires_fi_mxfp8
+@pytest.mark.parametrize("tokens", ["3328", "5000"])
+@pytest.mark.parametrize("heads", [16, 32])
+@torch.inference_mode()
+def test_gdn_gated_norm_mxfp8_large_m_warps(monkeypatch, tokens: str, heads: int):
+    """VLLM_MXFP8_NORM_LARGE_M: 4 warps from 3072 normalized rows keep >= 2
+    heads per warp, so the output still equals the layer's norm then quant.
+    """
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_tail_ops as G
+
+    num_tokens = _num_tokens(tokens)
+    x, z, w = _inputs(num_tokens, heads)
+    ref_q, ref_s = _quant(_layer_norm_strided(x, z, w, "silu"))
+    monkeypatch.setattr(G, "NORM_LARGE_M", True)
+    assert G._gdn_norm_mxfp8_num_warps(num_tokens, 32, x.device) == 4
+    q, s = _fused(x, z, w, "silu", (0, num_tokens), num_tokens)
+    assert torch.equal(q, ref_q)
+    assert torch.equal(s, ref_s)

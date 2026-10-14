@@ -19,6 +19,8 @@ map) and forms each row with ``vllm::moe_finalize``'s arithmetic, so the routed
 output is never written.
 """
 
+import os
+
 import torch
 
 from vllm.model_executor.layers.fusion.moe_finalize import (
@@ -31,6 +33,14 @@ from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 MXFP8_BLOCK = 32
+# VLLM_MXFP8_NORM_LARGE_M=1: the deferred-MoE form (8 gathered GEMM2 rows per
+# token) takes 4 warps per row from 3072 tokens instead of 2. VR sweep (MixedStep
+# track, mb/norm_mb.py): -6..-17% at 3328-16384 tokens (e.g. 4452: 28.7 -> 23.7
+# us), slower at <= 2048. A different warp count reduces the row's sum of
+# squares in another order: <= 5 of 20-100 MB output bytes differ (bf16/e4m3
+# rounding-boundary flips), not bitwise.
+NORM_LARGE_M = os.environ.get("VLLM_MXFP8_NORM_LARGE_M", "0") == "1"
+NORM_LARGE_M_TOKENS = 3072
 
 
 @triton.jit
@@ -299,6 +309,8 @@ def add_rms_norm_mxfp8_quant(
     linear_scales = torch.empty(linear_shape, dtype=torch.uint8, device=x.device)
     if tokens:
         default_warps, default_pdl = _launch_config(tokens)
+        if NORM_LARGE_M and top_k > 0 and tokens >= NORM_LARGE_M_TOKENS:
+            default_warps = 4
         num_warps = default_warps if num_warps is None else num_warps
         launch_pdl = default_pdl if launch_pdl is None else launch_pdl
         _add_rms_norm_mxfp8_kernel[(triton.cdiv(tokens, 128) * 128,)](

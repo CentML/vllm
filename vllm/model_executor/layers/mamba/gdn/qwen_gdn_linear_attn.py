@@ -247,6 +247,26 @@ def _gdn_mixed_fork_streams() -> tuple:
     return _gdn_mixed_fork_state[0]
 
 
+# Prefill checkpoint (VLLM_GDN_PREFILL_CHECKPOINT): with VLLM_GDN_CKPT_SIDE=1 the
+# two copies that do not feed the head chunk call, the checkpoint's conv window
+# (pre-conv inputs -> checkpoint conv slots) and the gather of the tail tokens'
+# q/k/v/g/beta, run on a side stream next to the conv and the head chunk call;
+# the prefill stream waits for them only before the tail call (and before the
+# layer ends). Same kernels and inputs: bitwise. Eager launches only.
+GDN_CKPT_SIDE = os.environ.get("VLLM_GDN_CKPT_SIDE", "0") == "1"
+_gdn_ckpt_side_state: list = []  # [(stream, fork, done)]
+
+
+def _gdn_ckpt_side_streams() -> tuple:
+    """Per-process side stream and events of the checkpoint copies."""
+    if not _gdn_ckpt_side_state:
+        _, high = torch.cuda.Stream.priority_range()
+        _gdn_ckpt_side_state.append(
+            (torch.cuda.Stream(priority=high), torch.cuda.Event(), torch.cuda.Event())
+        )
+    return _gdn_ckpt_side_state[0]
+
+
 def _gdn_fi_non_cp_max_tokens() -> int:
     """Longest single sequence that runs FlashInfer's non-CP prefill."""
     if _gdn_vsplit_ready:
@@ -2255,6 +2275,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpoint: GDNPrefillCheckpointMetadata,
         out: torch.Tensor | None,
         zeroed: bool = False,
+        side: bool = False,
     ) -> torch.Tensor:
         """Prefill chunk whose checkpointed sequences also leave their state at
         the checkpoint in the checkpoint slots (see
@@ -2262,7 +2283,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpointed sequence as two consecutive chunks split there.
         ``zeroed``: the fresh rows of the head chunk were zeroed already
         (VLLM_GDN_HOST_TRIM3 group launch).
+        ``side`` (VLLM_GDN_CKPT_SIDE): the conv window store is already queued on
+        the checkpoint side stream; the tail gather goes there too, and the
+        current stream waits for both before the tail call.
         """
+        idx = checkpoint.tail_token_indices
+        gathered = None
+        if side:
+            cur = torch.cuda.current_stream()
+            side_stream, fork, done = _gdn_ckpt_side_streams()
+            if checkpoint.tail_token_range is None:
+                # q/k/v/g/beta are ready here (conv prep above, current stream).
+                assert idx is not None
+                fork.record(cur)
+                with torch.cuda.stream(side_stream):
+                    fork.wait(side_stream)
+                    gathered = gather_prefill_rows(idx, q, k, v, g, beta)
+                for t in gathered:
+                    t.record_stream(cur)
+            done.record(side_stream)
         # 1. Heads (and unsplit sequences) from their initial state; the tails
         # here are throwaway sequences on the checkpoint slots.
         o = self._run_prefill_chunk(
@@ -2288,16 +2327,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             checkpoint.checkpoint_state_indices,
             checkpoint.tail_state_indices,
         )
+        if side:
+            done.wait(torch.cuda.current_stream())
         # 3. Rerun the tails from the checkpoint states. One tail is a token
         # range: run it on slices and write its outputs in place.
-        idx = checkpoint.tail_token_indices
         if checkpoint.tail_token_range is not None:
             start, end = checkpoint.tail_token_range
             q_t, k_t, v_t, g_t, beta_t = (t[:, start:end] for t in (q, k, v, g, beta))
             out_t: torch.Tensor | None = o[0, start:end]
         else:
             assert idx is not None
-            q_t, k_t, v_t, g_t, beta_t = gather_prefill_rows(idx, q, k, v, g, beta)
+            q_t, k_t, v_t, g_t, beta_t = (
+                gathered
+                if gathered is not None
+                else gather_prefill_rows(idx, q, k, v, g, beta)
+            )
             out_t = None
         o_tail = self._run_prefill_chunk(
             q_t,
@@ -2477,6 +2521,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.conv1d.bias is None
             and non_spec_query_start_loc is not None
         )
+        ckpt_side = False
         if (
             attn_metadata.num_prefills > 0
             and attn_metadata.prefill_checkpoint is not None
@@ -2484,12 +2529,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Both prefill conv paths read the pre-conv inputs; the checkpoint's
             # conv window is taken from them before either conv runs.
             assert mixed_qkv_non_spec is not None
-            self._store_conv_checkpoint(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights.size(-1),
-                attn_metadata.prefill_checkpoint,
-            )
+            # VLLM_GDN_CKPT_SIDE: the tail gather (in the chunk call below) moves
+            # to the side stream; the window store too when the fused conv prep
+            # runs (it only reads its input and writes new buffers, while the
+            # plain conv path may update the input in place).
+            ckpt_side = GDN_CKPT_SIDE and not torch.cuda.is_current_stream_capturing()
+            if ckpt_side and fused_conv_prep:
+                side, fork, _ = _gdn_ckpt_side_streams()
+                fork.record(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    fork.wait(side)
+                    self._store_conv_checkpoint(
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        conv_weights.size(-1),
+                        attn_metadata.prefill_checkpoint,
+                    )
+            else:
+                self._store_conv_checkpoint(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights.size(-1),
+                    attn_metadata.prefill_checkpoint,
+                )
         if fused_conv_prep:
             pass  # mixed_qkv_non_spec stays pre-conv for gdn_fused_conv_prep
         elif attn_metadata.num_prefills > 0:
@@ -2707,6 +2769,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     attn_metadata.prefill_checkpoint,
                     non_spec_out,
                     zeroed=GDN_HOST_TRIM3 and _htrim3_group_zero(self, attn_metadata),
+                    side=ckpt_side,
                 )
             elif self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
                 # FlashInfer reads and updates the pool rows in place through

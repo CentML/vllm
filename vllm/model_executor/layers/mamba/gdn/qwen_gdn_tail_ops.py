@@ -24,6 +24,8 @@ import torch
 from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     MXFP8_BLOCK,
+    NORM_LARGE_M,
+    NORM_LARGE_M_TOKENS,
     mxfp8_quantize_row,
     mxfp8_store_swizzled_scales,
 )
@@ -145,10 +147,14 @@ def _gdn_norm_mxfp8_num_warps(
     replaces: when that launch uses 1-row tiles (T <= 2 * SMs), its warp holds
     one row with lanes replicated, which only one head per warp reproduces;
     with >= 2-row tiles any >= 2 heads per warp matches. 8 warps: fastest on
-    VR at T = 2144..8192 (sweep 2/4/8/16).
+    VR at T = 2144..8192 (sweep 2/4/8/16). VLLM_MXFP8_NORM_LARGE_M=1: 4 warps
+    from 3072 normalized rows (VR, MixedStep mb/norm_mb.py: -1.5..-7% at
+    3328-16384 rows; >= 2 heads per warp, so bitwise to 8 warps).
     """
     if num_norm_rows > 0 and calc_rows_per_block(num_norm_rows, device) == 1:
         return min(block_h, 32)
+    if NORM_LARGE_M and num_norm_rows >= NORM_LARGE_M_TOKENS and block_h >= 8:
+        return 4
     return min(8, max(block_h // 2, 1))
 
 

@@ -177,3 +177,44 @@ def test_moe_finalize_matches_trtllm(tokens: int) -> None:
     idx = idx.view(tokens, TOP_K)
     out = moe_finalize(permuted[: tokens * TOP_K], weights.view(tokens, TOP_K), idx)
     assert _bitwise(out, finalized)
+
+
+@requires_mxfp8_quantize
+@pytest.mark.parametrize("tokens", [3072, 4452])
+@torch.inference_mode()
+def test_moe_finalize_norm_large_m_warps(monkeypatch, tokens: int) -> None:
+    """VLLM_MXFP8_NORM_LARGE_M: 4 warps per row from 3072 tokens. The residual
+    output does not depend on the row reduction: bitwise. The norm reduces its
+    sum of squares in another order: an e4m3 value may move to the adjacent
+    code, on a tiny fraction of elements, and a scale only with it.
+    """
+    from vllm.model_executor.layers.fusion import rms_norm_mxfp8_quant as R
+
+    torch.manual_seed(0)
+    permuted, weights, idx = _deferred(tokens, pad_rows=500, drop=False)
+    shared = torch.randn(tokens, HIDDEN, device="cuda").bfloat16()
+    gate = (torch.randn(tokens, 1, device="cuda") * 3).bfloat16()
+    residual = (torch.randn(tokens, HIDDEN, device="cuda") * 4).bfloat16()
+    w = torch.randn(HIDDEN, device="cuda").bfloat16()
+    args = (shared, residual, w, EPS, 1.0, True, gate, True)
+
+    def run():
+        return R.add_rms_norm_mxfp8_quant(permuted, *args, moe_route=(weights, idx))
+
+    ref = run()
+    monkeypatch.setattr(R, "NORM_LARGE_M", True)
+    out = run()
+    assert _bitwise(out[1], ref[1])  # residual_out
+    q, q_ref = out[2].view(torch.uint8), ref[2].view(torch.uint8)
+    differ = q != q_ref
+    assert differ.float().mean().item() < 1e-5
+    # Linear scales (one per 32 columns): a group's scale flips rarely, and
+    # where it holds, an e4m3 value moves at most to the adjacent code.
+    same_scale = (out[4] == ref[4]).repeat_interleave(32, dim=1)
+    assert (~same_scale).float().mean().item() < 1e-4
+    assert ((q.int() - q_ref.int()).abs()[differ & same_scale] <= 1).all()
+    assert (out[3] != ref[3]).float().mean().item() < 1e-4
+    # The normed bf16 output moves by at most one bf16 ulp.
+    n, n_ref = out[0].float(), ref[0].float()
+    ulp = n_ref.abs().clamp(min=1e-30) * 2.0**-7
+    assert ((n - n_ref).abs() <= ulp).all()
