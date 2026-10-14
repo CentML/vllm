@@ -25,7 +25,9 @@ from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
     FlashInferMoeEpWeights,
     apply_topk_in_fc1,
     flashinfer_moe_ep_unsupported_reasons,
+    sm107_nvfp4_epilogue,
     supports_current_device,
+    uses_sm107_megakernel,
     validate_flashinfer_moe_ep_layer,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -138,9 +140,19 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
 
         The oracle has already put the weights in kernel format; the per-expert
         weight global scales arrive through the quant config and become the
-        epilogue alphas.
+        epilogue alphas. On SM107 the NVFP4 checkpoint's input scales also set
+        the activation and FC1-output quantization grids (sm107_nvfp4_epilogue).
         """
         validate_flashinfer_moe_ep_layer(layer)  # type: ignore[arg-type]
+        epilogue = epilogue_from_quant_config(self.quant_config)
+        if epilogue.fc1_alpha is not None and uses_sm107_megakernel(
+            self.moe_config.moe_backend
+        ):
+            epilogue = sm107_nvfp4_epilogue(
+                epilogue,
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+            )
         adapter = FlashInferMoeEp(
             self.moe_config,
             FlashInferMoeEpWeights(
@@ -149,7 +161,7 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
                 w13_scale=getattr(layer, "w13_weight_scale", None),
                 w2_scale=getattr(layer, "w2_weight_scale", None),
             ),
-            epilogue_from_quant_config(self.quant_config),
+            epilogue,
             apply_topk_in_fc1=apply_topk_in_fc1(
                 self.moe_config,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
