@@ -8,11 +8,15 @@ combines in one launch, so it is paired with a pass-through prepare/finalize.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -25,6 +29,8 @@ from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
     FlashInferMoeEpWeights,
     apply_topk_in_fc1,
     flashinfer_moe_ep_unsupported_reasons,
+    resolve_sm107_shared_mode,
+    sm107_max_sm_count,
     sm107_nvfp4_epilogue,
     supports_current_device,
     uses_sm107_megakernel,
@@ -43,6 +49,8 @@ from vllm.model_executor.utils import replace_parameter
 
 if TYPE_CHECKING:
     pass
+
+logger = init_logger(__name__)
 
 # Layer parameters the megakernel reads. After ``process_weights_after_loading``
 # they alias the megakernel's own tensors, so EPLB permutes exactly what it uses.
@@ -64,6 +72,36 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         super().__init__(moe_config, quant_config)
         self._adapter: FlashInferMoeEp | None = None
+        # Shared experts next to the SM107 megakernel (VLLM_FI_MEGA_MOE_SHARED):
+        # "separate" runs them serially before the routed experts (the runner),
+        # "overlap" on a side stream inside apply_overlapping_shared_experts,
+        # with the megakernel capped at max_sm_count SMs.
+        self._shared_mode = "separate"
+        self._max_sm_count: int | None = None
+        if uses_sm107_megakernel(moe_config.moe_backend):
+            replicated_shared = (
+                moe_config.is_sequence_parallel
+                or get_tensor_model_parallel_world_size() == 1
+            )
+            self._shared_mode, fallback = resolve_sm107_shared_mode(
+                envs.VLLM_FI_MEGA_MOE_SHARED,
+                replicated_shared=replicated_shared,
+                has_side_stream=torch.cuda.is_available(),
+            )
+            if fallback is not None:
+                logger.warning_once(
+                    "VLLM_FI_MEGA_MOE_SHARED=overlap runs as separate, with no "
+                    "megakernel SM budget unless VLLM_FI_MEGA_MOE_MAX_SM_COUNT is "
+                    "an explicit count. Reason: %s.",
+                    fallback,
+                )
+            self._max_sm_count = sm107_max_sm_count(
+                envs.VLLM_FI_MEGA_MOE_MAX_SM_COUNT, self._shared_mode
+            )
+
+    @property
+    def overlaps_shared_experts(self) -> bool:
+        return self._shared_mode == "overlap"
 
     @staticmethod
     def is_supported_config(
@@ -166,6 +204,8 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
                 self.moe_config,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
             ),
+            shared_mode=self._shared_mode,
+            max_sm_count=self._max_sm_count,
         )
         adapter.warmup()
         for name, tensor in zip(KERNEL_WEIGHT_NAMES, adapter.kernel_weights()):
@@ -194,6 +234,35 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
         output.copy_(
             self._adapter(hidden_states, topk_ids.to(torch.int32), topk_weights)
+        )
+
+    def apply_overlapping_shared_experts(
+        self,
+        run_shared_experts: Callable[[], None],
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        if self._adapter is None:
+            raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
+        self._adapter.forward_overlapping_shared_experts(
+            hidden_states,
+            topk_ids.to(torch.int32),
+            topk_weights,
+            run_shared_experts,
+            output=output,
         )
 
 

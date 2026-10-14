@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -775,6 +776,19 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     def is_monolithic() -> bool:
         return False
 
+    @property
+    def overlaps_shared_experts(self) -> bool:
+        """Whether these experts run the shared experts themselves, concurrently
+        with the routed experts (``apply_overlapping_shared_experts``).
+
+        Experts with their own place for the shared experts in the routed
+        computation (e.g. a megakernel launched with an SM budget, next to which
+        the shared MLP runs on a side stream) return True; the modular kernel
+        then hands them the shared-experts call instead of running it in its
+        finalize stage or leaving it to the runner.
+        """
+        return False
+
     def moe_problem_size(
         self,
         a1: torch.Tensor,
@@ -966,6 +980,52 @@ class FusedMoEExpertsModular(FusedMoEExperts):
 
         """
         raise NotImplementedError
+
+    def apply_overlapping_shared_experts(
+        self,
+        run_shared_experts: Callable[[], None],
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> UnfinalizedMoEOutput | None:
+        """``apply`` plus ``run_shared_experts()``, which must have completed
+        (stream-ordered w.r.t. the current stream) when this returns.
+
+        Called instead of ``apply`` only when ``overlaps_shared_experts``.
+        ``run_shared_experts`` computes the shared experts and stores their
+        output for the runner, which adds it to the routed output. This default
+        runs it serially before the routed experts.
+        """
+        run_shared_experts()
+        return self.apply(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            a1q_scale=a1q_scale,
+            a2_scale=a2_scale,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_tokens_meta=expert_tokens_meta,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        )
 
 
 class FusedMoEExpertsMonolithic(FusedMoEExperts):
@@ -1287,6 +1347,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
         output_alias: torch.Tensor | None = None,
+        run_shared_experts: Callable[[], None] | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1299,6 +1360,8 @@ class FusedMoEKernelModularImpl:
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
         if M_full == 0:
+            if run_shared_experts is not None:
+                run_shared_experts()
             return torch.empty_like(a1q, dtype=in_dtype)
 
         workspace13, workspace2, fused_out, fused_out_is_specialized = (
@@ -1338,23 +1401,43 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
-        unfinalized = self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        if run_shared_experts is not None:
+            unfinalized = self.fused_experts.apply_overlapping_shared_experts(
+                run_shared_experts,
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
+        else:
+            unfinalized = self.fused_experts.apply(
+                output=fused_out,
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=a1q_scale,
+                a2_scale=self.fused_experts.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         # Experts that stopped after GEMM2 wrote nothing into `fused_out`; the
         # top-k reduction they left open belongs to whoever takes this.
@@ -1489,6 +1572,20 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
+        # Experts that overlap the shared experts themselves get the call;
+        # finalize then has none to run.
+        run_shared_experts: Callable[[], None] | None = None
+        if shared_experts is not None and self.fused_experts.overlaps_shared_experts:
+            assert shared_experts_input is not None
+            # The bound module call (hooks included); mypy cannot type a
+            # functools.partial over an nn.Module instance itself.
+            run_shared_experts = functools.partial(
+                shared_experts.__call__,
+                shared_experts_input,
+                SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
+            )
+            shared_experts = None
+
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
@@ -1520,6 +1617,7 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
             output_alias=output,
+            run_shared_experts=run_shared_experts,
         )
 
         if lora_ctx is not None:
@@ -1665,7 +1763,10 @@ class FusedMoEKernel:
     @property
     def can_overlap_shared_experts(self) -> bool:
         if isinstance(self.impl, FusedMoEKernelModularImpl):
-            return self.impl.prepare_finalize.supports_async()
+            return (
+                self.impl.prepare_finalize.supports_async()
+                or self.impl.fused_experts.overlaps_shared_experts
+            )
         else:
             return False
 

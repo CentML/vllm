@@ -7,6 +7,7 @@ import contextlib
 import functools
 import math
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -83,6 +84,71 @@ def supports_current_device() -> bool:
     if capability in _SM100_FAMILY_CAPABILITIES:
         return True
     return capability == SM107_CAPABILITY and flashinfer_has_sm107_nvfp4_megakernel()
+
+
+# SM budget of the SM107 megakernel when the shared MLP overlaps it: the
+# persistent kernel is enqueued first and the shared MLP runs on the remaining
+# SMs. 196 of VR200's SMs was the best single budget for DSv4.1 at 1260-2520
+# tokens/rank (true EP4), measured on the DSv4.1 branch.
+SM107_OVERLAP_SM_BUDGET = 196
+
+
+def sm107_max_sm_count(spec: str | None, shared_mode: str) -> int | None:
+    """``VLLM_FI_MEGA_MOE_MAX_SM_COUNT`` -> FlashInfer ``max_sm_count``.
+
+    ``auto`` (also an empty value): ``SM107_OVERLAP_SM_BUDGET`` in overlap
+    mode, else all SMs (None). ``0`` / ``none``: all SMs. ``<n>``: n SMs.
+    """
+    spec = (spec or "").strip().lower() or "auto"
+    if spec == "auto":
+        return SM107_OVERLAP_SM_BUDGET if shared_mode == "overlap" else None
+    if spec in ("0", "none"):
+        return None
+    try:
+        value = int(spec)
+    except ValueError:
+        raise ValueError(
+            "VLLM_FI_MEGA_MOE_MAX_SM_COUNT must be 'auto', 'none' or an SM "
+            f"count, got {spec!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(f"max SM count must be >= 0, got {value}")
+    return value or None
+
+
+def resolve_sm107_shared_mode(
+    requested: str, *, replicated_shared: bool, has_side_stream: bool
+) -> tuple[str, str | None]:
+    """Effective ``VLLM_FI_MEGA_MOE_SHARED`` mode and the reason for a fallback.
+
+    ``overlap`` needs a replicated shared MLP (sequence parallel or TP 1): a
+    tensor-parallel one would be reduced across ranks while the NVSHMEM
+    megakernel runs. A fallback runs ``separate``, with no megakernel SM budget
+    unless ``VLLM_FI_MEGA_MOE_MAX_SM_COUNT`` is an explicit count.
+    """
+    if requested != "overlap":
+        return requested, None
+    if not replicated_shared:
+        return "separate", "the shared MLP is tensor-parallel (no SP, TP > 1)"
+    if not has_side_stream:
+        return "separate", "no CUDA side stream"
+    return "overlap", None
+
+
+# Side stream of VLLM_FI_MEGA_MOE_SHARED=overlap, private to it (not the global
+# aux_stream()). The shared MLP's output is allocated on it and read on the main
+# stream after the join without record_stream (which would hold the block until
+# the end of each CUDA-graph capture). Reusing that block is safe because every
+# later use of this stream first waits on a fork event recorded on the main
+# stream after the consumer (the runner's add).
+_SHARED_EXPERTS_STREAM: torch.cuda.Stream | None = None
+
+
+def _shared_experts_stream() -> torch.cuda.Stream:
+    global _SHARED_EXPERTS_STREAM
+    if _SHARED_EXPERTS_STREAM is None:
+        _SHARED_EXPERTS_STREAM = torch.cuda.Stream()
+    return _SHARED_EXPERTS_STREAM
 
 
 def sm107_capacity_profiles(max_num_tokens: int, sp_size: int = 1) -> list[int]:
@@ -504,6 +570,8 @@ class FlashInferMoeEp:
         epilogue: FlashInferMoeEpEpilogue | None = None,
         *,
         apply_topk_in_fc1: bool,
+        shared_mode: str = "separate",
+        max_sm_count: int | None = None,
     ) -> None:
         spec = flashinfer_moe_ep_backend_spec(moe.moe_backend)
         if spec.kernel == "deep_gemm":
@@ -562,7 +630,7 @@ class FlashInferMoeEp:
                 combine_dtype="bf16",
                 input_norm_const=float(epilogue.input_norm_const),
                 knobs="cache",
-                max_sm_count=None,
+                max_sm_count=max_sm_count,
             )
         elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
@@ -619,17 +687,27 @@ class FlashInferMoeEp:
         self._sp_size = sp_size
         for capacity in self._capacities:
             self._workspaces[capacity] = self._mega_layer.create_workspace(capacity)
+        # VLLM_FI_MEGA_MOE_SHARED=overlap: forward_overlapping_shared_experts
+        # forks the shared MLP onto a private side stream (created here, not
+        # inside a CUDA-graph capture).
+        self._shared_stream: torch.cuda.Stream | None = None
+        self._shared_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        if self._sm107 and shared_mode == "overlap":
+            self._shared_stream = _shared_experts_stream()
+            self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
         if self._sm107:
             _log_sm107_megakernel(
                 moe,
                 self._capacities,
                 epilogue.input_norm_const,
-                shared_expert="separate",
-                max_sm_count=None,
+                shared_expert=shared_mode,
+                max_sm_count=max_sm_count,
             )
 
     @property
     def can_overlap_shared_experts(self) -> bool:
+        # The experts own the overlap (FlashInferMoeEpExperts.
+        # overlaps_shared_experts); prepare/finalize has nothing to overlap.
         return False
 
     @property
@@ -733,6 +811,57 @@ class FlashInferMoeEp:
         if return_view:
             return self._mega_layer.forward(tensors, return_workspace_view=True)
         return self._mega_layer(tensors)
+
+    def forward_overlapping_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        run_shared_experts: Callable[[], None],
+        *,
+        output: torch.Tensor,
+    ) -> None:
+        """Megakernel on the current stream, shared experts on a side stream.
+
+        The fork is recorded after the input staging and the persistent
+        megakernel is enqueued before the shared MLP, so the megakernel takes
+        its SMs (``max_sm_count``) first and the shared MLP runs on the rest;
+        forking before the gate, TensorRT-LLM's order, lost the SM-budget gain
+        at true EP4 on the DSv4.1 branch. The routed output is copied into
+        ``output`` on the current stream, then the side stream is joined, so
+        the shared experts' output is ready for the caller. The fork and the
+        join complete inside this call, so eager mode and CUDA-graph capture
+        (FULL or piecewise) behave alike.
+        """
+        if self._mega_layer is None:
+            raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
+        if hidden_states.shape[0] > self._max_num_tokens:
+            raise ValueError(
+                f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
+                f"the workspace supports at most {self._max_num_tokens}"
+            )
+        if self._shared_stream is None or self._shared_events is None:
+            raise RuntimeError(
+                "FlashInfer MoE-EP was not built to overlap the shared experts "
+                "(VLLM_FI_MEGA_MOE_SHARED=overlap on SM107)"
+            )
+        logger.info_once(
+            "FlashInfer SM107 MegaMoE: shared expert MLP overlapped on a side stream."
+        )
+        workspace = self._select_workspace(hidden_states.shape[0])
+        self._mega_layer.stage_inputs(
+            self._tensors(hidden_states, topk_ids, topk_weights), workspace=workspace
+        )
+        fork, join = self._shared_events
+        fork.record()
+        # SM107 megakernels return a workspace view (supports_output_view).
+        routed = self._mega_layer.compute_staged(output=None)
+        with torch.cuda.stream(self._shared_stream):
+            fork.wait()
+            run_shared_experts()
+            join.record()
+        output.copy_(routed)
+        join.wait()
 
     @torch.inference_mode()
     def warmup(self) -> None:
