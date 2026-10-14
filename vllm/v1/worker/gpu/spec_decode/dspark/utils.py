@@ -4,6 +4,10 @@
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
+from vllm.config.kernel import (
+    FLASHINFER_MOE_EP_BACKENDS,
+    PASSTHROUGH_ALL2ALL_BACKEND,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.models.deepseek_v4.common.eplb_util import dspark_draft_supports_eplb
@@ -37,6 +41,7 @@ def _get_dspark_parallel_config(
     parallel_config: ParallelConfig,
     tensor_parallel_size: int,
     draft_model_config: ModelConfig,
+    draft_moe_backend: str | None = None,
 ) -> ParallelConfig:
     enable_draft_eplb = parallel_config.enable_eplb and dspark_draft_supports_eplb(
         draft_model_config
@@ -48,12 +53,25 @@ def _get_dspark_parallel_config(
             draft_model_config.hf_config.model_type,
         )
 
+    overrides: dict = {}
+    if (
+        draft_moe_backend is not None
+        and draft_moe_backend not in FLASHINFER_MOE_EP_BACKENDS
+        and parallel_config.all2all_backend == PASSTHROUGH_ALL2ALL_BACKEND
+    ):
+        # The target's FlashInfer MoE-EP backend bound "passthrough"; a draft
+        # MoE backend that relies on the framework's dispatch/combine rejects
+        # it (bind_passthrough_all2all_backend), so the draft gets the
+        # ParallelConfig default back.
+        overrides["all2all_backend"] = "allgather_reducescatter"
+
     if enable_draft_eplb:
         return replace(
             parallel_config,
             pipeline_parallel_size=1,
             tensor_parallel_size=tensor_parallel_size,
             enable_elastic_ep=False,
+            **overrides,
         )
 
     return replace(
@@ -66,6 +84,7 @@ def _get_dspark_parallel_config(
             num_redundant_experts=0,
         ),
         enable_elastic_ep=False,
+        **overrides,
     )
 
 
@@ -90,13 +109,34 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         vllm_config.attention_config.backend,
     )
 
+    # Honor speculative_config.moe_backend for the draft: the target's MoE
+    # backend may not support the draft's expert quantization (e.g. an NVFP4
+    # target on flashinfer_moe_ep_cutedsl with the MXFP4 DSpark draft). The
+    # kernel and parallel configs change in this single replace() so that
+    # VllmConfig.__post_init__ binds the all2all backend once, for the draft's
+    # own MoE backend.
+    draft_moe_backend = speculative_config.moe_backend
+    draft_kernel_config = vllm_config.kernel_config
+    if draft_moe_backend is not None:
+        draft_kernel_config = replace(
+            vllm_config.kernel_config, moe_backend=draft_moe_backend
+        )
+        logger.info_once(
+            "DSpark draft uses moe_backend=%r (speculative_config.moe_backend); "
+            "the target uses %r.",
+            draft_moe_backend,
+            vllm_config.kernel_config.moe_backend,
+        )
+
     draft_vllm_config = replace(
         vllm_config,
         parallel_config=_get_dspark_parallel_config(
             vllm_config.parallel_config,
             speculative_config.draft_parallel_config.tensor_parallel_size,
             draft_model_config,
+            draft_moe_backend=draft_moe_backend,
         ),
+        kernel_config=draft_kernel_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
