@@ -1041,6 +1041,24 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             layer.w2_input_scale.data.fill_(1.0)
 
         # Use a single gscale for w13.
+        if (
+            self.moe.is_act_and_mul
+            and self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL
+        ):
+            # The megakernel takes one fc1 alpha per expert: fold the up/gate
+            # ratio into the up block scales where that is exact. The SM107
+            # megakernel requires it (raises otherwise); elsewhere a lossy fold
+            # is skipped and the gate value is kept with the warning below.
+            from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
+                fold_nvfp4_gate_up_weight_scale_2,
+                uses_sm107_megakernel,
+            )
+
+            fold_nvfp4_gate_up_weight_scale_2(
+                layer.w13_weight_scale,
+                layer.w13_weight_scale_2,
+                strict=uses_sm107_megakernel(self.moe.moe_backend),
+            )
         if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
         ):

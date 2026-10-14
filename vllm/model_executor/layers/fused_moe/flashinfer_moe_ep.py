@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import contextlib
+import functools
+import math
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -17,11 +19,13 @@ from vllm.config.kernel import (
     FLASHINFER_MOE_EP_DEEP_GEMM,
 )
 from vllm.distributed import get_ep_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
     kNvfp4Static,
+    require_finite_positive_scales,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import _import_deep_gemm
@@ -30,6 +34,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
+logger = init_logger(__name__)
+
 FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4"]
 _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
@@ -37,14 +43,65 @@ _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
     kMxfp4Static: "mxfp4",
 }
 
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SM100_FAMILY_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+# Rubin (SM107) runs only the CuTeDSL backend: FlashInfer's
+# sm107_nvfp4_nvfp4_bf16_cutedsl megakernel on the NVFP4 expert checkpoint
+# (MXFP4 experts run on SM107 with moe_backend=deep_gemm_mega_moe).
+SM107_CAPABILITY = (10, 7)
+SM107_NVFP4_MEGAKERNEL = "sm107_nvfp4_nvfp4_bf16_cutedsl"
+_SM107_NVFP4_CONFIG = "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig"
+# Smallest workspace capacity profile (tokens per rank) of the SM107 ladder.
+_SM107_MIN_CAPACITY = 128
+
+
+def _device_capability() -> tuple[int, int] | None:
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return None
+    return (capability.major, capability.minor)
+
+
+@functools.cache
+def flashinfer_has_sm107_nvfp4_megakernel() -> bool:
+    """Whether the installed FlashInfer ships the SM107 NVFP4 MegaMoE.
+
+    vLLM pins a FlashInfer release without it, so it is probed, not assumed.
+    """
+    try:
+        import flashinfer.moe_ep as moe_ep
+    except Exception:
+        return False
+    return hasattr(moe_ep, _SM107_NVFP4_CONFIG)
+
+
+def is_sm107_device() -> bool:
+    return _device_capability() == SM107_CAPABILITY
 
 
 def supports_current_device() -> bool:
-    capability = current_platform.get_device_capability()
-    return capability is not None and (
-        (capability.major, capability.minor) in _SUPPORTED_CAPABILITIES
-    )
+    capability = _device_capability()
+    if capability in _SM100_FAMILY_CAPABILITIES:
+        return True
+    return capability == SM107_CAPABILITY and flashinfer_has_sm107_nvfp4_megakernel()
+
+
+def sm107_capacity_profiles(max_num_tokens: int, sp_size: int = 1) -> list[int]:
+    """Workspace capacity ladder (tokens per rank) of the SM107 megakernel.
+
+    Powers of two from 128 below the per-rank cap ``ceil(max_num_tokens /
+    sp_size)``, plus the cap (sequence-parallel shards are equal, so a rank
+    never holds more than the cap). Each profile runs the knobs tuned for its
+    size.
+    """
+    if max_num_tokens <= 0:
+        raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
+    cap = -(-int(max_num_tokens) // max(int(sp_size), 1))
+    caps = {cap}
+    profile = _SM107_MIN_CAPACITY
+    while profile < cap:
+        caps.add(profile)
+        profile *= 2
+    return sorted(caps)
 
 
 _E2M1_LUT = (
@@ -71,6 +128,7 @@ _E2M1_LUT = (
 class FlashInferMoeEpBackendSpec:
     kernel: FlashInferMoeEpKernel
     weight_formats: frozenset[FlashInferMoeEpWeightFormat]
+    capabilities: frozenset[tuple[int, int]] = _SM100_FAMILY_CAPABILITIES
 
 
 @dataclass(frozen=True)
@@ -93,6 +151,7 @@ _BACKEND_SPECS = {
     FLASHINFER_MOE_EP_CUTEDSL: FlashInferMoeEpBackendSpec(
         kernel="cutedsl",
         weight_formats=frozenset({"nvfp4", "mxfp4"}),
+        capabilities=_SM100_FAMILY_CAPABILITIES | {SM107_CAPABILITY},
     ),
     FLASHINFER_MOE_EP_DEEP_GEMM: FlashInferMoeEpBackendSpec(
         kernel="deep_gemm",
@@ -117,6 +176,12 @@ def flashinfer_moe_ep_backend_spec(
             f"{moe_backend!r} is not a FlashInfer MoE-EP backend; expected "
             f"one of {sorted(_BACKEND_SPECS)}"
         ) from None
+
+
+def uses_sm107_megakernel(moe_backend: str) -> bool:
+    """Whether ``moe_backend`` runs FlashInfer's SM107 NVFP4 megakernel here."""
+    spec = _BACKEND_SPECS.get(moe_backend)
+    return spec is not None and spec.kernel == "cutedsl" and is_sm107_device()
 
 
 def flashinfer_moe_ep_unsupported_reasons(
@@ -151,13 +216,27 @@ def flashinfer_moe_ep_unsupported_reasons(
         and moe.routing_method is not RoutingMethodType.DeepseekV4
     ):
         unsupported.append(f"routing method {moe.routing_method.name}")
+    on_sm107 = is_sm107_device()
+    if on_sm107:
+        if SM107_CAPABILITY not in spec.capabilities:
+            unsupported.append(f"compute capability 10.7 ({spec.kernel} kernel)")
+        if weight_format == "mxfp4":
+            unsupported.append(
+                "MXFP4 weights on SM107 (the SM107 megakernel consumes the NVFP4 "
+                "expert checkpoint; run MXFP4 experts with "
+                "moe_backend=deep_gemm_mega_moe)"
+            )
 
     vllm_config = get_current_vllm_config()
     if vllm_config.weight_transfer_config is not None:
         unsupported.append("runtime weight transfer")
     if vllm_config.parallel_config.enable_dbo:
         unsupported.append("dual batch overlap")
-    if spec.kernel == "deep_gemm" and vllm_config.parallel_config.enable_eplb:
+    # SM107: the kernel-resident weight aliases have not been validated
+    # against expert rebalancing, and the epilogue scalars are derived ones.
+    if (spec.kernel == "deep_gemm" or on_sm107) and (
+        vllm_config.parallel_config.enable_eplb
+    ):
         unsupported.append("EPLB")
     return tuple(unsupported)
 
@@ -239,6 +318,138 @@ def mxfp4_moe_ep_weights(
     )
 
 
+def fold_nvfp4_gate_up_weight_scale_2(
+    w13_weight_scale: torch.Tensor,
+    w13_weight_scale_2: torch.Tensor,
+    *,
+    strict: bool,
+) -> bool:
+    """Give gate (w1) and up (w3) one per-expert NVFP4 global scale, in place.
+
+    The megakernel takes one fc1 alpha per expert, but the checkpoint carries a
+    ``weight_scale_2`` for each of gate and up. Where they differ, the up/gate
+    ratio is folded into the up half's E4M3 block scales and the up global
+    scale is set to the gate's. The fold is applied only when it round-trips
+    exactly for every such expert; otherwise nothing changes. Then ``strict``
+    (the SM107 megakernel, which has no other way to honour both scales)
+    raises, since a lossy rescale would silently change the model; without it
+    the caller keeps the gate value, as vLLM's other NVFP4 MoE backends do.
+
+    ``w13_weight_scale``: ``[E, 2 * I, K / 16]`` E4M3 (gate rows first);
+    ``w13_weight_scale_2``: ``[E, 2]`` fp32 (gate, up). Returns whether any
+    expert was folded.
+    """
+    scale = w13_weight_scale.data
+    scale_2 = w13_weight_scale_2.data
+    if scale_2.dim() != 2 or scale_2.shape[1] != 2:
+        raise ValueError(
+            f"expected [E, 2] gate/up weight_scale_2, got {tuple(scale_2.shape)}"
+        )
+    gate_s2 = scale_2[:, 0].float()
+    up_s2 = scale_2[:, 1].float()
+    if strict:
+        require_finite_positive_scales("w1 weight_scale_2", gate_s2)
+        require_finite_positive_scales("w3 weight_scale_2", up_s2)
+    differ = (gate_s2 != up_s2).nonzero().flatten().tolist()
+    if not differ:
+        return False
+    inter = scale.shape[1] // 2
+    folded: dict[int, torch.Tensor] = {}
+    for expert in differ:
+        gate, up = float(gate_s2[expert]), float(up_s2[expert])
+        if math.isfinite(gate) and math.isfinite(up) and gate > 0 and up > 0:
+            block = scale[expert, inter:].float() * (up_s2[expert] / gate_s2[expert])
+            block_e4m3 = block.to(torch.float8_e4m3fn)
+            if torch.equal(block_e4m3.float(), block):
+                folded[expert] = block_e4m3
+                continue
+        if strict:
+            raise ValueError(
+                "NVFP4 MoE cannot merge the gate and up weight_scale_2 values "
+                f"of expert {expert}: their ratio is not exactly representable "
+                "in the float8_e4m3fn block scales. Use a checkpoint quantized "
+                "with a shared gate/up weight_scale_2."
+            )
+        return False
+    for expert, block_e4m3 in folded.items():
+        scale[expert, inter:] = block_e4m3.to(scale.dtype)
+        scale_2[expert, 1] = scale_2[expert, 0]
+    logger.info_once(
+        "FlashInfer MoE-EP: folded the up/gate NVFP4 weight_scale_2 ratio into "
+        "the up block scales (exact)."
+    )
+    return True
+
+
+def _ep_global_max(local: torch.Tensor) -> torch.Tensor:
+    """``max(local)`` MAX-reduced over the EP group, as an fp32 ``[1]`` tensor.
+
+    A non-finite local entry makes it +inf on every rank, so callers validate
+    the reduced value and all ranks agree.
+    """
+    local = local.float()
+    amax = local.amax().reshape(1).clone()
+    if not torch.isfinite(local).all():
+        amax.fill_(math.inf)
+    ep_group = get_ep_group()
+    if ep_group.world_size > 1:
+        import torch.distributed as dist
+
+        dist.all_reduce(amax, op=dist.ReduceOp.MAX, group=ep_group.device_group)
+    return amax
+
+
+def sm107_nvfp4_epilogue(
+    epilogue: FlashInferMoeEpEpilogue,
+    *,
+    w13_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+) -> FlashInferMoeEpEpilogue:
+    """SM107 NVFP4 epilogue scalars (TensorRT-LLM convention).
+
+    The SM107 megakernel quantizes the bf16 tokens with one global scale and
+    requantizes the FC1 output with a per-expert norm constant. With the unit
+    constants of the SM100 path, the FC1-output block scales of DSv4.1's
+    small-activation layers underflow E4M3 (``w2.input_scale`` is about 1e-4
+    in some layers), so the checkpoint's calibrated input scales are used:
+
+    - ``input_norm_const = 1 / max(w13.input_scale)``;
+    - ``fc1_norm_const = 1 / max(w2.input_scale)``;
+    - ``fc2_alpha = w2.weight_scale_2 * max(w2.input_scale)``;
+    - ``fc1_alpha = gate weight_scale_2 / input_norm_const``.
+
+    Both maxima run over every expert of the layer (EP MAX all-reduce of the
+    local maxima): tokens are quantized on their source rank and consumed on
+    the expert's rank, and one grid per layer keeps the numerics independent
+    of the EP size. Only those maxima enter the numerics: every input-scale
+    entry must be finite and each maximum positive, checked on the reduced
+    values so every rank agrees. Collective: call on every EP rank in the same
+    layer order.
+    """
+    if epilogue.fc1_alpha is None or epilogue.fc2_alpha is None:
+        raise ValueError("the SM107 megakernel needs the NVFP4 weight global scales")
+    gate_s2 = epilogue.fc1_alpha.float().reshape(-1)
+    w2_s2 = epilogue.fc2_alpha.float().reshape(-1)
+    if gate_s2.shape != w2_s2.shape:
+        raise ValueError(
+            "per-expert NVFP4 scalars must all have shape [E_local]: got "
+            f"{tuple(gate_s2.shape)} and {tuple(w2_s2.shape)}"
+        )
+    w13_in = _ep_global_max(w13_input_scale)
+    w2_in = _ep_global_max(w2_input_scale)
+    require_finite_positive_scales("w13_input_scale (layer max)", w13_in)
+    require_finite_positive_scales("w2_input_scale (layer max)", w2_in)
+    # fp32 reciprocal, as the FusedMoE NVFP4 backends form a1_gscale.
+    input_norm_const = float((1.0 / w13_in).item())
+    w2_in = w2_in.to(w2_s2.device)
+    return FlashInferMoeEpEpilogue(
+        input_norm_const=input_norm_const,
+        fc1_alpha=(gate_s2 / input_norm_const).contiguous(),
+        fc2_alpha=(w2_s2 * w2_in).contiguous(),
+        fc1_norm_const=(1.0 / w2_in).expand_as(w2_s2).contiguous(),
+    )
+
+
 class _FlashInferMoeEpApi:
     def __init__(self) -> None:
         try:
@@ -266,6 +477,10 @@ class _FlashInferMoeEpApi:
         self.MoEEpTensors = MoEEpTensors
         self.MoEWeightPack = MoEWeightPack
         self.Nvfp4CutedslMegaMoeConfig = Nvfp4CutedslMegaMoeConfig
+        # Not in every FlashInfer release (see flashinfer_has_sm107_...).
+        import flashinfer.moe_ep as moe_ep
+
+        self.Sm107Nvfp4MegaMoeConfig: Any = getattr(moe_ep, _SM107_NVFP4_CONFIG, None)
 
 
 def _load_flashinfer_moe_ep_api() -> _FlashInferMoeEpApi:
@@ -296,6 +511,21 @@ class FlashInferMoeEp:
         api = _load_flashinfer_moe_ep_api()
         if epilogue is None:
             epilogue = FlashInferMoeEpEpilogue()
+        # SM107 (Rubin): FlashInfer's sm107_nvfp4_nvfp4_bf16_cutedsl, with one
+        # workspace per capacity profile (see _select_workspace).
+        self._sm107 = spec.kernel == "cutedsl" and is_sm107_device()
+        max_tokens_per_rank = moe.max_num_tokens
+        capacities: list[int] = []
+        sp_size = 1
+        if self._sm107:
+            if api.Sm107Nvfp4MegaMoeConfig is None:
+                raise RuntimeError(
+                    f"moe_backend={moe.moe_backend!r} on SM107 needs a FlashInfer "
+                    f"build that exports flashinfer.moe_ep.{_SM107_NVFP4_CONFIG}"
+                )
+            sp_size = max(int(getattr(moe, "sp_size", 1) or 1), 1)
+            capacities = sm107_capacity_profiles(moe.max_num_tokens, sp_size)
+            max_tokens_per_rank = capacities[-1]
         ep_group = get_ep_group()
         bootstrap = api.BootstrapConfig(
             world_size=ep_group.world_size,
@@ -305,7 +535,7 @@ class FlashInferMoeEp:
         )
         fleet_params = api.FleetParams(
             num_experts=moe.num_experts,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=max_tokens_per_rank,
             token_hidden_size=moe.hidden_dim,
         )
         weight_pack = api.MoEWeightPack(
@@ -314,7 +544,27 @@ class FlashInferMoeEp:
             w13_scale=weights.w13_scale,
             w2_scale=weights.w2_scale,
         )
-        if spec.kernel == "cutedsl":
+        if self._sm107:
+            # The knob cache keys on the exact clamp float. knobs="cache": the
+            # per-capacity winners of FlashInfer's offline knob cache
+            # (FLASHINFER_MOE_EP_KNOB_CACHE), else its per-capacity heuristic,
+            # instead of the config's fixed grouped-schedule defaults. The
+            # per-expert alphas and fc1_norm_const are staged per call through
+            # MoEEpTensors.
+            megakernel = api.Sm107Nvfp4MegaMoeConfig(
+                intermediate_size=moe.intermediate_size,
+                top_k=moe.experts_per_token,
+                gate_up_clamp=(
+                    float(moe.swiglu_limit) if moe.swiglu_limit is not None else None
+                ),
+                fast_math=True,
+                apply_topk_in_fc1=apply_topk_in_fc1,
+                combine_dtype="bf16",
+                input_norm_const=float(epilogue.input_norm_const),
+                knobs="cache",
+                max_sm_count=None,
+            )
+        elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
             # renamed in_kernel_fc2_reduce to enable_in_kernel_fc2_reduce.
             megakernel = api.Nvfp4CutedslMegaMoeConfig(
@@ -352,11 +602,31 @@ class FlashInferMoeEp:
         )
         self._device = weights.w13.device
         self._hidden_size = moe.hidden_dim
-        self._max_num_tokens = moe.max_num_tokens
+        self._max_num_tokens = max_tokens_per_rank
         self._num_experts = moe.num_experts
         self._top_k = moe.experts_per_token
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+
+        # SM107 capacity profiles: capacity -> FlashInfer workspace handle.
+        # Workspace creation is an EP collective on the symmetric heap: every
+        # rank creates the same profiles in the same order (layers process
+        # their weights in model order). FlashInfer pools the workspaces of a
+        # capacity across layers.
+        self._capacities: tuple[int, ...] = tuple(capacities)
+        self._workspaces: dict[int, Any] = {}
+        self._dp_size = int(getattr(moe, "dp_size", 1) or 1)
+        self._sp_size = sp_size
+        for capacity in self._capacities:
+            self._workspaces[capacity] = self._mega_layer.create_workspace(capacity)
+        if self._sm107:
+            _log_sm107_megakernel(
+                moe,
+                self._capacities,
+                epilogue.input_norm_const,
+                shared_expert="separate",
+                max_sm_count=None,
+            )
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -373,6 +643,51 @@ class FlashInferMoeEp:
     @property
     def is_monolithic(self) -> bool:
         return False
+
+    def _rank_consistent_num_tokens(self, num_tokens: int) -> int:
+        """Token count every EP rank agrees on for this step.
+
+        Dispatch and combine address peer workspaces at the same symmetric
+        offsets, so every EP rank must launch the same capacity profile.
+        Sequence-parallel shards are equal; DP ranks may differ, so use the
+        step's maximum over DP ranks (DSv4.1's decoder-replay graphs agree
+        their replay size across DP, and their forward context carries the
+        DP metadata). Without DP metadata under DP > 1, use the largest
+        profile, which every rank selects identically.
+        """
+        if self._dp_size <= 1:
+            return num_tokens
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        context = get_forward_context() if is_forward_context_available() else None
+        dp_metadata = context.dp_metadata if context is not None else None
+        if dp_metadata is None:
+            logger.info_once(
+                "FlashInfer SM107 MegaMoE: no DP metadata in the forward "
+                "context; using the largest capacity profile."
+            )
+            return self._capacities[-1]
+        n_max = int(dp_metadata.num_tokens_across_dp_cpu.max())
+        if self._sp_size > 1:
+            n_max = -(-n_max // self._sp_size)
+        return max(num_tokens, n_max)
+
+    def _select_workspace(self, num_tokens: int) -> Any | None:
+        """Workspace handle of the smallest capacity profile that holds the
+        step (SM107), or None for the layer's single workspace (SM100)."""
+        if not self._capacities:
+            return None
+        n = self._rank_consistent_num_tokens(num_tokens)
+        for capacity in self._capacities:
+            if capacity >= n:
+                return self._workspaces[capacity]
+        raise ValueError(
+            f"FlashInfer MoE-EP got {n} tokens per rank, but the largest "
+            f"workspace profile holds {self._capacities[-1]}"
+        )
 
     def _tensors(
         self,
@@ -403,10 +718,19 @@ class FlashInferMoeEp:
                 f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
                 f"the workspace supports at most {self._max_num_tokens}"
             )
+        workspace = self._select_workspace(hidden_states.shape[0])
         tensors = self._tensors(hidden_states, topk_ids, topk_weights)
-        if self._return_workspace_view and getattr(
+        return_view = self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
-        ):
+        )
+        if workspace is not None:
+            # SM107: the step's capacity profile.
+            return self._mega_layer.forward(
+                tensors, workspace=workspace, return_workspace_view=return_view
+            )
+        # SM100/SM103: the layer's single workspace. vLLM's pinned FlashInfer
+        # has no workspace argument in MoEEpMegaLayer.forward().
+        if return_view:
             return self._mega_layer.forward(tensors, return_workspace_view=True)
         return self._mega_layer(tensors)
 
@@ -431,7 +755,14 @@ class FlashInferMoeEp:
             dtype=torch.float32,
             device=self._device,
         )
-        self._mega_layer.warmup(self._tensors(hidden_states, topk_ids, topk_weights))
+        tensors = self._tensors(hidden_states, topk_ids, topk_weights)
+        if not self._workspaces:
+            self._mega_layer.warmup(tensors)
+            return
+        # Compile and launch every capacity profile once (collective), so no
+        # lazy compile can fire inside a CUDA-graph capture.
+        for capacity in self._capacities:
+            self._mega_layer.warmup(tensors, workspace=self._workspaces[capacity])
 
     def kernel_weights(
         self,
@@ -464,10 +795,43 @@ class FlashInferMoeEp:
         mega_layer.destroy()
         self._mega_layer = None
         self._epilogue = None
+        self._workspaces = {}
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self.destroy()
+
+
+_SM107_LOGGED: set[tuple] = set()
+
+
+def _log_sm107_megakernel(
+    moe: FusedMoEConfig,
+    capacities: tuple[int, ...],
+    input_norm_const: float,
+    *,
+    shared_expert: str,
+    max_sm_count: int | None,
+) -> None:
+    key = (moe.num_experts, moe.experts_per_token, capacities, shared_expert)
+    if key in _SM107_LOGGED:  # once per distinct layer config
+        return
+    _SM107_LOGGED.add(key)
+    logger.info(
+        "FlashInfer SM107 MegaMoE: megakernel %s, %d of %d experts local, "
+        "I %d, top-%d, clamp %s, input_norm_const %.6g, capacity profiles %s, "
+        "shared expert %s, megakernel SM budget %s.",
+        SM107_NVFP4_MEGAKERNEL,
+        getattr(moe, "num_local_experts", moe.num_experts),
+        moe.num_experts,
+        moe.intermediate_size,
+        moe.experts_per_token,
+        moe.swiglu_limit,
+        input_norm_const,
+        list(capacities),
+        shared_expert,
+        "all" if max_sm_count is None else max_sm_count,
+    )
 
 
 def _expert_major_bytes(tensor: torch.Tensor) -> torch.Tensor:

@@ -296,8 +296,8 @@ def _init_warmup_forward(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_device_capability_family(100),
-    reason="The FlashInfer MoE-EP megakernels require SM100",
+    not current_platform.is_device_capability_family(100) or fi_ep.is_sm107_device(),
+    reason="These MXFP4 cases need SM100/SM103 (SM107 runs only NVFP4 experts)",
 )
 @pytest.mark.parametrize("geometry", GEOMETRIES, ids=[g.name for g in GEOMETRIES])
 @pytest.mark.parametrize("backend", BACKENDS, ids=("cutedsl", "deep_gemm"))
@@ -313,27 +313,44 @@ def test_init_warmup_forward_is_exact_on_grid_inputs(
     distributed_run(_init_warmup_forward, world_size, geometry, backend)
 
 
-@pytest.mark.parametrize("backend", BACKENDS, ids=("cutedsl", "deep_gemm"))
+@pytest.mark.parametrize(
+    ("backend", "sm107"),
+    [
+        (FLASHINFER_MOE_EP_CUTEDSL, False),
+        (FLASHINFER_MOE_EP_DEEP_GEMM, False),
+        (FLASHINFER_MOE_EP_CUTEDSL, True),
+    ],
+    ids=("cutedsl", "deep_gemm", "cutedsl-sm107"),
+)
 def test_adapter_kwargs_match_installed_flashinfer(
-    monkeypatch: pytest.MonkeyPatch, backend: str
+    monkeypatch: pytest.MonkeyPatch, backend: str, sm107: bool
 ):
     """The adapter's kwargs construct the installed FlashInfer's config types.
 
     Needs no SM100, so config kwarg drift fails in CI rather than at model load.
     Fakes only the megakernel layer (symmetric memory), the EP group, the device
-    index and the DeepGEMM import.
+    index, the DeepGEMM import and the SM107 device probe, so the SM100 and the
+    SM107 (Rubin) branches both run on any device.
     """
     moe_ep = pytest.importorskip("flashinfer.moe_ep")
+    if sm107 and not hasattr(moe_ep, "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig"):
+        pytest.skip("The installed FlashInfer has no SM107 NVFP4 MegaMoE")
     layer_args: list[tuple] = []
+    workspaces: list[int] = []
 
     class FakeMegaLayer:
         def __init__(self, *args) -> None:
             layer_args.append(args)
 
+        def create_workspace(self, capacity: int) -> int:
+            workspaces.append(capacity)
+            return capacity
+
         def destroy(self) -> None:
             pass
 
     monkeypatch.setattr(moe_ep, "MoEEpMegaLayer", FakeMegaLayer)
+    monkeypatch.setattr(fi_ep, "is_sm107_device", lambda: sm107)
     monkeypatch.setattr(fi_ep, "_expose_deep_gemm_to_flashinfer", lambda: None)
     monkeypatch.setattr(
         fi_ep,
@@ -361,9 +378,14 @@ def test_adapter_kwargs_match_installed_flashinfer(
     )
 
     ((_, _, _, mega_config),) = layer_args
-    expected = (
-        moe_ep.Nvfp4CutedslMegaMoeConfig
-        if backend == FLASHINFER_MOE_EP_CUTEDSL
-        else moe_ep.DeepGemmMegaMoeConfig
-    )
+    if sm107:
+        expected = moe_ep.Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    elif backend == FLASHINFER_MOE_EP_CUTEDSL:
+        expected = moe_ep.Nvfp4CutedslMegaMoeConfig
+    else:
+        expected = moe_ep.DeepGemmMegaMoeConfig
     assert isinstance(mega_config.megakernel, expected)
+    # SM107 creates one workspace per capacity profile; SM100 uses the layer's.
+    assert workspaces == (
+        fi_ep.sm107_capacity_profiles(MAX_TOKENS_PER_RANK) if sm107 else []
+    )
