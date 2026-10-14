@@ -118,14 +118,18 @@ class MambaHybridModelState(DefaultModelState):
         )
         # VLLM_GDN_MTP_DEFER_WRITES: the GDN MTP verify kernel defers its state
         # snapshots to a commit after sampling (postprocess_state), run here.
-        # Not with adaptive verification: its varlen FULL decode graphs are
-        # captured with one-token rows as non-spec rows, which deferral turns
-        # into spec rows (prepare_attn).
+        # Not with adaptive verification or dynamic speculative decoding: their
+        # varlen / K=0 FULL decode graphs are captured with one-token rows as
+        # non-spec rows, which deferral turns into spec rows (prepare_attn).
         spec_config = vllm_config.speculative_config
         self._gdn_defer = (
             vllm_config.num_speculative_tokens > 0
             and vllm_config.parallel_config.pipeline_parallel_size == 1
             and not getattr(spec_config, "enable_adaptive_verification", False)
+            and not (
+                spec_config is not None
+                and spec_config.uses_dynamic_speculative_decoding()
+            )
             and gdn_mtp_cuda.defer_arm(self.device)
         )
         # GDN decode-metadata fusion per set of Mamba-family builders, keyed by
