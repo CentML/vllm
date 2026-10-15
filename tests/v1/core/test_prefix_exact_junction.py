@@ -87,7 +87,7 @@ def _run(prompts, arrival):
 
 @pytest.mark.parametrize("drops", [False, True], ids=["no_drops", "recipe_drops"])
 def test_siblings_hit_exact_junction(monkeypatch, drops):
-    prompts, arrival = _siblings(5)
+    prompts, arrival = _siblings(6)
     _env(monkeypatch, exact=False, drops=drops)
     _, _, base = _run(prompts, arrival)
     _env(monkeypatch, exact=True, drops=drops)
@@ -96,12 +96,14 @@ def test_siblings_hit_exact_junction(monkeypatch, drops):
     # and materializes the block-floored Marconi junction, as without the flag.
     assert base["r0"] == hits["r0"] == 0
     assert base["r1"] == hits["r1"] == 0
-    assert [base[f"r{i}"] for i in range(2, 5)] == [BLOCK_HIT] * 3
-    # The third request detects the exact junction and produces it.
-    assert hits["r2"] == BLOCK_HIT
-    assert JUNCTION + 2 * HASH in trace.chunk_ends["r2"]
+    assert [base[f"r{i}"] for i in range(2, 6)] == [BLOCK_HIT] * 4
+    # r1 and r2 record the shared block; the fourth request sees two sharers
+    # and produces the exact junction.
+    assert hits["r2"] == hits["r3"] == BLOCK_HIT
+    assert JUNCTION + 2 * HASH not in trace.chunk_ends["r2"]
+    assert JUNCTION + 2 * HASH in trace.chunk_ends["r3"]
     # Everyone after it hits the whole shared prefix minus one unit.
-    assert [hits[f"r{i}"] for i in (3, 4)] == [JUNCTION] * 2
+    assert [hits[f"r{i}"] for i in (4, 5)] == [JUNCTION] * 2
     # Follow-up turns are unaffected.
     assert {k: v for k, v in hits.items() if k.startswith("t2_")} == {
         k: v for k, v in base.items() if k.startswith("t2_")
@@ -125,28 +127,28 @@ def test_junction_survives_sequential_consumers(monkeypatch):
     next arrives; the junction entries are exempt from the superseded drops.
     """
     _env(monkeypatch, exact=True)
-    prompts, arrival = _siblings(6, gap=2, turn2_at=None)
+    prompts, arrival = _siblings(7, gap=2, turn2_at=None)
     _, _, hits = _run(prompts, arrival)
-    assert [hits[f"r{i}"] for i in range(3, 6)] == [JUNCTION] * 3
+    assert [hits[f"r{i}"] for i in range(4, 7)] == [JUNCTION] * 3
 
 
 def test_burst_arrival(monkeypatch):
     """Start-up burst: all siblings arrive in the same step."""
     _env(monkeypatch, exact=True)
-    prompts, arrival = _siblings(6, gap=0, turn2_at=None)
+    prompts, arrival = _siblings(7, gap=0, turn2_at=None)
     _, _, hits = _run(prompts, arrival)
     assert hits["r0"] == hits["r1"] == 0
-    assert hits["r2"] == BLOCK_HIT
-    assert [hits[f"r{i}"] for i in range(3, 6)] == [JUNCTION] * 3
+    assert hits["r2"] == hits["r3"] == BLOCK_HIT
+    assert [hits[f"r{i}"] for i in range(4, 7)] == [JUNCTION] * 3
 
 
 def test_cross_replay_tools_junction(monkeypatch):
     """A shorter shared prefix (the tools block shared across replays)."""
     _env(monkeypatch, exact=True)
     shared = 4755
-    prompts, arrival = _siblings(4, shared=shared, tail=27450, turn2_at=None)
+    prompts, arrival = _siblings(5, shared=shared, tail=27450, turn2_at=None)
     _, _, hits = _run(prompts, arrival)
-    assert hits["r3"] == shared // HASH * HASH - HASH
+    assert hits["r4"] == shared // HASH * HASH - HASH
 
 
 @pytest.mark.parametrize("shared", [290, 1200], ids=["sub_block", "one_block"])
@@ -175,4 +177,54 @@ def test_repeated_lookup_never_matches_itself(monkeypatch):
     for _ in range(3):
         _, hit, junction = manager.get_computed_blocks(req)
         assert (hit, junction) == (0, 0)
+        assert req.exact_junction is None
+
+
+def _detector(monkeypatch, min_sharers=None):
+    from vllm.v1.core.exact_junction import ExactJunctionDetector
+
+    if min_sharers is not None:
+        monkeypatch.setenv("VLLM_PREFIX_EXACT_JUNCTION_MIN_SHARERS", str(min_sharers))
+    return ExactJunctionDetector(
+        block_size=BLOCK,
+        hash_block_size=HASH,
+        eagle_unit=HASH,
+        export_valid=lambda start, stop, junction: True,
+    )
+
+
+def _req(rid, tokens):
+    return make_request(rid, tokens, HASH, sha256)
+
+
+def test_previous_turn_alone_is_not_a_family(monkeypatch):
+    """A follow-up turn whose own cached tail was lost (e.g. evicted) matches
+    only its previous turn: one sharer produces nothing by default.
+    """
+    rng = random.Random(5)
+    history = chunk._tokens(rng, 3 * BLOCK + 500)
+    longest = 3 * BLOCK - HASH  # attention covers 3 blocks (after the drop)
+    for min_sharers, produced in ((None, False), (1, True)):
+        det = _detector(monkeypatch, min_sharers)
+        prev = _req("turn1", list(history))
+        det.lookup(prev, hit=longest, longest=longest, junction=0)
+        nxt = _req("turn2", history + chunk._tokens(rng, 900))
+        det.lookup(nxt, hit=longest, longest=longest, junction=0)
+        assert (nxt.exact_junction is not None) == produced
+        if produced:
+            entry = (3 * BLOCK + 500) // HASH * HASH
+            assert nxt.exact_junction == (entry - HASH, entry, entry + HASH)
+
+
+def test_full_block_match_is_not_a_junction(monkeypatch):
+    """Siblings that share the whole uncovered block (e.g. queued before the
+    first one is cached) diverge later; no junction inside this block.
+    """
+    det = _detector(monkeypatch)
+    rng = random.Random(6)
+    shared = chunk._tokens(rng, 2 * BLOCK + 300)
+    longest = BLOCK - HASH
+    reqs = [_req(f"s{i}", shared + chunk._tokens(rng, 50)) for i in range(3)]
+    for req in reqs:
+        det.lookup(req, hit=longest, longest=longest, junction=0)
         assert req.exact_junction is None

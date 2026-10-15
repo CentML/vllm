@@ -17,9 +17,12 @@ Mechanism (content-agnostic; only prefix-chain hashes are compared):
 1. Detection. Every request records the ``hash_block_size``-granular prefix
    hashes of the first block its attention hit does not cover (at most one
    block of hashes). A later request probes the same region of its own hashes
-   against them; the longest match is the exact shared prefix ``S`` (rounded
-   down to the hash unit) with an earlier request. Equal chained hashes imply
-   equal token prefixes.
+   against them; the longest prefix recorded by at least ``MIN_SHARERS`` other
+   requests is the exact shared prefix ``S`` (rounded down to the hash unit).
+   Equal chained hashes imply equal token prefixes. Two sharers keep a
+   conversation's own previous turn (one sharer) from looking like a family,
+   and a match reaching the end of the block is skipped (the divergence lies
+   further and the full block will be cached anyway).
 2. Production. If the junction ``J = S - eagle_unit`` beats the request's
    current hit, the request becomes the junction producer: its prefill chunk
    stops at ``J + eagle_unit + hash_block_size`` so the GDN prefill-checkpoint
@@ -48,6 +51,8 @@ logger = init_logger(__name__)
 EXACT_JUNCTION_ENV = "VLLM_PREFIX_EXACT_JUNCTION"
 # Minimum tokens a junction must add over the current hit to be produced.
 MIN_GAIN_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_GAIN"
+# Distinct earlier requests that must share the prefix (default 2).
+MIN_SHARERS_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_SHARERS"
 # Remembered probe hashes (one per hash unit of one block per request).
 _MAX_SEEN = 1 << 17
 _MAX_KEYS = 4096
@@ -85,8 +90,10 @@ class ExactJunctionDetector:
         self.eagle_unit = eagle_unit
         self.export_valid = export_valid
         self.min_gain = int(os.getenv(MIN_GAIN_ENV, str(hash_block_size)) or 0)
-        # prefix hash -> id of the first request that recorded it
-        self._seen: OrderedDict[BlockHash, str] = OrderedDict()
+        self.min_sharers = max(1, int(os.getenv(MIN_SHARERS_ENV, "2") or 1))
+        # prefix hash -> distinct ids of the first requests that recorded it
+        # (at most min_sharers + 1, so one can be the probing request itself)
+        self._seen: OrderedDict[BlockHash, list[str]] = OrderedDict()
         # prefix hash at a produced junction's attention entry
         self._keys: OrderedDict[BlockHash, None] = OrderedDict()
         self.num_produced = 0  # distinct junctions
@@ -96,12 +103,13 @@ class ExactJunctionDetector:
         self.num_lookups = 0
         logger.info(
             "%s=1: exact shared-prefix junctions at %d-token granularity "
-            "(block %d, eagle unit %d, min gain %d).",
+            "(block %d, eagle unit %d, min gain %d, min sharers %d).",
             EXACT_JUNCTION_ENV,
             hash_block_size,
             block_size,
             eagle_unit,
             self.min_gain,
+            self.min_sharers,
         )
 
     def lookup(self, request: Request, hit: int, longest: int, junction: int) -> int:
@@ -128,11 +136,8 @@ class ExactJunctionDetector:
         # First block the attention hit does not cover; a sibling's divergence
         # point can only lie inside it (a later full block would have matched).
         raw = longest + self.eagle_unit if longest > 0 else 0
-        region_end = min(
-            (raw // self.block_size + 1) * self.block_size,
-            num_prompt,
-            len(hashes) * unit,
-        )
+        block_end = (raw // self.block_size + 1) * self.block_size
+        region_end = min(block_end, num_prompt, len(hashes) * unit)
         first = raw // unit
         last = region_end // unit  # hashes[i] covers (i + 1) * unit tokens
         if last <= first:
@@ -142,15 +147,24 @@ class ExactJunctionDetector:
         best = 0
         best_owner = None
         for i in range(last - 1, first - 1, -1):
-            owner = seen.get(hashes[i])
-            if owner is not None and owner != rid:
+            owners = seen.get(hashes[i])
+            if owners is None:
+                continue
+            others = [o for o in owners if o != rid]
+            if len(others) >= self.min_sharers:
                 best = (i + 1) * unit
-                best_owner = owner
+                best_owner = others[0]
                 break
+        cap = self.min_sharers + 1
         for i in range(first, last):
-            if seen.setdefault(hashes[i], rid) is rid and len(seen) > _MAX_SEEN:
-                seen.popitem(last=False)
-        if not best:
+            owners = seen.get(hashes[i])
+            if owners is None:
+                seen[hashes[i]] = [rid]
+                if len(seen) > _MAX_SEEN:
+                    seen.popitem(last=False)
+            elif len(owners) < cap and rid not in owners:
+                owners.append(rid)
+        if not best or best >= block_end:
             return junction
         new_junction = best - self.eagle_unit
         # The GDN prefill export of a chunk ending at ``stop`` lands at
