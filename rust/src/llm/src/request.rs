@@ -115,6 +115,7 @@ impl GenerateRequest {
                 reasoning_ended: None,
                 reasoning_parser_kwargs,
                 abort_immediately: false,
+                prompt_block_hashes: None,
             },
         })
     }

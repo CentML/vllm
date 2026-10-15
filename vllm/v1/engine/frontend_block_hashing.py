@@ -50,6 +50,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+from vllm.utils.hashing import SHA256_PICKLE_PROTOCOL
 
 if TYPE_CHECKING:
     from vllm.config import CacheConfig
@@ -309,6 +310,27 @@ def attach_prompt_block_hashes(
 
 
 # -------------------------------------------------------------- engine core
+
+
+def native_frontend_config(
+    cache_config: "CacheConfig", hash_block_size: int
+) -> dict[str, str | int] | None:
+    if (
+        not FEH_ENABLED
+        or not cache_config.enable_prefix_caching
+        or cache_config.prefix_caching_hash_algo != "sha256"
+        or SHA256_PICKLE_PROTOCOL != 5
+        or hash_block_size != FEH_BLOCK
+        or hash_block_size != 32
+    ):
+        return None
+    from vllm.v1.core import kv_cache_utils as kvu
+
+    return {
+        "algorithm": "sha256-pickle5-feh1",
+        "block_size": hash_block_size,
+        "none_hash": kvu.NONE_HASH.hex(),
+    }
 
 
 def log_engine_enabled() -> None:

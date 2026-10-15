@@ -7,6 +7,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
+use serde_with::serde_as;
 
 use crate::protocol::multimodal::MmFeatures;
 use crate::protocol::sampling::EngineCoreSamplingParams;
@@ -70,6 +71,7 @@ pub struct ReasoningParserKwargs {
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/3f5bd482f5c1a5dbdffbbf68d624e20bb7032013/vllm/v1/engine/__init__.py#L80-L129>
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreRequest {
     pub request_id: String,
@@ -127,6 +129,10 @@ pub struct EngineCoreRequest {
     /// Stable session identity shared by related requests.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Optional FEH1 prompt hashes from the native frontend.
+    #[serde_as(as = "Option<serde_with::Bytes>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_block_hashes: Option<Vec<u8>>,
 }
 
 impl EngineCoreRequest {
@@ -171,7 +177,7 @@ mod tests {
 
     #[test]
     fn engine_core_request_serializes_as_full_array() {
-        let request = EngineCoreRequest {
+        let mut request = EngineCoreRequest {
             request_id: "req-1".to_string(),
             prompt_token_ids: Some(vec![1, 2, 3]),
             sampling_params: Some(EngineCoreSamplingParams {
@@ -198,6 +204,13 @@ mod tests {
         assert_eq!(array[10], Value::Nil);
         assert_eq!(array[11], Value::from(7));
         assert_eq!(array[20], Value::from("session-1"));
+        request.prompt_block_hashes = Some(b"FEH1".to_vec());
+        let encoded = encode_msgpack(&request).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected request array");
+        };
+        assert_eq!(array.len(), 22);
+        assert_eq!(array[21], Value::Binary(b"FEH1".to_vec()));
     }
 
     #[test]
