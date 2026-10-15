@@ -53,6 +53,12 @@ EXACT_JUNCTION_ENV = "VLLM_PREFIX_EXACT_JUNCTION"
 MIN_GAIN_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_GAIN"
 # Distinct earlier requests that must share the prefix (default 2).
 MIN_SHARERS_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_SHARERS"
+# Minimum junction depth in tokens (default 8192). Shallow junctions save at
+# most a block of prefill against an extra chunk, and the depth bound keeps
+# junctions off shared preambles that precede a request-group salt (MLPerf
+# agentic: the 4,755-token tools block rendered before the per-pass salt,
+# whose reuse across dataset passes is disallowed).
+MIN_TOKENS_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_TOKENS"
 # Remembered probe hashes (one per hash unit of one block per request).
 _MAX_SEEN = 1 << 17
 _MAX_KEYS = 4096
@@ -91,6 +97,7 @@ class ExactJunctionDetector:
         self.export_valid = export_valid
         self.min_gain = int(os.getenv(MIN_GAIN_ENV, str(hash_block_size)) or 0)
         self.min_sharers = max(1, int(os.getenv(MIN_SHARERS_ENV, "2") or 1))
+        self.min_tokens = int(os.getenv(MIN_TOKENS_ENV, "8192") or 0)
         # prefix hash -> distinct ids of the first requests that recorded it
         # (at most min_sharers + 1, so one can be the probing request itself)
         self._seen: OrderedDict[BlockHash, list[str]] = OrderedDict()
@@ -103,13 +110,15 @@ class ExactJunctionDetector:
         self.num_lookups = 0
         logger.info(
             "%s=1: exact shared-prefix junctions at %d-token granularity "
-            "(block %d, eagle unit %d, min gain %d, min sharers %d).",
+            "(block %d, eagle unit %d, min gain %d, min sharers %d, "
+            "min tokens %d).",
             EXACT_JUNCTION_ENV,
             hash_block_size,
             block_size,
             eagle_unit,
             self.min_gain,
             self.min_sharers,
+            self.min_tokens,
         )
 
     def lookup(self, request: Request, hit: int, longest: int, junction: int) -> int:
@@ -171,9 +180,12 @@ class ExactJunctionDetector:
         # ``(stop - 1) // unit * unit - eagle_unit``, i.e. on ``new_junction``.
         stop = best + unit
         if (
-            new_junction <= max(hit, junction) + self.min_gain - 1
+            new_junction < self.min_tokens
+            or new_junction <= max(hit, junction) + self.min_gain - 1
             or new_junction % self.block_size == 0
-            or stop > num_prompt
+            # The prompt-tail checkpoint stop must not cut the chunk before
+            # ``stop`` (it would export below the junction).
+            or (num_prompt - 1) // unit * unit - self.eagle_unit < stop
             or not self.export_valid(hit, stop, new_junction)
         ):
             return junction

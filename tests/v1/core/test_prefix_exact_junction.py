@@ -142,13 +142,27 @@ def test_burst_arrival(monkeypatch):
     assert [hits[f"r{i}"] for i in range(4, 7)] == [JUNCTION] * 3
 
 
-def test_cross_replay_tools_junction(monkeypatch):
-    """A shorter shared prefix (the tools block shared across replays)."""
+@pytest.mark.parametrize("min_tokens", [None, "0"], ids=["default", "no_floor"])
+def test_cross_replay_tools_junction(monkeypatch, min_tokens):
+    """A shallow shared prefix (the tools block rendered before the per-pass
+    salt, shared across dataset passes): below the default 8192-token floor
+    no exact junction is produced, so nothing beyond today's block-floored
+    reuse happens; without the floor it would be made exact.
+    """
     _env(monkeypatch, exact=True)
+    if min_tokens is not None:
+        monkeypatch.setenv("VLLM_PREFIX_EXACT_JUNCTION_MIN_TOKENS", min_tokens)
     shared = 4755
     prompts, arrival = _siblings(5, shared=shared, tail=27450, turn2_at=None)
-    _, _, hits = _run(prompts, arrival)
-    assert hits["r4"] == shared // HASH * HASH - HASH
+    _env(monkeypatch, exact=False)
+    _, base_trace, base = _run(prompts, arrival)
+    _env(monkeypatch, exact=True)
+    manager, trace, hits = _run(prompts, arrival)
+    if min_tokens is None:
+        assert hits == base and trace.chunk_ends == base_trace.chunk_ends
+        assert manager.exact_junction.num_productions == 0
+    else:
+        assert hits["r4"] == shared // HASH * HASH - HASH
 
 
 @pytest.mark.parametrize("shared", [290, 1200], ids=["sub_block", "one_block"])
@@ -180,9 +194,48 @@ def test_repeated_lookup_never_matches_itself(monkeypatch):
         assert req.exact_junction is None
 
 
+@pytest.mark.parametrize("gap", [0, 1], ids=["burst", "staggered"])
+def test_no_same_step_read_of_unfilled_junction_copy(monkeypatch, gap):
+    """The producer's next allocation moves the junction entry to a copy that
+    only this step's worker copy fills. A sibling admitted in that same step
+    must not CoW from it: the worker gathers every copy source before it
+    scatters, so a chained copy (block -> copy -> cow) would read stale KV.
+    Models the worker's gather-then-scatter: within one drain, no source may
+    be another pair's destination.
+    """
+    _env(monkeypatch, exact=True)
+    prompts, arrival = _siblings(8, gap=gap, turn2_at=None)
+    manager = chunk._make_manager(num_spec=4)
+    # The harness drains copies per request; the scheduler drains them once
+    # per step, so collect each step's destinations across requests.
+    take = manager.take_kv_cache_block_copies
+    new_step = manager.new_step_starts
+    step_dsts: set[int] = set()
+    chained: list = []
+
+    def checked_take():
+        copies, retained = take()
+        chained.extend(c for c in copies if c.src_block_id in step_dsts)
+        step_dsts.update(c.dst_block_id for c in copies)
+        return copies, retained
+
+    def checked_new_step():
+        step_dsts.clear()
+        new_step()
+
+    monkeypatch.setattr(manager, "take_kv_cache_block_copies", checked_take)
+    monkeypatch.setattr(manager, "new_step_starts", checked_new_step)
+    trace = chunk._run(manager, prompts, free_done=set(prompts), arrival_step=arrival)
+    assert not chained
+    hits = [trace.hits[f"r{i}"][0] for i in range(8)]
+    assert hits[-1] == JUNCTION
+    chunk._check_cached_states_and_free(manager, trace)
+
+
 def _detector(monkeypatch, min_sharers=None):
     from vllm.v1.core.exact_junction import ExactJunctionDetector
 
+    monkeypatch.setenv("VLLM_PREFIX_EXACT_JUNCTION_MIN_TOKENS", "0")
     if min_sharers is not None:
         monkeypatch.setenv("VLLM_PREFIX_EXACT_JUNCTION_MIN_SHARERS", str(min_sharers))
     return ExactJunctionDetector(
@@ -228,3 +281,20 @@ def test_full_block_match_is_not_a_junction(monkeypatch):
     for req in reqs:
         det.lookup(req, hit=longest, longest=longest, junction=0)
         assert req.exact_junction is None
+
+
+def test_short_producer_prompt_produces_nothing(monkeypatch):
+    """A would-be producer whose prompt ends within two units after the
+    junction stop: its prompt-tail checkpoint stop would cut the chunk before
+    the junction export, so it must not produce (and must split nothing).
+    """
+    # r3 gets tail 9 + 21 = 30: prompt 32,161 < S + 2 * 32 + 1.
+    prompts, arrival = _siblings(5, tail=9, gap=2, turn2_at=None)
+    _env(monkeypatch, exact=False)
+    _, base_trace, base = _run(prompts, arrival)
+    _env(monkeypatch, exact=True)
+    manager, trace, hits = _run(prompts, arrival)
+    assert trace.chunk_ends["r3"] == base_trace.chunk_ends["r3"]
+    assert hits["r3"] == base["r3"]
+    attn = manager.coordinator.single_type_managers[-1]
+    assert attn.num_exact_junctions == manager.exact_junction.num_productions

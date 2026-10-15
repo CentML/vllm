@@ -848,7 +848,27 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         self._junction_producer: dict[str, tuple[int, KVCacheBlock]] = {}
         # Junction entries: never dropped as superseded CoW sources.
         self._junction_hashes: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        # Junction copies queued this step: only this step's worker copy fills
+        # them, and the worker gathers all copy sources before scattering, so
+        # a same-step CoW from one would read stale KV. Hits on them wait a
+        # step (the Mamba ``cached_blocks_this_step`` rule).
+        self._junction_copies_this_step: set[int] = set()
         self.num_exact_junctions = 0
+
+    def new_step_starts(self) -> None:
+        self._junction_copies_this_step.clear()
+
+    def _is_junction_source(self, block: KVCacheBlock) -> bool:
+        """Whether any prefix-cache entry of ``block`` (primary or secondary)
+        is an exact junction.
+        """
+        junctions = self._junction_hashes
+        if not junctions:
+            return False
+        if block.block_hash in junctions:
+            return True
+        extra = self.block_pool.cached_block_hashes_by_block.get(block.block_id, ())
+        return any(h in junctions for h in extra)
 
     def _apply_cow(
         self,
@@ -861,7 +881,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if (
             self.track_superseded_tail
             and source_block.block_hash is not None
-            and source_block.block_hash not in self._junction_hashes
+            and not self._is_junction_source(source_block)
         ):
             self._cow_sources[request_id] = [
                 source_block,
@@ -934,6 +954,13 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
     ) -> int:
+        if (
+            self._junction_copies_this_step
+            and new_computed_blocks
+            and new_computed_blocks[-1].block_id in self._junction_copies_this_step
+        ):
+            # Not schedulable now (see ``_junction_copies_this_step``).
+            return self.block_pool.num_gpu_blocks + 1
         num_blocks = super().get_num_blocks_to_allocate(
             request_id,
             num_tokens,
@@ -983,6 +1010,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block.ref_cnt += 1
         if self._record_new_block_ids:
             self.new_block_ids.append(copy.block_id)
+        self._junction_copies_this_step.add(copy.block_id)
 
     def _cache_exact_junction(self, request: Request, num_tokens: int) -> None:
         """Producer: register the attention entry of its exact junction."""
