@@ -4,6 +4,7 @@
 mod client;
 mod coordinator;
 mod error;
+mod frontend_hashing;
 mod metrics;
 pub mod mock_engine;
 pub mod protocol;
