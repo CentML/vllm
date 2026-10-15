@@ -52,6 +52,8 @@ MIN_GAIN_ENV = "VLLM_PREFIX_EXACT_JUNCTION_MIN_GAIN"
 _MAX_SEEN = 1 << 17
 _MAX_KEYS = 4096
 _LOG_EVERY = 500
+# Log the first productions individually (diagnostics; a handful per pass).
+_LOG_PRODUCTIONS = 200
 
 
 def exact_junction_enabled() -> bool:
@@ -87,7 +89,8 @@ class ExactJunctionDetector:
         self._seen: OrderedDict[BlockHash, str] = OrderedDict()
         # prefix hash at a produced junction's attention entry
         self._keys: OrderedDict[BlockHash, None] = OrderedDict()
-        self.num_produced = 0
+        self.num_produced = 0  # distinct junctions
+        self.num_productions = 0  # producer lookups (re-productions included)
         self.num_junction_hits = 0
         self.junction_hit_tokens = 0
         self.num_lookups = 0
@@ -137,10 +140,12 @@ class ExactJunctionDetector:
         rid = request.request_id
         seen = self._seen
         best = 0
+        best_owner = None
         for i in range(last - 1, first - 1, -1):
             owner = seen.get(hashes[i])
             if owner is not None and owner != rid:
                 best = (i + 1) * unit
+                best_owner = owner
                 break
         for i in range(first, last):
             if seen.setdefault(hashes[i], rid) is rid and len(seen) > _MAX_SEEN:
@@ -159,6 +164,20 @@ class ExactJunctionDetector:
         ):
             return junction
         request.exact_junction = (new_junction, best, stop)
+        self.num_productions += 1
+        if self.num_productions <= _LOG_PRODUCTIONS:
+            logger.info(
+                "exact junction #%d: req=%s prompt=%d hit=%d attn=%d "
+                "marconi=%d -> junction=%d (match with %s)",
+                self.num_productions,
+                rid,
+                num_prompt,
+                hit,
+                raw,
+                junction,
+                new_junction,
+                best_owner,
+            )
         key = hashes[best // unit - 1]
         if key not in self._keys:
             self._keys[key] = None
@@ -169,9 +188,10 @@ class ExactJunctionDetector:
 
     def log_stats(self) -> None:
         logger.info(
-            "exact junction stats: produced=%d junction_hits=%d "
+            "exact junction stats: produced=%d productions=%d junction_hits=%d "
             "mean_junction_hit=%.0f lookups=%d",
             self.num_produced,
+            self.num_productions,
             self.num_junction_hits,
             self.junction_hit_tokens / max(self.num_junction_hits, 1),
             self.num_lookups,
