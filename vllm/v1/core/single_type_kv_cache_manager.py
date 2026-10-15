@@ -225,6 +225,9 @@ class SingleTypeKVCacheManager(ABC):
         # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.fine_grained_prefix_cache = False
+        # VLLM_PREFIX_EXACT_JUNCTION; set by ``KVCacheManager`` on the attention
+        # and Mamba groups when the configuration supports it.
+        self.exact_junction = False
         # Initial-state copy-on-write bookkeeping: partial hits and, for
         # copy-initial Mamba backends, full hits. Empty in other managers.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -838,6 +841,14 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 "%s=1: dropping superseded partial prompt-tail attention blocks.",
                 _ATTN_DROP_SUPERSEDED_TAIL_ENV,
             )
+        # VLLM_PREFIX_EXACT_JUNCTION producers: request_id -> (block index,
+        # block) holding the just-registered junction entry. The next
+        # allocation moves the entry to an immutable copy (the request keeps
+        # appending to its own block, whose deeper entries would replace it).
+        self._junction_producer: dict[str, tuple[int, KVCacheBlock]] = {}
+        # Junction entries: never dropped as superseded CoW sources.
+        self._junction_hashes: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        self.num_exact_junctions = 0
 
     def _apply_cow(
         self,
@@ -847,7 +858,11 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         cow_block: KVCacheBlock,
     ) -> None:
         super()._apply_cow(request_id, block_idx, source_block, cow_block)
-        if self.track_superseded_tail and source_block.block_hash is not None:
+        if (
+            self.track_superseded_tail
+            and source_block.block_hash is not None
+            and source_block.block_hash not in self._junction_hashes
+        ):
             self._cow_sources[request_id] = [
                 source_block,
                 source_block.block_hash,
@@ -905,7 +920,99 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             entry = self._cow_sources.pop(request_id, None)
             if entry is not None and entry[3]:
                 self._release_superseded_tail(entry)
+        if self._junction_producer:
+            self._junction_producer.pop(request_id, None)
         return super().pop_blocks_for_free(request_id)
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        num_blocks = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap,
+        )
+        # The junction copy taken by the producer's next allocation.
+        return num_blocks + int(request_id in self._junction_producer)
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        if self._junction_producer:
+            produced = self._junction_producer.pop(request_id, None)
+            if produced is not None:
+                self._preserve_junction(request_id, *produced)
+        return super().allocate_new_blocks(
+            request_id, num_tokens, num_tokens_main_model
+        )
+
+    def _preserve_junction(
+        self, request_id: str, block_idx: int, block: KVCacheBlock
+    ) -> None:
+        """Move a producer's junction entry to an immutable copy of its block.
+
+        Runs before the producer's next step: the junction chunk's KV is in
+        ``block`` (attention KV is append-only, so tokens before the junction
+        never change). Like the Mamba producer tail, the worker block table of
+        a running request is append-only, so the request keeps ``block`` and
+        the cache entry moves to the copy. Both copy endpoints are retained
+        until the copy has run (``take_kv_cache_block_copies``).
+        """
+        req_blocks = self.req_to_blocks.get(request_id)
+        if (
+            req_blocks is None
+            or block_idx >= len(req_blocks)
+            or req_blocks[block_idx] is not block
+            or block.block_hash is None
+        ):
+            return
+        copy = self.block_pool.get_new_blocks(1)[0]
+        self.block_pool.move_block_hashes(block, copy)
+        self._pending_cow_copies.append((block, copy))
+        block.ref_cnt += 1
+        if self._record_new_block_ids:
+            self.new_block_ids.append(copy.block_id)
+
+    def _cache_exact_junction(self, request: Request, num_tokens: int) -> None:
+        """Producer: register the attention entry of its exact junction."""
+        junction = request.exact_junction
+        if junction is None:
+            return
+        entry = junction[1]
+        if not (request.num_computed_tokens < entry <= num_tokens):
+            return
+        if entry % self.block_size == 0:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = entry // self.block_size
+        if block_idx >= len(blocks) or blocks[block_idx].is_null:
+            return
+        block_hash = self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=entry,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if block_hash is None:
+            return
+        self._junction_hashes[block_hash] = None
+        self._junction_hashes.move_to_end(block_hash)
+        while len(self._junction_hashes) > _MAX_JUNCTION_HASHES:
+            self._junction_hashes.popitem(last=False)
+        self._junction_producer[request.request_id] = (block_idx, blocks[block_idx])
+        self.num_exact_junctions += 1
 
     def count_resident_superseded_tails(self) -> int:
         """Stats only (flag off): superseded tails still cached and free."""
@@ -1035,6 +1142,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        if self.exact_junction:
+            self._cache_exact_junction(request, num_tokens)
         if self._cow_sources:
             self._check_superseded_tail(request)
 
@@ -2737,6 +2846,18 @@ class MambaManager(SingleTypeKVCacheManager):
                     # checkpoint after it has been re-keyed.
                     self._pending_boundary_state_offloads.append(
                         (request.request_id, self.kv_cache_group_id, block, position)
+                    )
+                elif (
+                    self.exact_junction
+                    and self.drop_superseded_state
+                    and checkpoint is not None
+                    and request.exact_junction is not None
+                    and checkpoint[0] == request.exact_junction[0]
+                ):
+                    # Exact junction export (exact_junction.py): keep it like a
+                    # Marconi junction when consumers supersede it.
+                    self._record_junction_hashes(
+                        request, checkpoint[1], checkpoint[1] + 1
                     )
         if self.drop_superseded_state:
             if self._pending_superseded:

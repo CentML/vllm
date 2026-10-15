@@ -10,6 +10,11 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.exact_junction import (
+    EXACT_JUNCTION_ENV,
+    ExactJunctionDetector,
+    exact_junction_enabled,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
@@ -29,6 +34,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -198,6 +205,9 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.fine_grained_prefix_cache = True
+        self.exact_junction: ExactJunctionDetector | None = None
+        if enable_caching and exact_junction_enabled():
+            self.exact_junction = self._make_exact_junction_detector(kv_cache_config)
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -228,6 +238,90 @@ class KVCacheManager:
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
+        )
+
+    def _make_exact_junction_detector(
+        self, kv_cache_config: KVCacheConfig
+    ) -> ExactJunctionDetector | None:
+        """Build the VLLM_PREFIX_EXACT_JUNCTION detector, or None (with a
+        warning) when this configuration cannot produce exact junctions: it
+        needs fine-grained (partial) hash hits, single-token MTP lookahead and
+        GDN-style prefill-checkpoint exports in every Mamba "align" group.
+        """
+        coordinator = self.coordinator
+        mamba_specs = [
+            g.kv_cache_spec
+            for g in kv_cache_config.kv_cache_groups
+            if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        reason = None
+        if (
+            not isinstance(coordinator, HybridKVCacheCoordinator)
+            or not coordinator.enable_partial_hash_hits
+        ):
+            reason = "fine-grained (prefix_match_unit) hash hits are off"
+        elif coordinator.num_reprefillable_tokens != 0:
+            reason = "multi-module MTP re-prefills the chunk tail"
+        elif self.mamba_fine_grained_prefix_cache:
+            reason = "enable_mamba_fine_grained_prefix_cache is set"
+        elif not mamba_specs or not all(
+            spec.mamba_cache_mode == "align"
+            and spec.num_prefill_checkpoint_blocks > 0
+            and spec.prefill_checkpoint_alignment is not None
+            and not spec.prefill_checkpoint_copies_initial_block
+            for spec in mamba_specs
+        ):
+            reason = "Mamba groups lack align-mode prefill-checkpoint exports"
+        if reason is not None or not isinstance(coordinator, HybridKVCacheCoordinator):
+            logger.warning("%s=1 ignored: %s.", EXACT_JUNCTION_ENV, reason)
+            return None
+        attn = [
+            m
+            for m in coordinator.single_type_managers
+            if isinstance(m, FullAttentionManager)
+        ]
+        mamba = [
+            m for m in coordinator.single_type_managers if isinstance(m, MambaManager)
+        ]
+        eagle_flags = {m.use_eagle for m in attn} | {
+            m.drop_eagle_checkpoint_block for m in mamba
+        }
+        if len(eagle_flags) != 1:
+            logger.warning(
+                "%s=1 ignored: attention and Mamba groups disagree on the EAGLE drop.",
+                EXACT_JUNCTION_ENV,
+            )
+            return None
+        eagle = eagle_flags.pop()
+        hash_block_size = coordinator.hash_block_size
+
+        def export_valid(start: int, stop: int, junction: int) -> bool:
+            if (
+                get_mamba_prefill_checkpoint_position(stop, hash_block_size, eagle)
+                != junction
+            ):
+                return False
+            return all(
+                is_mamba_prefill_checkpoint_valid(
+                    query_start=start,
+                    query_end=stop,
+                    checkpoint_position=junction,
+                    hash_block_size=hash_block_size,
+                    mamba_block_size=spec.block_size,
+                    checkpoint_alignment=spec.prefill_checkpoint_alignment,
+                    reuse_initial_block=spec.prefill_checkpoint_reuses_initial_block,
+                    copy_initial_block=spec.prefill_checkpoint_copies_initial_block,
+                )
+                for spec in mamba_specs
+            )
+
+        for m in (*attn, *mamba):
+            m.exact_junction = True
+        return ExactJunctionDetector(
+            block_size=coordinator.scheduler_block_size,
+            hash_block_size=hash_block_size,
+            eagle_unit=hash_block_size if eagle else 0,
+            export_valid=export_valid,
         )
 
     @property
@@ -323,6 +417,13 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+        if self.exact_junction is not None:
+            shared_prefix_boundary = self.exact_junction.lookup(
+                request,
+                num_new_computed_tokens,
+                num_new_computed_tokens + num_uncached,
+                shared_prefix_boundary,
+            )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary

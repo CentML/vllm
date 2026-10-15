@@ -611,12 +611,21 @@ class Scheduler(SchedulerInterface):
         junction_requires_split = start < junction_stop < end and not (
             use_internal_checkpoint and junction_stop == checkpoint_position
         )
+        # VLLM_PREFIX_EXACT_JUNCTION (exact_junction.py): a producer ends the
+        # chunk where the GDN prefill export lands exactly on its sub-block
+        # junction; that stop replaces the block-floored one.
+        exact_stop = 0
+        exact = request.exact_junction
+        if exact is not None and start < exact[0]:
+            junction_requires_split = False
+            if start < exact[2] < end:
+                exact_stop = exact[2]
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
             if start % block_size != 0
-            and (stop_at_next_boundary or junction_requires_split)
+            and (stop_at_next_boundary or junction_requires_split or exact_stop)
             else 0,
             # Never run past a reusable boundary not covered by the export.
             extension_stop,
@@ -630,6 +639,7 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if junction_requires_split else 0,
+            exact_stop,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)

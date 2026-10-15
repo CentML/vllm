@@ -220,6 +220,11 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        # VLLM_PREFIX_EXACT_JUNCTION: ``(junction, attention_entry, chunk_stop)``
+        # when this request produces an exact (sub-block) shared-prefix junction
+        # detected at hash granularity, else None. See
+        # ``vllm/v1/core/exact_junction.py``.
+        self.exact_junction: tuple[int, int, int] | None = None
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
