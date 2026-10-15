@@ -22,6 +22,8 @@ try:
 except ImportError:  # pragma: no cover
     _xxhash = None
 
+SHA256_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
 
 def sha256(input: Any) -> bytes:
     """Hash any picklable Python object using SHA-256.
@@ -37,7 +39,7 @@ def sha256(input: Any) -> bytes:
         Bytes representing the SHA-256 hash of the serialized input.
 
     """
-    input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
+    input_bytes = pickle.dumps(input, protocol=SHA256_PICKLE_PROTOCOL)
     return hashlib.sha256(input_bytes).digest()
 
 

@@ -46,6 +46,26 @@ CACHE_CONFIG = SimpleNamespace(
 )
 
 
+def test_native_frontend_config_requires_supported_engine_hashing(hasher, monkeypatch):
+    monkeypatch.setattr(feh, "FEH_ENABLED", True)
+    assert feh.native_frontend_config(CACHE_CONFIG, BLOCK) == {
+        "algorithm": "sha256-pickle5-feh1",
+        "block_size": BLOCK,
+        "none_hash": kvu.NONE_HASH.hex(),
+    }
+    for target, name, value in [
+        (feh, "FEH_ENABLED", False),
+        (feh, "FEH_BLOCK", 64),
+        (CACHE_CONFIG, "enable_prefix_caching", False),
+        (CACHE_CONFIG, "prefix_caching_hash_algo", "sha256_cbor"),
+        (feh, "SHA256_PICKLE_PROTOCOL", 6),
+    ]:
+        with monkeypatch.context() as patch:
+            patch.setattr(target, name, value)
+            assert feh.native_frontend_config(CACHE_CONFIG, BLOCK) is None
+    assert feh.native_frontend_config(CACHE_CONFIG, 64) is None
+
+
 @pytest.mark.parametrize("num_tokens", [5, 31, 32, 33, 64, 1000, 4097])
 @pytest.mark.parametrize("cache_salt", [None, "abc"])
 def test_frontend_hashes_match_engine(hasher, num_tokens, cache_salt):
@@ -55,9 +75,7 @@ def test_frontend_hashes_match_engine(hasher, num_tokens, cache_salt):
     assert blob is not None
 
     # Survives the front-end -> EngineCore msgpack round trip.
-    decoded = MsgpackDecoder(EngineCoreRequest).decode(
-        MsgpackEncoder().encode(request)
-    )
+    decoded = MsgpackDecoder(EngineCoreRequest).decode(MsgpackEncoder().encode(request))
     assert decoded.prompt_block_hashes == blob
     assert decoded.prompt_token_ids == request.prompt_token_ids
 
@@ -108,7 +126,5 @@ def test_frontend_skips_unsupported_requests(hasher):
 
 def test_request_without_hashes_round_trips():
     request = _make_request(100, None)
-    decoded = MsgpackDecoder(EngineCoreRequest).decode(
-        MsgpackEncoder().encode(request)
-    )
+    decoded = MsgpackDecoder(EngineCoreRequest).decode(MsgpackEncoder().encode(request))
     assert decoded.prompt_block_hashes is None
