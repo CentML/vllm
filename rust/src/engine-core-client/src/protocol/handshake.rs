@@ -107,6 +107,16 @@ pub struct EngineCoreReadyResponse {
     /// Full-attention block size in tokens after initialization, or unavailable.
     #[serde(default)]
     pub effective_attention_block_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_frontend_hash_config: Option<FrontendHashConfig>,
+}
+
+/// Engine-resolved configuration for native frontend prompt hashing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrontendHashConfig {
+    pub algorithm: String,
+    pub block_size: u32,
+    pub none_hash: String,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup

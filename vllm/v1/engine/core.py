@@ -1097,7 +1097,6 @@ class EngineCore:
         raise NotImplementedError
 
 
-
 def _maybe_pin_engine_main_thread() -> None:
     """GB300 study (fix-host): opt-in pinning of the EngineCore MAIN thread only.
 
@@ -1132,6 +1131,7 @@ def _maybe_pin_engine_main_thread() -> None:
             len(before),
         )
         return
+
 
 class EngineShutdownState(IntEnum):
     RUNNING = 0
@@ -1806,6 +1806,10 @@ class EngineCoreProc(EngineCore):
             enable_sleep_mode=self.vllm_config.model_config.enable_sleep_mode,
             supports_draft_weight_updates=(
                 self.model_executor.supports_draft_weight_updates()
+            ),
+            native_frontend_hash_config=frontend_block_hashing.native_frontend_config(
+                self.vllm_config.cache_config,
+                self._request_block_hasher_block_size,
             ),
         )
 

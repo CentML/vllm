@@ -268,6 +268,7 @@ pub struct EngineCoreClient {
     input_address: String,
     output_address: String,
     engines: Vec<ConnectedEngine>,
+    frontend_hasher: Option<Arc<crate::frontend_hashing::FrontendHasher>>,
     inner: Arc<ClientInner>,
     coordinator: Option<CoordinatorHandle>,
     abort_tx: mpsc::UnboundedSender<AbortRequest>,
@@ -410,7 +411,11 @@ impl EngineCoreClient {
                 (None, None, None)
             };
 
+        let frontend_hasher = crate::frontend_hashing::FrontendHasher::from_ready_responses(
+            engines.iter().map(|engine| &engine.ready_response),
+        );
         Ok(Self {
+            frontend_hasher,
             config,
             input_address: connected.input_address,
             output_address: connected.output_address,
@@ -596,6 +601,16 @@ impl EngineCoreClient {
     pub async fn call(&self, mut req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         req.client_index = self.config.client_index;
         req.validate()?;
+        if let Some(hasher) = &self.frontend_hasher {
+            let hasher = Arc::clone(hasher);
+            req = self
+                .runtime
+                .spawn_blocking(move || {
+                    hasher.attach(&mut req);
+                    req
+                })
+                .await?;
+        }
         trace!(
             request_id = %req.request_id,
             client_index = req.client_index,
