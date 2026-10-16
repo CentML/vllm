@@ -3,11 +3,18 @@
 from functools import partial
 
 import pytest
+import torch
 
 from tests.models.utils import dummy_hf_overrides
 from vllm.compilation.counter import compilation_counter
-from vllm.config import VllmConfig
-from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.compilation import (
+    CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
+)
+from vllm.forward_context import set_forward_context
+from vllm.model_executor.models.qwen3_vl import Qwen3_VisionPatchMerger
 from vllm.platforms import current_platform
 
 
@@ -120,6 +127,42 @@ def test_qwen2_5_vl_compilation(vllm_runner, monkeypatch):
         ) as _,
     ):
         pass
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_qwen3_vl_patch_mergers_compile_per_instance(monkeypatch, tmp_path, dist_init):
+    """The deepstack mergers normalize after the 2x2 patch shuffle and the
+    main merger before it, so each must run its own compiled graph rather
+    than one AOT artifact shared through the class's forward."""
+    monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
+    monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            compile_mm_encoder=True,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+    )
+    with set_current_vllm_config(config):
+        # Same call order as Qwen3_VisionTransformer.forward.
+        mergers = [
+            Qwen3_VisionPatchMerger(
+                d_model=64, context_dim=32, use_postshuffle_norm=post
+            ).cuda()
+            for post in (True, False)
+        ]
+    with torch.no_grad():
+        for merger in mergers:
+            for param in merger.parameters():
+                param.normal_(std=0.1)
+
+    x = torch.randn(64, 1, 32, device="cuda")
+    with torch.inference_mode(), set_forward_context(None, vllm_config=config):
+        for merger in mergers:
+            torch.testing.assert_close(
+                merger(x), merger.forward(x), atol=1e-3, rtol=1e-3
+            )
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073

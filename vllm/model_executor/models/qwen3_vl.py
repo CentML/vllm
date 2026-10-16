@@ -506,6 +506,16 @@ class Qwen3_VisionBlock(nn.Module):
         return x
 
 
+# The main and deepstack mergers trace different graphs (pre- vs post-shuffle
+# norm) but would share one AOT artifact, which is keyed by the forward method.
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+    use_aot_compile=False,
+)
 class Qwen3_VisionPatchMerger(nn.Module):
     def __init__(
         self,
