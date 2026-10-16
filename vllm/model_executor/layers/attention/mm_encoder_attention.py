@@ -270,6 +270,37 @@ class MMEncoderAttention(CustomOp):
         return async_tensor_h2d(sequence_lengths, device=device)
 
     @classmethod
+    def maybe_compute_vit_work_counter(
+        cls,
+        attn_backend: AttentionBackendEnum,
+        cu_seqlens: np.ndarray,
+        num_heads: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Dynamic Work-ID queue state of the persistent Rubin ViT kernel.
+
+        Returns ``int32[2] = [0, Work IDs of cu_seqlens]`` (padded graph slots
+        contribute none) via a pinned async H2D copy, or None when the
+        persistent kernel is off. One counter serves every encoder layer of a
+        forward: the kernel resets element 0 when it finishes.
+        """
+        if (oot_class := maybe_get_oot_by_class(cls)) is not cls:
+            return oot_class.maybe_compute_vit_work_counter(  # type: ignore[attr-defined]
+                attn_backend, cu_seqlens, num_heads, device
+            )
+
+        if (
+            attn_backend != AttentionBackendEnum.FLASHINFER
+            or not envs.VLLM_RUBIN_CUTEDSL_VIT
+            or not envs.VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT
+        ):
+            return None
+        from flashinfer.attention.cute_dsl import cute_dsl_fmha_vit_work_count
+
+        work = cute_dsl_fmha_vit_work_count(np.diff(cu_seqlens).tolist(), num_heads)
+        return async_tensor_h2d(np.asarray([0, work], dtype=np.int32), device=device)
+
+    @classmethod
     def maybe_recompute_cu_seqlens(
         cls,
         attn_backend: AttentionBackendEnum,
@@ -402,6 +433,9 @@ class MMEncoderAttention(CustomOp):
             envs.VLLM_RUBIN_CUTEDSL_VIT
             and self.attn_backend == AttentionBackendEnum.FLASHINFER
         )
+        self.use_rubin_cutedsl_vit_persistent = (
+            self.use_rubin_cutedsl_vit and envs.VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT
+        )
         self._cutedsl_qkv_scales = (1.0, 1.0, 1.0)
         self.skip_scale_q = False
         self.skip_scale_k = False
@@ -438,6 +472,19 @@ class MMEncoderAttention(CustomOp):
                     "Install FlashInfer with the Rubin AOT ViT interface "
                     "and matching D72/D80 artifacts."
                 ) from exc
+            if self.use_rubin_cutedsl_vit_persistent:
+                try:
+                    from flashinfer.attention.cute_dsl import (  # noqa: F401
+                        RUBIN_VIT_TUNED_POLICY,
+                        cute_dsl_fmha_vit_work_count,
+                        rubin_vit_use_work_queue,
+                    )
+                except ImportError as exc:
+                    raise ValueError(
+                        "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT needs a FlashInfer "
+                        "with the persistent Rubin ViT interface and its "
+                        "exports (FLASHINFER_DSL_FMHA_LOCAL_DIR)."
+                    ) from exc
         if mm_cfg is None or mm_cfg.mm_encoder_attn_dtype != "fp8":
             return
 
@@ -762,6 +809,7 @@ class MMEncoderAttention(CustomOp):
         max_seqlen: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
+        vit_work_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.fp8_enabled:
             query, key, value = self._quantize_qkv_fp8(query, key, value)
@@ -777,6 +825,8 @@ class MMEncoderAttention(CustomOp):
                 self.head_size,
                 self.scale,
                 *self._cutedsl_qkv_scales,
+                persistent=self.use_rubin_cutedsl_vit_persistent,
+                work_counter=vit_work_counter,
             )
             return output[..., : self.head_size].contiguous()
 
@@ -847,6 +897,8 @@ class MMEncoderAttention(CustomOp):
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
+        vit_work_counter: torch.Tensor
+        | None = None,  # Only used for the persistent Rubin CuTeDSL ViT
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -859,6 +911,8 @@ class MMEncoderAttention(CustomOp):
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
+        vit_work_counter: torch.Tensor
+        | None = None,  # Only used for the persistent Rubin CuTeDSL ViT
     ) -> torch.Tensor:
         if self.fp8_enabled and self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA:
             return self._forward_aiter_fp8(query, key, value, cu_seqlens, max_seqlen)
@@ -868,7 +922,13 @@ class MMEncoderAttention(CustomOp):
             return self._forward_triton(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:
             return self._forward_flashinfer(
-                query, key, value, cu_seqlens, max_seqlen, sequence_lengths
+                query,
+                key,
+                value,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+                vit_work_counter,
             )
         elif self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
             return self._forward_sdpa(query, key, value, cu_seqlens)
@@ -887,6 +947,8 @@ class MMEncoderAttention(CustomOp):
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
+        vit_work_counter: torch.Tensor
+        | None = None,  # Only used for the persistent Rubin CuTeDSL ViT
     ) -> torch.Tensor:
         return self._forward_sdpa(query, key, value, cu_seqlens)
 
@@ -899,6 +961,8 @@ class MMEncoderAttention(CustomOp):
         max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
+        vit_work_counter: torch.Tensor
+        | None = None,  # Only used for the persistent Rubin CuTeDSL ViT
     ) -> torch.Tensor:
         if self.attn_backend == AttentionBackendEnum.FLASH_ATTN:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)

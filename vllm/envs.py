@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_RUBIN_CUTEDSL_VIT: bool = False
+    VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT: bool = False
     VLLM_RUBIN_CUTEDSL_PREFILL: bool = False
     VLLM_RUBIN_CUTEDSL_PREFILL_POLICY: Literal["legacy", "tuned"] = "legacy"
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
@@ -1795,6 +1796,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires matching FlashInfer wrappers/artifacts; defaults are unchanged.
     "VLLM_RUBIN_CUTEDSL_VIT": lambda: bool(
         int(os.getenv("VLLM_RUBIN_CUTEDSL_VIT", "0"))
+    ),
+    # With VLLM_RUBIN_CUTEDSL_VIT: run the persistent ViT kernel (at most one
+    # CTA per SM over the valid Q tiles, dynamic Work-ID queue for large
+    # encoder graphs) instead of one CTA per max_seqlen tile, slot and head.
+    # Needs FlashInfer's persistent ViT exports (FLASHINFER_DSL_FMHA_LOCAL_DIR).
+    "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT": lambda: bool(
+        int(os.getenv("VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT", "0"))
     ),
     # Run compatible SM107 FP8 HND causal prefills (TRTLLM route) with the
     # CuTeDSL paged GQA instead of trtllm-gen. The only switch for it; see

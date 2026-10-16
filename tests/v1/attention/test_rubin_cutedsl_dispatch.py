@@ -279,3 +279,86 @@ def test_vit_passes_logical_d72_with_padded_storage_and_host_scales(monkeypatch)
     assert kwargs["scale_v"] == 4.0
     assert result.shape == q.shape
     assert result.dtype == torch.bfloat16
+
+
+def _fake_persistent_vit_module(kernel):
+    return SimpleNamespace(
+        cute_dsl_fmha_vit=kernel,
+        cute_dsl_fmha_vit_work_count=lambda lens, heads: (
+            heads * sum((n + 255) // 256 for n in lens)
+        ),
+        RUBIN_VIT_TUNED_POLICY={"persistent": True, "mma_rowsum": True},
+        rubin_vit_use_work_queue=lambda capacity: capacity > 8192,
+    )
+
+
+def test_vit_work_counter_counts_q_tiles_of_padded_slots(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.attention.cute_dsl", _fake_persistent_vit_module(None)
+    )
+    backend = AttentionBackendEnum.FLASHINFER
+    # Lengths 300, 0 (empty slot) and 1024 -> 2 + 0 + 4 Q tiles of 256 rows.
+    offsets = np.array([0, 300, 300, 1324], dtype=np.int32)
+    compute = MMEncoderAttention.maybe_compute_vit_work_counter
+    cpu = torch.device("cpu")
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_VIT", True)
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT", False)
+    assert compute(backend, offsets, 16, cpu) is None
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT", True)
+    counter = compute(backend, offsets, 16, cpu)
+    torch.testing.assert_close(counter, torch.tensor([0, 96], dtype=torch.int32))
+    assert compute(AttentionBackendEnum.TORCH_SDPA, offsets, 16, cpu) is None
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_VIT", False)
+    assert compute(backend, offsets, 16, cpu) is None
+
+
+@pytest.mark.parametrize(
+    "capacity,with_counter,dynamic",
+    [(8192, True, False), (8193, True, True), (8193, False, False)],
+)
+def test_vit_persistent_policy_and_work_queue_choice(
+    monkeypatch, capacity, with_counter, dynamic
+):
+    kernel = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.attention.cute_dsl",
+        _fake_persistent_vit_module(kernel),
+    )
+    q = torch.empty(capacity, 16, 80, dtype=torch.float8_e4m3fn)
+    indptr = torch.tensor([0, 72, 190, 190], dtype=torch.int32)
+    counter = torch.tensor([0, 32], dtype=torch.int32) if with_counter else None
+    result = vit_attn_wrappers.rubin_cutedsl_vit_wrapper(
+        q, q, q, indptr, torch.tensor(capacity), 72, 0.125, 2.0, 3.0, 4.0,
+        True, counter,
+    )  # fmt: skip
+    args, kwargs = kernel.call_args
+    # The graph capacity, not the longest sequence, is the launch's max_seqlen.
+    assert args[5] == capacity
+    assert kwargs["persistent"] is True
+    assert kwargs["mma_rowsum"] is True
+    assert kwargs.get("work_counter") is (counter if dynamic else None)
+    assert result.dtype == torch.bfloat16
+
+
+def test_vit_default_path_stays_nonpersistent(monkeypatch):
+    kernel = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.attention.cute_dsl",
+        _fake_persistent_vit_module(kernel),
+    )
+    q = torch.empty(9000, 16, 80, dtype=torch.float8_e4m3fn)
+    indptr = torch.tensor([0, 72], dtype=torch.int32)
+    counter = torch.tensor([0, 16], dtype=torch.int32)
+    vit_attn_wrappers.rubin_cutedsl_vit_wrapper(
+        q, q, q, indptr, torch.tensor(9000), 72, 0.125, 1.0, 1.0, 1.0,
+        False, counter,
+    )  # fmt: skip
+    _, kwargs = kernel.call_args
+    assert "persistent" not in kwargs
+    assert "work_counter" not in kwargs
+    fake = vit_attn_wrappers.rubin_cutedsl_vit_wrapper_fake(
+        q, q, q, indptr, torch.tensor(9000), 72, 0.125, 1.0, 1.0, 1.0, True, None
+    )
+    assert fake.shape == q.shape

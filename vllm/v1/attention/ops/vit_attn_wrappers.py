@@ -37,6 +37,8 @@ def rubin_cutedsl_vit_wrapper(
     q_scale: float,
     k_scale: float,
     v_scale: float,
+    persistent: bool = False,
+    work_counter: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from flashinfer.attention.cute_dsl import cute_dsl_fmha_vit
 
@@ -45,6 +47,26 @@ def rubin_cutedsl_vit_wrapper(
     out = torch.empty_like(q, dtype=torch.bfloat16)
     with gpu_sync_allowed():
         max_seqlen_int = int(max_seqlen.item())
+    policy: dict[str, Any] = {}
+    if persistent:
+        from flashinfer.attention.cute_dsl import (
+            RUBIN_VIT_TUNED_POLICY,
+            rubin_vit_use_work_queue,
+        )
+
+        policy.update(RUBIN_VIT_TUNED_POLICY)
+        # q.shape[0] is the encoder graph token capacity, so the scheduler is
+        # fixed per captured graph. Without a counter (models that do not
+        # build one) the static Work-ID stride is always correct.
+        use_queue = rubin_vit_use_work_queue(q.shape[0])
+        if use_queue and work_counter is not None:
+            policy["work_counter"] = work_counter
+        # info_once caches its arguments, so log the policy as a string.
+        logger.info_once(
+            "Rubin CuTeDSL ViT persistent kernel active: %s Work IDs, policy %s.",
+            "dynamic" if "work_counter" in policy else "static",
+            str(sorted(RUBIN_VIT_TUNED_POLICY.items())),
+        )
     cute_dsl_fmha_vit(
         q,
         k,
@@ -58,6 +80,7 @@ def rubin_cutedsl_vit_wrapper(
         scale_k=k_scale,
         scale_v=v_scale,
         use_fp16_softmax=True,
+        **policy,
     )
     logger.info_once("Rubin CuTeDSL ViT active: FP8 D72/storage D80 -> BF16.")
     return out.reshape(original_shape)
@@ -74,10 +97,14 @@ def rubin_cutedsl_vit_wrapper_fake(
     q_scale: float,
     k_scale: float,
     v_scale: float,
+    persistent: bool = False,
+    work_counter: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q, dtype=torch.bfloat16)
 
 
+# The persistent kernel consumes work_counter[0] and resets it to 0 before it
+# exits, so the counter is unchanged from the graph's point of view.
 direct_register_custom_op(
     op_name="rubin_cutedsl_vit_wrapper",
     op_func=rubin_cutedsl_vit_wrapper,
@@ -96,6 +123,8 @@ def vit_rubin_cutedsl_wrapper(
     q_scale: float,
     k_scale: float,
     v_scale: float,
+    persistent: bool = False,
+    work_counter: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.rubin_cutedsl_vit_wrapper(
         q,
@@ -108,6 +137,8 @@ def vit_rubin_cutedsl_wrapper(
         q_scale,
         k_scale,
         v_scale,
+        persistent,
+        work_counter,
     )
 
 

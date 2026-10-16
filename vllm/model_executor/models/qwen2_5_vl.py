@@ -412,6 +412,8 @@ class Qwen2_5_VisionAttention(nn.Module):
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
         # Only used for FlashInfer CuDNN backend.
         sequence_lengths: torch.Tensor | None,
+        # Only used for the persistent Rubin CuTeDSL ViT kernel.
+        vit_work_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
@@ -447,6 +449,11 @@ class Qwen2_5_VisionAttention(nn.Module):
         else:
             q, k, v = qkv.unbind(dim=2)
 
+        # Pass the counter only when set: out-of-tree MMEncoderAttention
+        # forward overrides do not accept it.
+        extra_attn_kwargs = (
+            {} if vit_work_counter is None else {"vit_work_counter": vit_work_counter}
+        )
         context_layer = self.attn(
             query=q,
             key=k,
@@ -454,6 +461,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            **extra_attn_kwargs,
         )
 
         context_layer = einops.rearrange(

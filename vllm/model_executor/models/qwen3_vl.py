@@ -492,6 +492,8 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
         sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
+        # Only used for the persistent Rubin CuTeDSL ViT kernel.
+        vit_work_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -500,6 +502,7 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            vit_work_counter=vit_work_counter,
         )
 
         x = x + self.mlp(self.norm2(x))
@@ -844,6 +847,13 @@ class Qwen3_VisionTransformer(nn.Module):
         metadata["sequence_lengths"] = MMEncoderAttention.maybe_compute_seq_lens(
             self.attn_backend, cu_seqlens, device
         )
+        # Persistent Rubin ViT Work-ID queue state, from the padded cu_seqlens.
+        # A graph buffer key, so replays refresh it with the replayed lengths.
+        metadata["vit_work_counter"] = (
+            MMEncoderAttention.maybe_compute_vit_work_counter(
+                self.attn_backend, cu_seqlens, self.num_heads // self.tp_size, device
+            )
+        )
 
         # max_seqlen
         if max_seqlen_override is not None:
@@ -901,6 +911,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_sin=encoder_metadata["rotary_pos_emb_sin"],
                 max_seqlen=encoder_metadata["max_seqlen"],
                 sequence_lengths=encoder_metadata.get("sequence_lengths"),
+                vit_work_counter=encoder_metadata.get("vit_work_counter"),
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
@@ -2155,6 +2166,7 @@ class Qwen3VLForConditionalGeneration(
                 "cu_seqlens",
                 "max_seqlen",
                 "sequence_lengths",
+                "vit_work_counter",
             ],
             out_hidden_size=self.visual.out_hidden_size,
             max_frames_per_video=max_frames,
