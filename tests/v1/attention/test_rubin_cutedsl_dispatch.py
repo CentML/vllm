@@ -338,6 +338,9 @@ def test_vit_persistent_policy_and_work_queue_choice(
     assert kwargs["persistent"] is True
     assert kwargs["mma_rowsum"] is True
     assert kwargs.get("work_counter") is (counter if dynamic else None)
+    # The persistent kernel writes compact logical-width (D72) rows.
+    assert args[3].shape == (capacity, 16, 72)
+    assert result.shape == (capacity, 16, 72)
     assert result.dtype == torch.bfloat16
 
 
@@ -358,7 +361,11 @@ def test_vit_default_path_stays_nonpersistent(monkeypatch):
     _, kwargs = kernel.call_args
     assert "persistent" not in kwargs
     assert "work_counter" not in kwargs
-    fake = vit_attn_wrappers.rubin_cutedsl_vit_wrapper_fake(
-        q, q, q, indptr, torch.tensor(9000), 72, 0.125, 1.0, 1.0, 1.0, True, None
-    )
-    assert fake.shape == q.shape
+    assert kernel.call_args.args[3].shape == q.shape
+    for persistent, width in ((False, 80), (True, 72)):
+        fake = vit_attn_wrappers.rubin_cutedsl_vit_wrapper_fake(
+            q, q, q, indptr, torch.tensor(9000), 72, 0.125, 1.0, 1.0, 1.0,
+            persistent, None,
+        )  # fmt: skip
+        assert fake.shape == (9000, 16, width)
+        assert fake.dtype == torch.bfloat16

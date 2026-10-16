@@ -828,7 +828,10 @@ class MMEncoderAttention(CustomOp):
                 persistent=self.use_rubin_cutedsl_vit_persistent,
                 work_counter=vit_work_counter,
             )
-            return output[..., : self.head_size].contiguous()
+            # The persistent kernel already wrote compact D72 rows.
+            if output.shape[-1] != self.head_size:
+                output = output[..., : self.head_size].contiguous()
+            return output
 
         output = vit_flashinfer_wrapper(
             q=query,

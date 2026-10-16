@@ -44,7 +44,10 @@ def rubin_cutedsl_vit_wrapper(
 
     original_shape = q.shape
     q, k, v = (x.reshape(-1, x.shape[-2], x.shape[-1]) for x in (q, k, v))
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    # The persistent kernel stores O at the logical width (compact D72 rows),
+    # so callers need no D80 -> D72 crop copy.
+    out_dim = logical_head_dim if persistent else q.shape[-1]
+    out = torch.empty((*q.shape[:-1], out_dim), dtype=torch.bfloat16, device=q.device)
     with gpu_sync_allowed():
         max_seqlen_int = int(max_seqlen.item())
     policy: dict[str, Any] = {}
@@ -83,7 +86,7 @@ def rubin_cutedsl_vit_wrapper(
         **policy,
     )
     logger.info_once("Rubin CuTeDSL ViT active: FP8 D72/storage D80 -> BF16.")
-    return out.reshape(original_shape)
+    return out.reshape(*original_shape[:-1], out_dim)
 
 
 def rubin_cutedsl_vit_wrapper_fake(
@@ -100,7 +103,8 @@ def rubin_cutedsl_vit_wrapper_fake(
     persistent: bool = False,
     work_counter: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.empty_like(q, dtype=torch.bfloat16)
+    out_dim = logical_head_dim if persistent else q.shape[-1]
+    return q.new_empty((*q.shape[:-1], out_dim), dtype=torch.bfloat16)
 
 
 # The persistent kernel consumes work_counter[0] and resets it to 0 before it
