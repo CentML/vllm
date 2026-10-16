@@ -1796,6 +1796,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RUBIN_CUTEDSL_VIT": lambda: bool(
         int(os.getenv("VLLM_RUBIN_CUTEDSL_VIT", "0"))
     ),
+    # Run compatible SM107 FP8 HND causal prefills (TRTLLM route) with the
+    # CuTeDSL paged GQA instead of trtllm-gen. The only switch for it; see
+    # docs/design/rubin_cutedsl_attention.md.
     "VLLM_RUBIN_CUTEDSL_PREFILL": lambda: bool(
         int(os.getenv("VLLM_RUBIN_CUTEDSL_PREFILL", "0"))
     ),
