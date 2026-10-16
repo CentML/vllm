@@ -3,6 +3,7 @@
 import importlib.util
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,3 +59,28 @@ def test_has_flashinfer_requires_ninja(
     _make_exe(tmp_path / "cuda" / "bin" / "nvcc")
     monkeypatch.setenv("PATH", str(tmp_path / "cuda" / "bin"))
     assert not fi.has_flashinfer()
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_cutedsl_moe_autotune_cuda_graph_follows_signature(
+    monkeypatch: pytest.MonkeyPatch, supported: bool
+):
+    """FlashInfer builds without autotune_use_cuda_graph reject the kwarg, so
+    vLLM must pass it only when cute_dsl_fused_moe_nvfp4 accepts it."""
+
+    def with_kwarg(x, *, autotune_use_cuda_graph=False): ...
+
+    def without_kwarg(x, *, tactic=None): ...
+
+    impl = with_kwarg if supported else without_kwarg
+    monkeypatch.setattr(fi, "has_flashinfer_cutedsl_moe_nvfp4", lambda: True)
+    monkeypatch.setattr(
+        fi,
+        "_get_submodule",
+        lambda name: SimpleNamespace(cute_dsl_fused_moe_nvfp4=impl),
+    )
+    fi.has_flashinfer_cutedsl_moe_autotune_cuda_graph.cache_clear()
+    try:
+        assert fi.has_flashinfer_cutedsl_moe_autotune_cuda_graph() is supported
+    finally:
+        fi.has_flashinfer_cutedsl_moe_autotune_cuda_graph.cache_clear()

@@ -587,6 +587,22 @@ def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
 
 
 @functools.cache
+def has_flashinfer_cutedsl_moe_autotune_cuda_graph() -> bool:
+    """Return ``True`` if cute_dsl_fused_moe_nvfp4 accepts
+    ``autotune_use_cuda_graph``, which times tactics by CUDA graph replay."""
+    if not has_flashinfer_cutedsl_moe_nvfp4():
+        return False
+    import inspect
+
+    mod = _get_submodule("flashinfer")
+    try:
+        params = inspect.signature(mod.cute_dsl_fused_moe_nvfp4).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return "autotune_use_cuda_graph" in params
+
+
+@functools.cache
 def has_flashinfer_b12x_gemm() -> bool:
     """Return True if FlashInfer b12x FP4 GEMM backend is available (SM120+)."""
     if not has_flashinfer_cutedsl():
@@ -1281,6 +1297,7 @@ __all__ = [
     "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_cutedsl_moe_autotune_cuda_graph",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",

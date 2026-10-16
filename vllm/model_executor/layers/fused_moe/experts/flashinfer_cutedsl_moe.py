@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_cute_dsl_fused_moe_nvfp4,
+    has_flashinfer_cutedsl_moe_autotune_cuda_graph,
     has_flashinfer_cutedsl_moe_nvfp4,
 )
 
@@ -75,6 +76,14 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
                 (1,),
                 NVFP4_PER_TOKEN_BASE_GLOBAL_SCALE,
             )
+        # On Rubin (SM107), time autotune tactics by CUDA graph replay, the way
+        # captured forwards run them, so eager launch gaps cannot skew the pick.
+        self.autotune_kwargs = (
+            {"autotune_use_cuda_graph": True}
+            if current_platform.is_device_capability(107)
+            and has_flashinfer_cutedsl_moe_autotune_cuda_graph()
+            else {}
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)
@@ -243,4 +252,5 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             ),
             **swiglu_kwargs,
             **per_token_kwargs,
+            **self.autotune_kwargs,
         )
