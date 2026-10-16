@@ -9,7 +9,7 @@ is the cheapest way to catch metadata changes without requiring new artifacts.
 
 import sys
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import numpy as np
 import pytest
@@ -19,6 +19,7 @@ from vllm import envs
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops import rubin_cutedsl_prefill, vit_attn_wrappers
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 
 @pytest.fixture
@@ -109,6 +110,48 @@ def test_bf16_prefill_does_not_pass_fp4_scale_offset(monkeypatch, prefill_args):
     prefill_args["o_sf_scale"] = None
     assert rubin_cutedsl_prefill.try_rubin_cutedsl_prefill(**prefill_args)
     assert kernel.call_args.kwargs["o_sf_start_index"] == 0
+
+
+class _ReachedKVCache(Exception):
+    pass
+
+
+@pytest.mark.parametrize("trtllm_prefill", [True, False])
+def test_prefill_gate_warns_only_off_the_trtllm_route(monkeypatch, trtllm_prefill):
+    """Opting in must not read removed metadata fields such as `use_cascade`,
+    and only batches off the TRTLLM prefill route report a fallback."""
+    pytest.importorskip("flashinfer")
+    from vllm.v1.attention.backends import flashinfer as fi_backend
+
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_PREFILL", True)
+    warning_once = Mock()
+    monkeypatch.setattr(fi_backend.logger, "warning_once", warning_once)
+    impl = object.__new__(fi_backend.FlashInferImpl)
+    impl.bmm1_scale = impl.bmm2_scale = 1.0
+    impl.is_kvcache_nvfp4 = False
+    # The gate runs before the KV cache is first touched; stop there.
+    kv_cache = Mock()
+    type(kv_cache).dtype = PropertyMock(side_effect=_ReachedKVCache)
+    prefill_cls = fi_backend.TRTLLMPrefill if trtllm_prefill else fi_backend.FIPrefill
+    metadata = fi_backend.FlashInferMetadata(
+        kv_cache_layout=KVCacheLayout.LBHNC,
+        num_actual_tokens=4,
+        slot_mapping=torch.arange(4),
+        q_data_type_prefill=torch.float8_e4m3fn,
+        q_data_type_decode=torch.float8_e4m3fn,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=1,
+        num_prefill_tokens=4,
+        causal=True,
+        prefill=Mock(spec=prefill_cls),
+        decode=None,
+    )
+    query = torch.empty(4, 64, 128, dtype=torch.float8_e4m3fn)
+    output = torch.empty(4, 64 * 128, dtype=torch.bfloat16)
+    with pytest.raises(_ReachedKVCache):
+        impl.forward(Mock(), query, None, None, kv_cache, metadata, output)
+    assert warning_once.called == (not trtllm_prefill)
 
 
 def test_vit_metadata_is_token_indptr_not_cudnn_element_offsets(monkeypatch):

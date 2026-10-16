@@ -2074,7 +2074,7 @@ class FlashInferImpl(AttentionImpl):
         if (
             envs.VLLM_RUBIN_CUTEDSL_PREFILL
             and attn_metadata.num_prefills > 0
-            and (not prefill_use_trtllm or attn_metadata.use_cascade)
+            and not prefill_use_trtllm
         ):
             logger.warning_once(
                 "Rubin CuTeDSL prefill requires the non-cascade TRTLLM metadata "
