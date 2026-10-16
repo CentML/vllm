@@ -668,6 +668,10 @@ class TRTLLMPrefill:
     cutedsl_kv_token_indptr: torch.Tensor | None = None
     """Cumulative KV token counts (cum_seq_lens_kv counts pages instead)."""
 
+    cutedsl_query_lens_cpu: tuple[int, ...] | None = None
+    """Host query length of each prefill request, from query_start_loc_cpu.
+    Set only with VLLM_RUBIN_CUTEDSL_PREFILL."""
+
 
 @dataclass
 class FlashInferTrtllmAPIDecode:
@@ -1630,6 +1634,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
                 )
                 max_q_len_prefill = int(query_lens_prefill_cpu.max().item())
+                # Host-side lengths (no device sync) for the CuTeDSL query layout.
+                cutedsl_query_lens_cpu = (
+                    tuple(query_lens_prefill_cpu.tolist())
+                    if cutedsl_kv_token_indptr is not None
+                    else None
+                )
                 prefill_block_tables = block_table_tensor[prefill_start:]
                 if (
                     self.q_data_type_prefill != FP8_DTYPE
@@ -1660,6 +1670,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
                     cutedsl_kv_token_indptr=cutedsl_kv_token_indptr,
+                    cutedsl_query_lens_cpu=cutedsl_query_lens_cpu,
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
