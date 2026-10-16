@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_RUBIN_CUTEDSL_VIT: bool = False
     VLLM_RUBIN_CUTEDSL_PREFILL: bool = False
+    VLLM_RUBIN_CUTEDSL_PREFILL_POLICY: Literal["legacy", "tuned"] = "legacy"
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
@@ -1797,6 +1798,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_RUBIN_CUTEDSL_PREFILL": lambda: bool(
         int(os.getenv("VLLM_RUBIN_CUTEDSL_PREFILL", "0"))
+    ),
+    # Kernel policy of the opted-in Rubin CuTeDSL paged prefill:
+    # "legacy" loads the original packed-Q export; "tuned" picks the query
+    # layout per batch and passes FlashInfer's RUBIN_GQA_TUNED_POLICY.
+    # "tuned" needs the matching exports (FLASHINFER_DSL_FMHA_LOCAL_DIR) and
+    # falls back to "legacy" on FlashInfer without the tuned API.
+    "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY": env_with_choices(
+        "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY", "legacy", ["legacy", "tuned"]
     ),
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(

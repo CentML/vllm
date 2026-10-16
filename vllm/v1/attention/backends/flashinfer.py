@@ -2423,6 +2423,7 @@ class FlashInferImpl(AttentionImpl):
                         window_left=self.window_left,
                         sinks=self.sinks,
                         logits_soft_cap=self.logits_soft_cap,
+                        query_lens_cpu=attn_metadata.prefill.cutedsl_query_lens_cpu,
                     )
                 if not used_cutedsl:
                     trtllm_batch_context_with_kv_cache(

@@ -8,7 +8,7 @@ is the cheapest way to catch metadata changes without requiring new artifacts.
 """
 
 import sys
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import Mock, PropertyMock
 
 import numpy as np
@@ -20,6 +20,38 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderA
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops import rubin_cutedsl_prefill, vit_attn_wrappers
 from vllm.v1.kv_cache_layout import KVCacheLayout
+
+TUNED_POLICY = {
+    "scheduler": "auto",
+    "sequence_barrier": False,
+    "mma_rowsum": True,
+    "packed_nvfp4_epilogue": True,
+}
+
+
+@pytest.fixture(autouse=True)
+def reset_prefill_policy():
+    """The prefill policy and kernel options are cached per process."""
+    caches = (
+        rubin_cutedsl_prefill._tuned_prefill_policy,
+        rubin_cutedsl_prefill._tuned_kernel_options,
+    )
+    for cached in caches:
+        cached.cache_clear()
+    yield
+    for cached in caches:
+        cached.cache_clear()
+
+
+def fake_flashinfer(monkeypatch, kernel, select_query_layout=None):
+    """Install a fake FlashInfer, with the tuned API if a selector is given."""
+    api = {"cute_dsl_fmha_paged_prefill": kernel}
+    if select_query_layout is not None:
+        api["RUBIN_GQA_TUNED_POLICY"] = MappingProxyType(TUNED_POLICY)
+        api["rubin_paged_prefill_query_layout"] = select_query_layout
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.attention.cute_dsl", SimpleNamespace(**api)
+    )
 
 
 @pytest.fixture
@@ -110,6 +142,48 @@ def test_bf16_prefill_does_not_pass_fp4_scale_offset(monkeypatch, prefill_args):
     prefill_args["o_sf_scale"] = None
     assert rubin_cutedsl_prefill.try_rubin_cutedsl_prefill(**prefill_args)
     assert kernel.call_args.kwargs["o_sf_start_index"] == 0
+
+
+@pytest.mark.parametrize("fp4_output", [True, False])
+def test_tuned_policy_selects_query_layout_once_per_batch(
+    monkeypatch, prefill_args, fp4_output
+):
+    """The tuned policy passes FlashInfer's layout for the host query lengths,
+    selected once per batch rather than once per layer."""
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY", "tuned")
+    kernel = Mock()
+    select_query_layout = Mock(return_value=("uniform", "tma"))
+    fake_flashinfer(monkeypatch, kernel, select_query_layout)
+    if not fp4_output:
+        prefill_args["output"] = torch.empty(4, 64, 128, dtype=torch.bfloat16)
+        prefill_args["output_block_scale"] = None
+        prefill_args["o_sf_scale"] = None
+    prefill_args["query_lens_cpu"] = (1, 3)
+    for _layer in range(3):
+        assert rubin_cutedsl_prefill.try_rubin_cutedsl_prefill(**prefill_args)
+    select_query_layout.assert_called_once_with((1, 3), fp4_output=fp4_output)
+    kwargs = kernel.call_args.kwargs
+    assert {name: kwargs[name] for name in TUNED_POLICY} == TUNED_POLICY
+    assert (kwargs["query_layout"], kwargs["output_store"]) == ("uniform", "tma")
+
+
+@pytest.mark.parametrize(
+    "policy, tuned_api", [("legacy", True), ("tuned", False)], ids=["default", "old"]
+)
+def test_legacy_policy_keeps_original_export(
+    monkeypatch, prefill_args, policy, tuned_api
+):
+    """The default policy, and the tuned one on a FlashInfer without the tuned
+    API, keep the original packed-query export call."""
+    monkeypatch.setattr(envs, "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY", policy)
+    kernel = Mock()
+    select_query_layout = Mock(return_value=("uniform", "tma"))
+    fake_flashinfer(monkeypatch, kernel, select_query_layout if tuned_api else None)
+    prefill_args["query_lens_cpu"] = (1, 3)
+    assert rubin_cutedsl_prefill.try_rubin_cutedsl_prefill(**prefill_args)
+    select_query_layout.assert_not_called()
+    extra = {"query_layout", "output_store", *TUNED_POLICY}
+    assert not extra & kernel.call_args.kwargs.keys()
 
 
 class _ReachedKVCache(Exception):
