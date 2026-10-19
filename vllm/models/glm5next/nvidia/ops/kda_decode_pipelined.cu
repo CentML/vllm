@@ -31,24 +31,23 @@
 namespace glm5next_kda {
 
 constexpr int kD = 128;
-constexpr int kComputeWarps = 16;
 #ifndef GLM_KDA_AUX_GROUPS
   #define GLM_KDA_AUX_GROUPS 2
 #endif
 constexpr int kAuxGroups = GLM_KDA_AUX_GROUPS;
-constexpr int kAuxWarpsPerGroup = 4;
-constexpr int kAuxThreads = kAuxWarpsPerGroup * 32;
+constexpr int kMaxAuxWarpsPerGroup = 4;  // aux warps per group: 2 or 4
 constexpr int kNumBuf = 2 * kAuxGroups;
-constexpr int kProducerWarp = kComputeWarps + kAuxGroups * kAuxWarpsPerGroup;
-constexpr int kThreads = (kProducerWarp + 1) * 32;
 constexpr int kChunkBytes = 16384;
 constexpr int kMaxRing = 16;
 // Default ring depth: VR200 (jobs 800580/802514) streams bf16 state fastest
 // with 6 slots (96 KB in flight per SM; 13 slots was 1-8% slower), fp32 is
 // flat between 6 and 13.
 constexpr int kDefaultRing = 6;
+// Default variant: 1 (quarter-warp rows, packed fp32x2 math). VR200 job
+// 804296: 1.8-2.5% faster than variant 0 at H64 B64-512 bf16, up to 4.5% at
+// H8/H16, fp32 within +-1%; 42% fewer instructions (ncu 804297).
 #ifndef GLM_KDA_DEFAULT_FLAGS
-  #define GLM_KDA_DEFAULT_FLAGS 0
+  #define GLM_KDA_DEFAULT_FLAGS 1
 #endif
 constexpr int64_t kDefaultFlags = GLM_KDA_DEFAULT_FLAGS;
 
@@ -183,8 +182,6 @@ __device__ __forceinline__ void bulk_wait() {
   asm volatile("cp.async.bulk.wait_group %0;" ::"n"(N) : "memory");
 }
 
-constexpr int kComputeBarrier = 15;  // named barrier of the compute warps
-
 __device__ __forceinline__ void named_bar_sync(int id, int threads) {
   asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
 }
@@ -223,16 +220,14 @@ struct StateIO<float> {
 
 template <>
 struct StateIO<__nv_bfloat16> {
+  // bf16 -> fp32 is exact bit placement: low half << 16, high half masked.
   __device__ __forceinline__ static void load(const __nv_bfloat16* p,
                                               float (&s)[4]) {
-    uint2 raw = *reinterpret_cast<const uint2*>(p);
-    __nv_bfloat162 a = *reinterpret_cast<__nv_bfloat162*>(&raw.x);
-    __nv_bfloat162 b = *reinterpret_cast<__nv_bfloat162*>(&raw.y);
-    float2 fa = __bfloat1622float2(a), fb = __bfloat1622float2(b);
-    s[0] = fa.x;
-    s[1] = fa.y;
-    s[2] = fb.x;
-    s[3] = fb.y;
+    const uint2 raw = *reinterpret_cast<const uint2*>(p);
+    s[0] = __uint_as_float(raw.x << 16);
+    s[1] = __uint_as_float(raw.x & 0xffff0000u);
+    s[2] = __uint_as_float(raw.y << 16);
+    s[3] = __uint_as_float(raw.y & 0xffff0000u);
   }
   __device__ __forceinline__ static void store(__nv_bfloat16* p,
                                                const float (&s)[4]) {
@@ -252,13 +247,13 @@ struct SmemLayout {
   uint64_t* empty_s;
   uint64_t* pfull;
   uint64_t* pdone;
-  float* red;  // [kAuxGroups][2 (pro/epi)][kAuxWarpsPerGroup][4]
+  float* red;  // [kAuxGroups][2 (pro/epi)][kMaxAuxWarpsPerGroup][4]
 };
 
 __host__ __device__ inline size_t smem_bytes(int ring) {
   return static_cast<size_t>(ring) * kChunkBytes + kNumBuf * sizeof(ItemBuf) +
          (2 * ring + 2 * kNumBuf) * sizeof(uint64_t) +
-         kAuxGroups * 2 * kAuxWarpsPerGroup * 4 * sizeof(float);
+         kAuxGroups * 2 * kMaxAuxWarpsPerGroup * 4 * sizeof(float);
 }
 
 __device__ __forceinline__ SmemLayout carve(uint8_t* smem, int ring) {
@@ -309,11 +304,14 @@ __device__ __forceinline__ void producer(const Params& p, const SmemLayout& sm,
 // ---------------------------------------------------------------- aux
 // Each aux group (kAuxThreads threads) owns every kAuxGroups-th item of the
 // CTA; thread `at` handles channels at, at + kAuxThreads, ... of q, k and v.
-constexpr int kCpt = kD / kAuxThreads;  // channels per aux thread
 
+template <int kAW>
 __device__ __forceinline__ void aux_prologue(const Params& p,
                                              const SmemLayout& sm, int group,
                                              int at, int first, int i) {
+  constexpr int kAuxWarpsPerGroup = kAW;
+  constexpr int kAuxThreads = kAW * 32;
+  constexpr int kCpt = kD / kAuxThreads;  // channels per aux thread
   ItemBuf& B = sm.bufs[i % kNumBuf];
   const int t = first + i;
   const int r = t / p.heads;
@@ -379,7 +377,7 @@ __device__ __forceinline__ void aux_prologue(const Params& p,
   sq = warp_sum(sq);
   sk = warp_sum(sk);
   sqk = warp_sum(sqk);
-  float* red = sm.red + (group * 2 + 0) * kAuxWarpsPerGroup * 4;
+  float* red = sm.red + (group * 2 + 0) * kMaxAuxWarpsPerGroup * 4;
   const int wig = at >> 5;
   if ((at & 31) == 0) {
     red[wig * 4 + 0] = sq;
@@ -422,9 +420,13 @@ __device__ __forceinline__ void aux_prologue(const Params& p,
   mbar_arrive(&sm.pfull[i % kNumBuf]);
 }
 
+template <int kAW>
 __device__ __forceinline__ void aux_epilogue(const Params& p,
                                              const SmemLayout& sm, int group,
                                              int at, int first, int i) {
+  constexpr int kAuxWarpsPerGroup = kAW;
+  constexpr int kAuxThreads = kAW * 32;
+  constexpr int kCpt = kD / kAuxThreads;  // channels per aux thread
   mbar_wait(&sm.pdone[i % kNumBuf], (i / kNumBuf) & 1);
   const ItemBuf& B = sm.bufs[i % kNumBuf];
   const int t = first + i;
@@ -445,7 +447,7 @@ __device__ __forceinline__ void aux_epilogue(const Params& p,
     ss += o[cc] * o[cc];
   }
   ss = warp_sum(ss);
-  float* red = sm.red + (group * 2 + 1) * kAuxWarpsPerGroup * 4;
+  float* red = sm.red + (group * 2 + 1) * kMaxAuxWarpsPerGroup * 4;
   const int wig = at >> 5;
   if ((at & 31) == 0) red[wig * 4] = ss;
   named_bar_sync(1 + group, kAuxThreads);
@@ -461,28 +463,33 @@ __device__ __forceinline__ void aux_epilogue(const Params& p,
 }
 
 // ---------------------------------------------------------------- compute
-// A half-warp owns one state row (V index) at a time; lane j = lane & 15 holds
-// the K elements [4j, 4j+4) and [64+4j, 64+4j+4), so shared-memory reads and
-// global stores are conflict-free / coalesced and each row needs a 4-level
-// shuffle reduction shared by the two rows of the warp.
-// kBulkStore: updated rows go back into the ring slot and one thread stores
-// the whole chunk with a bulk async copy (TMA), releasing the slot once the
-// copy has read it; otherwise each lane stores its rows with st.global.
-template <typename StateT, bool kBulkStore>
-__device__ __forceinline__ void compute(const Params& p, const SmemLayout& sm,
-                                        int w, int lane, int first, int count) {
+// Warp-role layout for a given number of compute warps.
+template <int kCW, int kAW>
+struct Roles {
+  static constexpr int kComputeWarps = kCW;
+  static constexpr int kProducerWarp = kCW + kAuxGroups * kAW;
+  static constexpr int kThreads = (kProducerWarp + 1) * 32;
+};
+
+// Half-warp rows (variant 0): a half-warp owns one state row (V index) at a
+// time; lane j = lane & 15 holds the K elements [4j, 4j+4) and
+// [64+4j, 64+4j+4), so shared-memory reads and global stores are
+// conflict-free / coalesced and each row needs a 4-level shuffle reduction
+// shared by the two rows of the warp.
+template <typename StateT, int kCW>
+__device__ __forceinline__ void compute_half(const Params& p,
+                                             const SmemLayout& sm, int w,
+                                             int lane, int first, int count) {
   constexpr int kChunks =
       kD * kD * static_cast<int>(sizeof(StateT)) / kChunkBytes;
   constexpr int kChunkRows =
       kChunkBytes / (kD * static_cast<int>(sizeof(StateT)));
-  constexpr int kPairs =
-      kChunkRows / (2 * kComputeWarps);  // row pairs per warp per chunk
+  constexpr int kPairs = kChunkRows / (2 * kCW);  // row pairs per warp/chunk
   StateT* st = static_cast<StateT*>(p.state);
   const int half = lane >> 4;
   const int j = lane & 15;
   int rs = 0;
   uint32_t rph = 0;
-  int prev_rs = -1;  // kBulkStore: slot of the last chunk stored (thread 0)
   for (int i = 0; i < count; ++i) {
     ItemBuf& B = sm.bufs[i % kNumBuf];
     mbar_wait(&sm.pfull[i % kNumBuf], (i / kNumBuf) & 1);
@@ -512,13 +519,13 @@ __device__ __forceinline__ void compute(const Params& p, const SmemLayout& sm,
 #pragma unroll 1
       for (int c = 0; c < kChunks; ++c) {
         mbar_wait(&sm.full_s[rs], rph);
-        StateT* cs = reinterpret_cast<StateT*>(
+        const StateT* cs = reinterpret_cast<const StateT*>(
             sm.ring + static_cast<size_t>(rs) * kChunkBytes);
         const int cur_rs = rs;
         float s[kPairs][8];
 #pragma unroll
         for (int pp = 0; pp < kPairs; ++pp) {
-          const int lr = (pp * kComputeWarps + w) * 2 + half;
+          const int lr = (pp * kCW + w) * 2 + half;
 #pragma unroll
           for (int u = 0; u < 2; ++u) {
             float v4[4];
@@ -551,7 +558,7 @@ __device__ __forceinline__ void compute(const Params& p, const SmemLayout& sm,
             b[pp] += __shfl_xor_sync(0xffffffffu, b[pp], off);
           }
         }
-        if constexpr (!kBulkStore) {
+        {
           float dep = 0.f;
 #pragma unroll
           for (int pp = 0; pp < kPairs; ++pp) dep += a[pp] + b[pp];
@@ -559,72 +566,53 @@ __device__ __forceinline__ void compute(const Params& p, const SmemLayout& sm,
         }
 #pragma unroll
         for (int pp = 0; pp < kPairs; ++pp) {
-          const int row = c * kChunkRows + (pp * kComputeWarps + w) * 2 + half;
+          const int lr = (pp * kCW + w) * 2 + half;
+          const int row = c * kChunkRows + lr;
           const float delta = (B.v[row] - a[pp]) * beta;
           const float o = b[pp] + delta * qk;
 #pragma unroll
           for (int e = 0; e < 8; ++e) s[pp][e] += delta * k[e];
-          const int lr = (pp * kComputeWarps + w) * 2 + half;
 #pragma unroll
           for (int u = 0; u < 2; ++u) {
             float v4[4] = {s[pp][4 * u], s[pp][4 * u + 1], s[pp][4 * u + 2],
                            s[pp][4 * u + 3]};
-            if constexpr (kBulkStore) {
-              StateIO<StateT>::store(cs + lr * kD + 64 * u + 4 * j, v4);
-            } else {
-              StateIO<StateT>::store(gst + row * kD + 64 * u + 4 * j, v4);
-            }
+            StateIO<StateT>::store(gst + row * kD + 64 * u + 4 * j, v4);
           }
           if (j == 0) B.o[row] = bf16_round(o);
-        }
-        if constexpr (kBulkStore) {
-          fence_proxy_async();
-          named_bar_sync(kComputeBarrier, kComputeWarps * 32);
-          if (w == 0 && lane == 0) {
-            bulk_s2g(gst + static_cast<int64_t>(c) * kChunkRows * kD, cs,
-                     kChunkBytes);
-            bulk_commit();
-            if (prev_rs >= 0) {
-              bulk_wait_read<1>();
-              mbar_arrive(&sm.empty_s[prev_rs]);
-            }
-            prev_rs = cur_rs;
-          }
         }
       }
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(&sm.pdone[i % kNumBuf]);
   }
-  if constexpr (kBulkStore) {
-    if (w == 0 && lane == 0) {
-      bulk_wait<0>();
-      if (prev_rs >= 0) mbar_arrive(&sm.empty_s[prev_rs]);
-    }
-  }
 }
 
-// Whole-item variant: every compute warp gathers its rows of all chunks of the
-// item first (releasing each slot as soon as it is read, unless bulk stores
-// need it), then runs the kChunks * kPairs row-pair updates interleaved. More
-// ILP and one pass per item instead of one per chunk.
-template <typename StateT, bool kBulkStore>
-__device__ __forceinline__ void compute_wide(const Params& p,
+// Quarter-warp rows with packed fp32x2 math (variant 1): 8 lanes own one
+// state row, lane j = lane & 7 holding 16 K elements in four groups of 4
+// (K = 32 g + 4 j); the decay, both dot products and the rank-1 update run
+// as FMUL2/FFMA2 (fp32, same rounding as scalar), and the row reduction is a
+// 3-level shuffle shared by the warp's 4 rows. About 3x fewer instructions
+// per state row than variant 0 at the cost of 48 registers of q/k/decay, so
+// it runs with fewer compute warps. The group order is rotated by the row
+// within the warp so a bf16 row group spreads over all shared-memory banks.
+template <typename StateT, int kCW>
+__device__ __forceinline__ void compute_quad(const Params& p,
                                              const SmemLayout& sm, int w,
                                              int lane, int first, int count) {
   constexpr int kChunks =
       kD * kD * static_cast<int>(sizeof(StateT)) / kChunkBytes;
   constexpr int kChunkRows =
       kChunkBytes / (kD * static_cast<int>(sizeof(StateT)));
-  constexpr int kPairs = kChunkRows / (2 * kComputeWarps);
-  constexpr int kItemPairs = kChunks * kPairs;
+  constexpr int kQuads = kChunkRows / (4 * kCW);  // row quads per warp/chunk
+  static_assert(kQuads >= 1, "too many compute warps for the chunk");
   StateT* st = static_cast<StateT*>(p.state);
-  const int half = lane >> 4;
-  const int j = lane & 15;
+  const int r4 = lane >> 3;
+  const int j = lane & 7;
+  int koff[4];  // element offset of register group g within a row
+#pragma unroll
+  for (int g = 0; g < 4; ++g) koff[g] = 32 * ((g + r4) & 3) + 4 * j;
   int rs = 0;
   uint32_t rph = 0;
-  int prev_slots[kChunks];
-  bool have_prev = false;
   for (int i = 0; i < count; ++i) {
     ItemBuf& B = sm.bufs[i % kNumBuf];
     mbar_wait(&sm.pfull[i % kNumBuf], (i / kNumBuf) & 1);
@@ -633,144 +621,97 @@ __device__ __forceinline__ void compute_wide(const Params& p,
       const int h = (first + i) % p.heads;
       StateT* gst = st + static_cast<int64_t>(slot) * p.state_slot +
                     static_cast<int64_t>(h) * kD * kD;
-      float s[kItemPairs][8];
-      int slots[kChunks];
+      float2 q2[8], k2[8], d2[8];
 #pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const float4 q4 = *reinterpret_cast<const float4*>(&B.q[koff[g]]);
+        const float4 k4 = *reinterpret_cast<const float4*>(&B.k[koff[g]]);
+        const float4 d4 = *reinterpret_cast<const float4*>(&B.decay[koff[g]]);
+        q2[2 * g] = make_float2(q4.x, q4.y);
+        q2[2 * g + 1] = make_float2(q4.z, q4.w);
+        k2[2 * g] = make_float2(k4.x, k4.y);
+        k2[2 * g + 1] = make_float2(k4.z, k4.w);
+        d2[2 * g] = make_float2(d4.x, d4.y);
+        d2[2 * g + 1] = make_float2(d4.z, d4.w);
+      }
+      const float beta = B.beta;
+      const float qk = B.qk;
+#pragma unroll 1
       for (int c = 0; c < kChunks; ++c) {
         mbar_wait(&sm.full_s[rs], rph);
-        slots[c] = rs;
         const StateT* cs = reinterpret_cast<const StateT*>(
             sm.ring + static_cast<size_t>(rs) * kChunkBytes);
+        const int cur_rs = rs;
+        float2 s2[kQuads][8];
 #pragma unroll
-        for (int pp = 0; pp < kPairs; ++pp) {
-          const int lr = (pp * kComputeWarps + w) * 2 + half;
+        for (int qq = 0; qq < kQuads; ++qq) {
+          const int lr = (qq * kCW + w) * 4 + r4;
 #pragma unroll
-          for (int u = 0; u < 2; ++u) {
+          for (int g = 0; g < 4; ++g) {
             float v4[4];
-            StateIO<StateT>::load(cs + lr * kD + 64 * u + 4 * j, v4);
-#pragma unroll
-            for (int e = 0; e < 4; ++e) s[c * kPairs + pp][4 * u + e] = v4[e];
+            StateIO<StateT>::load(cs + lr * kD + koff[g], v4);
+            s2[qq][2 * g] = make_float2(v4[0], v4[1]);
+            s2[qq][2 * g + 1] = make_float2(v4[2], v4[3]);
           }
         }
         if (++rs == p.ring) {
           rs = 0;
           rph ^= 1u;
         }
-      }
-      float q[8], k[8], d[8];
+        float a[kQuads], b[kQuads];
 #pragma unroll
-      for (int u = 0; u < 2; ++u) {
-        const float4 q4 =
-            *reinterpret_cast<const float4*>(&B.q[64 * u + 4 * j]);
-        const float4 k4 =
-            *reinterpret_cast<const float4*>(&B.k[64 * u + 4 * j]);
-        const float4 d4 =
-            *reinterpret_cast<const float4*>(&B.decay[64 * u + 4 * j]);
-        q[4 * u] = q4.x, q[4 * u + 1] = q4.y, q[4 * u + 2] = q4.z,
-              q[4 * u + 3] = q4.w;
-        k[4 * u] = k4.x, k[4 * u + 1] = k4.y, k[4 * u + 2] = k4.z,
-              k[4 * u + 3] = k4.w;
-        d[4 * u] = d4.x, d[4 * u + 1] = d4.y, d[4 * u + 2] = d4.z,
-              d[4 * u + 3] = d4.w;
-      }
-      float a[kItemPairs], b[kItemPairs];
+        for (int qq = 0; qq < kQuads; ++qq) {
+          float2 a2 = make_float2(0.f, 0.f), b2 = make_float2(0.f, 0.f);
 #pragma unroll
-      for (int pp = 0; pp < kItemPairs; ++pp) {
-        a[pp] = 0.f;
-        b[pp] = 0.f;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) {
-          s[pp][e] *= d[e];
-          a[pp] += s[pp][e] * k[e];
-          b[pp] += s[pp][e] * q[e];
+          for (int e = 0; e < 8; ++e) {
+            s2[qq][e] = __fmul2_rn(s2[qq][e], d2[e]);
+            a2 = __ffma2_rn(s2[qq][e], k2[e], a2);
+            b2 = __ffma2_rn(s2[qq][e], q2[e], b2);
+          }
+          a[qq] = a2.x + a2.y;
+          b[qq] = b2.x + b2.y;
         }
-      }
 #pragma unroll
-      for (int off = 8; off > 0; off >>= 1) {
+        for (int off = 4; off > 0; off >>= 1) {
 #pragma unroll
-        for (int pp = 0; pp < kItemPairs; ++pp) {
-          a[pp] += __shfl_xor_sync(0xffffffffu, a[pp], off);
-          b[pp] += __shfl_xor_sync(0xffffffffu, b[pp], off);
+          for (int qq = 0; qq < kQuads; ++qq) {
+            a[qq] += __shfl_xor_sync(0xffffffffu, a[qq], off);
+            b[qq] += __shfl_xor_sync(0xffffffffu, b[qq], off);
+          }
         }
-      }
-      if constexpr (!kBulkStore) {
-        float dep = 0.f;
+        {
+          float dep = 0.f;
 #pragma unroll
-        for (int pp = 0; pp < kItemPairs; ++pp) dep += a[pp] + b[pp];
-        if (lane == 0) {
-#pragma unroll
-          for (int c = 0; c < kChunks; ++c)
-            mbar_arrive_after(&sm.empty_s[slots[c]], dep);
+          for (int qq = 0; qq < kQuads; ++qq) dep += a[qq] + b[qq];
+          if (lane == 0) mbar_arrive_after(&sm.empty_s[cur_rs], dep);
         }
-      }
-      const float beta = B.beta;
-      const float qk = B.qk;
 #pragma unroll
-      for (int c = 0; c < kChunks; ++c) {
-#pragma unroll
-        for (int pp = 0; pp < kPairs; ++pp) {
-          const int lr = (pp * kComputeWarps + w) * 2 + half;
+        for (int qq = 0; qq < kQuads; ++qq) {
+          const int lr = (qq * kCW + w) * 4 + r4;
           const int row = c * kChunkRows + lr;
-          const int ip = c * kPairs + pp;
-          const float delta = (B.v[row] - a[ip]) * beta;
-          const float o = b[ip] + delta * qk;
+          const float delta = (B.v[row] - a[qq]) * beta;
+          const float o = b[qq] + delta * qk;
+          const float2 dd = make_float2(delta, delta);
 #pragma unroll
-          for (int e = 0; e < 8; ++e) s[ip][e] += delta * k[e];
+          for (int e = 0; e < 8; ++e)
+            s2[qq][e] = __ffma2_rn(dd, k2[e], s2[qq][e]);
 #pragma unroll
-          for (int u = 0; u < 2; ++u) {
-            float v4[4] = {s[ip][4 * u], s[ip][4 * u + 1], s[ip][4 * u + 2],
-                           s[ip][4 * u + 3]};
-            if constexpr (kBulkStore) {
-              StateT* cs = reinterpret_cast<StateT*>(
-                  sm.ring + static_cast<size_t>(slots[c]) * kChunkBytes);
-              StateIO<StateT>::store(cs + lr * kD + 64 * u + 4 * j, v4);
-            } else {
-              StateIO<StateT>::store(gst + row * kD + 64 * u + 4 * j, v4);
-            }
+          for (int g = 0; g < 4; ++g) {
+            float v4[4] = {s2[qq][2 * g].x, s2[qq][2 * g].y,
+                           s2[qq][2 * g + 1].x, s2[qq][2 * g + 1].y};
+            StateIO<StateT>::store(gst + row * kD + koff[g], v4);
           }
           if (j == 0) B.o[row] = bf16_round(o);
-        }
-      }
-      if constexpr (kBulkStore) {
-        fence_proxy_async();
-        named_bar_sync(kComputeBarrier, kComputeWarps * 32);
-        if (w == 0 && lane == 0) {
-#pragma unroll
-          for (int c = 0; c < kChunks; ++c) {
-            bulk_s2g(gst + static_cast<int64_t>(c) * kChunkRows * kD,
-                     sm.ring + static_cast<size_t>(slots[c]) * kChunkBytes,
-                     kChunkBytes);
-            bulk_commit();
-          }
-          if (have_prev) {
-            bulk_wait_read<kChunks>();
-#pragma unroll
-            for (int c = 0; c < kChunks; ++c)
-              mbar_arrive(&sm.empty_s[prev_slots[c]]);
-          }
-#pragma unroll
-          for (int c = 0; c < kChunks; ++c) prev_slots[c] = slots[c];
-          have_prev = true;
         }
       }
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(&sm.pdone[i % kNumBuf]);
   }
-  if constexpr (kBulkStore) {
-    if (w == 0 && lane == 0) {
-      bulk_wait<0>();
-      if (have_prev) {
-#pragma unroll
-        for (int c = 0; c < kChunks; ++c)
-          mbar_arrive(&sm.empty_s[prev_slots[c]]);
-      }
-    }
-  }
 }
 
-template <typename StateT, bool kBulkStore, bool kWide>
-__global__ void __launch_bounds__(kThreads, 1)
+template <typename StateT, int kCW, int kAW, bool kQuad>
+__global__ void __launch_bounds__(Roles<kCW, kAW>::kThreads, 1)
     kda_decode_kernel(const Params p) {
   extern __shared__ __align__(128) uint8_t smem[];
   const SmemLayout sm = carve(smem, p.ring);
@@ -786,36 +727,35 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (threadIdx.x == 0) {
     for (int i = 0; i < p.ring; ++i) {
       mbar_init(&sm.full_s[i], 1);
-      mbar_init(&sm.empty_s[i], kBulkStore ? 1 : kComputeWarps);
+      mbar_init(&sm.empty_s[i], kCW);
     }
     for (int i = 0; i < kNumBuf; ++i) {
-      mbar_init(&sm.pfull[i], kAuxThreads);
-      mbar_init(&sm.pdone[i], kComputeWarps);
+      mbar_init(&sm.pfull[i], kAW * 32);
+      mbar_init(&sm.pdone[i], kCW);
     }
     fence_barrier_init();
   }
   __syncthreads();
 
-  if (warp == kProducerWarp) {
+  if (warp == Roles<kCW, kAW>::kProducerWarp) {
     if (lane == 0) producer<StateT>(p, sm, first, count);
     return;
   }
-  if (warp >= kComputeWarps) {
-    const int group = (warp - kComputeWarps) / kAuxWarpsPerGroup;
-    const int at =
-        threadIdx.x - (kComputeWarps + group * kAuxWarpsPerGroup) * 32;
-    if (group < count) aux_prologue(p, sm, group, at, first, group);
+  if (warp >= kCW) {
+    const int group = (warp - kCW) / kAW;
+    const int at = threadIdx.x - (kCW + group * kAW) * 32;
+    if (group < count) aux_prologue<kAW>(p, sm, group, at, first, group);
     for (int i = group; i < count; i += kAuxGroups) {
       if (i + kAuxGroups < count)
-        aux_prologue(p, sm, group, at, first, i + kAuxGroups);
-      aux_epilogue(p, sm, group, at, first, i);
+        aux_prologue<kAW>(p, sm, group, at, first, i + kAuxGroups);
+      aux_epilogue<kAW>(p, sm, group, at, first, i);
     }
     return;
   }
-  if constexpr (kWide) {
-    compute_wide<StateT, kBulkStore>(p, sm, warp, lane, first, count);
+  if constexpr (kQuad) {
+    compute_quad<StateT, kCW>(p, sm, warp, lane, first, count);
   } else {
-    compute<StateT, kBulkStore>(p, sm, warp, lane, first, count);
+    compute_half<StateT, kCW>(p, sm, warp, lane, first, count);
   }
 }
 
@@ -825,8 +765,10 @@ __global__ void __launch_bounds__(kThreads, 1)
 // them to `dst` (512 B per warp per row, as the fp32 state rows). Measures the
 // bandwidth ceiling of this pipeline design on the device. kBulkStore: one
 // thread stores each chunk straight from shared memory with a bulk async copy.
+constexpr int kStreamCW = 16;
+
 template <bool kBulkStore>
-__global__ void __launch_bounds__(kThreads, 1)
+__global__ void __launch_bounds__(Roles<kStreamCW, 4>::kThreads, 1)
     stream_copy_kernel(const uint8_t* src, uint8_t* dst, int64_t chunks,
                        int ring) {
   extern __shared__ __align__(128) uint8_t smem[];
@@ -842,12 +784,12 @@ __global__ void __launch_bounds__(kThreads, 1)
   if (threadIdx.x == 0) {
     for (int i = 0; i < ring; ++i) {
       mbar_init(&full_s[i], 1);
-      mbar_init(&empty_s[i], kBulkStore ? 1 : kComputeWarps);
+      mbar_init(&empty_s[i], kBulkStore ? 1 : kStreamCW);
     }
     fence_barrier_init();
   }
   __syncthreads();
-  if (warp == kProducerWarp) {
+  if (warp == Roles<kStreamCW, 4>::kProducerWarp) {
     if (lane != 0) return;
     int rs = 0;
     uint32_t rph = 0;
@@ -863,7 +805,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
     return;
   }
-  if (warp >= kComputeWarps) return;
+  if (warp >= kStreamCW) return;
   int rs = 0;
   uint32_t rph = 0;
   if constexpr (kBulkStore) {
@@ -894,8 +836,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     float v[2][4];
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr)
-      StateIO<float>::load(cs + (rr * kComputeWarps + warp) * kD + 4 * lane,
-                           v[rr]);
+      StateIO<float>::load(cs + (rr * kStreamCW + warp) * kD + 4 * lane, v[rr]);
     const int cur = rs;
     if (++rs == ring) {
       rs = 0;
@@ -904,8 +845,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     float* d = reinterpret_cast<float*>(dst + (first + c) * kChunkBytes);
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr)
-      StateIO<float>::store(d + (rr * kComputeWarps + warp) * kD + 4 * lane,
-                            v[rr]);
+      StateIO<float>::store(d + (rr * kStreamCW + warp) * kD + 4 * lane, v[rr]);
     float dep = v[0][0] + v[1][0];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -1083,46 +1023,31 @@ void kda_decode(TensorView x, TensorView conv_w, TensorView conv_state,
 
   const cudaStream_t stream = get_stream(x.device());
   const size_t smem = smem_bytes(ring_used);
-  {
-    const int chunks = static_cast<int>(kD * kD * esize / kChunkBytes);
-    const int64_t fl = flags < 0 ? kDefaultFlags : flags;
-    // Bulk stores hold a slot until its copy-out has read it: the whole-item
-    // pass needs two items of slots, the per-chunk pass two chunks.
-    const int need =
-        (fl & 1) ? ((fl & 2) ? 2 * chunks : 2) : ((fl & 2) ? chunks : 1);
-    TVM_FFI_ICHECK(ring_used >= need)
-        << "ring depth " << ring_used << " too small for flags " << fl;
-  }
-  // flags bit 0: bulk (TMA) state stores, bit 1: whole-item compute pass;
-  // flags < 0: the default variant.
+  // flags: 0 = half-warp rows, 16 compute + 2x4 aux warps (800 threads);
+  // 1 = quarter-warp rows with packed fp32x2 math, 8 compute + 2x2 aux warps
+  // (416 threads, up to 128 registers); < 0 = the default variant.
   const int64_t f = flags < 0 ? kDefaultFlags : flags;
+  TVM_FFI_ICHECK(f == 0 || f == 1) << "unknown kda_decode variant " << f;
   const bool is_f32 = state_code == float32_code;
-  const int which = (is_f32 ? 0 : 1) + static_cast<int>(f & 3) * 2;
+  const int which = (is_f32 ? 0 : 1) + static_cast<int>(f) * 2;
   void (*kernel)(Params) = nullptr;
+  int threads = 0;
   switch (which) {
     case 0:
-      kernel = kda_decode_kernel<float, false, false>;
+      kernel = kda_decode_kernel<float, 16, 4, false>;
+      threads = Roles<16, 4>::kThreads;
       break;
     case 1:
-      kernel = kda_decode_kernel<__nv_bfloat16, false, false>;
+      kernel = kda_decode_kernel<__nv_bfloat16, 16, 4, false>;
+      threads = Roles<16, 4>::kThreads;
       break;
     case 2:
-      kernel = kda_decode_kernel<float, true, false>;
-      break;
-    case 3:
-      kernel = kda_decode_kernel<__nv_bfloat16, true, false>;
-      break;
-    case 4:
-      kernel = kda_decode_kernel<float, false, true>;
-      break;
-    case 5:
-      kernel = kda_decode_kernel<__nv_bfloat16, false, true>;
-      break;
-    case 6:
-      kernel = kda_decode_kernel<float, true, true>;
+      kernel = kda_decode_kernel<float, 8, 2, true>;
+      threads = Roles<8, 2>::kThreads;
       break;
     default:
-      kernel = kda_decode_kernel<__nv_bfloat16, true, true>;
+      kernel = kda_decode_kernel<__nv_bfloat16, 8, 2, true>;
+      threads = Roles<8, 2>::kThreads;
       break;
   }
   if (!di.attr_set[which]) {
@@ -1132,7 +1057,7 @@ void kda_decode(TensorView x, TensorView conv_w, TensorView conv_state,
         << "cudaFuncSetAttribute: " << cudaGetErrorString(e);
     di.attr_set[which] = true;
   }
-  kernel<<<static_cast<unsigned>(grid), kThreads, smem, stream>>>(p);
+  kernel<<<static_cast<unsigned>(grid), threads, smem, stream>>>(p);
   cudaError_t e = cudaGetLastError();
   TVM_FFI_ICHECK(e == cudaSuccess)
       << "kda_decode launch failed: " << cudaGetErrorString(e);
@@ -1171,7 +1096,7 @@ void stream_copy(TensorView src, TensorView dst, int64_t ring, int64_t ctas,
   const int64_t chunks = nbytes / kChunkBytes;
   int64_t grid = ctas > 0 ? ctas : di.sms;
   if (grid > chunks) grid = chunks;
-  kernel<<<static_cast<unsigned>(grid), kThreads, smem,
+  kernel<<<static_cast<unsigned>(grid), Roles<kStreamCW, 4>::kThreads, smem,
            get_stream(src.device())>>>(
       static_cast<const uint8_t*>(src.data_ptr()),
       static_cast<uint8_t*>(dst.data_ptr()), chunks, ring_used);

@@ -89,7 +89,8 @@ def kda_decode(
     norm_weight: [128] fp32; output: [(1,) rows, H, 128] bf16.
     ``ring``/``ctas`` override the shared-memory ring depth and the grid size
     (0 = defaults: 6 slots or the deepest that fits, one CTA per SM); ``flags`` picks
-    the variant (bit 0: bulk TMA state stores; -1 = the default variant).
+    the variant (0: half-warp rows; 1: quarter-warp rows with packed fp32x2
+    math; -1 = the default, 1).
     """
     _module().kda_decode(
         x,
