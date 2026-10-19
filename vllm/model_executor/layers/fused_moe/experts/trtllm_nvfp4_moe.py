@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -397,6 +398,69 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         assert isinstance(routed_output, UnfinalizedMoEOutput)
         return routed_output
 
+    # Large-M path: FlashInfer CuTe-DSL MoE on the same (re-laid-out) weights.
+    _cutedsl_large_m_state: str | None = None  # None: undecided, "on", "off"
+
+    def _use_cutedsl_large_m(
+        self, num_rows: int, hidden_states: torch.Tensor, output: torch.Tensor | None
+    ) -> bool:
+        threshold = envs.VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M
+        if threshold <= 0 or num_rows < threshold or output is None:
+            return False
+        if self.moe_config.should_defer_moe_finalize(num_rows):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        if self._cutedsl_large_m_state is None:
+            from vllm.model_executor.layers.fused_moe.experts import (
+                trtllm_nvfp4_cutedsl_large_m as large_m,
+            )
+
+            ok = current_platform.is_device_capability_family(
+                100
+            ) and large_m.supported(self, hidden_states)
+            self._cutedsl_large_m_state = "on" if ok else "off"
+            logger.info_once(
+                "TRT-LLM NVFP4 MoE: CuTe-DSL large-M path (>= %d rows, tactic %s) %s",
+                threshold,
+                envs.VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M_TACTIC,
+                "enabled" if ok else "not supported for this layer; keeping trtllm-gen",
+            )
+        return self._cutedsl_large_m_state == "on"
+
+    def _apply_cutedsl_large_m(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+        a1q_scale: torch.Tensor | None,
+    ) -> bool:
+        from vllm.model_executor.layers.fused_moe.experts import (
+            trtllm_nvfp4_cutedsl_large_m as large_m,
+        )
+
+        assert a1q_scale is not None
+        limit = self.quant_config.gemm1_clamp_limit
+        if limit is None:
+            limit = getattr(self.moe_config, "swiglu_limit", None)
+        return large_m.apply_cutedsl_large_m(
+            self,
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            a1q_scale,
+            large_m.tactic_from_name(envs.VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M_TACTIC),
+            limit,
+        )
+
     def apply(
         self,
         output: torch.Tensor,
@@ -423,6 +487,19 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         topk_ids = topk_ids.to(dtype=torch.int32)
 
         M = hidden_states.shape[0]
+        if self._use_cutedsl_large_m(
+            M, hidden_states, output
+        ) and self._apply_cutedsl_large_m(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            a1q_scale,
+        ):
+            return None
         chunk_size = self._get_chunk_size()
 
         if chunk_size >= M:

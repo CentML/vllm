@@ -226,6 +226,8 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
     VLLM_FLASHINFER_MOE_A2A_ZERO_COPY_COMBINE: bool = False
+    VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M: int = 0
+    VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M_TACTIC: str = "t128_n256_n256"
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1845,6 +1847,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # skipping moeA2APrepareCombineKernel's staging copy. BF16 combine only.
     "VLLM_FLASHINFER_MOE_A2A_ZERO_COPY_COMBINE": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_A2A_ZERO_COPY_COMBINE", "0"))
+    ),
+    # flashinfer_trtllm NVFP4 MoE: run calls with at least this many (dispatched)
+    # rows through FlashInfer's CuTe-DSL MoE kernels, reading the same weights
+    # via a per-call re-layout into shared scratch (0 = off). Smaller calls
+    # (decode) keep trtllm-gen. See fused_moe/experts/
+    # trtllm_nvfp4_cutedsl_large_m.py.
+    "VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M": lambda: int(
+        os.getenv("VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M", "0")
+    ),
+    # Tactic of that path: t128_n256_n256 (default), t128_n128_n128,
+    # t128_n256_n128, or "auto" (FlashInfer autotuner / its default).
+    "VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M_TACTIC": lambda: os.getenv(
+        "VLLM_FLASHINFER_MOE_CUTEDSL_LARGE_M_TACTIC", "t128_n256_n256"
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
