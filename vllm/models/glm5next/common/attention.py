@@ -30,6 +30,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.glm5next.common.fp8_linear import glm53_fp8_linear_quant_config
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
@@ -424,11 +425,20 @@ class Glm5NextMLAAttention(nn.Module):
         # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)
         proj_input_size = input_size if input_size is not None else self.hidden_size
 
+        # Opt-in online FP8 (additional_config.glm53_fp8_linear) for the
+        # BF16 projections; kv_b_proj (absorbed into W_UK/W_UV at load) and the
+        # MLA attention layer itself keep quant_config.
+        def _proj_quant_config(group: str) -> QuantizationConfig | None:
+            return (
+                glm53_fp8_linear_quant_config(group, prefix, vllm_config)
+                or quant_config
+            )
+
         if self.q_lora_rank is not None:
             self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(
                 proj_input_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                quant_config=quant_config,
+                quant_config=_proj_quant_config("mla_qkv_a"),
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
         else:
@@ -446,7 +456,7 @@ class Glm5NextMLAAttention(nn.Module):
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=_proj_quant_config("mla_q_b"),
                 prefix=f"{prefix}.q_b_proj",
             )
         else:
@@ -469,7 +479,7 @@ class Glm5NextMLAAttention(nn.Module):
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=_proj_quant_config("mla_out"),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -521,7 +531,8 @@ class Glm5NextMLAAttention(nn.Module):
                 config,
                 hidden_size,
                 q_lora_rank,
-                quant_config,
+                # Used only for wq_b (wk_weights_proj stays BF16).
+                _proj_quant_config("indexer_q"),
                 cache_config,
                 topk_indices_buffer,
                 f"{prefix}.indexer",
