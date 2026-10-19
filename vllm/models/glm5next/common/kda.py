@@ -187,11 +187,43 @@ def _resolve_kda_decode_backend(
     pipelined CUDA kernel (kda_decode_pipelined), the latter two doing all
     three in one launch. ``backend`` comes from
     ``additional_config.kda_decode_backend``; "flashinfer" and "pipelined" are
-    opt-in, "triton" (default) and "auto" keep the Triton kernels."""
+    opt-in, "triton" (default) and "auto" keep the Triton kernels.
+
+    With speculative decoding every decode row is a draft-verify row of
+    1 + num_spec tokens (and the conv state is 3 + num_spec wide), so the
+    single-token kernels never run; "flashinfer" and "pipelined" then select
+    FlashInfer's packed multi-token fused decode for the verify rows
+    (see _FlashInferPackedKdaSpecDecode)."""
     if backend in ("auto", "triton"):
         return "triton"
     if backend not in ("flashinfer", "pipelined"):
         raise ValueError(f"Unsupported GLM-5.3 KDA decode backend: {backend}")
+    if num_spec > 0:
+        capability = current_platform.get_device_capability()
+        if not (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 10
+            and head_dim == 128
+            and conv_size == 4
+            and 1 <= num_spec <= 7
+            and lower_bound is not None
+            and lower_bound < 0
+            and dtype == torch.bfloat16
+            and conv_state_dtype == torch.bfloat16
+            and recurrent_state_dtype in (torch.float32, torch.bfloat16)
+            and not is_conv_state_dim_first()
+        ):
+            raise RuntimeError(
+                f"kda_decode_backend={backend} with speculative decoding uses "
+                "FlashInfer's packed multi-token KDA decode, which requires "
+                "CUDA SM10x, bfloat16 activations and conv state, a float32 or "
+                "bfloat16 recurrent state, head_dim 128, conv kernel 4, a "
+                "bounded gate, 1-7 speculative tokens and the SD conv-state "
+                "layout (unset VLLM_SSM_CONV_STATE_LAYOUT=DS). Use "
+                "kda_decode_backend=triton otherwise."
+            )
+        return backend
     capability = current_platform.get_device_capability()
     if not (
         current_platform.is_cuda()
@@ -446,6 +478,212 @@ class _PipelinedKdaDecode:
         )
 
 
+class _FlashInferPackedKdaSpecDecode:
+    """FlashInfer packed multi-token fused KDA decode for draft-verify rows
+    (FlashInfer 0.7.2 ``fused_kda_decode_multitoken``, CuTe DSL, SM10x): conv +
+    SiLU, T = 1 + num_spec recurrent KDA steps and the gated RMSNorm in one
+    launch per layer, replacing causal_conv1d_update + fused_recurrent_kda +
+    o_norm on the spec path.
+
+    Same cache contract as vLLM's Triton spec path: ``state_indices`` [N, T],
+    column t receives the recurrent checkpoint after token t; the source
+    checkpoint is column ``num_accepted_tokens - 1``; the conv window (width
+    T + 2, SD layout) lives in column 0's slot and is read at offset
+    ``num_accepted_tokens - 1``. Non-positive slots and zero-length rows (CUDA
+    graph padding) are null rows that touch no cache.
+
+    FlashInfer's validating wrapper allows 12/24/32/48/96 heads; the kernel is
+    head-count generic (grid H x N, H a compile-time constant), so like the
+    single-token path we launch it for GLM-5.3's 16 (TP4) / 64 (TP1, DEP)
+    local heads. That bypasses the wrapper, so this class repeats its tile
+    pick and does the structural checks once, on the first call. All tile
+    specialisations reachable for max_num_seqs are compiled at construction
+    (disk-cached under FLASHINFER_WORKSPACE_BASE), so no CuTe DSL compile lands
+    in a served step.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        num_spec: int,
+        lower_bound: float,
+        norm_eps: float,
+        state_dtype: torch.dtype,
+        max_num_seqs: int,
+    ) -> None:
+        # flashinfer.kda_kernels rebinds the module name to the function, so
+        # import the submodule by its path.
+        module = importlib.import_module(
+            "flashinfer.kda_kernels.fused_kda_decode_multitoken"
+        )
+        for attr in ("_pick_tile", "_get_compiled_kernel", "_required_smem_bytes"):
+            if not callable(getattr(module, attr, None)):
+                raise RuntimeError(
+                    "kda_decode_backend with speculative decoding needs "
+                    f"FlashInfer 0.7.2's fused_kda_decode_multitoken.{attr}."
+                )
+        self._module = module
+        self._num_heads = num_heads
+        self._T = num_spec + 1
+        self._lower_bound = float(lower_bound)
+        self._norm_eps = float(norm_eps)
+        self._state_is_bf16 = state_dtype == torch.bfloat16
+        device = torch.accelerator.current_device_index()
+        props = torch.cuda.get_device_properties(device)
+        self._sm_count = props.multi_processor_count
+        self._capability = (props.major, props.minor)
+        self._validated = False
+        # Reachable tiles: _pick_tile depends on N * H only (and T, SMs).
+        tiles = {self._tile(n) for n in range(1, max(1, max_num_seqs) + 1)}
+        for tile, norm_order in sorted(tiles):
+            required = module._required_smem_bytes(
+                self._T, tile[0], tile[1], tile[3], tile[4], norm_order
+            )
+            if required > props.shared_memory_per_block_optin:
+                raise RuntimeError(
+                    f"FlashInfer packed KDA decode T={self._T} tile {tile} needs "
+                    f"{required} B of shared memory; the device allows "
+                    f"{props.shared_memory_per_block_optin} B."
+                )
+            self._kernel(tile, norm_order)
+        logger.info_once(
+            "Using FlashInfer packed fused KDA decode for spec-verify rows "
+            "(T=%d, %d local heads, %s state, %d tile variants).",
+            self._T,
+            num_heads,
+            "bf16" if self._state_is_bf16 else "fp32",
+            len(tiles),
+        )
+
+    def _tile(self, num_seqs: int) -> tuple[tuple[int, ...], int]:
+        tile = tuple(
+            self._module._pick_tile(
+                self._T, num_seqs * self._num_heads, self._sm_count, self._capability
+            )
+        )
+        R, KQ, _, NCH, SPLIT = tile
+        # Same rule as FlashInfer's _run_fused_kda_decode_multitoken.
+        norm_order = 3 if (R, KQ, NCH, SPLIT) == (2, 16, 2, 1) else 1
+        return tile, norm_order
+
+    def _kernel(self, tile: tuple[int, ...], norm_order: int) -> Callable[..., None]:
+        R, KQ, bpm, NCH, SPLIT = tile
+        # functools.cache'd in FlashInfer: a dict lookup after the first call.
+        return self._module._get_compiled_kernel(
+            self._T,
+            self._num_heads,
+            self._lower_bound,
+            self._norm_eps,
+            R,
+            KQ,
+            bpm,
+            NCH,
+            SPLIT,
+            self._state_is_bf16,
+            norm_order,
+        )
+
+    def _validate(self, x, weight, conv_state, raw_gate, raw_beta, A_log,
+                  dt_bias, state_indices, query_start_loc, num_accepted_tokens,
+                  state, output_gate, norm_weight, output) -> None:  # fmt: skip
+        H, T, D = self._num_heads, self._T, 128
+        P = H * D
+        n, rows = state_indices.shape[0], x.shape[0]
+        checks = {
+            "x [rows, 3P] bf16, unit channel stride": x.dtype == torch.bfloat16
+            and x.shape[1] == 3 * P
+            and x.stride(1) == 1,
+            "weight [3, 4, P] fp32 contiguous": weight.dtype == torch.float32
+            and tuple(weight.shape) == (3, 4, P)
+            and weight.is_contiguous(),
+            "conv_state [slots, 3P, T+2] bf16 SD": conv_state.dtype == torch.bfloat16
+            and tuple(conv_state.shape[1:]) == (3 * P, T + 2)
+            and conv_state.stride(1) == 1
+            and conv_state.stride(2) == 3 * P,
+            "raw_gate [1, rows, H, 128] contiguous": tuple(raw_gate.shape)
+            == (1, rows, H, D)
+            and raw_gate.is_contiguous(),
+            "raw_beta [1, rows, H]": tuple(raw_beta.shape) == (1, rows, H)
+            and raw_beta.stride(2) == 1,
+            "A_log [H] fp32": A_log.dtype == torch.float32
+            and tuple(A_log.shape) == (H,),
+            "dt_bias [P] fp32": dt_bias.dtype == torch.float32
+            and tuple(dt_bias.shape) == (P,),
+            "state_indices [N, T] int32 contiguous": state_indices.dtype == torch.int32
+            and state_indices.shape[1] == T
+            and state_indices.is_contiguous(),
+            "query_start_loc [N+1] int32": query_start_loc.dtype == torch.int32
+            and tuple(query_start_loc.shape) == (n + 1,)
+            and query_start_loc.is_contiguous(),
+            "num_accepted_tokens [N] int32": num_accepted_tokens.dtype == torch.int32
+            and tuple(num_accepted_tokens.shape) == (n,)
+            and num_accepted_tokens.is_contiguous(),
+            "state [slots, H, 128, 128]": state.dtype
+            == (torch.bfloat16 if self._state_is_bf16 else torch.float32)
+            and tuple(state.shape[1:]) == (H, D, D)
+            and tuple(state.stride()[1:]) == (D * D, D, 1)
+            and state.shape[0] == conv_state.shape[0],
+            "output_gate [rows, H, 128]": tuple(output_gate.shape) == (rows, H, D)
+            and output_gate.stride(2) == 1
+            and output_gate.stride(1) == D,
+            "norm_weight [128] fp32": norm_weight.dtype == torch.float32
+            and tuple(norm_weight.shape) == (D,),
+            "output [1, rows, H, 128] contiguous": tuple(output.shape)
+            == (1, rows, H, D)
+            and output.is_contiguous(),
+        }
+        bad = [name for name, ok in checks.items() if not ok]
+        if bad:
+            raise ValueError(f"FlashInfer packed KDA decode: bad inputs: {bad}")
+        self._validated = True
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        conv_state: torch.Tensor,
+        raw_gate: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        state: torch.Tensor,
+        output_gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        if not state_indices.is_contiguous():
+            # Unstaged (eager) metadata slices the block table.
+            state_indices = state_indices.contiguous()
+        if not self._validated:
+            self._validate(x, weight, conv_state, raw_gate, raw_beta, A_log,
+                           dt_bias, state_indices, query_start_loc,
+                           num_accepted_tokens, state, output_gate,
+                           norm_weight, output)  # fmt: skip
+        tile, norm_order = self._tile(state_indices.shape[0])
+        self._kernel(tile, norm_order)(
+            x,
+            weight,
+            conv_state,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_indices,
+            query_start_loc,
+            num_accepted_tokens,
+            state,
+            output_gate,
+            norm_weight,
+            output,
+            x.stride(0),
+            raw_beta.stride(1),
+            output_gate.stride(0),
+        )
+
+
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
@@ -682,7 +920,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # layout [3, 4, H * 128] and the fp32 norm weight.
         self._fi_conv_weight: torch.Tensor | None = None
         self._fi_norm_weight: torch.Tensor | None = None
-        if self.kda_decode_backend == "flashinfer":
+        # Spec decode: FlashInfer packed multi-token decode for the verify rows
+        # (the single-token kernels below are never reached then).
+        self._fi_spec_kda_decode: _FlashInferPackedKdaSpecDecode | None = None
+        # Fused decode backends leave _forward's output gated-RMS-normed in
+        # every step (fused kernels, or o_norm inside _forward on the Triton
+        # paths), so forward() must not apply o_norm again.
+        self._output_normed = self.kda_decode_backend != "triton"
+        if self.kda_decode_backend != "triton" and self.num_spec > 0:
+            assert self.kda_lower_bound is not None
+            self._fi_spec_kda_decode = _FlashInferPackedKdaSpecDecode(
+                self.local_num_heads,
+                self.num_spec,
+                self.kda_lower_bound,
+                self.o_norm.eps,
+                recurrent_state_dtype,
+                vllm_config.scheduler_config.max_num_seqs,
+            )
+        elif self.kda_decode_backend == "flashinfer":
             assert self.kda_lower_bound is not None
             self._fi_fused_kda_decode = _FlashInferFusedKdaDecode(
                 self._conv_state_dim_first,
@@ -851,7 +1106,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Triton paths). This must not depend on the step type: a breakable
         # CUDA graph replay re-runs _forward eagerly for the live batch but
         # replays whatever followed it at capture time.
-        if self._fi_fused_kda_decode is None:
+        if not self._output_normed:
             core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
@@ -1013,8 +1268,61 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             qkv_spec = g1_spec = beta_spec = None
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
 
+        # Spec-verify rows through FlashInfer's packed fused decode (conv +
+        # T recurrent steps + gated RMSNorm, one launch, normed output). A
+        # pure verify step writes the layer output in place and is done; a
+        # mixed step (prefill + verify rows) merges below, with the non-spec
+        # rows normed before the merge.
+        fused_spec = use_spec and self._fi_spec_kda_decode is not None
+        if fused_spec:
+            assert self._fi_spec_kda_decode is not None
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            assert num_accepted_tokens is not None
+            assert qkv_spec is not None and g1_spec is not None
+            assert beta_spec is not None
+            assert conv_bias is None
+            if self._fi_norm_weight is None:
+                self._fi_norm_weight = self.o_norm.weight.float().contiguous()
+            if self._fi_conv_weight is None:
+                self._fi_conv_weight = (
+                    conv_weights.view(3, self.local_projection_size, self.conv_size)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+            pure_spec = non_spec_token_indx is None or non_spec_token_indx.numel() == 0
+            if pure_spec:
+                fused_spec_out = core_attn_out[:, :num_actual_tokens]
+                fused_spec_gate = g2[:num_actual_tokens]
+            else:
+                assert spec_token_indx is not None
+                fused_spec_out = torch.empty(
+                    (1, qkv_spec.size(0), self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+                fused_spec_gate = g2.index_select(0, spec_token_indx)
+            self._fi_spec_kda_decode(
+                x=qkv_spec,
+                weight=self._fi_conv_weight,
+                conv_state=conv_state,
+                raw_gate=g1_spec,
+                raw_beta=beta_spec,
+                A_log=self.A_log.view(-1),
+                dt_bias=self.dt_bias,
+                state_indices=spec_state_indices_tensor,
+                query_start_loc=spec_query_start_loc,
+                num_accepted_tokens=num_accepted_tokens,
+                state=recurrent_state,
+                output_gate=fused_spec_gate,
+                norm_weight=self._fi_norm_weight,
+                output=fused_spec_out,
+            )
+            if pure_spec:
+                return
+
         # --- causal conv1d: spec (draft-verify) path ---
-        if use_spec:
+        if use_spec and not fused_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
@@ -1093,7 +1401,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
             else None
         )
-        if use_spec:
+        if fused_spec:
+            core_attn_out_spec = fused_spec_out
+        elif use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
@@ -1292,6 +1602,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- merge spec / non-spec outputs back into token order ---
         if use_spec and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
+            if fused_spec:
+                # Spec rows come out of the fused kernel normed; norm the
+                # non-spec (prefill) rows here so the whole output is normed.
+                assert non_spec_token_indx is not None
+                core_attn_out_non_spec = self.o_norm(
+                    core_attn_out_non_spec,
+                    g2.index_select(0, non_spec_token_indx),
+                )
             core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
             core_attn_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
         elif use_spec:
@@ -1305,9 +1623,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     0, :num_actual_tokens
                 ]
 
-        if self._fi_fused_kda_decode is not None:
-            # forward() skips o_norm for the FlashInfer decode backend, so the
+        if self._output_normed and not fused_spec:
+            # forward() skips o_norm for the fused decode backends, so the
             # Triton paths (prefill / mixed steps) apply it here, in place.
+            # (With fused_spec the spec rows are normed by the kernel and the
+            # non-spec rows were normed before the merge above.)
             live_out = core_attn_out[:, :num_actual_tokens]
             normed = self.o_norm(live_out, g2[:num_actual_tokens])
             if normed.data_ptr() != live_out.data_ptr():
