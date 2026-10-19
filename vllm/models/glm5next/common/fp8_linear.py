@@ -156,6 +156,13 @@ class Glm53HybridFp8LinearMethod(UnquantizedLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         weight = layer.weight.data  # [N, K] bf16
+        if weight.shape[0] % 16 or weight.shape[1] % 16:
+            # torch._scaled_mm (cuBLASLt FP8) needs N and K divisible by 16;
+            # e.g. the merged KDA in_proj is 3336 wide per rank at TP8. Such a
+            # layer simply stays BF16.
+            layer.weight_fp8 = None
+            _HYBRID_FP8_COPY["skipped"] = _HYBRID_FP8_COPY.get("skipped", 0) + 1
+            return
         fp8_max = get_fp8_min_max()[1]
         scale = (weight.abs().amax().float() / fp8_max).clamp_min(1e-12).reshape(1)
         qweight, _ = ops.scaled_fp8_quant(weight, scale=scale)
@@ -174,7 +181,11 @@ class Glm53HybridFp8LinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = x.numel() // x.shape[-1]
-        if num_tokens < self.min_tokens or envs.VLLM_BATCH_INVARIANT:
+        if (
+            num_tokens < self.min_tokens
+            or envs.VLLM_BATCH_INVARIANT
+            or getattr(layer, "weight_fp8", None) is None
+        ):
             return super().apply(layer, x, bias)
         x_2d = x.reshape(-1, x.shape[-1])
         if not x_2d.is_contiguous():
@@ -327,5 +338,12 @@ def log_glm53_fp8_linear_memory() -> None:
             "copy next to BF16, +%.2f GiB on this GPU.",
             _HYBRID_FP8_COPY["layers"],
             _HYBRID_FP8_COPY["bytes"] / 2**30,
+            scope="local",
+        )
+    if _HYBRID_FP8_COPY.get("skipped"):
+        logger.info_once(
+            "GLM-5.3 FP8 linear (hybrid_tensor): %d layers stay BF16 (weight "
+            "dims not divisible by 16 for torch._scaled_mm).",
+            _HYBRID_FP8_COPY["skipped"],
             scope="local",
         )
