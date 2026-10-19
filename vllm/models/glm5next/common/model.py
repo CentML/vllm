@@ -92,6 +92,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .attention import Glm5NextMLAAttention
+from .fp8_linear import glm53_shared_expert_quant_config
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
     Glm5NextMultiModalProcessor,
@@ -278,7 +279,11 @@ class Glm5NextMoE(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                quant_config=quant_config,
+                # Opt-in online FP8 (additional_config.glm53_fp8_linear) when
+                # the checkpoint keeps the shared expert in BF16.
+                quant_config=glm53_shared_expert_quant_config(
+                    quant_config, f"{prefix}.shared_experts"
+                ),
                 is_sequence_parallel=self.is_sequence_parallel,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
