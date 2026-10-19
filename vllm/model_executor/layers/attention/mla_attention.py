@@ -1867,6 +1867,8 @@ def _use_masked_mha(
     if backend_name == "FLASH_ATTN_MLA_SPARSE_FA4":
         # Its prefill batches run on FlashInfer's kernel, so it shares those rows.
         backend_name = "FLASHINFER_MLA_SPARSE"
+    if envs.VLLM_SPARSE_MLA_MASKED_MHA == "force":
+        return True
     thresholds = (
         _MASKED_MHA_THRESHOLDS.get((qk_head_dim, v_head_dim), {})
         .get(backend_name, {})
