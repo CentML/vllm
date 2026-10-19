@@ -10,16 +10,14 @@ its last ``W-1`` tokens), with two differences:
 - The output is planar, ``[num_planes, T, dim // num_planes]``: for the merged
   q|k|v channels each of q, k and v is a dense ``[T, H * D]`` tensor, which is
   what FlashKDA consumes, so no ``.contiguous()`` copies are needed.
-- Programs tile 16 tokens x BLOCK_N channels independently of sequence
-  boundaries (each token finds its sequence by binary search over
-  ``query_start_loc``). Away from sequence starts a program issues one 2D
-  load of its 16 rows plus a 4-row halo (16-byte vectors, all in flight),
-  unpacks the rows in registers and slides the width-4 window over them;
-  causal_conv1d_fn instead loops token by token with 4-byte loads and ~200
-  registers per thread, which kept VR200 at ~3 TB/s. Blocks that contain the
-  first tokens of a sequence go token by token and read the initial state.
-  The state update is a second, tiny launch, so the initial-state reads of
-  the first launch never race with the writes.
+- The main kernel is a sequence-agnostic width-4 stencil over tiles of 16
+  tokens x BLOCK_N channels (no per-token metadata): each tile is one 2D
+  load (registers, the next tile prefetched; or TMA through shared memory,
+  pipelined over TILES tiles per program), rows are unpacked in registers
+  and slid through the window, and a tile's last 3 rows are the next one's
+  halo. A second launch recomputes the first 3 tokens of every sequence with
+  the initial conv state (or zeros) as history; a third updates the state.
+  causal_conv1d_fn instead loops token by token with 4-byte loads.
 """
 
 import torch
@@ -76,9 +74,186 @@ def _conv_silu(a, b, c, d, w0, w1, w2, w3, acc0, SILU_ACTIVATION: tl.constexpr):
     return acc
 
 
-# Batch-dependent scalars are not specialized (no recompiles per batch shape).
-@triton.jit(do_not_specialize=["num_tokens", "num_seqs", "search_step"])
+@triton.jit
+def _conv_tile(
+    xt,
+    h1,
+    h2,
+    h3,
+    w0,
+    w1,
+    w2,
+    w3,
+    acc0,
+    dt: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+):
+    """Conv + SiLU of 16 rows ``xt`` [BN, 16] given the 3 rows before them;
+    returns the outputs [BN, 16] and the tile's last 3 rows."""
+    e, o = _split_rows(xt)
+    s0, s2 = _split_rows(e)  # rows 0,4,8,12 / 2,6,10,14
+    s1, s3 = _split_rows(o)  # rows 1,5,9,13 / 3,7,11,15
+    x0, x4, x8, x12 = _rows4(s0)
+    x1, x5, x9, x13 = _rows4(s1)
+    x2, x6, x10, x14 = _rows4(s2)
+    x3, x7, x11, x15 = _rows4(s3)
+    y0 = _conv_silu(h1, h2, h3, x0, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y1 = _conv_silu(h2, h3, x0, x1, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y2 = _conv_silu(h3, x0, x1, x2, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y3 = _conv_silu(x0, x1, x2, x3, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y4 = _conv_silu(x1, x2, x3, x4, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y5 = _conv_silu(x2, x3, x4, x5, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y6 = _conv_silu(x3, x4, x5, x6, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y7 = _conv_silu(x4, x5, x6, x7, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y8 = _conv_silu(x5, x6, x7, x8, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y9 = _conv_silu(x6, x7, x8, x9, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y10 = _conv_silu(x7, x8, x9, x10, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y11 = _conv_silu(x8, x9, x10, x11, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y12 = _conv_silu(x9, x10, x11, x12, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y13 = _conv_silu(x10, x11, x12, x13, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y14 = _conv_silu(x11, x12, x13, x14, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    y15 = _conv_silu(x12, x13, x14, x15, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
+    u0 = _unrows4(y0, y4, y8, y12)
+    u1 = _unrows4(y1, y5, y9, y13)
+    u2 = _unrows4(y2, y6, y10, y14)
+    u3 = _unrows4(y3, y7, y11, y15)
+    return _join_rows(_join_rows(u0, u2), _join_rows(u1, u3)), x13, x14, x15
+
+
+@triton.jit
+def _load_weights(
+    w_ptr,
+    bias_ptr,
+    offs_f,
+    mask_f,
+    stride_w_dim,
+    stride_w_width,
+    HAS_BIAS: tl.constexpr,
+):
+    w_row = w_ptr + offs_f * stride_w_dim
+    w0 = tl.load(w_row, mask=mask_f, other=0.0)
+    w1 = tl.load(w_row + stride_w_width, mask=mask_f, other=0.0)
+    w2 = tl.load(w_row + 2 * stride_w_width, mask=mask_f, other=0.0)
+    w3 = tl.load(w_row + 3 * stride_w_width, mask=mask_f, other=0.0)
+    if HAS_BIAS:
+        acc0 = tl.load(bias_ptr + offs_f, mask=mask_f, other=0.0).to(tl.float32)
+    else:
+        acc0 = tl.zeros(offs_f.shape, dtype=tl.float32)
+    return w0, w1, w2, w3, acc0
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
 def _kda_conv_fwd_planar_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    out_ptr,
+    num_tokens,
+    dim,
+    plane_dim,
+    stride_x_token,
+    stride_w_dim,
+    stride_w_width,
+    stride_out_plane,
+    stride_out_token,
+    HAS_BIAS: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    TILES: tl.constexpr,
+):
+    # Sequence-agnostic width-4 stencil over TILES consecutive 16-token
+    # blocks x BLOCK_N channels: every token takes its 3 predecessors from x.
+    # The first 3 tokens of each sequence are redone by the fixup kernel.
+    # The next block's rows are loaded before the current block is computed
+    # and stored; a block's last 3 rows are the next block's halo.
+    rows = tl.arange(0, 16)
+    t_first = tl.program_id(0).to(tl.int64) * (16 * TILES)
+    offs_f = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_f = offs_f < dim
+    w0, w1, w2, w3, acc0 = _load_weights(
+        w_ptr, bias_ptr, offs_f, mask_f, stride_w_dim, stride_w_width, HAS_BIAS
+    )
+    # BLOCK_N divides plane_dim, so a program writes inside one plane.
+    plane = (tl.program_id(1) * BLOCK_N) // plane_dim
+    out_base = (
+        out_ptr + plane.to(tl.int64) * stride_out_plane + offs_f - plane * plane_dim
+    )
+    x_base = x_ptr + offs_f
+    dt: tl.constexpr = out_ptr.dtype.element_ty
+
+    halo_t = t_first - 4 + tl.arange(0, 4)
+    hx = tl.load(
+        x_base[:, None] + halo_t[None, :] * stride_x_token,
+        mask=mask_f[:, None] & ((halo_t >= 0) & (halo_t < num_tokens))[None, :],
+        other=0.0,
+    )
+    _, h1, h2, h3 = _rows4(hx)
+    xt = tl.load(
+        x_base[:, None] + (t_first + rows)[None, :] * stride_x_token,
+        mask=mask_f[:, None] & ((t_first + rows) < num_tokens)[None, :],
+        other=0.0,
+    )
+    for it in range(TILES):
+        offs_t = t_first + it * 16 + rows
+        nxt_t = offs_t + 16
+        xn = tl.load(
+            x_base[:, None] + nxt_t[None, :] * stride_x_token,
+            mask=mask_f[:, None] & ((nxt_t < num_tokens) & (it + 1 < TILES))[None, :],
+            other=0.0,
+        )
+        yt, h1, h2, h3 = _conv_tile(
+            xt, h1, h2, h3, w0, w1, w2, w3, acc0, dt, SILU_ACTIVATION
+        )
+        tl.store(
+            out_base[:, None] + offs_t[None, :] * stride_out_token,
+            yt,
+            mask=mask_f[:, None] & (offs_t < num_tokens)[None, :],
+        )
+        xt = xn
+
+
+@triton.jit(do_not_specialize=["num_tokens"])
+def _kda_conv_fwd_planar_tma_kernel(
+    x_desc,
+    x_halo_desc,
+    out_desc,
+    w_ptr,
+    bias_ptr,
+    num_tokens,
+    dim,
+    plane_dim,
+    stride_w_dim,
+    stride_w_width,
+    HAS_BIAS: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    TILES: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    # As _kda_conv_fwd_planar_kernel, with TMA loads (pipelined over the
+    # tiles; rows outside [0, num_tokens) read as zero) and TMA stores.
+    t_first = tl.program_id(0) * (16 * TILES)
+    f0 = tl.program_id(1) * BLOCK_N
+    offs_f = f0 + tl.arange(0, BLOCK_N)
+    mask_f = offs_f < dim
+    w0, w1, w2, w3, acc0 = _load_weights(
+        w_ptr, bias_ptr, offs_f, mask_f, stride_w_dim, stride_w_width, HAS_BIAS
+    )
+    plane = f0 // plane_dim
+    col0 = f0 - plane * plane_dim
+    dt: tl.constexpr = out_desc.dtype
+    for it in tl.range(0, TILES, num_stages=NUM_STAGES):
+        t0 = t_first + it * 16
+        _, h1, h2, h3 = _rows4(tl.trans(x_halo_desc.load([t0 - 4, f0])))
+        xt = tl.trans(x_desc.load([t0, f0]))  # [BLOCK_N, 16]
+        yt, _, _, _ = _conv_tile(
+            xt, h1, h2, h3, w0, w1, w2, w3, acc0, dt, SILU_ACTIVATION
+        )
+        out_desc.store([plane, t0, col0], tl.reshape(tl.trans(yt), [1, 16, BLOCK_N]))
+
+
+@triton.jit
+def _kda_conv_fixup_kernel(
     x_ptr,
     w_ptr,
     bias_ptr,
@@ -87,9 +262,6 @@ def _kda_conv_fwd_planar_kernel(
     has_initial_state_ptr,
     query_start_loc_ptr,
     out_ptr,
-    num_tokens,
-    num_seqs,
-    search_step,
     dim,
     plane_dim,
     stride_x_token,
@@ -108,167 +280,56 @@ def _kda_conv_fwd_planar_kernel(
     SILU_ACTIVATION: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Width-4 conv, 16 tokens x BLOCK_N channels per program.
-    BLOCK_M: tl.constexpr = 16
-    t0 = tl.program_id(0).to(tl.int64) * BLOCK_M
-    rows = tl.arange(0, BLOCK_M)
-    offs_t = t0 + rows
+    # Recompute the first 3 tokens of sequence program_id(0): their taps
+    # before the sequence start come from the initial conv state (or zero).
+    seq = tl.program_id(0)
     offs_f = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_f = offs_f < dim
-    total = tl.load(query_start_loc_ptr + num_seqs)
-    limit = tl.minimum(total, num_tokens)
-    mask_t = offs_t < limit
-
-    # Sequence of each token: the last s with query_start_loc[s] <= t.
-    seq = tl.zeros([BLOCK_M], dtype=tl.int32)
-    step = search_step
-    while step > 0:
-        cand = seq + step
-        start_cand = tl.load(
-            query_start_loc_ptr + tl.minimum(cand, num_seqs),
-            mask=mask_t,
-            other=0,
-        )
-        seq = tl.where((cand <= num_seqs) & (start_cand <= offs_t), cand, seq)
-        step = step // 2
-    seq = tl.minimum(seq, num_seqs - 1)
-    seq_start = tl.load(query_start_loc_ptr + seq, mask=mask_t, other=0)
-    pos = offs_t - seq_start
-
-    w0 = tl.load(w_ptr + offs_f * stride_w_dim, mask=mask_f, other=0.0)
-    w1 = tl.load(w_ptr + offs_f * stride_w_dim + stride_w_width, mask=mask_f, other=0.0)
-    w2 = tl.load(
-        w_ptr + offs_f * stride_w_dim + 2 * stride_w_width, mask=mask_f, other=0.0
+    start = tl.load(query_start_loc_ptr + seq).to(tl.int64)
+    seq_len = (tl.load(query_start_loc_ptr + seq + 1) - start).to(tl.int32)
+    if seq_len <= 0:
+        return
+    cache_idx = tl.load(cache_indices_ptr + seq * stride_cache_indices).to(tl.int64)
+    has_state = (
+        tl.load(has_initial_state_ptr + seq * stride_has_initial_state).to(tl.int1)
+        & (cache_idx != pad_slot_id)
+        & (cache_idx != null_block_id)
     )
-    w3 = tl.load(
-        w_ptr + offs_f * stride_w_dim + 3 * stride_w_width, mask=mask_f, other=0.0
+    cache_idx = tl.where(has_state, cache_idx, 0)
+    w0, w1, w2, w3, acc0 = _load_weights(
+        w_ptr, bias_ptr, offs_f, mask_f, stride_w_dim, stride_w_width, HAS_BIAS
     )
-    if HAS_BIAS:
-        acc0 = tl.load(bias_ptr + offs_f, mask=mask_f, other=0.0).to(tl.float32)
-    else:
-        acc0 = tl.zeros([BLOCK_N], dtype=tl.float32)
-    # BLOCK_N divides plane_dim, so a program writes inside one plane.
     plane = (tl.program_id(1) * BLOCK_N) // plane_dim
-    col = offs_f - plane * plane_dim
-    out_base = out_ptr + plane.to(tl.int64) * stride_out_plane + col
+    out_base = (
+        out_ptr + plane.to(tl.int64) * stride_out_plane + offs_f - plane * plane_dim
+    )
     x_base = x_ptr + offs_f
-
-    near_start = tl.min(tl.where(mask_t, pos, 3)) < 3
-    if near_start:
-        # Some token is among the first 3 of its sequence: taps before the
-        # sequence start read the initial conv state. Token by token (rare).
-        cache_idx = tl.load(
-            cache_indices_ptr + seq * stride_cache_indices,
-            mask=mask_t,
-            other=pad_slot_id,
-        ).to(tl.int64)
-        has_state = tl.load(
-            has_initial_state_ptr + seq * stride_has_initial_state,
-            mask=mask_t,
-            other=0,
-        ).to(tl.int32)
-        has_state = tl.where(
-            (cache_idx != pad_slot_id) & (cache_idx != null_block_id), has_state, 0
-        )
-        for i in range(BLOCK_M):
-            sel = rows == i
-            p = tl.sum(tl.where(sel, pos, 0))
-            ci = tl.sum(tl.where(sel & (has_state != 0), cache_idx, 0))
-            hs = tl.sum(tl.where(sel, has_state, 0)) != 0
-            t = t0 + i
-            m = mask_f & (t < limit)
-            st_base = state_ptr + ci * stride_state_seq + offs_f * stride_state_dim
-            a = tl.load(x_base + (t - 3) * stride_x_token, mask=m & (p >= 3), other=0.0)
-            a = tl.where(
-                p >= 3,
-                a,
-                tl.load(
-                    st_base + tl.maximum(p, 0) * stride_state_tok,
-                    mask=m & (p < 3) & hs,
-                    other=0.0,
-                ),
-            )
-            b = tl.load(x_base + (t - 2) * stride_x_token, mask=m & (p >= 2), other=0.0)
-            b = tl.where(
-                p >= 2,
-                b,
-                tl.load(
-                    st_base + tl.minimum(tl.maximum(p + 1, 0), 2) * stride_state_tok,
-                    mask=m & (p < 2) & hs,
-                    other=0.0,
-                ),
-            )
-            c = tl.load(x_base + (t - 1) * stride_x_token, mask=m & (p >= 1), other=0.0)
-            c = tl.where(
-                p >= 1,
-                c,
-                tl.load(
-                    st_base + 2 * stride_state_tok,
-                    mask=m & (p < 1) & hs,
-                    other=0.0,
-                ),
-            )
-            d = tl.load(x_base + t * stride_x_token, mask=m, other=0.0)
-            y = _conv_silu(a, b, c, d, w0, w1, w2, w3, acc0, SILU_ACTIVATION)
-            tl.store(
-                out_base + t * stride_out_token,
-                y.to(out_ptr.dtype.element_ty),
-                mask=m,
-            )
-    else:
-        # One 2D load of the 16 rows (+ a 4-row halo), all in flight, then
-        # rows are unpacked in registers and slid through the window.
-        mask_x = mask_f[:, None] & mask_t[None, :]
-        xt = tl.load(
-            x_base[:, None] + offs_t[None, :] * stride_x_token, mask=mask_x, other=0.0
-        )
-        halo_t = t0 - 4 + tl.arange(0, 4)
-        hx = tl.load(
-            x_base[:, None] + halo_t[None, :] * stride_x_token,
-            mask=mask_f[:, None] & (halo_t >= 0)[None, :],
-            other=0.0,
-        )
-        _, h1, h2, h3 = _rows4(hx)
-        e, o = _split_rows(xt)
-        s0, s2 = _split_rows(e)  # rows 0,4,8,12 / 2,6,10,14
-        s1, s3 = _split_rows(o)  # rows 1,5,9,13 / 3,7,11,15
-        x0, x4, x8, x12 = _rows4(s0)
-        x1, x5, x9, x13 = _rows4(s1)
-        x2, x6, x10, x14 = _rows4(s2)
-        x3, x7, x11, x15 = _rows4(s3)
-        dt = out_ptr.dtype.element_ty
-        y0 = _conv_silu(h1, h2, h3, x0, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y1 = _conv_silu(h2, h3, x0, x1, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y2 = _conv_silu(h3, x0, x1, x2, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y3 = _conv_silu(x0, x1, x2, x3, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y4 = _conv_silu(x1, x2, x3, x4, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y5 = _conv_silu(x2, x3, x4, x5, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y6 = _conv_silu(x3, x4, x5, x6, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y7 = _conv_silu(x4, x5, x6, x7, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y8 = _conv_silu(x5, x6, x7, x8, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y9 = _conv_silu(x6, x7, x8, x9, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y10 = _conv_silu(x7, x8, x9, x10, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y11 = _conv_silu(x8, x9, x10, x11, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(dt)
-        y12 = _conv_silu(x9, x10, x11, x12, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(
-            dt
-        )
-        y13 = _conv_silu(x10, x11, x12, x13, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(
-            dt
-        )
-        y14 = _conv_silu(x11, x12, x13, x14, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(
-            dt
-        )
-        y15 = _conv_silu(x12, x13, x14, x15, w0, w1, w2, w3, acc0, SILU_ACTIVATION).to(
-            dt
-        )
-        u0 = _unrows4(y0, y4, y8, y12)
-        u1 = _unrows4(y1, y5, y9, y13)
-        u2 = _unrows4(y2, y6, y10, y14)
-        u3 = _unrows4(y3, y7, y11, y15)
-        yt = _join_rows(_join_rows(u0, u2), _join_rows(u1, u3))
-        tl.store(
-            out_base[:, None] + offs_t[None, :] * stride_out_token, yt, mask=mask_x
-        )
+    st_base = state_ptr + cache_idx * stride_state_seq + offs_f * stride_state_dim
+    m_st = mask_f & has_state
+    s0 = tl.load(st_base, mask=m_st, other=0.0)
+    s1 = tl.load(st_base + stride_state_tok, mask=m_st, other=0.0)
+    s2 = tl.load(st_base + 2 * stride_state_tok, mask=m_st, other=0.0)
+    x0 = tl.load(x_base + start * stride_x_token, mask=mask_f, other=0.0)
+    y = _conv_silu(s0, s1, s2, x0, w0, w1, w2, w3, acc0, SILU_ACTIVATION)
+    tl.store(
+        out_base + start * stride_out_token, y.to(out_ptr.dtype.element_ty), mask=mask_f
+    )
+    m1 = mask_f & (seq_len > 1)
+    x1 = tl.load(x_base + (start + 1) * stride_x_token, mask=m1, other=0.0)
+    y = _conv_silu(s1, s2, x0, x1, w0, w1, w2, w3, acc0, SILU_ACTIVATION)
+    tl.store(
+        out_base + (start + 1) * stride_out_token,
+        y.to(out_ptr.dtype.element_ty),
+        mask=m1,
+    )
+    m2 = mask_f & (seq_len > 2)
+    x2 = tl.load(x_base + (start + 2) * stride_x_token, mask=m2, other=0.0)
+    y = _conv_silu(s2, x0, x1, x2, w0, w1, w2, w3, acc0, SILU_ACTIVATION)
+    tl.store(
+        out_base + (start + 2) * stride_out_token,
+        y.to(out_ptr.dtype.element_ty),
+        mask=m2,
+    )
 
 
 @triton.jit
@@ -382,6 +443,18 @@ def _kda_conv_new_state(
     return tl.where(rel >= 0, x_val, s_val)
 
 
+def _tma_ok(x: torch.Tensor, out: torch.Tensor) -> bool:
+    # TMA: 16-byte aligned base addresses and row strides.
+    e = x.element_size()
+    return (
+        x.data_ptr() % 16 == 0
+        and out.data_ptr() % 16 == 0
+        and (x.stride(0) * e) % 16 == 0
+        and (out.stride(0) * e) % 16 == 0
+        and (out.stride(1) * e) % 16 == 0
+    )
+
+
 def kda_causal_conv1d_planar(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -395,6 +468,9 @@ def kda_causal_conv1d_planar(
     out: torch.Tensor | None = None,
     block_n: int = 512,
     num_warps: int = 4,
+    tiles: int = 1,
+    impl: str = "regs",
+    num_stages: int = 3,
 ) -> torch.Tensor:
     """Causal conv1d (+ SiLU) over a varlen token batch, planar output.
 
@@ -417,6 +493,12 @@ def kda_causal_conv1d_planar(
         block_n: channels per program (16 tokens each); must divide
             ``dim // num_planes``.
         num_warps: warps per program.
+        tiles: consecutive 16-token blocks per program.
+        impl: "regs" (16-row tiles loaded into registers, the next tile
+            prefetched) or "tma" (TMA loads/stores through shared memory,
+            pipelined over the tiles; needs 16-byte aligned rows, else
+            "regs" is used).
+        num_stages: TMA pipeline depth (impl="tma").
 
     Returns:
         ``[num_planes, T, dim // num_planes]`` output in ``x.dtype``.
@@ -441,8 +523,59 @@ def kda_causal_conv1d_planar(
     if num_tokens == 0 or num_seqs <= 0:
         return out[:, :num_tokens]
     silu = activation in ("silu", "swish")
-    grid = (triton.cdiv(num_tokens, 16), triton.cdiv(dim, block_n))
-    _kda_conv_fwd_planar_kernel[grid](
+    grid = (triton.cdiv(num_tokens, 16 * tiles), triton.cdiv(dim, block_n))
+    meta = dict(
+        HAS_BIAS=bias is not None,
+        SILU_ACTIVATION=silu,
+        BLOCK_N=block_n,
+        TILES=tiles,
+        num_warps=num_warps,
+    )
+    if impl == "tma" and _tma_ok(x, out):
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        x_desc = TensorDescriptor(x, [num_tokens, dim], [x.stride(0), 1], [16, block_n])
+        x_halo_desc = TensorDescriptor(
+            x, [num_tokens, dim], [x.stride(0), 1], [4, block_n]
+        )
+        out_desc = TensorDescriptor(
+            out,
+            [num_planes, num_tokens, plane_dim],
+            [out.stride(0), out.stride(1), 1],
+            [1, 16, block_n],
+        )
+        _kda_conv_fwd_planar_tma_kernel[grid](
+            x_desc,
+            x_halo_desc,
+            out_desc,
+            weight,
+            bias,
+            num_tokens,
+            dim,
+            plane_dim,
+            weight.stride(0),
+            weight.stride(1),
+            NUM_STAGES=num_stages,
+            **meta,
+        )
+    else:
+        _kda_conv_fwd_planar_kernel[grid](
+            x,
+            weight,
+            bias,
+            out,
+            num_tokens,
+            dim,
+            plane_dim,
+            x.stride(0),
+            weight.stride(0),
+            weight.stride(1),
+            out.stride(0),
+            out.stride(1),
+            **meta,
+        )
+    fixup_block_n = min(1024, plane_dim)
+    _kda_conv_fixup_kernel[(num_seqs, triton.cdiv(dim, fixup_block_n))](
         x,
         weight,
         bias,
@@ -451,9 +584,6 @@ def kda_causal_conv1d_planar(
         has_initial_state,
         query_start_loc,
         out,
-        num_tokens,
-        num_seqs,
-        1 << (num_seqs.bit_length() - 1),
         dim,
         plane_dim,
         x.stride(0),
@@ -470,8 +600,8 @@ def kda_causal_conv1d_planar(
         null_block_id=NULL_BLOCK_ID,
         HAS_BIAS=bias is not None,
         SILU_ACTIVATION=silu,
-        BLOCK_N=block_n,
-        num_warps=num_warps,
+        BLOCK_N=fixup_block_n,
+        num_warps=4,
     )
     update_block_n = 1024
     _kda_conv_state_update_kernel[(num_seqs, triton.cdiv(dim, update_block_n))](
