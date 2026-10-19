@@ -112,41 +112,50 @@ checkpoint nor `Glm5NextTextConfig` carries."""
 _MHC_POST_MULT_VALUE = 2.0
 
 
-def _resolve_mhc_prefill_min_tokens(
+def _resolve_mhc_prefill(
     vllm_config: VllmConfig, hidden_size: int, hc_mult: int
-) -> int:
-    """Token count from which sublayer boundaries run the single-pass CUDA
-    mHC kernel (nvidia/ops/mhc_prefill.cu), or 0 for TileLang everywhere.
+) -> tuple[str, int]:
+    """(backend, token count) from which sublayer boundaries run a single-
+    launch mHC kernel instead of TileLang's three, or ("tilelang", 0).
 
-    Opt-in via ``additional_config.mhc_prefill_backend`` ("tilelang" default,
-    "cuda"); ``mhc_prefill_min_tokens`` overrides the switch-over point."""
+    Opt-in via ``additional_config.mhc_prefill_backend``: "tilelang" (default),
+    "deepgemm" (DeepGEMM mega_mhc, from 1024 tokens) or "cuda" (experimental
+    nvidia/ops/mhc_prefill.cu, slower than TileLang on VR200);
+    ``mhc_prefill_min_tokens`` overrides the switch-over point."""
     additional_config = vllm_config.additional_config
     if not isinstance(additional_config, dict):
         additional_config = {}
     backend = additional_config.get("mhc_prefill_backend", "tilelang")
     if backend == "tilelang":
-        return 0
-    if backend != "cuda":
-        raise ValueError(
-            f"mhc_prefill_backend must be 'tilelang' or 'cuda', got {backend!r}"
-        )
+        return backend, 0
     from vllm.models.glm5next.nvidia.ops import mhc_prefill
 
-    if not mhc_prefill.is_supported(hidden_size, hc_mult):
-        logger.warning_once(
-            "mhc_prefill_backend=cuda needs hidden_size 4096, hc_mult 4 and "
-            "SM80+; using TileLang."
+    if backend not in mhc_prefill.BACKENDS:
+        raise ValueError(
+            "mhc_prefill_backend must be 'tilelang' or one of "
+            f"{mhc_prefill.BACKENDS}, got {backend!r}"
         )
-        return 0
-    mhc_prefill.load()
+    if not mhc_prefill.is_supported(backend, hidden_size, hc_mult):
+        logger.warning_once(
+            "mhc_prefill_backend=%s is not supported here (needs hidden_size "
+            "4096, hc_mult 4; deepgemm: DeepGEMM mega_mhc on SM10x, cuda: "
+            "SM80+); using TileLang.",
+            backend,
+        )
+        return "tilelang", 0
+    if backend == "cuda":
+        mhc_prefill.load()
     min_tokens = int(
-        additional_config.get("mhc_prefill_min_tokens", mhc_prefill.DEFAULT_MIN_TOKENS)
+        additional_config.get(
+            "mhc_prefill_min_tokens", mhc_prefill.DEFAULT_MIN_TOKENS[backend]
+        )
     )
     logger.info_once(
-        "Using the single-pass CUDA mHC kernel at >= %d tokens per step.",
+        "mHC sublayer boundaries with >= %d tokens use the %s single-launch kernel.",
         min_tokens,
+        backend,
     )
-    return max(min_tokens, 1)
+    return backend, max(min_tokens, 1)
 
 
 """mHC post-multiplier. A GLM-5.3-Flash trained value that neither the
@@ -517,8 +526,8 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_pre_op = MHCPreOp()
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
-            self.mhc_prefill_min_tokens = _resolve_mhc_prefill_min_tokens(
-                vllm_config, self.hidden_size, n
+            self.mhc_prefill_backend, self.mhc_prefill_min_tokens = (
+                _resolve_mhc_prefill(vllm_config, self.hidden_size, n)
             )
 
             if vllm_config.kernel_config.enable_jit_warmup:
@@ -734,6 +743,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_weight,
                 norm_eps,
                 self.mhc_prefill_min_tokens,
+                self.mhc_prefill_backend,
             )
         return self.mhc_fused_post_pre_op(
             x=x,
