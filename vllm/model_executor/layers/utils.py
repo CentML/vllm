@@ -165,6 +165,57 @@ def _get_flashinfer_bf16_backend(vllm_backend: str) -> _FlashInferBf16Backend:
     return backend_spec
 
 
+# Optional measured per-shape choice for the low-M BF16 GEMMs of the
+# flashinfer_cutedsl linear backend: VLLM_FLASHINFER_BF16_LOWM_TABLE = path to a
+# JSON {"buckets": [...], "table": {"N,K": {"M bucket": "torch"|"cute"|"tgv"}}}
+# ("glm53_vr200" = the bundled GLM-5.3-Flash table measured on VR200). Each
+# call with M <= the largest bucket takes the entry of the smallest bucket
+# >= M; shapes not in the table keep the backend's default. CuTe-DSL low-M
+# kernels lose to cuBLAS at M 24-32 on some shapes and TGV wins at M 2-16 on
+# others (GEMM bench 806943).
+_LOWM_BACKENDS = {"cute": "cute-dsl", "tgv": "tgv", "torch": None}
+
+
+@functools.cache
+def _flashinfer_bf16_lowm_table() -> tuple[tuple[int, ...], dict] | None:
+    import json
+    import os
+
+    path = os.environ.get("VLLM_FLASHINFER_BF16_LOWM_TABLE", "")
+    if not path:
+        return None
+    if path == "glm53_vr200":
+        path = os.path.join(os.path.dirname(__file__), "glm53_vr200_bf16_lowm.json")
+    with open(path) as f:
+        spec = json.load(f)
+    buckets = tuple(sorted(int(b) for b in spec["buckets"]))
+    table = {
+        tuple(int(v) for v in nk.split(",")): {int(m): c for m, c in per_m.items()}
+        for nk, per_m in spec["table"].items()
+    }
+    logger.info_once(
+        "FlashInfer BF16 low-M table %s: %d shapes, buckets %s.",
+        path,
+        len(table),
+        buckets,
+    )
+    return buckets, table
+
+
+def _flashinfer_bf16_lowm_choice(n: int, k: int, m: int) -> str | None:
+    spec = _flashinfer_bf16_lowm_table()
+    if spec is None:
+        return None
+    buckets, table = spec
+    per_m = table.get((n, k))
+    if per_m is None:
+        return None
+    if m > buckets[-1]:
+        return "torch"
+    bucket = next(b for b in buckets if b >= m)
+    return per_m.get(bucket)
+
+
 def cuda_flashinfer_bf16_gemm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -179,12 +230,18 @@ def cuda_flashinfer_bf16_gemm_impl(
     k = x.shape[-1]
     n = weight.shape[0]
     x_2d = x.view(-1, k)
+    flashinfer_backend = backend_spec.flashinfer_backend
+    choice = _flashinfer_bf16_lowm_choice(n, k, x_2d.shape[0])
+    if choice is not None:
+        flashinfer_backend = _LOWM_BACKENDS[choice]
+        if flashinfer_backend is None:
+            return torch.nn.functional.linear(x, weight, bias)
     out_2d = flashinfer_bf16_mm(
         x_2d,
         weight.t(),
         bias,
         pdl,
-        backend_spec.flashinfer_backend,
+        flashinfer_backend,
     )
     return out_2d.view(*x.shape[:-1], n)
 
