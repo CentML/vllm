@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -9,6 +10,9 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceNoOP,
+)
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
@@ -47,6 +51,10 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
         all2all_manager = device_communicator.all2all_manager
         assert all2all_manager is not None
         self.all2all_manager = all2all_manager
+        # Zero-copy combine: the experts write their finalized output straight
+        # into the all2all workspace (see allocate_fused_expert_output).
+        self.zero_copy_combine = envs.VLLM_FLASHINFER_MOE_A2A_ZERO_COPY_COMBINE
+        self._combine_payload: torch.Tensor | None = None
         self.all2all_manager.initialize(  # type: ignore[attr-defined]
             max_num_tokens=self.max_num_tokens,
             top_k=self.top_k,
@@ -71,6 +79,42 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int32
+
+    def allocate_fused_expert_output(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> torch.Tensor | None:
+        """Hand the experts the combine payload region of the a2a workspace.
+
+        combine() otherwise stages the [ep_size * max_tokens_per_rank, hidden]
+        expert output into that region with moeA2APrepareCombineKernel (a full
+        HBM read + write of the payload). Same hazards as the staging copy:
+        it is written after this round's dispatch, whose completion flags
+        guarantee every peer finished pulling from it in the previous combine.
+        """
+        self._combine_payload = None
+        if (
+            not self.zero_copy_combine
+            or not isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
+            or self.all2all_manager.low_precision_combine  # type: ignore[attr-defined]
+            or dtype != torch.bfloat16
+            or len(shape) != 2
+            or shape[1] != self.hidden_size
+            or shape[0]
+            != self.all2all_manager.world_size * self.runtime_max_tokens_per_rank
+        ):
+            return None
+        moe_alltoall = self.all2all_manager.moe_alltoall  # type: ignore[attr-defined]
+        payload = moe_alltoall.get_combine_payload_tensor_in_workspace(
+            self.runtime_max_tokens_per_rank, shape[1], dtype
+        ).view(shape)
+        if payload.device != device or not payload.is_contiguous():
+            return None
+        self._combine_payload = payload
+        return payload
 
     def prepare(
         self,
@@ -166,8 +210,14 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             ep_size, self.runtime_max_tokens_per_rank, hidden_size
         )
 
+        in_workspace = (
+            self._combine_payload is not None
+            and fused_expert_output.data_ptr() == self._combine_payload.data_ptr()
+        )
+        self._combine_payload = None
         self.all2all_manager.combine_into(  # type: ignore[attr-defined]
             payload=fused_expert_output,
             runtime_max_tokens_per_rank=self.runtime_max_tokens_per_rank,
             output=output,
+            payload_in_workspace=in_workspace,
         )
