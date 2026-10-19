@@ -863,7 +863,8 @@ class EngineArgs:
         Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl"] | None
     ) = None
     kda_prefill_backend: (
-        Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
+        Literal["auto", "triton", "flashkda", "flashkda_planar", "flashinfer", "fused"]
+        | None
     ) = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
 
@@ -1937,10 +1938,19 @@ class EngineArgs:
         parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
-            choices=["auto", "triton", "flashkda", "flashinfer", "fused"],
+            choices=[
+                "auto",
+                "triton",
+                "flashkda",
+                "flashkda_planar",
+                "flashinfer",
+                "fused",
+            ],
             default=None,
             help="Select KDA prefill backend. 'flashkda' is CUDA-only and "
-            "'fused' is ROCm-only; 'auto' picks a supported backend.",
+            "'fused' is ROCm-only; 'auto' picks a supported backend. "
+            "'flashkda_planar' (GLM-5.3 only) is FlashKDA with a planar "
+            "short-conv output and decode rows peeled off mixed steps.",
         )
         parser.add_argument(
             "--kda-decode-backend",
@@ -2846,11 +2856,12 @@ class EngineArgs:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
         if self.kda_prefill_backend is not None:
             if (
-                self.kda_prefill_backend == "flashkda"
+                self.kda_prefill_backend in ("flashkda", "flashkda_planar")
                 and not current_platform.is_cuda()
             ):
                 raise ValueError(
-                    "--kda-prefill-backend=flashkda is only available on CUDA."
+                    f"--kda-prefill-backend={self.kda_prefill_backend} is only "
+                    "available on CUDA."
                 )
             if self.kda_prefill_backend == "fused" and not current_platform.is_rocm():
                 raise ValueError(
