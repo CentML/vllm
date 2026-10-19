@@ -106,6 +106,45 @@ _MHC_TAU = 0.05
 checkpoint nor `Glm5NextTextConfig` carries."""
 
 _MHC_POST_MULT_VALUE = 2.0
+
+
+def _resolve_mhc_prefill_min_tokens(
+    vllm_config: VllmConfig, hidden_size: int, hc_mult: int
+) -> int:
+    """Token count from which sublayer boundaries run the single-pass CUDA
+    mHC kernel (nvidia/ops/mhc_prefill.cu), or 0 for TileLang everywhere.
+
+    Opt-in via ``additional_config.mhc_prefill_backend`` ("tilelang" default,
+    "cuda"); ``mhc_prefill_min_tokens`` overrides the switch-over point."""
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+    backend = additional_config.get("mhc_prefill_backend", "tilelang")
+    if backend == "tilelang":
+        return 0
+    if backend != "cuda":
+        raise ValueError(
+            f"mhc_prefill_backend must be 'tilelang' or 'cuda', got {backend!r}"
+        )
+    from vllm.models.glm5next.nvidia.ops import mhc_prefill
+
+    if not mhc_prefill.is_supported(hidden_size, hc_mult):
+        logger.warning_once(
+            "mhc_prefill_backend=cuda needs hidden_size 4096, hc_mult 4 and "
+            "SM80+; using TileLang."
+        )
+        return 0
+    mhc_prefill.load()
+    min_tokens = int(
+        additional_config.get("mhc_prefill_min_tokens", mhc_prefill.DEFAULT_MIN_TOKENS)
+    )
+    logger.info_once(
+        "Using the single-pass CUDA mHC kernel at >= %d tokens per step.",
+        min_tokens,
+    )
+    return max(min_tokens, 1)
+
+
 """mHC post-multiplier. A GLM-5.3-Flash trained value that neither the
 checkpoint nor `Glm5NextTextConfig` carries."""
 
@@ -470,6 +509,9 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_pre_op = MHCPreOp()
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
+            self.mhc_prefill_min_tokens = _resolve_mhc_prefill_min_tokens(
+                vllm_config, self.hidden_size, n
+            )
 
             if vllm_config.kernel_config.enable_jit_warmup:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
@@ -667,6 +709,24 @@ class Glm5NextDecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
+        if self.mhc_prefill_min_tokens and norm_weight is not None:
+            return torch.ops.vllm.glm5next_mhc_fused_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.mhc_post_mult_value,
+                self.mhc_sinkhorn_iterations,
+                norm_weight,
+                norm_eps,
+                self.mhc_prefill_min_tokens,
+            )
         return self.mhc_fused_post_pre_op(
             x=x,
             residual=residual,

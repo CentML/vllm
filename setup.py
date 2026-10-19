@@ -1645,6 +1645,8 @@ package_data = {
         "third_party/fmha_sm100/cutlass/include/**/*.hpp",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.h",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.hpp",
+        # GLM-5.3 CUDA kernels, built at runtime with FlashInfer's JIT
+        "models/glm5next/nvidia/ops/*.cu",
     ]
 }
 
