@@ -112,6 +112,44 @@ checkpoint nor `Glm5NextTextConfig` carries."""
 _MHC_POST_MULT_VALUE = 2.0
 
 
+def _resolve_mhc_decode(
+    vllm_config: VllmConfig, hidden_size: int, hc_mult: int
+) -> bool:
+    """Whether sublayer boundaries with <= 32 tokens run the CUDA decode pre
+    kernel (nvidia/ops/mhc_decode.cu) after TileLang's fused post + prenorm
+    GEMM, instead of TileLang's pre_big_fuse_with_norm.
+
+    Opt-in via ``additional_config.mhc_decode_backend``: "tilelang" (default)
+    or "cuda"."""
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+    backend = additional_config.get("mhc_decode_backend", "tilelang")
+    if backend == "tilelang":
+        return False
+    if backend != "cuda":
+        raise ValueError(
+            f"mhc_decode_backend must be 'tilelang' or 'cuda', got {backend!r}"
+        )
+    from vllm.models.glm5next.nvidia.ops import mhc_decode
+
+    if not mhc_decode.is_supported(hidden_size, hc_mult):
+        logger.warning_once(
+            "mhc_decode_backend=cuda needs hidden_size 4096, hc_mult 4 and "
+            "SM90+; using TileLang."
+        )
+        return False
+    mhc_decode.load()
+    mhc_decode.SIDE_STREAM = bool(additional_config.get("mhc_decode_side_stream", True))
+    logger.info_once(
+        "mHC sublayer boundaries with <= %d tokens use the CUDA decode pre kernel "
+        "(Sinkhorn on a side stream: %s).",
+        mhc_decode.MAX_TOKENS,
+        mhc_decode.SIDE_STREAM,
+    )
+    return True
+
+
 def _resolve_mhc_prefill(
     vllm_config: VllmConfig, hidden_size: int, hc_mult: int
 ) -> tuple[str, int]:
@@ -529,6 +567,10 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_prefill_backend, self.mhc_prefill_min_tokens = (
                 _resolve_mhc_prefill(vllm_config, self.hidden_size, n)
             )
+            self.mhc_decode_cuda = _resolve_mhc_decode(
+                vllm_config, self.hidden_size, n
+            )
+            self.mhc_decode_max_tokens = 32
 
             if vllm_config.kernel_config.enable_jit_warmup:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
@@ -712,6 +754,10 @@ class Glm5NextDecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
+        if self.mhc_decode_cuda:
+            from vllm.models.glm5next.nvidia.ops import mhc_decode
+
+            mhc_decode.join()
         return self.mhc_post_op(x, residual, post, comb)
 
     def hc_fused_post_pre(
@@ -726,6 +772,31 @@ class Glm5NextDecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
+        if (
+            self.mhc_decode_cuda
+            and norm_weight is not None
+            and x.shape[0] <= self.mhc_decode_max_tokens
+        ):
+            return torch.ops.vllm.glm5next_mhc_decode_post_pre(
+                x,
+                residual,
+                post,
+                comb,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.mhc_post_mult_value,
+                self.mhc_sinkhorn_iterations,
+                norm_weight,
+                norm_eps,
+            )
+        if self.mhc_decode_cuda:
+            from vllm.models.glm5next.nvidia.ops import mhc_decode
+
+            mhc_decode.join()
         if self.mhc_prefill_min_tokens and norm_weight is not None:
             return torch.ops.vllm.glm5next_mhc_fused_post_pre(
                 x,
