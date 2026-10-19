@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_SPARSE_MLA_MASKED_MHA: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -1084,6 +1085,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    # Sparse-MLA masked-MHA prefill (FA4 with a top-k mask) policy.
+    # "auto": the built-in per-TP thresholds, never with a quantized KV cache.
+    # "quant_kv": also with a quantized (e.g. fp8) KV cache; context chunks are
+    #   dequantized by the existing gather, the current chunk uses its BF16 K/V.
+    # "force": as "quant_kv", and use masked MHA for every prefill whose mask
+    #   fits the workspace, ignoring the per-TP thresholds.
+    "VLLM_SPARSE_MLA_MASKED_MHA": env_with_choices(
+        "VLLM_SPARSE_MLA_MASKED_MHA", "auto", ["auto", "quant_kv", "force"]
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

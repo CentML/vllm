@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
@@ -130,7 +131,12 @@ def _is_masked_mha_available(
         fa_version = get_flash_attn_version(
             head_size=qk_head_dim, head_size_v=v_head_dim
         )
-    return fa_version == 4 and not is_quantized_kv_cache(kv_cache_dtype)
+    if fa_version != 4:
+        return False
+    return (
+        not is_quantized_kv_cache(kv_cache_dtype)
+        or envs.VLLM_SPARSE_MLA_MASKED_MHA != "auto"
+    )
 
 
 def _use_dense_mha_prefill(
