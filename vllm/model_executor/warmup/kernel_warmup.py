@@ -27,7 +27,8 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     use_flashinfer_autotune_v2,
 )
 from vllm.model_executor.warmup.flashinfer_moe_tactics import (
-    ep_aware_trtllm_moe_tactics,
+    trtllm_moe_only_tuning,
+    trtllm_moe_tactic_candidates,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -385,6 +386,41 @@ def _run_flashinfer_autotune_dummy_runs(
                 **dummy_run_kwargs,
             )
 
+    # Under DP+EP the MoE of a rank runs on up to dp_size * num_tokens rows
+    # (all2all receive buffer or all-gather), and FlashInfer serves the rows
+    # above the tuned buckets with its default tactic. Tune the trtllm-gen MoE
+    # ops (only) for those buckets too; FlashInfer's runtime bucket cap is the
+    # same dp_size * max_num_batched_tokens (fi_moe_largest_bucket).
+    parallel_config = runner.vllm_config.parallel_config
+    dp_size = parallel_config.data_parallel_size
+    if (
+        envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING
+        and parallel_config.enable_expert_parallel
+        and dp_size > 1
+    ):
+        num_tokens = runner.scheduler_config.max_num_batched_tokens
+        tuning_buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(
+            num_tokens * dp_size
+        )
+        logger.info(
+            "Running FlashInfer trtllm-gen MoE autotune for dispatched rows: "
+            "%d tokens per rank x DP %d, token buckets %s.",
+            num_tokens,
+            dp_size,
+            tuning_buckets,
+        )
+        with (
+            fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True),
+            trtllm_moe_only_tuning(),
+        ):
+            runner._dummy_run(
+                num_tokens=num_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                randomize_inputs=True,
+                **dummy_run_kwargs,
+            )
+
 
 def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
     """Identify a saved autotune file by its FlashInfer metadata and size."""
@@ -474,7 +510,11 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
         # EP-aware MoE tuning selects different tactics; keep its results
         # apart from (and never reuse) a cache tuned without it.
-        ep_aware = "_moeep" if envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING else ""
+        ep_aware = (
+            f"_moeep{envs.VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS}"
+            if envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING
+            else ""
+        )
         cache_path = cache_path.with_name(
             f"{cache_path.stem}{ep_aware}_dp{dp_rank}_rank{world.rank_in_group}"
             f"{cache_path.suffix}"
@@ -500,7 +540,10 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         with (
             torch.inference_mode(),
             autotune_context,
-            ep_aware_trtllm_moe_tactics(envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING),
+            trtllm_moe_tactic_candidates(
+                envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING,
+                envs.VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS,
+            ),
         ):
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None

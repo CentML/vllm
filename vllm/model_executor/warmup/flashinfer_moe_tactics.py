@@ -1,42 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""EP-aware tactic candidates for FlashInfer trtllm-gen MoE autotuning.
+"""FlashInfer trtllm-gen MoE autotuning under data/expert parallelism.
 
-FlashInfer's trtllm-gen MoE runner (``flashinfer.fused_moe.backends.trtllm.
-MoERunner``) asks ``trtllm_get_valid_moe_configs`` for its autotune candidates.
-That C++ helper (``computeSelectedTileN``) keeps only the tile sizes around
-``num_tokens * top_k / num_local_experts``: one tile below the covering tile,
-the covering tile and two above. The estimate assumes every top-k slot of
-every row is local. Under expert parallelism the rows carry global expert ids
-(the all2all receive buffer has ``ep_size * max_tokens_per_rank`` rows; TP+EP
-without all2all sees all tokens), so only about
-``top_k * num_local_experts / num_experts`` slots per row are local and the
-estimate is ``ep_size`` times too large. Example, DEP2 decode at 257 requests
-per rank: 544 rows, tuning bucket 768, 144 local experts, about 14 tokens per
-local expert; the candidates are tiles 32-256 while the untuned default (the
-smallest tile of the window around the runtime row count) runs tile 16. The
-tuned tactic therefore cannot match the default, and autotuning this op
-regressed DEP2 throughput while it helped TP4.
+Opt-in via ``VLLM_FLASHINFER_MOE_EP_AWARE_TUNING=1``. Measured on VR200
+(GLM-5.3-Flash NVFP4, DEP2 rank shapes, 144 local experts, job 800152): for
+post-dispatch rows >= 8192 the default heuristic (tactic -1) runs tile 128
+while tile 256 is 1.36-1.38x faster for the whole op (bitwise-identical
+output), and the autotuner finds it. But vLLM tunes buckets only up to
+``max_num_batched_tokens`` while the MoE of a DP+EP rank sees up to
+``dp_size * max_num_batched_tokens`` rows (all2all receive buffer or
+all-gather), and FlashInfer maps larger row counts to an untuned bucket, so
+the biggest prefill steps always fall back to tactic -1.
 
-``ep_aware_trtllm_moe_tactics`` widens the candidates during the tuning pass:
+With the flag:
 
-- EP: also list the candidates for the EP-effective row count
-  ``num_tokens * num_local_experts // num_experts`` (no change without EP).
-- Always: race the default heuristic (tactic -1), so a tuned entry is never
-  slower than the untuned path at the profiled shape.
+- ``trtllm_moe_only_tuning`` + an extra dummy run (see kernel_warmup.py) tune
+  the trtllm-gen MoE ops for buckets up to ``dp_size * max_num_batched_tokens``
+  rows; every other op only looks up its cache during that run.
+- ``trtllm_moe_tactic_candidates`` races the default heuristic (tactic -1)
+  against FlashInfer's candidates, so a tuned entry is never slower than the
+  untuned path at the profiled shape (FlashInfer only does this in
+  autotune_v2, which vLLM does not use with world_size > 1), and keeps the
+  default for profiles with fewer rows than
+  ``VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS`` (0 = tune all), to tune only
+  prefill-sized MoE calls.
 
-Only candidate enumeration changes. Every candidate still goes through
-FlashInfer's validity checks and profiling (failing tactics are skipped), and
-kernels, routing and the serving-time cache lookup are unchanged.
+Kernels, routing and the serving-time cache lookup are FlashInfer's.
 """
 
 import contextlib
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def is_trtllm_moe_op(custom_op: str) -> bool:
+    """FlashInfer trtllm-gen MoE ops: flashinfer::trtllm_<dtype>_moe."""
+    return custom_op.startswith("flashinfer::trtllm_") and custom_op.endswith("_moe")
 
 
 def _tactic_key(tactic: Any) -> tuple[int, ...]:
@@ -45,69 +48,12 @@ def _tactic_key(tactic: Any) -> tuple[int, ...]:
     return tuple(int(x) for x in tactic)
 
 
-def _valid_configs(runner: Any, inputs: list[Any], num_tokens: int) -> list[Any]:
-    """``MoERunner.get_valid_tactics`` for another row count (same cache)."""
-    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
-
-    moe_inputs = MoeRunnerInputs.from_list(inputs)
-    nfse = runner.num_fused_shared_experts
-    # Same key layout as MoERunner.get_valid_tactics (FlashInfer 0.7.2).
-    query_key = (
-        runner.dtype_act,
-        runner.dtype_weights,
-        runner.fp8_quantization_type,
-        runner.top_k + nfse,
-        runner.hidden_size,
-        runner.hidden_size_output,
-        runner.intermediate_size,
-        runner.num_local_experts + nfse,
-        runner.activation_type,
-        runner.use_shuffled_weight,
-        runner.weight_layout,
-        runner.use_per_token_scaling,
-        num_tokens,
-        moe_inputs.gemm1_lora_delta is not None,
-    )
-    cache = type(runner).valid_tactics_dict
-    instance_key = (id(runner.moe_op), query_key)
-    if instance_key not in cache:
-        try:
-            cache[instance_key] = runner.moe_op.trtllm_get_valid_moe_configs(*query_key)
-        except Exception as e:
-            logger.debug("trtllm_get_valid_moe_configs%s failed: %s", query_key, e)
-            return []
-    return list(cache[instance_key])
-
-
-def ep_aware_valid_tactics(
-    runner: Any,
-    get_valid_tactics: Callable[..., list[Any]],
-    inputs: list[Any],
-    profile: Any,
-) -> list[Any]:
-    """Candidates of ``get_valid_tactics`` + EP-effective window + default."""
-    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
-
-    tactics = list(get_valid_tactics(runner, inputs, profile))
+def race_default_tactic(tactics: list[Any], num_tokens: int, min_tokens: int) -> list:
+    """Tactic -1 first, then FlashInfer's candidates (deduplicated)."""
     if not tactics:
         return tactics
-    num_local = int(runner.num_local_experts)
-    num_experts = int(getattr(runner, "num_experts", num_local) or num_local)
-    num_tokens = int(MoeRunnerInputs.from_list(inputs).hidden_states.shape[0])
-    if 0 < num_local < num_experts and num_tokens > 0:
-        eff_tokens = max(1, num_tokens * num_local // num_experts)
-        extra = _valid_configs(runner, inputs, eff_tokens)
-        logger.debug(
-            "EP-aware trtllm-gen MoE candidates: %d rows (%d effective, "
-            "%d/%d local experts): tiles %s + %s",
-            num_tokens,
-            eff_tokens,
-            num_local,
-            num_experts,
-            sorted({_tactic_key(t)[0] for t in tactics}),
-            sorted({_tactic_key(t)[0] for t in extra}),
-        )
-        tactics += extra
+    if num_tokens < min_tokens:
+        return [-1]
     result: list[Any] = [-1]
     seen = {(-1,)}
     for tactic in tactics:
@@ -119,13 +65,14 @@ def ep_aware_valid_tactics(
 
 
 @contextlib.contextmanager
-def ep_aware_trtllm_moe_tactics(enabled: bool) -> Iterator[None]:
-    """Widen FlashInfer trtllm-gen MoE autotune candidates inside the block."""
+def trtllm_moe_tactic_candidates(enabled: bool, min_tokens: int = 0) -> Iterator[None]:
+    """Race tactic -1 (and skip small profiles) in trtllm-gen MoE tuning."""
     if not enabled:
         yield
         return
     try:
         from flashinfer.fused_moe.backends.trtllm import MoERunner
+        from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
     except ImportError:
         logger.warning_once(
             "VLLM_FLASHINFER_MOE_EP_AWARE_TUNING is set but this FlashInfer "
@@ -137,14 +84,44 @@ def ep_aware_trtllm_moe_tactics(enabled: bool) -> Iterator[None]:
     original = MoERunner.__dict__["get_valid_tactics"]
 
     def get_valid_tactics(self, inputs, profile):
-        return ep_aware_valid_tactics(self, original, inputs, profile)
+        num_tokens = int(MoeRunnerInputs.from_list(inputs).hidden_states.shape[0])
+        tactics = list(original(self, inputs, profile))
+        return race_default_tactic(tactics, num_tokens, min_tokens)
 
     logger.info_once(
-        "FlashInfer trtllm-gen MoE autotune: EP-aware candidates and default "
-        "tactic racing enabled (VLLM_FLASHINFER_MOE_EP_AWARE_TUNING=1)."
+        "FlashInfer trtllm-gen MoE autotune: racing the default tactic, "
+        "tuning only profiles with >= %d rows.",
+        min_tokens,
     )
     MoERunner.get_valid_tactics = get_valid_tactics
     try:
         yield
     finally:
         MoERunner.get_valid_tactics = original
+
+
+@contextlib.contextmanager
+def trtllm_moe_only_tuning() -> Iterator[None]:
+    """Inside an autotune context, profile only the trtllm-gen MoE ops.
+
+    Other ops are served from the cache (or their fallback tactic) as if
+    tuning were off, so a pass with wider buckets does not re-tune them.
+    """
+    from flashinfer.autotuner import AutoTuner
+
+    original = AutoTuner.__dict__["choose_one"]
+
+    def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        if not self.is_tuning_mode or is_trtllm_moe_op(custom_op):
+            return original(self, custom_op, runners, tuning_config, inputs, **kwargs)
+        self.is_tuning_mode = False
+        try:
+            return original(self, custom_op, runners, tuning_config, inputs, **kwargs)
+        finally:
+            self.is_tuning_mode = True
+
+    AutoTuner.choose_one = choose_one
+    try:
+        yield
+    finally:
+        AutoTuner.choose_one = original
