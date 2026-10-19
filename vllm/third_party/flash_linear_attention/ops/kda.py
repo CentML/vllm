@@ -360,7 +360,11 @@ def layer_norm_gated_fwd(
     if D > BD:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     if D <= 512:
-        BT = 16
+        # Per-row math, so the tile size does not change results. 64-row
+        # tiles for large prefill batches: kdap-bench 800163 (VR200, 4.2M
+        # rows x 128) 0.34 ms out of place vs 0.54 ms for the stock in-place
+        # 16-row launch, bit-identical; in-place 64-row not yet measured.
+        BT = 64 if T >= 65536 else 16
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
