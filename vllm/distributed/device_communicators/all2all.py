@@ -942,17 +942,24 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         output: torch.Tensor,
+        payload_in_workspace: bool = False,
     ) -> None:
-        """Combine into ``output``, with a fallback for older FlashInfer."""
+        """Combine into ``output``, with a fallback for older FlashInfer.
+
+        ``payload_in_workspace``: ``payload`` is the view returned by
+        ``get_combine_payload_tensor_in_workspace`` (no staging copy).
+        """
         assert self.moe_alltoall is not None
         if self._combine_supports_output:
             self.moe_alltoall.combine(
                 payload=payload,
                 runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
                 output=output,
+                payload_in_workspace=payload_in_workspace,
                 use_low_precision=self.low_precision_combine,
             )
         else:
+            assert not payload_in_workspace
             # FlashInfer < 0.6.16 has neither `output` nor `use_low_precision`.
             combined_output = self.moe_alltoall.combine(
                 payload=payload,
