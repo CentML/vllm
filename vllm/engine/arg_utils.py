@@ -1950,7 +1950,9 @@ class EngineArgs:
             help="Select KDA prefill backend. 'flashkda' is CUDA-only and "
             "'fused' is ROCm-only; 'auto' picks a supported backend. "
             "'flashkda_planar' (GLM-5.3 only) is FlashKDA with a planar "
-            "short-conv output and decode rows peeled off mixed steps.",
+            "short-conv output and decode rows peeled off mixed steps; for "
+            "GLM-5.3 'flashinfer' is the same with FlashInfer's CuTe DSL "
+            "prefill in place on the state pool.",
         )
         parser.add_argument(
             "--kda-decode-backend",
