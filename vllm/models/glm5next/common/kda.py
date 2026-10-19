@@ -177,16 +177,22 @@ def _resolve_kda_decode_backend(
     recurrent_state_dtype: torch.dtype,
 ) -> str:
     """Pick the plain single-token decode path: the three Triton kernels (conv
-    update, recurrence, gated RMSNorm) or FlashInfer's fused_kda_decode, which
-    does all three in one launch. ``backend`` comes from
-    ``additional_config.kda_decode_backend``; "flashinfer" is opt-in, "triton"
-    (default) and "auto" keep the Triton kernels."""
+    update, recurrence, gated RMSNorm), FlashInfer's fused_kda_decode, or the
+    pipelined CUDA kernel (kda_decode_pipelined), the latter two doing all
+    three in one launch. ``backend`` comes from
+    ``additional_config.kda_decode_backend``; "flashinfer" and "pipelined" are
+    opt-in, "triton" (default) and "auto" keep the Triton kernels."""
     if backend in ("auto", "triton"):
         return "triton"
-    if backend != "flashinfer":
+    if backend not in ("flashinfer", "pipelined"):
         raise ValueError(f"Unsupported GLM-5.3 KDA decode backend: {backend}")
+    capability = current_platform.get_device_capability()
     if not (
         current_platform.is_cuda()
+        and (
+            backend == "flashinfer"
+            or (capability is not None and capability.major >= 9)
+        )
         and head_dim == 128
         and conv_size == 4
         and num_spec == 0
@@ -196,11 +202,12 @@ def _resolve_kda_decode_backend(
         and recurrent_state_dtype in (torch.float32, torch.bfloat16)
     ):
         raise RuntimeError(
-            "kda_decode_backend=flashinfer requires CUDA, bfloat16 activations "
-            "and conv state, a float32 or bfloat16 recurrent state, head_dim "
-            "128, conv kernel 4, a bounded gate and no speculative decoding."
+            f"kda_decode_backend={backend} requires CUDA (SM90+ for pipelined), "
+            "bfloat16 activations and conv state, a float32 or bfloat16 "
+            "recurrent state, head_dim 128, conv kernel 4, a bounded gate and no "
+            "speculative decoding."
         )
-    return "flashinfer"
+    return backend
 
 
 class _FlashInferFusedKdaDecode:
@@ -228,6 +235,7 @@ class _FlashInferFusedKdaDecode:
         num_heads: int,
         lower_bound: float,
         norm_eps: float,
+        state_dtype: torch.dtype | None = None,
     ) -> None:
         module: Any  # the FlashInfer kernel module (or its DS variant)
         run: Callable[..., torch.Tensor]
@@ -258,6 +266,12 @@ class _FlashInferFusedKdaDecode:
         self._lower_bound = lower_bound
         self._norm_eps = norm_eps
         self._kernel: Callable[..., None] | None = None
+        get_kernel = getattr(module, "_get_compiled_kernel", None)
+        if state_dtype is not None and get_kernel is not None:
+            # CuTe DSL compile (disk-cached under FLASHINFER_WORKSPACE_BASE)
+            # at model construction, not on the first decode step: profile
+            # and PIECEWISE-capture runs carry no KDA metadata.
+            get_kernel(state_dtype, lower_bound, float(norm_eps))
         logger.info_once(
             "Using FlashInfer fused KDA decode (%s conv-state layout).",
             "DS" if conv_state_dim_first else "SD",
@@ -317,6 +331,113 @@ class _FlashInferFusedKdaDecode:
             self._kernel = get_kernel(
                 state.dtype, self._lower_bound, float(self._norm_eps)
             )
+
+
+# Below this many (row, head) items a step is latency-bound and FlashInfer's
+# one-CTA-per-item kernel is faster; at and above it the pipelined kernel wins
+# with a bf16 state (VR200 jobs 800580/802514: 1.02-1.04x at 512 items,
+# 1.26-1.32x at 4096-32768; 0.85-0.89x at 8-256 items).
+_PIPELINED_MIN_ITEMS = 512
+
+
+class _PipelinedKdaDecode:
+    """Pipelined single-token KDA decode (kda_decode_pipelined.cu): one launch
+    of a persistent, warp-specialised kernel that streams the recurrent state
+    through a shared-memory ring with bulk async copies (conv + SiLU, q/k
+    norms, gates, recurrence and gated RMSNorm fused), taking vLLM's merged
+    [3*H*128, 4] conv weight and either conv-state layout as is.
+
+    Used for bf16 recurrent state with at least _PIPELINED_MIN_ITEMS
+    (row, head) items per step; smaller steps and fp32 state (where it only
+    matches FlashInfer) go to FlashInfer's fused decode, which shares the
+    same state contract. Both are built at construction (FlashInfer nvcc JIT
+    for the CUDA module, CuTe DSL for FlashInfer), so a missing toolchain fails
+    at startup and no compile lands in the first decode steps."""
+
+    def __init__(
+        self,
+        conv_state_dim_first: bool,
+        num_heads: int,
+        lower_bound: float,
+        norm_eps: float,
+        state_dtype: torch.dtype,
+    ) -> None:
+        self._fallback = _FlashInferFusedKdaDecode(
+            conv_state_dim_first, num_heads, lower_bound, norm_eps, state_dtype
+        )
+        self._kernel: Callable[..., None] | None = None
+        self._min_rows = -(-_PIPELINED_MIN_ITEMS // num_heads)
+        if state_dtype == torch.bfloat16:
+            from vllm.models.glm5next.nvidia.ops import kda_decode_pipelined
+
+            self._kernel = kda_decode_pipelined.get_kernel()
+            logger.info_once(
+                "Using the pipelined KDA decode kernel (bf16 state, >= %d rows "
+                "per step; FlashInfer below).",
+                self._min_rows,
+            )
+        else:
+            logger.info_once(
+                "kda_decode_backend=pipelined: %s recurrent state uses "
+                "FlashInfer's fused decode (pipelined kernel is bf16-only).",
+                state_dtype,
+            )
+        self._lower_bound = float(lower_bound)
+        self._norm_eps = float(norm_eps)
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        fi_weight: torch.Tensor,
+        conv_state: torch.Tensor,
+        raw_gate: torch.Tensor,
+        raw_beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        state_indices: torch.Tensor,
+        state: torch.Tensor,
+        output_gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """``weight``: merged [3*H*128, 4] conv weight (pipelined kernel);
+        ``fi_weight``: the same in FlashInfer's [3, 4, H*128] layout."""
+        if self._kernel is None or x.shape[0] < self._min_rows:
+            self._fallback(
+                x=x,
+                weight=fi_weight,
+                conv_state=conv_state,
+                raw_gate=raw_gate,
+                raw_beta=raw_beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state_indices=state_indices,
+                state=state,
+                output_gate=output_gate,
+                norm_weight=norm_weight,
+                output=output,
+            )
+            return
+        self._kernel(
+            x,
+            weight,
+            conv_state,
+            raw_gate,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state_indices,
+            state,
+            output_gate,
+            norm_weight,
+            output,
+            self._lower_bound,
+            self._norm_eps,
+            0,
+            0,
+            -1,
+        )
 
 
 class Glm5NextLinearAttention(GatedDeltaNetAttention):
@@ -521,7 +642,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             conv_state_dtype,
             recurrent_state_dtype,
         )
-        self._fi_fused_kda_decode: _FlashInferFusedKdaDecode | None = None
+        self._fi_fused_kda_decode: (
+            _FlashInferFusedKdaDecode | _PipelinedKdaDecode | None
+        ) = None
         # Built on first use (after weight loading): FlashInfer's conv weight
         # layout [3, 4, H * 128] and the fp32 norm weight.
         self._fi_conv_weight: torch.Tensor | None = None
@@ -533,6 +656,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 self.local_num_heads,
                 self.kda_lower_bound,
                 self.o_norm.eps,
+                recurrent_state_dtype,
+            )
+        elif self.kda_decode_backend == "pipelined":
+            assert self.kda_lower_bound is not None
+            self._fi_fused_kda_decode = _PipelinedKdaDecode(
+                self._conv_state_dim_first,
+                self.local_num_heads,
+                self.kda_lower_bound,
+                self.o_norm.eps,
+                recurrent_state_dtype,
             )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
@@ -760,11 +893,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         conv_weights = self._merged_conv_weight
         conv_bias = self.q_conv1d.bias
 
-        # Plain single-token decode step (no prefill, no spec tokens): FlashInfer
-        # fused conv + recurrence + gated RMSNorm in one launch, written
-        # straight into the layer output buffer. Same state contract as the
-        # Triton path (recurrent state [slot, H, V, K], conv state in the
-        # configured layout, slot 0 = null row, no cache write).
+        # Plain single-token decode step (no prefill, no spec tokens): fused
+        # conv + recurrence + gated RMSNorm in one launch (FlashInfer or the
+        # pipelined kernel), written straight into the layer output buffer.
+        # Same state contract as the Triton path (recurrent state
+        # [slot, H, V, K], conv state in the configured layout, slot 0 = null
+        # row, no cache write).
         if (
             self._fi_fused_kda_decode is not None
             and not use_spec
@@ -774,28 +908,45 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             num_decodes = attn_metadata_narrowed.num_decodes
             assert num_decodes == num_actual_tokens
+            if self._fi_norm_weight is None:
+                self._fi_norm_weight = self.o_norm.weight.float().contiguous()
             if self._fi_conv_weight is None:
                 self._fi_conv_weight = (
                     conv_weights.view(3, self.local_projection_size, self.conv_size)
                     .transpose(1, 2)
                     .contiguous()
                 )
-                self._fi_norm_weight = self.o_norm.weight.float().contiguous()
-            assert self._fi_norm_weight is not None
-            self._fi_fused_kda_decode(
-                x=qkv_proj_states,
-                weight=self._fi_conv_weight,
-                conv_state=conv_state,
-                raw_gate=g1,
-                raw_beta=beta,
-                A_log=self.A_log.view(-1),
-                dt_bias=self.dt_bias,
-                state_indices=non_spec_state_indices_tensor[:num_decodes],
-                state=recurrent_state,
-                output_gate=g2[:num_decodes],
-                norm_weight=self._fi_norm_weight,
-                output=core_attn_out[:, :num_decodes],
-            )
+            if isinstance(self._fi_fused_kda_decode, _PipelinedKdaDecode):
+                self._fi_fused_kda_decode(
+                    x=qkv_proj_states,
+                    weight=conv_weights,
+                    fi_weight=self._fi_conv_weight,
+                    conv_state=conv_state,
+                    raw_gate=g1,
+                    raw_beta=beta,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    state_indices=non_spec_state_indices_tensor[:num_decodes],
+                    state=recurrent_state,
+                    output_gate=g2[:num_decodes],
+                    norm_weight=self._fi_norm_weight,
+                    output=core_attn_out[:, :num_decodes],
+                )
+            else:
+                self._fi_fused_kda_decode(
+                    x=qkv_proj_states,
+                    weight=self._fi_conv_weight,
+                    conv_state=conv_state,
+                    raw_gate=g1,
+                    raw_beta=beta,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias,
+                    state_indices=non_spec_state_indices_tensor[:num_decodes],
+                    state=recurrent_state,
+                    output_gate=g2[:num_decodes],
+                    norm_weight=self._fi_norm_weight,
+                    output=core_attn_out[:, :num_decodes],
+                )
             return
 
         # Split projections / gating into spec (draft-verify) and non-spec token
