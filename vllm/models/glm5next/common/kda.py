@@ -48,6 +48,9 @@ from vllm.model_executor.utils import (
     set_weight_attrs,
 )
 from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import kda_causal_conv1d_planar
+from vllm.models.glm5next.nvidia.ops.kda_prefill_flashinfer import (
+    FlashInferKdaPrefill,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -509,14 +512,26 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         )
         # "flashkda_planar": FlashKDA whose inputs come from a short conv with
         # planar q|k|v output (no .contiguous() copies), with the decode rows
-        # of mixed steps peeled off to the recurrent kernel.
-        self._planar_prefill = requested_prefill_backend == "flashkda_planar"
+        # of mixed steps peeled off to the recurrent kernel. "flashinfer":
+        # the same, with FlashInfer's CuTe DSL prefill in place on the state
+        # pool instead of FlashKDA (FlashKDA stays for spec-decode steps and
+        # prefix-cache checkpoints).
+        self._planar_prefill = requested_prefill_backend in (
+            "flashkda_planar",
+            "flashinfer",
+        )
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
             "flashkda" if self._planar_prefill else requested_prefill_backend,
             self.head_dim,
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
+        self._fi_prefill: FlashInferKdaPrefill | None = None
+        if requested_prefill_backend == "flashinfer":
+            assert self.kda_lower_bound is not None
+            self._fi_prefill = FlashInferKdaPrefill(
+                self.local_num_heads, self.head_dim, self.kda_lower_bound
+            )
         conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
         self.kda_decode_backend = _resolve_kda_decode_backend(
             additional_config.get("kda_decode_backend", "triton")
@@ -1004,57 +1019,87 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     v_ns[num_peeled:],
                 )
                 g1_ns, beta_ns = g1_ns[:, num_peeled:], beta_ns[:, num_peeled:]
-            initial_state = gather_initial_states(
-                recurrent_state, prefill_state_indices, prefill_has_initial_state
-            )
-            if self.kda_prefill_backend == "flashkda":
-                # Non-spec step: write straight into the layer output buffer
-                # (dense token order, no merge copy). Step with spec-decode
-                # tokens: write to the workspace buffer and scatter below.
-                ns_out = (
-                    None if use_spec else core_attn_out[:, num_peeled:num_actual_tokens]
-                )
-                core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
+            if (
+                self._fi_prefill is not None
+                and not use_spec
+                and attn_metadata_narrowed.checkpoint is None
+            ):
+                # FlashInfer updates the state in place at the slot indices
+                # (no gather / scatter); trailing padding rows are excluded.
+                ns_out = core_attn_out[:, num_peeled:num_actual_tokens]
+                self._fi_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
                     v=_rearr(v_ns),
                     g=g1_ns,
                     beta=beta_ns,
-                    initial_state=initial_state,
+                    A_log=self.A_log.view(-1),
+                    dt_bias=self.dt_bias.view(-1, self.head_dim),
+                    state=recurrent_state,
+                    state_indices=prefill_state_indices,
+                    has_initial_state=prefill_has_initial_state,
                     cu_seqlens=prefill_query_start_loc,
+                    num_seqs=attn_metadata_narrowed.num_prefills
+                    + (0 if num_peeled else attn_metadata_narrowed.num_decodes),
                     out=ns_out,
-                    checkpoint=attn_metadata_narrowed.checkpoint,
-                    raw_qkv=raw_qkv_ns,
-                    conv_state=conv_state,
-                    recurrent_state=recurrent_state,
                 )
+                core_attn_out_non_spec = ns_out
             else:
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=_rearr(q_ns),
-                    k=_rearr(k_ns),
-                    v=_rearr(v_ns),
-                    raw_g=g1_ns,
-                    # Chunk path wants the pre-sigmoided fp32 beta (its
-                    # kernels don't sigmoid); beta_ns is raw bf16 from forward.
-                    beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=non_spec_query_start_loc,
-                    safe_gate=safe_gate,
-                    lower_bound=lower_bound,
+                initial_state = gather_initial_states(
+                    recurrent_state, prefill_state_indices, prefill_has_initial_state
                 )
-            # Init cache
-            scatter_states(
-                recurrent_state,
-                last_recurrent_state,
-                prefill_state_indices,
-            )
+                if self.kda_prefill_backend == "flashkda":
+                    # Non-spec step: write straight into the layer output buffer
+                    # (dense token order, no merge copy). Step with spec-decode
+                    # tokens: write to the workspace buffer and scatter below.
+                    ns_out = (
+                        None
+                        if use_spec
+                        else core_attn_out[:, num_peeled:num_actual_tokens]
+                    )
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        self._flashkda_prefill(
+                            q=_rearr(q_ns),
+                            k=_rearr(k_ns),
+                            v=_rearr(v_ns),
+                            g=g1_ns,
+                            beta=beta_ns,
+                            initial_state=initial_state,
+                            cu_seqlens=prefill_query_start_loc,
+                            out=ns_out,
+                            checkpoint=attn_metadata_narrowed.checkpoint,
+                            raw_qkv=raw_qkv_ns,
+                            conv_state=conv_state,
+                            recurrent_state=recurrent_state,
+                        )
+                    )
+                else:
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=_rearr(q_ns),
+                        k=_rearr(k_ns),
+                        v=_rearr(v_ns),
+                        raw_g=g1_ns,
+                        # Chunk path wants the pre-sigmoided fp32 beta (its
+                        # kernels don't sigmoid); beta_ns is raw bf16 from forward.
+                        beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        safe_gate=safe_gate,
+                        lower_bound=lower_bound,
+                    )
+                # Init cache
+                scatter_states(
+                    recurrent_state,
+                    last_recurrent_state,
+                    prefill_state_indices,
+                )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
