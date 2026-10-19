@@ -44,6 +44,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# trtllm-gen MLA decode (non-persistent) launch-grid limit on B * Q query rows.
+_TRTLLM_MLA_MAX_GRID_ROWS = 65535
+
+
 class _FlashInferMLASparseBackendBase(AttentionBackend):
     """Common metadata for concrete FlashInfer sparse MLA backends."""
 
@@ -574,6 +578,56 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         )
 
     def _forward_mqa_kernel(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        layer: AttentionLayer,
+        block_size: int,
+        is_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Every query token is its own trtllm-gen "request" (q_len 1), and the
+        # non-persistent kernel's launch grid only holds B * Q <= 65535 rows.
+        # A larger batch (e.g. max_num_batched_tokens=65536 on a full prefill
+        # step) launches nothing and returns the uninitialized output buffer,
+        # so split the rows into launches that fit.
+        num_rows = topk_indices.shape[0]
+        if num_rows <= _TRTLLM_MLA_MAX_GRID_ROWS:
+            return self._forward_mqa_kernel_rows(
+                q,
+                kv_cache,
+                topk_indices,
+                seq_lens,
+                layer=layer,
+                block_size=block_size,
+                is_decode=is_decode,
+            )
+        outs: list[torch.Tensor] = []
+        lses: list[torch.Tensor] = []
+        for start in range(0, num_rows, _TRTLLM_MLA_MAX_GRID_ROWS):
+            end = min(start + _TRTLLM_MLA_MAX_GRID_ROWS, num_rows)
+            q_rows = (
+                (q[0][start:end], q[1][start:end])
+                if isinstance(q, tuple)
+                else q[start:end]
+            )
+            out, lse = self._forward_mqa_kernel_rows(
+                q_rows,
+                kv_cache,
+                topk_indices[start:end],
+                seq_lens[start:end],
+                layer=layer,
+                block_size=block_size,
+                is_decode=is_decode,
+            )
+            outs.append(out)
+            if lse is not None:
+                lses.append(lse)
+        return torch.cat(outs), (torch.cat(lses) if lses else None)
+
+    def _forward_mqa_kernel_rows(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_cache: torch.Tensor,
