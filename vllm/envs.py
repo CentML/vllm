@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
+    VLLM_FLASHINFER_MOE_EP_AWARE_TUNING: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
@@ -1808,6 +1809,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
             for v in os.environ["VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS"].split(",")
             if v.strip()
         ]
+    ),
+    # FlashInfer autotuning of the trtllm-gen MoE ops: also list the tactic
+    # candidates of the expert-parallel effective row count (FlashInfer sizes
+    # the candidate tiles as if every top-k slot were local) and race the
+    # default heuristic tactic. Only changes candidate enumeration while
+    # tuning; see vllm/model_executor/warmup/flashinfer_moe_tactics.py.
+    "VLLM_FLASHINFER_MOE_EP_AWARE_TUNING": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_MOE_EP_AWARE_TUNING", "0"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(

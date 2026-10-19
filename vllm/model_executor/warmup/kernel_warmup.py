@@ -26,6 +26,9 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_v2_root,
     use_flashinfer_autotune_v2,
 )
+from vllm.model_executor.warmup.flashinfer_moe_tactics import (
+    ep_aware_trtllm_moe_tactics,
+)
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
     deepseek_v4_sparse_mla_attention_warmup,
@@ -469,8 +472,12 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         cache_path = resolve_flashinfer_autotune_file(runner)
         # The world group only spans DP ranks when vLLM folds DP into it.
         dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
+        # EP-aware MoE tuning selects different tactics; keep its results
+        # apart from (and never reuse) a cache tuned without it.
+        ep_aware = "_moeep" if envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING else ""
         cache_path = cache_path.with_name(
-            f"{cache_path.stem}_dp{dp_rank}_rank{world.rank_in_group}{cache_path.suffix}"
+            f"{cache_path.stem}{ep_aware}_dp{dp_rank}_rank{world.rank_in_group}"
+            f"{cache_path.suffix}"
         )
         if is_leader:
             logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
@@ -490,7 +497,11 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
     try:
-        with torch.inference_mode(), autotune_context:
+        with (
+            torch.inference_mode(),
+            autotune_context,
+            ep_aware_trtllm_moe_tactics(envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING),
+        ):
             hisparse_enabled = (
                 runner.vllm_config.attention_config.hisparse_config is not None
             )
