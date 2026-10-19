@@ -86,6 +86,33 @@ class TrtLlmBf16ExpertsBase:
 
         self.moe_config = moe_config
         self.quant_config = quant_config
+        self.gemm1_clamp_limit = self._make_gemm1_clamp_limit(moe_config, quant_config)
+
+    @staticmethod
+    def _make_gemm1_clamp_limit(
+        moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig
+    ) -> torch.Tensor | None:
+        """Per-local-expert SwiGLU clamp for the TRTLLM-Gen BF16 kernels.
+
+        Models with a clamped SwiGLU (e.g. GLM-5.3 ``swiglu_limit``: gate
+        clamped from above, up to [-limit, limit]) set it on the MoE config;
+        the unquantized method also forwards it as ``gemm1_clamp_limit``.
+        BF16 weights carry no dequant scale, so the raw limit is passed as is
+        (the NVFP4 kernel divides it by its per-expert global scale).
+        Without this the clamp was silently dropped, e.g. for the BF16 MTP
+        layer of an NVFP4 GLM-5.3 checkpoint.
+        """
+        clamp = getattr(quant_config, "gemm1_clamp_limit", None)
+        if clamp is None:
+            clamp = moe_config.swiglu_limit
+        if clamp is None or not moe_config.is_act_and_mul:
+            return None
+        return torch.full(
+            (moe_config.num_local_experts,),
+            float(clamp),
+            dtype=torch.float32,
+            device=torch.accelerator.current_device_index(),
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -224,6 +251,7 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
         )
         # FlashInfer's BF16 routed wrapper does not expose an output= argument.
         output.copy_(result[0] if isinstance(result, list) else result)
@@ -303,6 +331,7 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
             routing_replay_out=routing_replay_out,
             do_finalize=not defer,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
         )
         routed_output = convert_flashinfer_moe_output(
             flashinfer_output,
