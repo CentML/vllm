@@ -393,7 +393,7 @@ def kda_causal_conv1d_planar(
     num_planes: int = 3,
     activation: str | None = "silu",
     out: torch.Tensor | None = None,
-    block_n: int = 1024,
+    block_n: int = 512,
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Causal conv1d (+ SiLU) over a varlen token batch, planar output.
