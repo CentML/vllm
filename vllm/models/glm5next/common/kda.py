@@ -1056,6 +1056,61 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
         return out, final_state
 
+    def _fused_decode(
+        self,
+        x: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        raw_gate: torch.Tensor,
+        raw_beta: torch.Tensor,
+        state_indices: torch.Tensor,
+        state: torch.Tensor,
+        output_gate: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Single-token rows through the fused decode backend (conv + SiLU
+        with conv-state update, recurrence, gated RMSNorm; normed output)."""
+        assert self._fi_fused_kda_decode is not None
+        if self._fi_norm_weight is None:
+            self._fi_norm_weight = self.o_norm.weight.float().contiguous()
+        if self._fi_conv_weight is None:
+            self._fi_conv_weight = (
+                conv_weights.view(3, self.local_projection_size, self.conv_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
+        if isinstance(self._fi_fused_kda_decode, _PipelinedKdaDecode):
+            self._fi_fused_kda_decode(
+                x=x,
+                weight=conv_weights,
+                fi_weight=self._fi_conv_weight,
+                conv_state=conv_state,
+                raw_gate=raw_gate,
+                raw_beta=raw_beta,
+                A_log=self.A_log.view(-1),
+                dt_bias=self.dt_bias,
+                state_indices=state_indices,
+                state=state,
+                output_gate=output_gate,
+                norm_weight=self._fi_norm_weight,
+                output=output,
+            )
+        else:
+            self._fi_fused_kda_decode(
+                x=x,
+                weight=self._fi_conv_weight,
+                conv_state=conv_state,
+                raw_gate=raw_gate,
+                raw_beta=raw_beta,
+                A_log=self.A_log.view(-1),
+                dt_bias=self.dt_bias,
+                state_indices=state_indices,
+                state=state,
+                output_gate=output_gate,
+                norm_weight=self._fi_norm_weight,
+                output=output,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1196,45 +1251,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             num_decodes = attn_metadata_narrowed.num_decodes
             assert num_decodes == num_actual_tokens
-            if self._fi_norm_weight is None:
-                self._fi_norm_weight = self.o_norm.weight.float().contiguous()
-            if self._fi_conv_weight is None:
-                self._fi_conv_weight = (
-                    conv_weights.view(3, self.local_projection_size, self.conv_size)
-                    .transpose(1, 2)
-                    .contiguous()
-                )
-            if isinstance(self._fi_fused_kda_decode, _PipelinedKdaDecode):
-                self._fi_fused_kda_decode(
-                    x=qkv_proj_states,
-                    weight=conv_weights,
-                    fi_weight=self._fi_conv_weight,
-                    conv_state=conv_state,
-                    raw_gate=g1,
-                    raw_beta=beta,
-                    A_log=self.A_log.view(-1),
-                    dt_bias=self.dt_bias,
-                    state_indices=non_spec_state_indices_tensor[:num_decodes],
-                    state=recurrent_state,
-                    output_gate=g2[:num_decodes],
-                    norm_weight=self._fi_norm_weight,
-                    output=core_attn_out[:, :num_decodes],
-                )
-            else:
-                self._fi_fused_kda_decode(
-                    x=qkv_proj_states,
-                    weight=self._fi_conv_weight,
-                    conv_state=conv_state,
-                    raw_gate=g1,
-                    raw_beta=beta,
-                    A_log=self.A_log.view(-1),
-                    dt_bias=self.dt_bias,
-                    state_indices=non_spec_state_indices_tensor[:num_decodes],
-                    state=recurrent_state,
-                    output_gate=g2[:num_decodes],
-                    norm_weight=self._fi_norm_weight,
-                    output=core_attn_out[:, :num_decodes],
-                )
+            self._fused_decode(
+                x=qkv_proj_states,
+                conv_weights=conv_weights,
+                conv_state=conv_state,
+                raw_gate=g1,
+                raw_beta=beta,
+                state_indices=non_spec_state_indices_tensor[:num_decodes],
+                state=recurrent_state,
+                output_gate=g2[:num_decodes],
+                output=core_attn_out[:, :num_decodes],
+            )
             return
 
         # Split projections / gating into spec (draft-verify) and non-spec token
@@ -1343,20 +1370,62 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
+        # Mixed non-spec step without prefix-cache checkpoints: the leading
+        # decode rows are peeled off the chunked prefill (vLLM orders decodes
+        # first; the builder precomputes the prefill tail).
+        peel_decodes = (
+            attn_metadata_narrowed.num_prefills > 0
+            and self._planar_prefill
+            and not use_spec
+            and attn_metadata_narrowed.num_decodes > 0
+            and attn_metadata_narrowed.checkpoint is None
+            and attn_metadata_narrowed.prefill_query_start_loc is not None
+        )
+        # With a fused decode backend they go through the same single-token
+        # kernel as pure decode steps (conv + recurrence + gated RMSNorm,
+        # normed output), before the prefill rows' conv.
+        num_fused_peeled = 0
+        if peel_decodes and self._fi_fused_kda_decode is not None and conv_bias is None:
+            assert qkv_ns is not None and g1_ns is not None and beta_ns is not None
+            assert non_spec_state_indices_tensor is not None
+            num_fused_peeled = attn_metadata_narrowed.num_decode_tokens
+            self._fused_decode(
+                x=qkv_ns[:num_fused_peeled],
+                conv_weights=conv_weights,
+                conv_state=conv_state,
+                raw_gate=g1_ns[:, :num_fused_peeled],
+                raw_beta=beta_ns[:, :num_fused_peeled],
+                state_indices=non_spec_state_indices_tensor[:num_fused_peeled],
+                state=recurrent_state,
+                output_gate=g2[:num_fused_peeled],
+                output=core_attn_out[:, :num_fused_peeled],
+            )
         if attn_metadata_narrowed.num_prefills > 0 and self._planar_prefill:
             assert qkv_ns is not None
             assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
+            conv_query_start_loc = non_spec_query_start_loc
+            conv_state_indices = non_spec_state_indices_tensor
+            conv_has_initial_state = has_initial_state
+            if num_fused_peeled:
+                assert attn_metadata_narrowed.prefill_query_start_loc is not None
+                assert attn_metadata_narrowed.prefill_state_indices is not None
+                assert attn_metadata_narrowed.prefill_has_initial_state is not None
+                conv_query_start_loc = attn_metadata_narrowed.prefill_query_start_loc
+                conv_state_indices = attn_metadata_narrowed.prefill_state_indices
+                conv_has_initial_state = (
+                    attn_metadata_narrowed.prefill_has_initial_state
+                )
             # Planar [3, T, P] output: q, k and v are each dense for FlashKDA.
             q_ns, k_ns, v_ns = kda_causal_conv1d_planar(
-                qkv_ns,
+                qkv_ns[num_fused_peeled:],
                 conv_weights,
                 conv_bias,
                 conv_state,
-                query_start_loc=non_spec_query_start_loc,
-                cache_indices=non_spec_state_indices_tensor,
-                has_initial_state=has_initial_state,
+                query_start_loc=conv_query_start_loc,
+                cache_indices=conv_state_indices,
+                has_initial_state=conv_has_initial_state,
             ).unbind(0)
         elif attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
@@ -1445,17 +1514,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             prefill_state_indices = non_spec_state_indices_tensor
             prefill_has_initial_state = has_initial_state
             num_peeled = 0
-            if (
-                self._planar_prefill
-                and not use_spec
-                and attn_metadata_narrowed.num_decodes > 0
-                and attn_metadata_narrowed.checkpoint is None
-                and attn_metadata_narrowed.prefill_query_start_loc is not None
-            ):
+            if num_fused_peeled:
+                # Decode rows already done by the fused decode kernel; the
+                # conv above only produced the prefill rows.
+                num_peeled = num_fused_peeled
+                prefill_query_start_loc = attn_metadata_narrowed.prefill_query_start_loc
+                prefill_state_indices = attn_metadata_narrowed.prefill_state_indices
+                prefill_has_initial_state = (
+                    attn_metadata_narrowed.prefill_has_initial_state
+                )
+                assert prefill_query_start_loc is not None
+                assert prefill_state_indices is not None
+                assert prefill_has_initial_state is not None
+                g1_ns, beta_ns = g1_ns[:, num_peeled:], beta_ns[:, num_peeled:]
+            elif peel_decodes:
                 # Mixed step: the leading decode rows go through the
                 # recurrent kernel in place on the state pool, so FlashKDA,
-                # gather and scatter only see the prefill rows (vLLM orders
-                # decodes first; the builder precomputes the prefill tail).
+                # gather and scatter only see the prefill rows.
                 num_peeled = attn_metadata_narrowed.num_decode_tokens
                 fused_recurrent_kda(
                     q=_rearr(q_ns[:num_peeled]),
@@ -1640,7 +1715,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Triton paths (prefill / mixed steps) apply it here, in place.
             # (With fused_spec the spec rows are normed by the kernel and the
             # non-spec rows were normed before the merge above.)
-            live_out = core_attn_out[:, :num_actual_tokens]
-            normed = self.o_norm(live_out, g2[:num_actual_tokens])
+            # Rows from the fused decode kernel are already normed.
+            live_out = core_attn_out[:, num_fused_peeled:num_actual_tokens]
+            normed = self.o_norm(live_out, g2[num_fused_peeled:num_actual_tokens])
             if normed.data_ptr() != live_out.data_ptr():
                 live_out.copy_(normed)
