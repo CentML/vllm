@@ -396,10 +396,14 @@ def has_flashinfer_nvlink_two_sided() -> bool:
 
 @functools.cache
 def has_flashinfer_nvlink_one_sided() -> bool:
-    """Return `True` if FlashInfer trtllm_moe_alltoall module is available."""
+    """Return `True` if FlashInfer's one-sided MoeAlltoAll is available."""
     if not has_flashinfer_comm():
         return False
-    return importlib.util.find_spec("flashinfer.comm.trtllm_moe_alltoall") is not None
+    mod = _get_submodule("flashinfer.comm.trtllm_moe_alltoall")
+    return mod is not None and all(
+        hasattr(mod, name)
+        for name in ("MoeAlltoAll", "moe_a2a_get_workspace_size_per_rank")
+    )
 
 
 @functools.cache
