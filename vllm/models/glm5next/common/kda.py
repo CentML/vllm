@@ -47,6 +47,7 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import kda_causal_conv1d_planar
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -146,7 +147,8 @@ def _resolve_kda_prefill_backend(
     """Pick the chunked-prefill kernel: FlashKDA (fused CUDA, ~2-4x faster on
     SM90/SM10x/SM12x for bf16, head_dim 128 and a bounded gate) or the Triton
     ``chunk_kda_with_fused_gate`` path. ``backend`` comes from
-    ``additional_config.kda_prefill_backend`` (auto / triton / flashkda)."""
+    ``additional_config.kda_prefill_backend`` (auto / triton / flashkda;
+    flashkda_planar is resolved as flashkda by the caller)."""
     if backend not in ("auto", "triton", "flashkda"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
     capability = current_platform.get_device_capability()
@@ -500,10 +502,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self._conv_state_dim_first = is_conv_state_dim_first()
 
         additional_config = vllm_config.additional_config
-        self.kda_prefill_backend = _resolve_kda_prefill_backend(
+        requested_prefill_backend = (
             additional_config.get("kda_prefill_backend", "auto")
             if isinstance(additional_config, dict)
-            else "auto",
+            else "auto"
+        )
+        # "flashkda_planar": FlashKDA whose inputs come from a short conv with
+        # planar q|k|v output (no .contiguous() copies), with the decode rows
+        # of mixed steps peeled off to the recurrent kernel.
+        self._planar_prefill = requested_prefill_backend == "flashkda_planar"
+        self.kda_prefill_backend = _resolve_kda_prefill_backend(
+            "flashkda" if self._planar_prefill else requested_prefill_backend,
             self.head_dim,
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
@@ -851,7 +860,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        if attn_metadata_narrowed.num_prefills > 0 and self._planar_prefill:
+            assert qkv_ns is not None
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
+            # Planar [3, T, P] output: q, k and v are each dense for FlashKDA.
+            q_ns, k_ns, v_ns = kda_causal_conv1d_planar(
+                qkv_ns,
+                conv_weights,
+                conv_bias,
+                conv_state,
+                query_start_loc=non_spec_query_start_loc,
+                cache_indices=non_spec_state_indices_tensor,
+                has_initial_state=has_initial_state,
+            ).unbind(0)
+        elif attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
             qkv_ns = causal_conv1d_fn(
                 qkv_ns.transpose(0, 1),
@@ -927,17 +951,69 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # stays None there and the merge copy below runs as before.
         ns_out = None
         if attn_metadata_narrowed.num_prefills > 0:
-            assert q_ns is not None
+            assert q_ns is not None and k_ns is not None and v_ns is not None
+            assert g1_ns is not None and beta_ns is not None
+            assert non_spec_query_start_loc is not None
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
+            prefill_query_start_loc = non_spec_query_start_loc
+            prefill_state_indices = non_spec_state_indices_tensor
+            prefill_has_initial_state = has_initial_state
+            num_peeled = 0
+            if (
+                self._planar_prefill
+                and not use_spec
+                and attn_metadata_narrowed.num_decodes > 0
+                and attn_metadata_narrowed.checkpoint is None
+                and attn_metadata_narrowed.prefill_query_start_loc is not None
+            ):
+                # Mixed step: the leading decode rows go through the
+                # recurrent kernel in place on the state pool, so FlashKDA,
+                # gather and scatter only see the prefill rows (vLLM orders
+                # decodes first; the builder precomputes the prefill tail).
+                num_peeled = attn_metadata_narrowed.num_decode_tokens
+                fused_recurrent_kda(
+                    q=_rearr(q_ns[:num_peeled]),
+                    k=_rearr(k_ns[:num_peeled]),
+                    v=_rearr(v_ns[:num_peeled]),
+                    g=g1_ns[:, :num_peeled],
+                    beta=beta_ns[:, :num_peeled],
+                    initial_state=recurrent_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=non_spec_query_start_loc[
+                        : attn_metadata_narrowed.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    out=core_attn_out[:, :num_peeled],
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
+                prefill_query_start_loc = attn_metadata_narrowed.prefill_query_start_loc
+                prefill_state_indices = attn_metadata_narrowed.prefill_state_indices
+                prefill_has_initial_state = (
+                    attn_metadata_narrowed.prefill_has_initial_state
+                )
+                assert prefill_state_indices is not None
+                assert prefill_has_initial_state is not None
+                q_ns, k_ns, v_ns = (
+                    q_ns[num_peeled:],
+                    k_ns[num_peeled:],
+                    v_ns[num_peeled:],
+                )
+                g1_ns, beta_ns = g1_ns[:, num_peeled:], beta_ns[:, num_peeled:]
             initial_state = gather_initial_states(
-                recurrent_state, non_spec_state_indices_tensor, has_initial_state
+                recurrent_state, prefill_state_indices, prefill_has_initial_state
             )
             if self.kda_prefill_backend == "flashkda":
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
                 # tokens: write to the workspace buffer and scatter below.
-                ns_out = None if use_spec else core_attn_out[:, :num_actual_tokens]
+                ns_out = (
+                    None if use_spec else core_attn_out[:, num_peeled:num_actual_tokens]
+                )
                 core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
@@ -945,7 +1021,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     g=g1_ns,
                     beta=beta_ns,
                     initial_state=initial_state,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
                     out=ns_out,
                     checkpoint=attn_metadata_narrowed.checkpoint,
                     raw_qkv=raw_qkv_ns,
@@ -977,7 +1053,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             scatter_states(
                 recurrent_state,
                 last_recurrent_state,
-                non_spec_state_indices_tensor,
+                prefill_state_indices,
             )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_query_start_loc is not None
