@@ -1491,12 +1491,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 g1_ns, beta_ns = g1_ns[:, num_peeled:], beta_ns[:, num_peeled:]
             if (
                 self._fi_prefill is not None
-                and not use_spec
                 and attn_metadata_narrowed.checkpoint is None
             ):
                 # FlashInfer updates the state in place at the slot indices
                 # (no gather / scatter); trailing padding rows are excluded.
-                ns_out = core_attn_out[:, num_peeled:num_actual_tokens]
+                # With spec-verify rows in the step the prefill rows are not
+                # contiguous in the output, so write a buffer that the merge
+                # below scatters. (Falling back to FlashKDA here would ask the
+                # locked workspace for buffers the warmup never reserved:
+                # job 803405, "Workspace is locked ... 6960 MB".)
+                if use_spec:
+                    assert q_ns is not None
+                    ns_out = torch.empty(
+                        (1, q_ns.size(0), self.local_num_heads, self.head_dim),
+                        dtype=core_attn_out.dtype,
+                        device=core_attn_out.device,
+                    )
+                else:
+                    ns_out = core_attn_out[:, num_peeled:num_actual_tokens]
                 self._fi_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
