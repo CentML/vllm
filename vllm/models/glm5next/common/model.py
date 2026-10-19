@@ -92,7 +92,10 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .attention import Glm5NextMLAAttention
-from .fp8_linear import glm53_shared_expert_quant_config
+from .fp8_linear import (
+    glm53_shared_expert_quant_config,
+    log_glm53_fp8_linear_memory,
+)
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
     Glm5NextMultiModalProcessor,
@@ -1078,6 +1081,10 @@ class Glm5NextForCausalLM(
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def process_weights_after_loading(self) -> None:
+        # Model-level post-load hook (after every layer's quant processing).
+        log_glm53_fp8_linear_memory()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1171,6 +1178,10 @@ class Glm5NextForConditionalGeneration(
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+
+    def process_weights_after_loading(self) -> None:
+        # Model-level post-load hook (after every layer's quant processing).
+        log_glm53_fp8_linear_memory()
 
     # NOTE: weight-prefix mapping is inherited from Glm4vForConditionalGeneration
     # (``model.visual.`` -> ``visual.``, ``model.language_model.`` ->
