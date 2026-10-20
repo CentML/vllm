@@ -33,7 +33,7 @@ MIX_SIZE = HC_MULT * (HC_MULT + 2)
 
 # Supported (block_m, splits) instantiations, each with fn staged through
 # shared memory or loaded into registers (fn_reg).
-CONFIGS = ((64, 16), (64, 8), (64, 32), (32, 16), (32, 32), (32, 8))
+CONFIGS = ((64, 16), (64, 8), (64, 32), (32, 16), (32, 32), (32, 8), (32, 64))
 # Fastest single-launch config on VR200 (job 803407), still 0.96x of TileLang.
 DEFAULT_CONFIG = (64, 16)
 DEFAULT_FN_REG = False

@@ -768,6 +768,7 @@ void mhc_post_pre(TensorView x, TensorView residual, TensorView post_in,
   GLM_MHCP_CASE(32, 16)
   GLM_MHCP_CASE(32, 32)
   GLM_MHCP_CASE(32, 8)
+  GLM_MHCP_CASE(32, 64)  // decode batches (mhc_decode.py, 33-256 tokens)
   else {
     ok = false;
   }

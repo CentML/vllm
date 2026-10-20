@@ -144,7 +144,7 @@ def _resolve_mhc_decode(
     logger.info_once(
         "mHC sublayer boundaries with <= %d tokens use the CUDA decode pre kernel "
         "(Sinkhorn on a side stream: %s).",
-        mhc_decode.MAX_TOKENS,
+        mhc_decode.MID_MAX_TOKENS,
         mhc_decode.SIDE_STREAM,
     )
     return True
@@ -570,7 +570,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_decode_cuda = _resolve_mhc_decode(
                 vllm_config, self.hidden_size, n
             )
-            self.mhc_decode_max_tokens = 32
+            self.mhc_decode_max_tokens = 128
 
             if vllm_config.kernel_config.enable_jit_warmup:
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (

@@ -31,6 +31,16 @@ HC_MULT = 4
 MIX_SIZE = HC_MULT * (HC_MULT + 2)
 # The TileLang fused post + GEMM covers up to this many tokens.
 MAX_TOKENS = 32
+# From MAX_TOKENS + 1 to MID_MAX_TOKENS (decode batches of TP / DEP decode
+# workers) TileLang runs three kernels (post, DeepGEMM TF32 prenorm GEMM, pre;
+# 11.3-11.5 us at 64-128 tokens on VR200, bench 806796). There the post + GEMM
+# partials come from mhc_prefill.cu's GEMM-only mode (32-token tiles, 64
+# splits, fn in TF32 as DeepGEMM's TF32 GEMM: 3.6-4.7 us; post / comb within
+# the TF32 path's own error vs fp64, bench 806796 g32x64+tlpre) and the pre
+# from the kernel above. Above MID_MAX_TOKENS nothing changes (at 256 tokens the
+# GEMM-only kernel no longer beats TileLang + DeepGEMM: 806796).
+MID_MAX_TOKENS = 128
+_MID_BLOCK_M, _MID_SPLITS = 32, 64
 # Run the Sinkhorn half on a side stream (set from additional_config by the
 # model; the caller must call join() before reading post / comb).
 SIDE_STREAM = False
@@ -52,8 +62,11 @@ def _module():
 
 
 def load() -> None:
-    """Build (or load the cached build of) the kernel module."""
+    """Build (or load the cached build of) the kernel modules."""
+    from vllm.models.glm5next.nvidia.ops import mhc_prefill
+
     _module()
+    mhc_prefill.load()
 
 
 def is_supported(hidden_size: int, hc_mult: int) -> bool:
@@ -197,7 +210,8 @@ def glm5next_mhc_decode_post_pre(
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     num_tokens = residual.numel() // (hc_mult * hidden_size)
-    if (
+    mid = MAX_TOKENS < num_tokens <= MID_MAX_TOKENS
+    if not mid and (
         num_tokens > MAX_TOKENS
         or mhc_fused_post_pre_split_config(num_tokens, hidden_size, hc_mult) is None
     ):
@@ -220,16 +234,49 @@ def glm5next_mhc_decode_post_pre(
     join()
     outer_shape = residual.shape[:-2]
     hc_mult3 = hc_mult * (hc_mult + 2)
-    gemm_out_mul, gemm_out_sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
-        comb_res_mix.reshape(num_tokens, hc_mult, hc_mult),
-        residual.reshape(num_tokens, hc_mult, hidden_size),
-        post_layer_mix.reshape(num_tokens, hc_mult),
-        x.reshape(num_tokens, hidden_size),
-        fn.view(hc_mult3, hc_mult, hidden_size),
-        hc_mult,
-        hidden_size,
-        hc_mult3,
-    )
+    if mid:
+        from vllm.models.glm5next.nvidia.ops import mhc_prefill
+
+        dev = residual.device
+        gemm_out_mul = torch.empty(
+            _MID_SPLITS, num_tokens, MIX_SIZE, dtype=torch.float32, device=dev
+        )
+        gemm_out_sqrsum = torch.empty(
+            _MID_SPLITS, num_tokens, dtype=torch.float32, device=dev
+        )
+        residual_cur, _, _, _ = mhc_prefill.mhc_post_pre(
+            x.reshape(num_tokens, hidden_size),
+            residual.reshape(num_tokens, hc_mult, hidden_size),
+            post_layer_mix.reshape(num_tokens, hc_mult),
+            comb_res_mix.reshape(num_tokens, hc_mult, hc_mult),
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_eps,
+            block_m=_MID_BLOCK_M,
+            splits=_MID_SPLITS,
+            mode="gemm",
+            fn_tf32=True,
+            fn_reg=False,
+            workspace=(gemm_out_mul, gemm_out_sqrsum),
+        )
+    else:
+        gemm_out_mul, gemm_out_sqrsum, residual_cur = _MHC_FUSED_TILELANG_KERNEL(
+            comb_res_mix.reshape(num_tokens, hc_mult, hc_mult),
+            residual.reshape(num_tokens, hc_mult, hidden_size),
+            post_layer_mix.reshape(num_tokens, hc_mult),
+            x.reshape(num_tokens, hidden_size),
+            fn.view(hc_mult3, hc_mult, hidden_size),
+            hc_mult,
+            hidden_size,
+            hc_mult3,
+        )
     eps = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
            norm_eps)
     if SIDE_STREAM and _side_stream_allowed():

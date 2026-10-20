@@ -50,7 +50,9 @@ constexpr int kCollapseWarps = 16;         // 512 threads x 8 columns = 4096
 constexpr int kCollapseThreads = kCollapseWarps * 32;
 constexpr int kThreads = kCollapseThreads + 32;  // + the Sinkhorn warp
 static_assert(kCollapseThreads * 8 == kHidden, "one uint4 per thread/stream");
-constexpr int kMaxSplits = 16;  // TileLang's fused post + GEMM uses 8 or 16
+// TileLang's fused post + GEMM uses 8 or 16 splits; mhc_prefill.cu's GEMM-only
+// mode (used here for 33-256 tokens) 64.
+constexpr int kMaxSplits = 64;
 
 struct Params {
   const float* part;                  // [S, M, 24] prenorm GEMM partials
@@ -243,7 +245,7 @@ void mhc_pre_decode(TensorView part, TensorView sq, TensorView hc_scale,
       << "part must be [S, M, 24]";
   const int64_t S = part.size(0);
   TVM_FFI_ICHECK(sq.numel() == S * M) << "sq must be [S, M]";
-  TVM_FFI_ICHECK(S >= 1 && S <= kMaxSplits) << "at most 16 splits";
+  TVM_FFI_ICHECK(S >= 1 && S <= kMaxSplits) << "at most 64 splits";
   TVM_FFI_ICHECK(hc_scale.numel() == 3 && hc_base.numel() == kMix);
   TVM_FFI_ICHECK(norm_w.numel() == kHidden);
   // Mode 1 writes only layer_input, mode 2 only post / comb.
