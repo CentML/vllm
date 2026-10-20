@@ -202,6 +202,16 @@ def _flashinfer_bf16_lowm_table() -> tuple[tuple[int, ...], dict] | None:
     return buckets, table
 
 
+@functools.cache
+def _flashinfer_bf16_max_m() -> int:
+    """VLLM_FLASHINFER_BF16_MAX_M: largest M the flashinfer_cutedsl linear
+    backend serves; larger GEMMs go to torch.nn.functional.linear (0: no
+    limit, the default)."""
+    import os
+
+    return int(os.environ.get("VLLM_FLASHINFER_BF16_MAX_M", "0"))
+
+
 def _flashinfer_bf16_lowm_choice(n: int, k: int, m: int) -> str | None:
     spec = _flashinfer_bf16_lowm_table()
     if spec is None:
@@ -230,6 +240,11 @@ def cuda_flashinfer_bf16_gemm_impl(
     k = x.shape[-1]
     n = weight.shape[0]
     x_2d = x.view(-1, k)
+    if 0 < _flashinfer_bf16_max_m() < x_2d.shape[0]:
+        # cute-dsl serves M <= 32 itself and hands larger M to FlashInfer's
+        # cuBLASLt runner, which measured slightly slower than torch's cuBLAS
+        # heuristics on GLM-5.3 shapes (806782 vs 805625 at M 128: -1.2%).
+        return torch.nn.functional.linear(x, weight, bias)
     flashinfer_backend = backend_spec.flashinfer_backend
     choice = _flashinfer_bf16_lowm_choice(n, k, x_2d.shape[0])
     if choice is not None:
