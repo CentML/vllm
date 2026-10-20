@@ -178,7 +178,7 @@ def wy_source(tune: str, pdl: bool, v2: int = 0) -> str:
         if item == "1":
             continue
         key, val = item.split("=")
-        assert key in ("PF", "QS", "KS", "MINB", "CLPC", "CST", "V2"), key
+        assert key in ("PF", "QS", "KS", "MINB", "CLPC", "CST", "V2", "CH"), key
         assert not (key == "V2" and v2), "V2 given twice"
         defines += f"#define GWY_{key} {int(val)}\n"
     return defines + _WY_SOURCE
@@ -1295,6 +1295,13 @@ namespace {
 #ifndef GWY_MINB
 #define GWY_MINB 4
 #endif
+// GWY_CH (bit mask; cache hints only, values unchanged): 1: the commit stages its
+// source state and replay log with cp.async L2::evict_first (both are read once);
+// 2: wy2 stages its source state the same way; 4: the commit's snapshot stores
+// are plain (st.global) instead of streaming (st.global.cs).
+#ifndef GWY_CH
+#define GWY_CH 0
+#endif
 
 constexpr int kK = 128;
 constexpr int kV = 128;
@@ -1385,6 +1392,21 @@ __device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
   const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(src) : "memory");
+}
+// cp_async16 with an L2::evict_first cache policy (pol from l2_evict_first()).
+__device__ __forceinline__ uint64_t l2_evict_first() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+__device__ __forceinline__ void cp_async16_ef(void* dst, const void* src, uint64_t pol) {
+  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(d), "l"(src), "l"(pol) : "memory");
+}
+template <bool kEF>
+__device__ __forceinline__ void cp_async16_h(void* dst, const void* src, uint64_t pol) {
+  if constexpr (kEF) cp_async16_ef(dst, src, pol);
+  else cp_async16(dst, src);
 }
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -1952,6 +1974,7 @@ __global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) w
 
   // Source states -> smem (warp w: rows [16w, 16w + 16) of each head, its own commit group).
   {
+    const uint64_t pol = (GWY_CH & 2) ? l2_evict_first() : 0;
 #pragma unroll
     for (int j = 0; j < kNH; ++j) {
       const __nv_bfloat16* sp =
@@ -1960,7 +1983,7 @@ __global__ void __launch_bounds__(kNT, kNH > 1 ? 2 : (TM <= 6 ? GWY_MINB : 3)) w
       for (int i = 0; i < 8; ++i) {
         const int q = i * 32 + lane;
         const int row = warp * kRW + (q >> 4), ch = q & 15;
-        cp_async16(&sm.st[j][row * kK + ((ch ^ (row & 7)) << 3)], sp + row * kK + ch * 8);
+        cp_async16_h<(GWY_CH & 2) != 0>(&sm.st[j][row * kK + ((ch ^ (row & 7)) << 3)], sp + row * kK + ch * 8, pol);
       }
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
@@ -2355,7 +2378,11 @@ __device__ __forceinline__ void replay(const CStage& cs, const int* slots, bool 
       const float2 d2 = make_float2(dd[t], dd[t]);
       h0 = fma2(kr[t][0], dl2, mul2(h0, d2));
       h1 = fma2(kr[t][1], dl2, mul2(h1, d2));
-      if (dst[t] != nullptr) __stcs(reinterpret_cast<uint2*>(dst[t] + rr * kK), make_uint2(pack_bf2(h0.x, h0.y), pack_bf2(h1.x, h1.y)));
+      if (dst[t] != nullptr) {
+        const uint2 w2 = make_uint2(pack_bf2(h0.x, h0.y), pack_bf2(h1.x, h1.y));
+        if constexpr ((GWY_CH & 4) != 0) *reinterpret_cast<uint2*>(dst[t] + rr * kK) = w2;
+        else __stcs(reinterpret_cast<uint2*>(dst[t] + rr * kK), w2);
+      }
     }
   }
 }
@@ -2454,13 +2481,15 @@ __global__ void __launch_bounds__(kNT, GWY_CST > 2 ? 1 : 2) commit_kernel(const 
       const __nv_bfloat16* sp = sm.state[j] + static_cast<int64_t>(sm.rec[j][2]) * sm.s_slot[j] + head;
       const float* lg =
           reinterpret_cast<const float*>(sm.state[j] + static_cast<int64_t>(sm.rec[j][3]) * sm.s_slot[j] + head);
+      const uint64_t pol = (GWY_CH & 1) ? l2_evict_first() : 0;
+      constexpr bool kEF = (GWY_CH & 1) != 0;
 #pragma unroll
-      for (int c = tid; c < kV * kK / 8; c += kNT) cp_async16(cs.st + 8 * c, sp + 8 * c);
+      for (int c = tid; c < kV * kK / 8; c += kNT) cp_async16_h<kEF>(cs.st + 8 * c, sp + 8 * c, pol);
       for (int c = tid; c < T * (kV / 4); c += kNT) {
-        cp_async16(&cs.dl[0][0] + 4 * c, lg + 4 * c);
-        cp_async16(&cs.k[0][0] + 4 * c, lg + kLogK + 4 * c);
+        cp_async16_h<kEF>(&cs.dl[0][0] + 4 * c, lg + 4 * c, pol);
+        cp_async16_h<kEF>(&cs.k[0][0] + 4 * c, lg + kLogK + 4 * c, pol);
       }
-      if (tid < kMaxT / 4) cp_async16(cs.dec + 4 * tid, lg + kLogD + 4 * tid);
+      if (tid < kMaxT / 4) cp_async16_h<kEF>(cs.dec + 4 * tid, lg + kLogD + 4 * tid, pol);
     }
     asm volatile("cp.async.commit_group;" ::: "memory");
   };

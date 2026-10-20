@@ -23,6 +23,7 @@
 # self-resetting atom.inc counter.
 import heapq
 import math
+import os
 
 
 import torch
@@ -39,6 +40,24 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass import Float32, Int32, Int64, Boolean, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+
+# VLLM_KF_PREFILL_ATTN_L2_HINT="kv=last+q=first" (CacheHint track): L2 cache
+# policy of the K/V (kv=) and Q (q=) TMA loads, each first|last|normal; unset
+# items keep the plain load. Values are unchanged (bitwise); read when a kernel
+# form is traced, so set it before warmup().
+_L2_POLICY = {"first": 0x12F0000000000000, "last": 0x14F0000000000000, "normal": 0x1000000000000000}
+
+
+def _l2_hints(spec):
+    hints = {"kv": {}, "q": {}}
+    for item in filter(None, (x.strip() for x in spec.replace(",", "+").split("+"))):
+        key, val = item.split("=")
+        assert key in hints and val in _L2_POLICY, item
+        hints[key] = {"cache_policy": Int64(_L2_POLICY[val])}
+    return hints["kv"], hints["q"]
+
+
+_KV_HINT, _Q_HINT = _l2_hints(os.environ.get("VLLM_KF_PREFILL_ATTN_L2_HINT", ""))
 
 HQ = 16
 HKV = 2
@@ -1048,7 +1067,7 @@ class PagedFp8Attn:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         mbar + MB_Q, self.tma_bytes_q)
-            cute.copy(tma_atom_q, tQgQ, tQsQ[None, 0], tma_bar_ptr=mbar + MB_Q)
+            cute.copy(tma_atom_q, tQgQ, tQsQ[None, 0], tma_bar_ptr=mbar + MB_Q, **_Q_HINT)
             qphase = qphase ^ 1
 
             pg0 = kv_begin >> 7
@@ -1069,11 +1088,11 @@ class PagedFp8Attn:
                     cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page],
                               tKsK[None, kstage],
                               tma_bar_ptr=mbar + MB_K + kstage,
-                              mcast_mask=kv_mask)
+                              mcast_mask=kv_mask, **_KV_HINT)
                 else:
                     cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page],
                               tKsK[None, kstage],
-                              tma_bar_ptr=mbar + MB_K + kstage)
+                              tma_bar_ptr=mbar + MB_K + kstage, **_KV_HINT)
                 kstage = kstage + 1
                 if kstage == self.kvstage:
                     kstage = Int32(0)
@@ -1099,11 +1118,11 @@ class PagedFp8Attn:
                             cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page_next],
                                       tKsK[None, kstage],
                                       tma_bar_ptr=mbar + MB_K + kstage,
-                                      mcast_mask=kv_mask)
+                                      mcast_mask=kv_mask, **_KV_HINT)
                         else:
                             cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page_next],
                                       tKsK[None, kstage],
-                                      tma_bar_ptr=mbar + MB_K + kstage)
+                                      tma_bar_ptr=mbar + MB_K + kstage, **_KV_HINT)
                         kstage = kstage + 1
                         if kstage == self.kvstage:
                             kstage = Int32(0)
@@ -1123,11 +1142,11 @@ class PagedFp8Attn:
                         cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page],
                                   tKsK[None, kstage],
                                   tma_bar_ptr=mbar + MB_K + kstage,
-                                  mcast_mask=kv_mask)
+                                  mcast_mask=kv_mask, **_KV_HINT)
                     else:
                         cute.copy(tma_atom_k, tKgK[None, 0, h_kv, page],
                                   tKsK[None, kstage],
-                                  tma_bar_ptr=mbar + MB_K + kstage)
+                                  tma_bar_ptr=mbar + MB_K + kstage, **_KV_HINT)
                     kstage = kstage + 1
                     if kstage == self.kvstage:
                         kstage = Int32(0)
@@ -1147,11 +1166,11 @@ class PagedFp8Attn:
                     cute.copy(tma_atom_v, tVgV[None, 0, h_kv, page],
                               tVsV[None, vstage],
                               tma_bar_ptr=mbar + MB_V + vstage,
-                              mcast_mask=kv_mask)
+                              mcast_mask=kv_mask, **_KV_HINT)
                 else:
                     cute.copy(tma_atom_v, tVgV[None, 0, h_kv, page],
                               tVsV[None, vstage],
-                              tma_bar_ptr=mbar + MB_V + vstage)
+                              tma_bar_ptr=mbar + MB_V + vstage, **_KV_HINT)
                 vstage = vstage + 1
                 if vstage == self.kvstage:
                     vstage = Int32(0)
