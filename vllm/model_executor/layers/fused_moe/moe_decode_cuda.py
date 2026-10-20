@@ -199,13 +199,40 @@ __device__ __forceinline__ void mbar_wait_sleep(uint32_t b, uint32_t parity, uin
 #endif
   }
 }
+// MDC_L2W (CacheHint; VLLM_MOE_DECODE_TUNE="L2W=n"): L2 cache policy of the weight tile (tma2d) and weight
+// scale (bulk_g2s) loads, the only users of these two helpers. 0: plain (default), 1: evict_first,
+// 2: evict_last, 3: evict_first on the tiles only, 4: tiles evict_first + scales evict_last,
+// 5: evict_normal (explicit) on both. Values unchanged.
+#ifndef MDC_L2W
+#define MDC_L2W 0
+#endif
+template <bool kScale>
+__device__ __forceinline__ uint64_t l2w_policy() {
+  uint64_t pol = 0;
+  constexpr bool ef = MDC_L2W == 1 || MDC_L2W == 3 || (MDC_L2W == 4 && !kScale);
+  constexpr bool el = MDC_L2W == 2 || (MDC_L2W == 4 && kScale);
+  if constexpr (ef) asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  if constexpr (el) asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  if constexpr (MDC_L2W == 5) asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
 __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
-  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-               :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+  if constexpr (MDC_L2W != 0 && MDC_L2W != 3) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar), "l"(l2w_policy<true>()) : "memory");
+  } else {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+  }
 }
 __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
-  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
-               :: "r"(dst), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(bar) : "memory");
+  if constexpr (MDC_L2W != 0) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
+                 :: "r"(dst), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(bar), "l"(l2w_policy<false>()) : "memory");
+  } else {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+                 :: "r"(dst), "l"(reinterpret_cast<uint64_t>(map)), "r"(x), "r"(y), "r"(bar) : "memory");
+  }
 }
 __device__ __forceinline__ void bulk_s2g(void* dst, uint32_t src, uint32_t bytes) {
   asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
@@ -1041,7 +1068,7 @@ def tuned_source(tune: str) -> str:
     defines = ""
     for item in filter(None, (x.strip() for x in tune.replace(",", "+").split("+"))):
         key, val = item.split("=")
-        assert key in ("DEBUG", "EARLY_PDL"), key
+        assert key in ("DEBUG", "EARLY_PDL", "L2W"), key
         defines += f"#define MDC_{key} {int(val)}\n"
     return defines + _SOURCE
 

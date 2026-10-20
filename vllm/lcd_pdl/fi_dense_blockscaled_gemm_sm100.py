@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -30,7 +33,7 @@
 # with modifications for FlashInfer integration.
 # Original: https://github.com/NVIDIA/TensorRT-LLM
 
-from typing import Optional, Tuple, Type, Union
+import os as _os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -39,13 +42,13 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass.cute.nvgpu import cpasync, tcgen05
-
-from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
-
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
+from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
-import os as _os
+from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import (
+    _Sm100BlockScaledGemmCommon,
+)
+
 # [gemm-smallm F87] PFW: L2-prefetch the WEIGHT operand of the first work tile(s) BEFORE griddepcontrol_wait so the
 # weight stream overlaps the (PDL) predecessor. Weights are never written by the predecessor; activations and their
 # scales are only touched after the wait. Math is unchanged (bitwise). Env (read at import, baked at compile):
@@ -71,9 +74,29 @@ _PREWAIT = _os.environ.get("LCD_FI_PREWAIT", "0") == "1"
 _PREWAIT_STAGES = int(_os.environ.get("LCD_FI_PREWAIT_STAGES", "0"))
 _PREWAIT_WAITALL = _os.environ.get("LCD_FI_PREWAIT_WAITALL", "0") == "1"
 _TRIG = int(_os.environ.get("LCD_FI_TRIG", "0"))
+# [cachehint] LCD_FI_L2W=first|last|normal: L2 cache policy of the weight-operand TMA loads (A + SFA under swap-AB,
+# else B + SFB); LCD_FI_L2W_SF=0 leaves the weight scale-factor loads unhinted; LCD_FI_L2X: the same for the
+# activation operand. Unset (default): plain loads. Values unchanged (bitwise).
+_L2POL = {
+    "first": 0x12F0000000000000,
+    "last": 0x14F0000000000000,
+    "normal": 0x1000000000000000,
+}
+_L2W = _os.environ.get("LCD_FI_L2W", "")
+_L2W_SF = _os.environ.get("LCD_FI_L2W_SF", "1") == "1"
+_L2X = _os.environ.get("LCD_FI_L2X", "")
+
+
+def _l2(kernel, op):
+    weight = (op in ("a", "sfa")) == (kernel.c_layout == utils.LayoutEnum.COL_MAJOR)
+    pol = _L2W if weight else _L2X
+    if not pol or (weight and op.startswith("sf") and not _L2W_SF):
+        return {}
+    return {"cache_policy": cutlass.Int64(_L2POL[pol])}
+
+
 if _TRIG not in (0, 1, 2):
     raise ValueError(f"LCD_FI_TRIG must be 0, 1 or 2, got {_TRIG}")
-
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
@@ -102,18 +125,25 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
     Example:
         >>> gemm = Sm100BlockScaledPersistentDenseGemmKernel(
-        ...     sf_vec_size=16,
-        ...     mma_tiler_mn=(256, 128),
-        ...     cluster_shape_mn=(2, 1)
+        ...     sf_vec_size=16, mma_tiler_mn=(256, 128), cluster_shape_mn=(2, 1)
         ... )
-        >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
+        >>> gemm(
+        ...     a_tensor,
+        ...     b_tensor,
+        ...     sfa_tensor,
+        ...     sfb_tensor,
+        ...     c_tensor,
+        ...     max_active_clusters,
+        ...     stream,
+        ... )
+
     """
 
     def __init__(
         self,
         sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
+        mma_tiler_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
         use_prefetch: bool = False,
         enable_pdl: bool = True,
     ):
@@ -133,8 +163,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
             sf_vec_size (int): Scalefactor vector size.
             mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
-        """
 
+        """
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
@@ -396,6 +426,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Raises:
             TypeError: If input data types are incompatible with the MMA instruction.
+
         """
         (
             tiled_mma,
@@ -528,7 +559,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
-        tma_atom_c: Optional[cute.CopyAtom],
+        tma_atom_c: cute.CopyAtom | None,
         mC_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -536,15 +567,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
-        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+        c_smem_layout_staged: cute.Layout | cute.ComposedLayout | None,
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
-        """
-        GPU device kernel performing the Persistent batched GEMM computation.
-        """
+        """GPU device kernel performing the Persistent batched GEMM computation."""
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
@@ -909,6 +938,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tAsA[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=a_full_mcast_mask,
+                                **_l2(self, "a"),
                             )
                             cute.copy(
                                 tma_atom_sfa,
@@ -916,6 +946,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tAsSFA[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=sfa_full_mcast_mask,
+                                **_l2(self, "sfa"),
                             )
                             pre_state.advance()
                         if cutlass.const_expr(self.pfw):
@@ -936,6 +967,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tBsB[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=b_full_mcast_mask,
+                                **_l2(self, "b"),
                             )
                             cute.copy(
                                 tma_atom_sfb,
@@ -943,6 +975,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tBsSFB[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=sfb_full_mcast_mask,
+                                **_l2(self, "sfb"),
                             )
                             pre_state.advance()
                         if cutlass.const_expr(self.pfw):
@@ -1032,6 +1065,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=b_full_mcast_mask,
+                                **_l2(self, "b"),
                             )
                             cute.copy(
                                 tma_atom_sfb,
@@ -1041,6 +1075,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=sfb_full_mcast_mask,
+                                **_l2(self, "sfb"),
                             )
                         else:
                             cute.copy(
@@ -1051,6 +1086,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=a_full_mcast_mask,
+                                **_l2(self, "a"),
                             )
                             cute.copy(
                                 tma_atom_sfa,
@@ -1060,6 +1096,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=sfa_full_mcast_mask,
+                                **_l2(self, "sfa"),
                             )
                         ab_producer_state.advance()
                     k_start = pre_left
@@ -1085,6 +1122,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
+                        **_l2(self, "a"),
                     )
                     cute.copy(
                         tma_atom_b,
@@ -1092,6 +1130,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
+                        **_l2(self, "b"),
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -1099,6 +1138,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
+                        **_l2(self, "sfa"),
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -1106,6 +1146,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
+                        **_l2(self, "sfb"),
                     )
 
                     # Prefetch: Rolling prefetch for next tiles
@@ -1646,10 +1687,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
     @staticmethod
     def _compute_grid(
         c: cute.Tensor,
-        cta_tile_shape_mnk: Tuple[int, int, int],
-        cluster_shape_mn: Tuple[int, int],
+        cta_tile_shape_mnk: tuple[int, int, int],
+        cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
         """Computes the grid size for the kernel launch.
 
         This method uses a persistent tile scheduler to determine the grid
@@ -1666,6 +1707,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         Returns:
             A tuple containing the tile scheduler parameters and the computed
             grid shape.
+
         """
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
@@ -1683,10 +1725,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        sf_dtype: type[cutlass.Numeric],
         sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
     ) -> bool:
         """Checks if the data types and scale factor vector size are a valid combination.
 
@@ -1698,6 +1740,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Returns:
             bool: True if the combination is valid, False otherwise.
+
         """
         is_valid = True
 
@@ -1737,8 +1780,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
     @staticmethod
     def is_valid_layouts(
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         c_major: str,
@@ -1754,6 +1797,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Returns:
             bool: True if the layouts are valid, False otherwise.
+
         """
         is_valid = True
 
@@ -1763,8 +1807,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
     @staticmethod
     def is_valid_mma_tiler_and_cluster_shape(
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
+        mma_tiler_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
     ) -> bool:
         """Checks if the MMA tiler and cluster shape are a valid combination.
 
@@ -1774,6 +1818,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Returns:
             bool: True if the combination is valid, False otherwise.
+
         """
         is_valid = True
         # Skip invalid mma tile shape
@@ -1806,8 +1851,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         n: cutlass.Int64,
         k: cutlass.Int64,
         l: cutlass.Int64,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         c_major: str,
@@ -1827,6 +1872,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Returns:
             bool: True if the tensor alignment is valid, False otherwise.
+
         """
         is_valid = True
 
@@ -1847,12 +1893,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
     @classmethod
     def can_implement(
         cls,
-        ab_dtype: Type[cutlass.Numeric],
-        sf_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        sf_dtype: type[cutlass.Numeric],
         sf_vec_size: int,
-        c_dtype: Type[cutlass.Numeric],
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
+        c_dtype: type[cutlass.Numeric],
+        mma_tiler_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
         m: cutlass.Int64,
         n: cutlass.Int64,
         k: cutlass.Int64,
@@ -1884,6 +1930,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Returns:
             bool: True if the configuration is supported, False otherwise.
+
         """
         can_implement = True
         # Skip unsupported types

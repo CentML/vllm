@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -29,7 +32,7 @@
 # This kernel keeps FlashInfer's block-scaled MXFP8 mainloop and adapts the
 # cluster-local reduction protocol from NVIDIA DKG's FP8 split-K tutorial.
 
-from typing import Optional, Tuple, Union
+import os as _os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -38,10 +41,9 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
-import os as _os
 # [pdl-why] PFWS: L2-prefetch this CTA's WEIGHT K-slice (+ its scale factors) BEFORE griddepcontrol_wait, so the weight
 # stream overlaps the (PDL) predecessor. Weights are never written by the predecessor; activations / scales are only
 # touched after the wait. Math unchanged (bitwise). PFWS_TRIG=1: launch_dependents right after the wait (every PDL
@@ -56,18 +58,38 @@ _PREWAITS = _os.environ.get("LCD_FI_PREWAITS", "0") == "1"
 _PREWAIT_STAGES = int(_os.environ.get("LCD_FI_PREWAIT_STAGES", "0"))
 _PREWAIT_WAITALL = _os.environ.get("LCD_FI_PREWAIT_WAITALL", "0") == "1"
 _TRIGS = int(_os.environ.get("LCD_FI_TRIGS", "0"))
+# [cachehint] LCD_FI_L2W / LCD_FI_L2W_SF / LCD_FI_L2X: see fi_dense_blockscaled_gemm_sm100.py.
+_L2POL = {
+    "first": 0x12F0000000000000,
+    "last": 0x14F0000000000000,
+    "normal": 0x1000000000000000,
+}
+_L2W = _os.environ.get("LCD_FI_L2W", "")
+_L2W_SF = _os.environ.get("LCD_FI_L2W_SF", "1") == "1"
+_L2X = _os.environ.get("LCD_FI_L2X", "")
+
+
+def _l2(kernel, op):
+    weight = (op in ("a", "sfa")) == (kernel.c_layout == utils.LayoutEnum.COL_MAJOR)
+    pol = _L2W if weight else _L2X
+    if not pol or (weight and op.startswith("sf") and not _L2W_SF):
+        return {}
+    return {"cache_policy": cutlass.Int64(_L2POL[pol])}
+
+
 if _TRIGS not in (0, 1, 2):
     raise ValueError(f"LCD_FI_TRIGS must be 0, 1 or 2, got {_TRIGS}")
-from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
-from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
-
 from cutlass.cutlass_dsl import (
     T,
     dsl_user_op,
     extract_mlir_values,
     new_from_mlir_values,
+)
+from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
+from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import (
+    _Sm100BlockScaledGemmCommon,
 )
 
 
@@ -216,7 +238,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         return m <= cls.MAX_M
 
     @classmethod
-    def mma_tiler_mn_for_m(cls, m: int) -> Tuple[int, int]:
+    def mma_tiler_mn_for_m(cls, m: int) -> tuple[int, int]:
         """Return the specialized MMA tile selected for M."""
         if not cls.supports_m(m):
             raise ValueError(f"MXFP8 split-K requires M <= {cls.MAX_M}, got {m}")
@@ -244,7 +266,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
     def __init__(
         self,
         sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
+        mma_tiler_mn: tuple[int, int],
         split_k_slices: int,
         enable_pdl: bool = True,
     ):
@@ -256,8 +278,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 (128, 16), and (128, 32).
             split_k_slices: Physical cluster-K size; must be 2 or 4.
             enable_pdl: Whether to enable programmatic dependent launch.
-        """
 
+        """
         self.acc_dtype = cutlass.Float32
         if sf_vec_size != 32:
             raise ValueError(
@@ -522,6 +544,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
 
         Raises:
             TypeError: If input data types are incompatible with the MMA instruction.
+
         """
         (
             tiled_mma,
@@ -652,7 +675,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
-        tma_atom_c: Optional[cute.CopyAtom],
+        tma_atom_c: cute.CopyAtom | None,
         mC_mnl: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
@@ -660,14 +683,12 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         b_smem_layout_staged: cute.ComposedLayout,
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
-        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
+        c_smem_layout_staged: cute.Layout | cute.ComposedLayout | None,
         epi_tile: cute.Tile,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
     ):
-        """
-        GPU device kernel performing the Persistent batched GEMM computation.
-        """
+        """GPU device kernel performing the Persistent batched GEMM computation."""
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
@@ -944,7 +965,9 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         #
         if cutlass.const_expr(_PFWS and not _PREWAITS):
             if warp_idx == self.tma_warp_id:
-                pf_sched = _SplitKOneTileScheduler.create(cute.arch.block_idx(), cta_rank_in_cluster)
+                pf_sched = _SplitKOneTileScheduler.create(
+                    cute.arch.block_idx(), cta_rank_in_cluster
+                )
                 pf_work = pf_sched.initial_work_tile_info()
                 pf_coord = pf_work.tile_idx
                 pf_m = pf_coord[0] // cute.size(tiled_mma.thr_id.shape)
@@ -1029,6 +1052,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tAsA[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=a_full_mcast_mask,
+                                **_l2(self, "a"),
                             )
                             cute.copy(
                                 tma_atom_sfa,
@@ -1036,12 +1060,15 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tAsSFA[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=sfa_full_mcast_mask,
+                                **_l2(self, "sfa"),
                             )
                             pre_state.advance()
                         if cutlass.const_expr(_PFWS):
                             for pf_k in cutlass.range(pre_left, k_block_cnt, unroll=1):
                                 cute.prefetch(tma_atom_a, pre_a[(None, pre_ks + pf_k)])
-                                cute.prefetch(tma_atom_sfa, pre_sfa[(None, pre_ks + pf_k)])
+                                cute.prefetch(
+                                    tma_atom_sfa, pre_sfa[(None, pre_ks + pf_k)]
+                                )
                     else:
                         pre_sn = pre_coord[1]
                         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
@@ -1056,6 +1083,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tBsB[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=b_full_mcast_mask,
+                                **_l2(self, "b"),
                             )
                             cute.copy(
                                 tma_atom_sfb,
@@ -1063,12 +1091,15 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                 tBsSFB[(None, pre_state.index)],
                                 tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
                                 mcast_mask=sfb_full_mcast_mask,
+                                **_l2(self, "sfb"),
                             )
                             pre_state.advance()
                         if cutlass.const_expr(_PFWS):
                             for pf_k in cutlass.range(pre_left, k_block_cnt, unroll=1):
                                 cute.prefetch(tma_atom_b, pre_b[(None, pre_ks + pf_k)])
-                                cute.prefetch(tma_atom_sfb, pre_sfb[(None, pre_ks + pf_k)])
+                                cute.prefetch(
+                                    tma_atom_sfb, pre_sfb[(None, pre_ks + pf_k)]
+                                )
                 griddepcontrol_wait()  # [gemmpdl] TMA-warp PDL wait
 
             #
@@ -1135,6 +1166,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=b_full_mcast_mask,
+                                **_l2(self, "b"),
                             )
                             cute.copy(
                                 tma_atom_sfb,
@@ -1146,6 +1178,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=sfb_full_mcast_mask,
+                                **_l2(self, "sfb"),
                             )
                         else:
                             cute.copy(
@@ -1158,6 +1191,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=a_full_mcast_mask,
+                                **_l2(self, "a"),
                             )
                             cute.copy(
                                 tma_atom_sfa,
@@ -1169,6 +1203,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     ab_producer_state
                                 ),
                                 mcast_mask=sfa_full_mcast_mask,
+                                **_l2(self, "sfa"),
                             )
                         ab_producer_state.advance()
                     k_start = pre_left
@@ -1194,6 +1229,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
+                        **_l2(self, "a"),
                     )
                     cute.copy(
                         tma_atom_b,
@@ -1201,6 +1237,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
+                        **_l2(self, "b"),
                     )
                     cute.copy(
                         tma_atom_sfa,
@@ -1208,6 +1245,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         tAsSFA[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
+                        **_l2(self, "sfa"),
                     )
                     cute.copy(
                         tma_atom_sfb,
@@ -1215,6 +1253,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
+                        **_l2(self, "sfb"),
                     )
 
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
@@ -1774,8 +1813,8 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
     def _compute_grid(
         self,
         c: cute.Tensor,
-        cta_tile_shape_mnk: Tuple[int, int, int],
-    ) -> Tuple[int, int, int]:
+        cta_tile_shape_mnk: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
         """Return one physical K-cluster for every output tile."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
