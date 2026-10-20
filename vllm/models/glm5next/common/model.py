@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -146,6 +147,44 @@ def _resolve_mhc_decode(
         "(Sinkhorn on a side stream: %s).",
         mhc_decode.MID_MAX_TOKENS,
         mhc_decode.SIDE_STREAM,
+    )
+    return True
+
+
+def _resolve_mhc_decode_ar_fusion(
+    vllm_config: VllmConfig, mhc_decode_cuda: bool
+) -> bool:
+    """Whether o_proj / MoE / MLP outputs skip their TP all-reduce and the next
+    mHC boundary all-reduces them itself: fused with the hc_post + prenorm
+    GEMM in one launch at <= 32 tokens (nvidia/ops/mhc_ar_post.cu, on
+    FlashInfer's MNNVL all-reduce workspace; bit-identical to the separate
+    all-reduce), a plain all-reduce otherwise.
+
+    Opt-in via ``additional_config.mhc_decode_ar_fusion = True``; needs
+    ``mhc_decode_backend = "cuda"``, TP 2/4/8 without sequence parallelism."""
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        additional_config = {}
+    if not additional_config.get("mhc_decode_ar_fusion", False):
+        return False
+    from vllm.models.glm5next.nvidia.ops import mhc_ar_post
+
+    tp_size = get_tensor_model_parallel_world_size()
+    reason = None
+    if not mhc_decode_cuda:
+        reason = 'mhc_decode_backend="cuda" is off'
+    elif tp_size not in mhc_ar_post.WORLD_SIZES:
+        reason = f"TP size {tp_size} (needs 2, 4 or 8)"
+    elif vllm_config.parallel_config.use_sequence_parallel_moe:
+        reason = "sequence-parallel MoE"
+    if reason is not None:
+        logger.warning_once("mhc_decode_ar_fusion ignored: %s.", reason)
+        return False
+    mhc_ar_post.load(tp_size)
+    logger.info_once(
+        "mHC sublayer boundaries with <= %d tokens fuse the TP all-reduce of the "
+        "sublayer output (FlashInfer MNNVL workspace).",
+        mhc_ar_post.MAX_TOKENS,
     )
     return True
 
@@ -304,6 +343,7 @@ class Glm5NextMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -395,6 +435,7 @@ class Glm5NextMoE(nn.Module):
             scoring_func=config.scoring_func,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scale_to_output=apply_routed_scale_to_output,
+            reduce_results=reduce_results,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
@@ -461,6 +502,14 @@ class Glm5NextDecoderLayer(nn.Module):
         self.num_experts = config.n_routed_experts
         self.is_mtp_layer = is_mtp_layer
         self.mhc = config.mhc
+        # mHC layers can leave their sublayer outputs as TP partial sums for the
+        # next boundary to all-reduce (additional_config.mhc_decode_ar_fusion).
+        self.mhc_ar_fusion = False
+        if self.mhc and not is_mtp_layer:
+            self.mhc_ar_fusion = _resolve_mhc_decode_ar_fusion(
+                vllm_config,
+                _resolve_mhc_decode(vllm_config, config.hidden_size, config.hc_mult),
+            )
         is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
         self.layer_kind = "kda" if is_kda_layer else "mla"
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
@@ -509,6 +558,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=not self.mhc_ar_fusion,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -529,6 +579,10 @@ class Glm5NextDecoderLayer(nn.Module):
         # their o_proj must still reduce normally.
         if self.is_sequence_parallel and not is_mtp_layer:
             self.self_attn.o_proj.reduce_results = False
+        if self.mhc_ar_fusion:
+            self.self_attn.o_proj.reduce_results = False
+            if not self._mlp_is_moe:
+                self.mlp.down_proj.reduce_results = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -679,6 +733,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 self.hc_attn_base,
                 norm_weight=self.input_layernorm.weight.data,
                 norm_eps=self.input_layernorm.variance_epsilon,
+                partial=self.mhc_ar_fusion,
             )
 
         # Attention needs the full token sequence; mHC above ran on the SP
@@ -705,6 +760,7 @@ class Glm5NextDecoderLayer(nn.Module):
             self.hc_ffn_base,
             norm_weight=self.post_attention_layernorm.weight.data,
             norm_eps=self.post_attention_layernorm.variance_epsilon,
+            partial=self.mhc_ar_fusion,
         )
 
         # Fully Connected
@@ -715,8 +771,11 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
-        # the next layer's fused pre, returning the state.
+        # the next layer's fused pre, returning the state (with
+        # mhc_ar_fusion, x is still this rank's TP partial sum).
         if self.layer_idx == self.num_hidden_layers - 1:
+            if self.mhc_ar_fusion:
+                x = tensor_model_parallel_all_reduce(x)
             x = self.hc_post(x, residual, post, comb)
             x = hc_contract(x, self.n)
             return x, None, None, None
@@ -771,7 +830,31 @@ class Glm5NextDecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        partial: bool = False,
     ):
+        if partial:
+            # x is this rank's TP partial sum (mhc_ar_fusion): all-reduce it
+            # inside the boundary kernel at <= 32 tokens, separately otherwise.
+            from vllm.models.glm5next.nvidia.ops import mhc_decode
+
+            if norm_weight is not None and mhc_decode.ar_post_applies(x):
+                return torch.ops.vllm.glm5next_mhc_ar_decode_post_pre(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.mhc_post_mult_value,
+                    self.mhc_sinkhorn_iterations,
+                    norm_weight,
+                    norm_eps,
+                )
+            x = tensor_model_parallel_all_reduce(x)
         if (
             self.mhc_decode_cuda
             and norm_weight is not None
@@ -895,6 +978,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self._aux_post_op = MHCPostOp()
+        # mHC layers hand on TP partial sums (additional_config.mhc_decode_ar_fusion).
+        self.mhc_ar_fusion = any(
+            getattr(layer, "mhc_ar_fusion", False) for layer in self.layers
+        )
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
@@ -936,6 +1023,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if post is None:
             return hidden_states
         assert residual is not None and comb is not None
+        if self.mhc_ar_fusion:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         completed = self._aux_post_op(hidden_states, residual, post, comb)
         return hc_contract(completed, self.config.hc_mult)
 

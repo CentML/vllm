@@ -277,8 +277,25 @@ def glm5next_mhc_decode_post_pre(
             hidden_size,
             hc_mult3,
         )
-    eps = (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
-           norm_eps)
+    return _pre(gemm_out_mul, gemm_out_sqrsum, residual_cur, hc_scale, hc_base,
+                norm_weight, (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+                              sinkhorn_repeat, norm_eps), outer_shape)
+
+
+def _pre(
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    residual_cur: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: tuple[float, float, float, float, int, float],
+    outer_shape: torch.Size,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The decode pre kernel on the split partials (Sinkhorn on the side stream
+    when enabled) -> (residual_cur, post, comb, layer_input) in model shapes."""
+    num_tokens = residual_cur.shape[0]
+    hc_mult, hidden_size = HC_MULT, HIDDEN_SIZE
     if SIDE_STREAM and _side_stream_allowed():
         # Sinkhorn (post / comb, read only by the next boundary) on the side
         # stream; collapse + RMSNorm (layer_input) stays on the critical path.
@@ -315,6 +332,59 @@ def glm5next_mhc_decode_post_pre(
     )
 
 
+def glm5next_mhc_ar_decode_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``glm5next_mhc_decode_post_pre`` on the TP partial sum ``x`` (<= 32
+    tokens): the all-reduce, post and prenorm GEMM partials in one launch
+    (mhc_ar_post.cu, bit-identical to all-reduce + mhc_fused_tilelang), then the
+    decode pre. The caller checks ``ar_post_applies`` first."""
+    from vllm.models.glm5next.nvidia.ops import mhc_ar_post
+
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    num_tokens = residual.numel() // (hc_mult * hidden_size)
+    join()
+    ws = mhc_ar_post.tp_workspace(x)
+    assert ws is not None
+    gemm_out_mul, gemm_out_sqrsum, residual_cur = mhc_ar_post.mhc_ar_post(
+        x.reshape(num_tokens, hidden_size),
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        ws,
+    )
+    return _pre(gemm_out_mul, gemm_out_sqrsum, residual_cur, hc_scale, hc_base,
+                norm_weight, (rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+                              sinkhorn_repeat, norm_eps), residual.shape[:-2])
+
+
+def ar_post_applies(x: torch.Tensor) -> bool:
+    """Whether a boundary on the TP partial ``x`` takes the AR-fused path (the
+    same answer on every TP rank: token count and the shared workspace)."""
+    from vllm.models.glm5next.nvidia.ops import mhc_ar_post
+
+    num_tokens = x.numel() // HIDDEN_SIZE
+    if num_tokens > mhc_ar_post.MAX_TOKENS or num_tokens == 0:
+        return False
+    ws = mhc_ar_post.tp_workspace(x)
+    return ws is not None and ws.fits(num_tokens)
+
+
 def _glm5next_mhc_decode_post_pre_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -343,5 +413,11 @@ def _glm5next_mhc_decode_post_pre_fake(
 direct_register_custom_op(
     op_name="glm5next_mhc_decode_post_pre",
     op_func=glm5next_mhc_decode_post_pre,
+    fake_impl=_glm5next_mhc_decode_post_pre_fake,
+)
+
+direct_register_custom_op(
+    op_name="glm5next_mhc_ar_decode_post_pre",
+    op_func=glm5next_mhc_ar_decode_post_pre,
     fake_impl=_glm5next_mhc_decode_post_pre_fake,
 )
