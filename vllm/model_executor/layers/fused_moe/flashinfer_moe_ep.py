@@ -674,7 +674,12 @@ class FlashInferMoeEp:
         self._num_experts = moe.num_experts
         self._top_k = moe.experts_per_token
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
-        self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
+        # FlashInferMoeEpExperts.apply copies the result into the modular
+        # kernel's output right away, so on SM107 a workspace view (valid
+        # until the next use of the workspace) saves the owned-output copy.
+        self._return_workspace_view = (
+            self._sm107 or moe.routing_method is RoutingMethodType.DeepseekV4
+        )
 
         # SM107 capacity profiles: capacity -> FlashInfer workspace handle.
         # Workspace creation is an EP collective on the symmetric heap: every

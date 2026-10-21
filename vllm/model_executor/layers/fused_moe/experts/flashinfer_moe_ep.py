@@ -16,6 +16,7 @@ import torch
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -64,6 +65,37 @@ _supported_weight_quant_schemes: frozenset[QuantKey] = frozenset(
 _supported_activations: frozenset[MoEActivation] = frozenset((MoEActivation.SILU,))
 
 
+def _kernel_routes(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    mask_padding: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """int32 routes for the megakernel, with padding rows masked out.
+
+    FlashInfer checks every route on device (ids in [-1, E), unique per row,
+    finite weights) behind a sticky device assert, and dispatches every valid
+    route. Routers other than DSv4's (e.g. GLM-5.3's grouped top-k) route the
+    CUDA-graph and DP padding rows on whatever those rows hold, so the forward
+    context's padding mask turns them into masked slots (-1, weight 0): they
+    are neither validated as live nor sent to a peer. Rows map 1:1 to the
+    forward context's tokens only without sequence parallelism.
+    """
+    topk_ids = topk_ids.to(torch.int32)
+    if not (mask_padding and envs.VLLM_MOE_SKIP_PADDING):
+        return topk_ids, topk_weights
+    if not is_forward_context_available():
+        return topk_ids, topk_weights
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or is_padding.shape[0] < topk_ids.shape[0]:
+        return topk_ids, topk_weights
+    is_padding = is_padding[: topk_ids.shape[0]].unsqueeze(1)
+    return (
+        topk_ids.masked_fill(is_padding, -1),
+        topk_weights.masked_fill(is_padding, 0.0),
+    )
+
+
 class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -78,6 +110,7 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
         # with the megakernel capped at max_sm_count SMs.
         self._shared_mode = "separate"
         self._max_sm_count: int | None = None
+        self._mask_padding = not moe_config.is_sequence_parallel
         if uses_sm107_megakernel(moe_config.moe_backend):
             replicated_shared = (
                 moe_config.is_sequence_parallel
@@ -232,9 +265,10 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         if self._adapter is None:
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
-        output.copy_(
-            self._adapter(hidden_states, topk_ids.to(torch.int32), topk_weights)
+        topk_ids, topk_weights = _kernel_routes(
+            topk_ids, topk_weights, mask_padding=self._mask_padding
         )
+        output.copy_(self._adapter(hidden_states, topk_ids, topk_weights))
 
     def apply_overlapping_shared_experts(
         self,
@@ -257,9 +291,12 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         if self._adapter is None:
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
+        topk_ids, topk_weights = _kernel_routes(
+            topk_ids, topk_weights, mask_padding=self._mask_padding
+        )
         self._adapter.forward_overlapping_shared_experts(
             hidden_states,
-            topk_ids.to(torch.int32),
+            topk_ids,
             topk_weights,
             run_shared_experts,
             output=output,
