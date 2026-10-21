@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import (
     FLASHINFER_MOE_EP_BACKENDS,
@@ -612,7 +613,13 @@ class FlashInferMoeEp:
                     f"build that exports flashinfer.moe_ep.{_SM107_NVFP4_CONFIG}"
                 )
             sp_size = max(int(getattr(moe, "sp_size", 1) or 1), 1)
-            capacities = sm107_capacity_profiles(moe.max_num_tokens, sp_size)
+            capacity_cap = envs.VLLM_FI_MEGA_MOE_MAX_CAPACITY
+            capacities = sm107_capacity_profiles(
+                min(moe.max_num_tokens, capacity_cap)
+                if capacity_cap > 0
+                else moe.max_num_tokens,
+                sp_size,
+            )
             max_tokens_per_rank = capacities[-1]
         ep_group = get_ep_group()
         bootstrap = api.BootstrapConfig(
@@ -817,6 +824,11 @@ class FlashInferMoeEp:
     ) -> torch.Tensor:
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
+        if self._capacities and (
+            self._rank_consistent_num_tokens(hidden_states.shape[0])
+            > self._capacities[-1]
+        ):
+            return self._chunked_call(hidden_states, topk_ids, topk_weights)
         if hidden_states.shape[0] > self._max_num_tokens:
             raise ValueError(
                 f"FlashInfer MoE-EP got {hidden_states.shape[0]} tokens, but "
@@ -845,6 +857,51 @@ class FlashInferMoeEp:
         if return_view:
             return self._mega_layer.forward(tensors, return_workspace_view=True)
         return self._mega_layer(tensors)
+
+    def _chunked_call(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """SM107 step larger than the largest capacity profile
+        (``VLLM_FI_MEGA_MOE_MAX_CAPACITY``): consecutive launches of that profile.
+
+        Every EP rank must launch the same profiles in the same order, so the
+        chunk count comes from the step's maximum token count over DP; a rank
+        with fewer tokens launches empty chunks (FlashInfer accepts empty
+        batches). Each chunk's result is copied out before the next launch
+        reuses the pooled workspace.
+        """
+        num_tokens = hidden_states.shape[0]
+        cap = self._capacities[-1]
+        workspace = self._workspaces[cap]
+        n_max = self._rank_consistent_num_tokens(num_tokens)
+        output = hidden_states.new_empty((num_tokens, self._hidden_size))
+        return_view = self._return_workspace_view and getattr(
+            self._mega_layer, "supports_output_view", False
+        )
+        event = _take_pending_shared_experts_event() if self._pre_shared else None
+        for lo in range(0, n_max, cap):
+            lo_local = min(lo, num_tokens)
+            hi_local = min(lo + cap, num_tokens)
+            tensors = self._tensors(
+                hidden_states[lo_local:hi_local],
+                topk_ids[lo_local:hi_local],
+                topk_weights[lo_local:hi_local],
+            )
+            if event is not None:
+                self._mega_layer.stage_inputs(tensors, workspace=workspace)
+                torch.cuda.current_stream().wait_event(event)
+                event = None
+                out = self._mega_layer.compute_staged(output=None)
+            else:
+                out = self._mega_layer.forward(
+                    tensors, workspace=workspace, return_workspace_view=return_view
+                )
+            if hi_local > lo_local:
+                output[lo_local:hi_local].copy_(out[: hi_local - lo_local])
+        return output
 
     def forward_overlapping_shared_experts(
         self,

@@ -308,6 +308,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_FI_MEGA_MOE_SHARED: Literal["separate", "overlap", "pre"] = "separate"
     VLLM_FI_MEGA_MOE_MAX_SM_COUNT: str = "auto"
+    VLLM_FI_MEGA_MOE_MAX_CAPACITY: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2148,6 +2149,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "<n>": n SMs.
     "VLLM_FI_MEGA_MOE_MAX_SM_COUNT": lambda: os.getenv(
         "VLLM_FI_MEGA_MOE_MAX_SM_COUNT", "auto"
+    ),
+    # Largest SM107 MegaMoE workspace capacity profile (tokens per rank); 0
+    # (default): max_num_batched_tokens. The workspaces live on the NVSHMEM
+    # heap and grow with capacity, so a cap trades KV-cache memory for larger
+    # steps running as several launches of the largest profile.
+    "VLLM_FI_MEGA_MOE_MAX_CAPACITY": lambda: int(
+        os.getenv("VLLM_FI_MEGA_MOE_MAX_CAPACITY", "0")
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream
