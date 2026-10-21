@@ -18,6 +18,10 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.kernels.linear import Mxfp8LinearKernel
+from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+    maybe_use_lowm_bf16_gemm,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -50,7 +54,12 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    kMxfp8Dynamic,
+)
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from vllm.model_executor.layers.row_gather import gather_rows3
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,6 +68,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
 from .interfaces import (
@@ -201,6 +211,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.shared_expert_gate",
         )
+        # Decode-size router / shared-expert-gate GEMMs: one kernel instead of
+        # cuBLAS split-K + reduce (SM107; SM100/SM103 with
+        # VLLM_LOWM_BF16_GEMM_SM100=1; no-op elsewhere).
+        maybe_use_lowm_bf16_gemm(self.gate)
+        maybe_use_lowm_bf16_gemm(self.shared_expert_gate)
 
         if (
             self.is_fused_shared_expert_enabled
@@ -244,10 +259,24 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             else None,
         )
 
+        # The decoder layer may hand the MoE input pre-quantized to MXFP8 by
+        # the post-attention norm (MLPerf submission path; specialized for
+        # Qwen3.6-35B-A3B).
+        self.accepts_quantized_input = (
+            getattr(self.experts, "accepts_quantized_input", False)
+            and not self.replicate_shared_expert
+            and not self.is_sequence_parallel
+        )
+        if self.accepts_quantized_input:
+            # Registers vllm::add_rms_norm_mxfp8_quant before any compiled
+            # graph (including one loaded from the compile cache) runs.
+            import vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant  # noqa: F401
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        quantized_input: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -262,9 +291,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.replicate_shared_expert and self.shared_expert is not None
             else None
         )
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if quantized_input is None:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                quantized_input=quantized_input,
+            )
         if replicated_shared_output is not None:
             final_hidden_states += replicated_shared_output
 
@@ -392,6 +428,50 @@ class Qwen3NextAttention(nn.Module):
             and supports_dtype
             and (text_only or supports_mrope)
         )
+        # Token-tile qk-norm-RoPE (one CTA per token tile instead of per
+        # token-head). It also stores q as the attention backend's FP8 query
+        # when the layer has a static per-tensor query quant the backend
+        # consumes (FlashInfer trtllm-gen FP8-Q on SM100), which removes that
+        # separate quant kernel.
+        self.use_qk_norm_rope_tokens = (
+            self.use_fused_qk_norm_rope_gate
+            and current_platform.is_cuda()
+            and self.head_dim > 32
+        )
+        query_quant = self.attn.query_quant
+        self.qk_norm_rope_fp8_q = bool(
+            self.use_qk_norm_rope_tokens
+            and query_quant is not None
+            and self.attn.impl.supports_quant_query_input
+            and query_quant.group_shape == GroupShape.PER_TENSOR
+            and current_platform.fp8_dtype() == torch.float8_e4m3fn
+        )
+        # The attention gate is read in place from the QKV output when
+        # AttnGateMxfp8QuantFusionPass fuses attn * sigmoid(gate) into o_proj's
+        # MXFP8 quant: o_proj takes FlashInfer's swizzled MXFP8 activation
+        # (MLPerf submission path; specialized for Qwen3.6-35B-A3B). The fused
+        # producer reads the strided gate at full speed; Inductor's gate kernel
+        # reads it about 2.5x slower than a contiguous copy, so everywhere else
+        # the qk-norm-RoPE kernel copies the gate.
+        o_proj_kernel = getattr(self.o_proj.quant_method, "kernel", None)
+        self.attn_gate_mxfp8 = (
+            self.use_qk_norm_rope_tokens
+            and isinstance(o_proj_kernel, Mxfp8LinearKernel)
+            and o_proj_kernel.input_quant_key() == kMxfp8Dynamic
+        )
+        # The token-tile kernel also writes k and v into the paged KV cache
+        # (replacing the backend's reshape_and_cache_flash launch) when the
+        # backend exposes its cache views and stores e4m3 with per-tensor
+        # scales or the model dtype.
+        attn_impl = self.attn.impl
+        self.qk_norm_rope_kv_cache = (
+            self.use_qk_norm_rope_tokens
+            and hasattr(attn_impl, "kv_cache_write_views")
+            and not getattr(attn_impl, "is_kvcache_nvfp4", True)
+            and self.attn.kv_cache_dtype in ("auto", "fp8", "fp8_e4m3")
+            and self.attn.kv_sharing_target_layer_name is None
+            and not self.attn.attn_backend.forward_includes_kv_cache_update
+        )
 
     def _project_qkv_gate(
         self,
@@ -455,18 +535,95 @@ class Qwen3NextAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def _project_qkv_gate_tokens(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Like the fused ``_project_qkv_gate`` path, via the token-tile kernel.
+
+        With ``attn_gate_mxfp8`` the gate is not copied: ``gate`` is a strided
+        ``[tokens, heads, head_dim]`` view of ``qkv`` that the fused gate ->
+        MXFP8 producer reads in place. ``q`` is FP8 (quantized with
+        ``attn._q_scale``) when ``qk_norm_rope_fp8_q``.
+        """
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        mrope_section = getattr(self.rotary_emb, "mrope_section", None)
+        if positions.ndim == 2 and not mrope_section:
+            positions = positions[0]
+        args = (
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.attn._q_scale if self.qk_norm_rope_fp8_q else None,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.rotary_dim,
+        )
+        tail = (
+            list(mrope_section) if positions.ndim == 2 else None,
+            1.0,
+            not self.attn_gate_mxfp8,
+        )
+        if self.qk_norm_rope_kv_cache:
+            q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope_kv_cache(
+                q_gate, k, v, *args, _encode_layer_name(self.attn.layer_name), *tail
+            )
+        else:
+            q, k, gate = torch.ops.vllm.fused_qk_rmsnorm_rope(q_gate, k, *args, *tail)
+        if self.attn_gate_mxfp8:
+            gate = q_gate.view(-1, self.num_heads, 2, self.head_dim)[:, :, 1]
+        return q, k, v, gate
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        out_rows: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """With ``out_rows`` (MTP draft prefill, VLLM_MTP_DRAFT_PREFILL_ROWS),
+        attention still runs over (and writes the KV of) every row, then only
+        ``out_rows`` of its output, the gate and ``residual`` go on: returns
+        ``(o_proj output, residual)`` for those rows.
+        """
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        attn_output = self.attn(q, k, v)
-        if gate is not None:
+        if self.use_qk_norm_rope_tokens:
+            q, k, v, gate = self._project_qkv_gate_tokens(qkv, positions)
+            # An FP8 q skips the attention layer's own query quant.
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                output_dtype=qkv.dtype,
+                kv_cache_written=self.qk_norm_rope_kv_cache,
+            )
+            attn_output = attn_output.view(gate.shape)
+            if out_rows is not None:
+                assert residual is not None
+                attn_output, gate, residual = gather_rows3(
+                    attn_output, gate, residual, out_rows
+                )
             attn_output = attn_output * torch.sigmoid(gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+            output, _ = self.o_proj(attn_output.flatten(1))
+        else:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            attn_output = self.attn(q, k, v)
+            if out_rows is not None:
+                assert residual is not None and gate is not None
+                attn_output, gate, residual = gather_rows3(
+                    attn_output, gate, residual, out_rows
+                )
+            if gate is not None:
+                attn_output = attn_output * torch.sigmoid(gate)
+            output, _ = self.o_proj(attn_output)
+        if out_rows is None:
+            return output
+        assert residual is not None
+        return output, residual
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -560,8 +717,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         positions: torch.Tensor,
+        out_rows: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        """``out_rows`` (full-attention layers only): rows kept after the
+        attention; every later op of the layer runs on those rows only.
+        """
         full_num_tokens = positions.shape[-1]
 
         if residual is None:
@@ -577,10 +738,19 @@ class Qwen3NextDecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states=hidden_states)
         elif self.layer_type == "full_attention":
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-            )
+            if out_rows is None:
+                hidden_states = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                )
+            else:
+                assert not self.use_attn_reduce_scatter_for_moe
+                hidden_states, residual = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    out_rows=out_rows,
+                    residual=residual,
+                )
         else:
             raise ValueError("Invalid layer_type")
 
@@ -603,14 +773,38 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self.use_attn_reduce_scatter_for_moe:
+        if self._moe_takes_quantized_input():
+            # The norm also writes the MoE input as MXFP8 (swizzled + linear
+            # scales), so neither the shared expert nor the routed experts
+            # quantize it again.
+            norm = self.post_attention_layernorm
+            hidden_states, residual, act_q, act_sf, act_sf_linear = (
+                torch.ops.vllm.add_rms_norm_mxfp8_quant(
+                    hidden_states,
+                    None,
+                    residual,
+                    norm.weight,
+                    norm.variance_epsilon,
+                    1.0,
+                    True,
+                    None,
+                    True,
+                )
+            )
             hidden_states = self.mlp(
-                hidden_states,
-                already_sequence_parallel=True,
+                hidden_states, quantized_input=(act_q, act_sf, act_sf_linear)
             )
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            if self.use_attn_reduce_scatter_for_moe:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    already_sequence_parallel=True,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -627,6 +821,16 @@ class Qwen3NextDecoderLayer(nn.Module):
                 )
 
         return hidden_states, residual
+
+    def _moe_takes_quantized_input(self) -> bool:
+        # The shared expert's input linear takes swizzled MXFP8, and the norm
+        # is the Gemma form the fused producer implements.
+        return (
+            getattr(self.mlp, "accepts_quantized_input", False)
+            and not self.layer_scale
+            and not self.use_attn_reduce_scatter_for_moe
+            and isinstance(self.post_attention_layernorm, Qwen3NextRMSNorm)
+        )
 
 
 @support_torch_compile

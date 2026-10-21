@@ -247,6 +247,7 @@ LinearBackend = Literal[
     "cutlass",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
+    "flashinfer_cutedsl_sm107",
     "flashinfer_trtllm",
     "flashinfer_cudnn",
     "flashinfer_b12x",

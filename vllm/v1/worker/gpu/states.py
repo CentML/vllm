@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import array
+
 import numpy as np
 import torch
 
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import DeviceParamTable, StagedWriteTensor
 
 
 class RequestState:
@@ -49,8 +51,13 @@ class RequestState:
         # preemption, prefill_len may be greater. Differentiating between these values
         # is crucial, as certain features such as prompt logprobs or frequency penalties
         # must treat prompt and output tokens separately.
-        self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
-        self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        self.lens = DeviceParamTable(
+            self.max_num_reqs,
+            {"prompt_len": torch.int32, "prefill_len": torch.int32},
+            device,
+        )
+        self.prompt_len = self.lens["prompt_len"]
+        self.prefill_len = self.lens["prefill_len"]
         # total_len = prompt_len + output_len. It grows as the request progresses.
         self.total_len = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
@@ -92,10 +99,17 @@ class RequestState:
         self,
         req_id: str,
         prompt_len: int,
-        all_token_ids: list[int],
+        all_token_ids: "list[int] | array.array",
         num_computed_tokens: int,
         max_tokens: int,
+        staging_start: int = 0,
     ) -> None:
+        """Add a new request.
+
+        ``staging_start > 0`` stages only ``all_token_ids[staging_start:]``;
+        positions below it keep stale data and must not be read (see
+        ``vllm/v1/worker/gpu/suffix_staging.py``).
+        """
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
         self.req_id_to_index[req_id] = req_idx
@@ -109,7 +123,12 @@ class RequestState:
         )
         self.prefill_len.np[req_idx] = prefill_len
         self.total_len.stage_write_elem(req_idx, prefill_len)
-        self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
+        if staging_start > 0:
+            self.all_token_ids.stage_write(
+                req_idx, staging_start, all_token_ids[staging_start:]
+            )
+        else:
+            self.all_token_ids.stage_write(req_idx, 0, all_token_ids)
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
@@ -118,8 +137,7 @@ class RequestState:
             self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:
-        self.prompt_len.copy_to_uva()
-        self.prefill_len.copy_to_uva()
+        self.lens.sync()
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()

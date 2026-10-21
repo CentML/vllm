@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -79,6 +80,26 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _mamba_chunk_may_be_capped(
+    request: Request, start: int, end: int, num_prefill_lookahead: int
+) -> bool:
+    """Whether a cap applied after the Mamba split may shorten [start, end).
+
+    Mirrors the two later caps: `_reserve_prefill_lookahead` and
+    `_try_schedule_encoder_inputs`, which can stop before any encoder input in
+    its lookahead-shifted window. Conservative: an input that turns out to be
+    cached or schedulable does not cap the chunk.
+    """
+    if 0 < request.num_tokens - end < num_prefill_lookahead:
+        return True
+    if not request.has_encoder_inputs:
+        return False
+    lo, hi = get_mm_features_in_window(
+        request.mm_features, start=start, end=end + num_prefill_lookahead
+    )
+    return lo < hi
 
 
 class Scheduler(SchedulerInterface):
@@ -422,6 +443,27 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        self.mamba_prefill_checkpoint_reuses_initial_block = (
+            self.has_mamba_layers
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_checkpoint_reuses_initial_block
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+        self.mamba_prefill_checkpoint_copies_initial_block = (
+            self.has_mamba_layers
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_checkpoint_copies_initial_block
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+        # Opt-in: keep replay/extension stops beside a valid internal export
+        # even without copy-initial (sibling reuse over TTFT).
+        self.mamba_prefill_checkpoint_reuse_stops = (
+            envs.VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS
+        )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -503,7 +545,14 @@ class Scheduler(SchedulerInterface):
         ckpt_block_size = (
             self.hash_block_size if self.mamba_partial_cache_hit else self.block_size
         )
-        last_cache_position = get_mamba_prefill_checkpoint_position(
+        last_cache_position = request.num_tokens - request.num_tokens % block_size
+        if self.use_eagle_block_drop:
+            last_cache_position = max(last_cache_position - block_size, 0)
+        # An identical resend recomputes its final token for logits. If the
+        # prompt ends exactly on a block boundary, its reusable replay state
+        # is one block earlier than an extension's state. EAGLE lookups read
+        # the whole prompt before dropping a block, so there the two coincide.
+        replay_cache_position = get_mamba_prefill_checkpoint_position(
             request.num_tokens,
             block_size,
             self.use_eagle_block_drop,
@@ -514,6 +563,9 @@ class Scheduler(SchedulerInterface):
             prefill_end,
             ckpt_block_size,
             drop_eagle_block=self.use_eagle_block_drop,
+            query_start=start,
+            mamba_block_size=block_size,
+            copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
         )
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
@@ -525,10 +577,66 @@ class Scheduler(SchedulerInterface):
                 hash_block_size=self.hash_block_size,
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                reuse_initial_block=self.mamba_prefill_checkpoint_reuses_initial_block,
+                copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
             )
         )
-        if use_internal_checkpoint:
-            last_cache_position = 0
+        # Preserve full-block replay states distinct from the internal tail.
+        # When the tail itself is a replay boundary, its export already
+        # materializes that state and a separate stop would be redundant.
+        replay_stop = (
+            0
+            if use_internal_checkpoint and replay_cache_position == checkpoint_position
+            else replay_cache_position
+        )
+        extension_stop = (
+            0
+            if use_internal_checkpoint and last_cache_position == checkpoint_position
+            else last_cache_position
+        )
+        # Without the copy-initial capability, a valid internal export makes
+        # one chunk to the prefill end correct: the validity check never lets
+        # it alias a block-aligned (shareable) initial column, and the manager
+        # hashes no boundary the chunk runs through. The stops above would only
+        # add full-block states for siblings with a shorter shared prefix or a
+        # block-aligned resend, at the cost of extra prefill steps (three for a
+        # cold 4608-token prompt at block size 1152), so they are opt-in
+        # (VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS). This also covers KDA
+        # (flashkda) align-mode checkpoints.
+        if (
+            use_internal_checkpoint
+            and not self.mamba_prefill_checkpoint_copies_initial_block
+            and not self.mamba_prefill_checkpoint_reuse_stops
+        ):
+            replay_stop = extension_stop = 0
+        # A warm request need not re-align if all reusable boundaries are
+        # behind it (or covered by the export). Re-aligning there can destroy
+        # a valid private-initial-block export by turning it into a shared,
+        # block-aligned initial-column alias on the following step.
+        stop_at_next_boundary = (
+            not use_internal_checkpoint or max(replay_stop, extension_stop) > start
+        )
+        # Running past the next boundary from mid-block relies on the export
+        # rewriting the private initial column. If a later encoder or drafter
+        # lookahead cap can end the chunk early, the export is cancelled and
+        # that column would still hold the chunk-start state when the manager
+        # hashes it as the boundary state. Copy-initial backends need no stop:
+        # they preserve the initial column and select the next boundary as
+        # the export. Neither does a boundary within the drafter's runway of
+        # the prefill end: `_reserve_prefill_lookahead` pulls any early end
+        # back to or below it, while stopping there would leave a remainder
+        # shorter than the runway that the reservation then never schedules.
+        next_block_boundary = (start // block_size + 1) * block_size
+        if (
+            not stop_at_next_boundary
+            and start % block_size != 0
+            and not self.mamba_prefill_checkpoint_copies_initial_block
+            and prefill_end - next_block_boundary >= self.num_prefill_lookahead
+            and _mamba_chunk_may_be_capped(
+                request, start, end, self.num_prefill_lookahead
+            )
+        ):
+            stop_at_next_boundary = True
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
         # tokens. State is written at chunk ends, so chunk ends must be block
         # aligned. Exempt: the prompt's last chunk, whose slot decode advances
@@ -543,7 +651,6 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
 
-        next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
             get_mamba_prefill_checkpoint_position(
                 request.num_prompt_tokens,
@@ -565,21 +672,26 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
+        junction_requires_split = start < junction_stop < end and not (
+            use_internal_checkpoint and junction_stop == checkpoint_position
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
-            if start % block_size != 0 and not use_internal_checkpoint
+            if start % block_size != 0
+            and (stop_at_next_boundary or junction_requires_split)
             else 0,
-            # Never run past the last cacheable block boundary mid-chunk.
-            last_cache_position,
+            # Never run past a reusable boundary not covered by the export.
+            extension_stop,
+            replay_stop,
             # Stop at the prompt checkpoint unless the backend saves it internally.
             tail_boundary
-            if last_cache_position < tail_boundary < request.num_prompt_tokens
+            if replay_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
-            junction_stop if start < junction < end else 0,
+            junction_stop if junction_requires_split else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
@@ -1504,6 +1616,7 @@ class Scheduler(SchedulerInterface):
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
                     uses_mrope=self.model_uses_mrope,
+                    prefill_token_array=req.take_prompt_token_array(),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1737,6 +1850,7 @@ class Scheduler(SchedulerInterface):
         # Keep all output tokens but the final sampled one.
         keep_end = session.num_tokens - 1
         assert keep_end >= session.num_computed_tokens
+        session.prompt_token_array = None  # VLLM_PROMPT_TOKEN_ARRAY: stale now
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : keep_end
         ]

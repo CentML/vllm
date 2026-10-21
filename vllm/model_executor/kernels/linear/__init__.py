@@ -117,6 +117,7 @@ from vllm.model_executor.kernels.linear.mxfp8.emulation import (
 )
 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
     FlashInferCutedslMxfp8LinearKernel,
+    FlashInferCutedslSm107Mxfp8LinearKernel,
     FlashInferCutlassMxfp8LinearKernel,
     FlashInferTrtllmMxfp8LinearKernel,
 )
@@ -304,6 +305,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         FlashInferCuteDslNvFp4W4A16LinearKernel,
         FlashInferCutedslMxfp8LinearKernel,
     },
+    "flashinfer_cutedsl_sm107": {FlashInferCutedslSm107Mxfp8LinearKernel},
     "flashinfer_trtllm": {
         FlashInferTrtllmMxfp8LinearKernel,
         FlashInferTrtllmNvFp4LinearKernel,
@@ -964,6 +966,8 @@ def init_mxfp8_linear_kernel(
         )
     else:
         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
+        if _get_linear_backend(quantization="mxfp8") == "flashinfer_cutedsl_sm107":
+            possible = [FlashInferCutedslSm107Mxfp8LinearKernel]
 
     # Apply --linear-backend filtering when set.
     possible = _resolve_backend_kernels(

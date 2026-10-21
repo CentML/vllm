@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
-import inspect
-from collections.abc import Sequence
+import math
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
@@ -88,6 +89,22 @@ from vllm.v1.attention.ops.dcp import (
     dcp_a2a_lse_reduce,
     mask_dcp_empty_shards_,
 )
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    ENABLED as PREFILL_GEN_ROUTING_ENABLED,
+)
+from vllm.v1.attention.ops.flashinfer_prefill_gen_routing import (
+    trtllm_batch_context_with_kv_cache as routed_trtllm_batch_context_with_kv_cache,
+)
+from vllm.v1.attention.ops.kf_decode_attn.runtime import MAXP as KF_DECODE_MAXP
+from vllm.v1.attention.ops.kf_decode_attn.runtime import (
+    get_runtime as get_kf_decode_runtime,
+)
+from vllm.v1.attention.ops.kf_prefill_attn.runtime import MAXP as KF_MAXP
+from vllm.v1.attention.ops.kf_prefill_attn.runtime import (
+    KfPrefillPlan,
+    get_runtime,
+    kf_supported_kv,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -108,34 +125,6 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
-trtllm_gen_prefill_counter_buffer: torch.Tensor | None = None
-
-# Relative cost per (CTA wave x KV token) of the trtllm-gen generation kernel when the
-# KV of each CTA's query tile is split across `s` CTAs (index s), normalized to the
-# unsplit kernel (which costs the same as the context kernel). The split kernels use the
-# static scheduler and a separate reduction kernel. Measured on SM107 for FP8 Q/KV,
-# head_dim 256, 8 q heads per kv head, KV 40k-200k tokens.
-_TRTLLM_GEN_PREFILL_SPLIT_COST = (
-    0.0,
-    1.0,
-    1.123,
-    1.151,
-    1.184,
-    1.235,
-    1.273,
-    1.315,
-    1.355,
-)
-# Each split must keep at least this many KV tokens, or its fixed cost dominates.
-_TRTLLM_GEN_PREFILL_MIN_KV_PER_SPLIT = 8192
-# The generation kernel's CTA tile is 128 query rows (tokens x heads per kv head).
-_TRTLLM_GEN_PREFILL_ROWS_PER_CTA = 128
-# Largest number of prefill requests per launch the cost model was validated on.
-_TRTLLM_GEN_PREFILL_MAX_REQS = 64
-
-_TRTLLM_DECODE_TAKES_SM_COUNT = (
-    "sm_count" in inspect.signature(trtllm_batch_decode_with_kv_cache).parameters
-)
 
 
 def _nvfp4_kv_on_fa2() -> bool:
@@ -177,11 +166,90 @@ def _get_trtllm_workspace_buffer():
     return trtllm_workspace_buffer
 
 
-def _get_trtllm_gen_prefill_counter_buffer(num_bytes: int) -> torch.Tensor:
-    """Zeroed multi-CTA KV semaphores for generation-kernel prefills. The kernel
-    resets them after every launch, so zeroing once at allocation suffices.
+# trtllm-gen decode split-KV control (see _trtllm_gen_decode_sm_count).
+_TRTLLM_GEN_MAX_GROUPED_Q_ROWS = 128
+_TRTLLM_GEN_PARTIAL_BYTES_PER_ROW_ELT = 4
+_TRTLLM_GEN_PARTIAL_STATS_BYTES_PER_ROW = 8
+trtllm_gen_decode_counter_buffer: torch.Tensor | None = None
+
+
+def _trtllm_gen_decode_sm_count(
+    num_reqs: int,
+    max_q_len: int,
+    max_seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    device_sm_count: int,
+    workspace_bytes: int,
+    max_kv_per_cta: int,
+) -> int:
+    """SM count to report to FlashInfer's trtllm-gen decode kernel selection.
+
+    FlashInfer splits every sequence's KV over
+    ``k = min(ceil(max_seq_len / 512), sm_count // (num_q_ctas * num_kv_heads *
+    num_reqs))`` CTAs, i.e. it fills exactly one wave, and each CTA covers
+    ``max_seq_len / k`` KV tokens (k == 1 selects the Persistent kernel). CUDA
+    graphs are captured with ``max_seq_len = max_model_len``, so with long,
+    uneven contexts the longest request decides the kernel time: on 212 SMs at
+    40-53 requests (k = 2) a request shorter than ``max_model_len / 2`` runs on
+    a single CTA, and from 54 requests on every request does.
+
+    This raises k to ``ceil(max_seq_len / max_kv_per_cta)`` by reporting
+    ``k * num_kv_heads * num_reqs`` SMs. CTAs whose chunk starts beyond their
+    request's KV length exit at once. The partial-O scratch of the gmem
+    reduction (one tile per CTA, inside ``workspace_bytes``) caps k.
+    """
+    if max_kv_per_cta <= 0 or num_reqs <= 0:
+        return device_sm_count
+    q_rows = max_q_len * (num_qo_heads // num_kv_heads)
+    if q_rows > _TRTLLM_GEN_MAX_GROUPED_Q_ROWS:
+        # More than one Q CTA per request and KV head: keep FlashInfer's choice.
+        return device_sm_count
+    ctas_per_split = num_kv_heads * num_reqs
+    default_splits = device_sm_count // ctas_per_split
+    splits = cdiv(max_seq_len, max_kv_per_cta)
+    tile_q = max(8, 1 << (q_rows - 1).bit_length())
+    bytes_per_cta = tile_q * (
+        _TRTLLM_GEN_PARTIAL_STATS_BYTES_PER_ROW
+        + _TRTLLM_GEN_PARTIAL_BYTES_PER_ROW_ELT * head_size
+    )
+    splits = min(splits, workspace_bytes // 2 // (bytes_per_cta * ctas_per_split))
+    if splits <= max(default_splits, 1):
+        return device_sm_count
+    return splits * ctas_per_split
+
+
+# Relative cost per (CTA wave x KV token) of the trtllm-gen generation kernel when the
+# KV of each CTA's query tile is split across `s` CTAs (index s), normalized to the
+# unsplit kernel (which costs the same as the context kernel). The split kernels use the
+# static scheduler and a separate reduction kernel. Measured on VR-288GB (SM107, 212
+# SMs) for FP8 Q/KV, head_dim 256, 8 q heads per kv head, KV 40k-200k tokens.
+_TRTLLM_GEN_PREFILL_SPLIT_COST = (
+    0.0,
+    1.0,
+    1.123,
+    1.151,
+    1.184,
+    1.235,
+    1.273,
+    1.315,
+    1.355,
+)
+# Each split must keep at least this many KV tokens, or its fixed cost dominates.
+_TRTLLM_GEN_PREFILL_MIN_KV_PER_SPLIT = 8192
+# The generation kernel's CTA tile is 128 query rows (tokens x heads per kv head).
+_TRTLLM_GEN_PREFILL_ROWS_PER_CTA = 128
+
+trtllm_gen_prefill_counter_buffer = None
+
+
+def _get_trtllm_gen_prefill_counter_buffer(sm_count: int) -> torch.Tensor:
+    """Zeroed multi-CTA KV semaphores for the generation-kernel prefill (the kernel
+    resets them after every launch, so one zeroing at allocation suffices).
     """
     global trtllm_gen_prefill_counter_buffer
+    num_bytes = 4 * cdiv(sm_count, 8) * 8
     if (
         trtllm_gen_prefill_counter_buffer is None
         or trtllm_gen_prefill_counter_buffer.numel() < num_bytes
@@ -190,6 +258,49 @@ def _get_trtllm_gen_prefill_counter_buffer(num_bytes: int) -> torch.Tensor:
             num_bytes, dtype=torch.uint8, device="cuda"
         )
     return trtllm_gen_prefill_counter_buffer
+
+
+def _fp32_paged_prefill_reference(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens_q: list[int],
+    seq_lens: list[int],
+    bmm1_scale: float,
+    bmm2_scale: float,
+) -> torch.Tensor:
+    """fp32 causal paged attention over FP8 Q/KV (HND, K|V packed in the last dim),
+    for the VLLM_KF_PREFILL_ATTN_CHECK debug comparison. Returns [T, Hq, D] fp32.
+    """
+    num_tokens, num_heads, head_dim = query.shape
+    num_kv_heads, page = kv_cache.shape[1], kv_cache.shape[2]
+    group = num_heads // num_kv_heads
+    out = torch.empty(num_tokens, num_heads, head_dim, device=query.device)
+    for b in range(len(seq_lens)):
+        q0, q1, seq = cu_seqlens_q[b], cu_seqlens_q[b + 1], seq_lens[b]
+        if q1 == q0:
+            continue
+        pages = block_tables[b, : cdiv(seq, page)].long()
+        kv = kv_cache.index_select(0, pages).float()  # [n, Hkv, page, 2D]
+        kv = kv.permute(1, 0, 2, 3).reshape(num_kv_heads, -1, 2 * head_dim)[:, :seq]
+        k, v = kv[..., :head_dim], kv[..., head_dim:]
+        prefix = seq - (q1 - q0)
+        rows = max(1, (1 << 22) // seq)
+        for r0 in range(0, q1 - q0, rows):
+            r1 = min(q1 - q0, r0 + rows)
+            qc = query[q0 + r0 : q0 + r1].float()  # [n, Hq, D]
+            qc = qc.view(r1 - r0, num_kv_heads, group, head_dim).permute(1, 0, 2, 3)
+            s = torch.einsum("hngd,hkd->hngk", qc, k) * bmm1_scale
+            pos = torch.arange(seq, device=query.device)
+            lim = prefix + torch.arange(r0, r1, device=query.device)
+            s.masked_fill_(
+                (pos[None, :] > lim[:, None])[None, :, None, :], float("-inf")
+            )
+            o = torch.einsum("hngk,hkd->hngd", torch.softmax(s, -1), v) * bmm2_scale
+            out[q0 + r0 : q0 + r1] = o.permute(1, 0, 2, 3).reshape(
+                r1 - r0, -1, head_dim
+            )
+    return out
 
 
 def trtllm_gen_prefill_sm_count(
@@ -217,11 +328,13 @@ def trtllm_gen_prefill_sm_count(
     count by); tiles past a request's own chunk exit at once, so waves are counted
     over the real tiles at the mean KV of those tiles. A kernel also takes at least
     as long as its longest CTA (the longest sequence's KV, divided by the split), so
-    each cost is the larger of the two. Splits need >= 8192 KV tokens of the
-    longest sequence each.
+    each cost is the larger of the two. One request reduces to the per-chunk wave
+    model. Splits need >= 8192 KV tokens of the longest sequence each.
 
-    A single request must be prefix-dominated (cached prefix >= 8x the chunk): on
-    causal-heavy single chunks the generation kernel loses.
+    A single request must be prefix-dominated (cached prefix >= 8x the chunk): its
+    synthetic grid showed the generation kernel losing on causal-heavy chunks.
+    Multi-request launches have no such guard; on 160 C512 PMU32LL + PI3 launches the
+    guard only kept launches whose short-prefix rows are cheap on the context kernel.
     """
     if len(query_lens) == 1 and seq_lens[0] - query_lens[0] < 8 * query_lens[0]:
         return None
@@ -256,24 +369,124 @@ def trtllm_gen_prefill_sm_count(
     return best_splits * grid_ctas if best_splits else None
 
 
-def _trtllm_batch_decode_with_sm_count(sm_count: int, **kwargs: Any) -> None:
-    """``trtllm_batch_decode_with_kv_cache`` with its kernel selection planned for
-    ``sm_count`` SMs (this sets the multi-CTA KV split).
+@contextmanager
+def _flashinfer_decode_sm_count(sm_count: int) -> Iterator[None]:
+    """Make ``flashinfer.decode`` report ``sm_count`` SMs within this scope.
 
-    FlashInfer releases without the ``sm_count`` argument read the SM count from
-    ``flashinfer.decode.get_device_sm_count``; for those it is overridden for the
-    duration of the call. Drop that fallback once the minimum FlashInfer version
-    takes ``sm_count``.
+    ``trtllm_batch_decode_with_kv_cache`` reads the SM count from
+    ``flashinfer.decode.get_device_sm_count`` and passes it to the kernel
+    selection; it has no parameter for it.
     """
-    if _TRTLLM_DECODE_TAKES_SM_COUNT:
-        trtllm_batch_decode_with_kv_cache(**kwargs, sm_count=sm_count)
-        return
-    get_device_sm_count = flashinfer_decode.get_device_sm_count
+    device_sm_count = flashinfer_decode.get_device_sm_count
     flashinfer_decode.get_device_sm_count = lambda _device: sm_count
     try:
-        trtllm_batch_decode_with_kv_cache(**kwargs)
+        yield
     finally:
-        flashinfer_decode.get_device_sm_count = get_device_sm_count
+        flashinfer_decode.get_device_sm_count = device_sm_count
+
+
+def _get_trtllm_gen_decode_counter_buffer(
+    num_bytes: int, device: torch.device
+) -> torch.Tensor:
+    """Persistent zeroed semaphore buffer for trtllm-gen multi-CTA-KV decode.
+
+    The kernel resets its semaphores after every launch, so the buffer is
+    zeroed once. Without it, ``trtllm_batch_decode_with_kv_cache`` allocates
+    and zero-fills a fresh buffer before every decode FMHA. Sized once for the
+    worst case so CUDA graphs never see it reallocated.
+    """
+    global trtllm_gen_decode_counter_buffer
+    if trtllm_gen_decode_counter_buffer is None:
+        trtllm_gen_decode_counter_buffer = torch.zeros(
+            num_bytes, dtype=torch.uint8, device=device
+        )
+    return trtllm_gen_decode_counter_buffer
+
+
+trtllm_ctx_counter_buffers: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_trtllm_ctx_counter_buffer(
+    device: torch.device, num_bytes: int
+) -> torch.Tensor | None:
+    """VLLM_FI_PERSISTENT_KV_COUNTER: persistent zeroed multi-CTA KV semaphore
+    buffer for the trtllm-gen context kernel, one per device and separate from
+    the decode / generation-kernel prefill buffers (those launches may overlap
+    the context launch under PDL).
+
+    Without it, ``trtllm_batch_context_with_kv_cache`` allocates and zero-fills
+    a fresh buffer on every call; the kernel resets its semaphores after every
+    launch, so one zeroing at allocation suffices. Returns None when the
+    launch needs more than ``VLLM_FI_PERSISTENT_KV_COUNTER_BYTES`` or the
+    buffer does not exist yet during graph capture (it would live in the
+    graph's private pool); FlashInfer then allocates its own.
+    """
+    buf = trtllm_ctx_counter_buffers.get(device)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        buf = torch.zeros(
+            envs.VLLM_FI_PERSISTENT_KV_COUNTER_BYTES, dtype=torch.uint8, device=device
+        )
+        trtllm_ctx_counter_buffers[device] = buf
+        logger.info(
+            "Persistent trtllm-gen context KV counter on: device=%s bytes=%d",
+            device,
+            buf.numel(),
+        )
+    return buf if num_bytes <= buf.numel() else None
+
+
+def draft_prefill_rows(
+    cum_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_decodes: int,
+    num_decode_tokens: int,
+    num_prefills: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefill-bucket rows an MTP draft prefill samples and their KV lengths.
+
+    ``last_token_indices`` is the speculator's per-request index of the last
+    accepted row into the whole batch's tokens; prefill request ``i`` is batch
+    request ``num_decodes + i`` (decodes are ordered first) and its rows start
+    at ``num_decode_tokens + cum_q[i]``. Each row is clamped into its request's
+    span of the prefill query (``cum_q``, prefill-local), which keeps CUDA-graph
+    capture and dummy runs (zero-filled indices) in bounds without a host sync.
+    The causal KV length of a row is the request's sequence length minus the
+    rows after it (e.g. rejected draft tokens).
+
+    Returns ``(rows, kv_lens)``: int64 row indices into the prefill query and
+    int32 KV lengths, one per prefill request.
+    """
+    cum_q = cum_q[: num_prefills + 1].long()
+    lo = cum_q[:-1]
+    hi = cum_q[1:] - 1
+    rows = last_token_indices[num_decodes : num_decodes + num_prefills].long()
+    rows = (rows - num_decode_tokens).clamp(lo, hi)
+    kv_lens = (seq_lens[:num_prefills].long() - (hi - rows)).to(torch.int32)
+    return rows, kv_lens
+
+
+def _bounded_dequant_block_tables(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Bound temporary KV pages by live context, not model/table capacity.
+
+    Zero out each request's unused tail before the dequantizer reads page IDs:
+    persistent tables may retain stale IDs beyond that request's causal span.
+    The returned table is contiguous, as required by the dequant kernel.
+    """
+    width = min(cdiv(max_seq_len, block_size), block_tables.shape[1])
+    page_starts = (
+        torch.arange(width, dtype=torch.int32, device=block_tables.device) * block_size
+    )
+    return torch.where(
+        page_starts[None, :] < seq_lens[:, None], block_tables[:, :width], 0
+    )
 
 
 def _pack_draft_block_bool_mask(
@@ -702,6 +915,11 @@ class FlashInferBackend(AttentionBackend):
             )
         if not use_large_pages:
             return [16, 32, 64]
+        # The Kernel Factory prefill/decode kernels hard-code page 128. A hybrid
+        # block divisible by 256 (e.g. 1280 tokens: MTP k=6 with a bf16 GDN state)
+        # would otherwise select 256 and silently turn both KF kernels off.
+        if envs.VLLM_KF_PREFILL_ATTN or envs.VLLM_KF_DECODE_ATTN:
+            return [16, 32, 64, 128]
         return [16, 32, 64, 128, 256, 512, 1024]
 
     @staticmethod
@@ -839,21 +1057,17 @@ class FlashInferBackend(AttentionBackend):
 
 
 @dataclass
-class DraftPrefillRows:
-    """The rows a draft-model prefill samples, one per request.
+class DraftPrefillPruning:
+    """Request-local sampled rows for one eager/piecewise MTP prefill.
 
-    Set on a draft attention layer for one forward when
-    ``SpeculativeConfig.prune_draft_prefill_attention`` is enabled.
+    KV writes remain a separate all-token operation. These inputs are scoped
+    to the prefill forward, never reused by subsequent autoregressive steps.
     """
 
     rows: torch.Tensor
-    """Token index of each request's sampled row in the batch. Shape: [num_reqs]"""
-
     seq_lens: torch.Tensor
-    """Causal KV length of each sampled row (int32). Shape: [num_reqs]"""
-
+    block_tables: torch.Tensor
     max_seq_len: int
-    """Upper bound of ``seq_lens``."""
 
 
 @dataclass
@@ -910,8 +1124,12 @@ class TRTLLMPrefill:
 
     gen_sm_count: int | None = None
     """If set, run the prefill on the trtllm-gen generation kernel with this
-    ``sm_count`` (see ``trtllm_gen_prefill_sm_count``) instead of the context
-    kernel."""
+    ``sm_count`` (see ``trtllm_gen_prefill_sm_count``) instead of the context kernel."""
+
+    kf: KfPrefillPlan | None = None
+    """If set, run the prefill on the Kernel Factory kernel with this step's work
+    list (vllm/v1/attention/ops/kf_prefill_attn); takes precedence over
+    ``gen_sm_count``."""
 
 
 @dataclass
@@ -947,6 +1165,14 @@ class FlashInferTrtllmAPIDecode:
     dcp_query_start_loc: torch.Tensor | None = None
     """Decode query boundaries for masking empty DCP shards during reduction."""
 
+    kf_block_tables: torch.Tensor | None = None
+    """VLLM_KF_DECODE_ATTN: the decode rows' block table with row stride
+    KF_DECODE_MAXP when this batch runs on the Kernel Factory decode kernel."""
+
+    kf_q: int = 0
+    """Query tokens per request (uniform; graph-padded rows have none) for the
+    Kernel Factory decode kernel."""
+
 
 @dataclass
 class FlashInferMetadata:
@@ -979,9 +1205,6 @@ class FlashInferMetadata:
     Holds the metadata for the decode portion of the batch.
     Will be `None` if `num_decode_tokens == 0`.
     """
-
-    block_table: torch.Tensor | None = None
-    """Block table of every request. Shape: [num_reqs, max_num_blocks_per_seq]"""
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1118,11 +1341,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.q_data_type_decode = self.get_q_data_type(is_prefill=False)
 
         # Chunked prefills over a long cached prefix may run on the trtllm-gen
-        # generation kernel (trtllm_gen_prefill_sm_count). Its cost model was
-        # measured on SM107 for FP8 Q/KV, head_dim 256 and 8 q heads per kv head.
+        # generation kernel (trtllm_gen_prefill_sm_count), up to
+        # VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS requests per launch. Its cost
+        # model was measured on SM107 for FP8 Q/KV, head_dim 256 and 8 q heads per
+        # kv head.
+        self.trtllm_gen_prefill_max_reqs = (
+            envs.VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS
+        )
         self.trtllm_gen_prefill_num_sms = (
             torch.cuda.get_device_properties(device).multi_processor_count
-            if self.attention_config.trtllm_gen_split_kv_prefill
+            if envs.VLLM_FLASHINFER_TRTLLM_GEN_PREFILL
             and current_platform.is_device_capability(107)
             and self.q_data_type_prefill == FP8_DTYPE
             and self.kv_cache_dtype == FP8_DTYPE
@@ -1131,6 +1359,21 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             and not self.use_dcp
             else 0
         )
+        # Kernel Factory prefill kernel (VLLM_KF_PREFILL_ATTN): same envelope, plus the
+        # geometry it hard-codes (16 q / 2 kv heads, kernel page 128). Planned once per
+        # step in build(); the draft model's builder never plans (build_for_drafting).
+        self.kf_prefill = (
+            envs.VLLM_KF_PREFILL_ATTN
+            and current_platform.is_device_capability(107)
+            and self.q_data_type_prefill == FP8_DTYPE
+            and self.kv_cache_dtype == FP8_DTYPE
+            and self.head_dim == 256
+            and self.num_qo_heads == 16
+            and self.num_kv_heads == 2
+            and self.page_size == 128
+            and not self.use_dcp
+        )
+        self._kf_drafting = False
 
         # Prefer TRTLLM/XQA for decoding whenever supported. The decode kernel
         # must be selected statically for FULL cudagraph capture.
@@ -1186,12 +1429,43 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             vllm_config, self.flashinfer_trtllm_api_decode_kernel, self.use_dcp
         )
         # Fused draft steps advance seq_lens in place and keep block tables fixed,
-        # so one trtllm-gen decode build serves every step (not DCP-local seq_lens).
+        # so one XQA/trtllm-gen decode build serves every draft step: see
+        # update_draft_decode_metadata(). The native decode path plans on the host
+        # from the sequence lengths, and DCP reads rank-local lengths that the
+        # draft loop does not advance.
         self.supports_draft_decode_metadata_update = (
-            self.flashinfer_trtllm_api_decode_kernel
-            == FlashInferDecodeKernel.TRTLLM_GEN
-            and not self.use_dcp
+            self.use_trtllm_decode_attention and not self.use_dcp
         )
+        # Kernel Factory decode kernel (VLLM_KF_DECODE_ATTN): the trtllm-gen decode
+        # envelope plus the geometry it hard-codes (16 q / 2 kv heads, kernel page
+        # 128). Its block-table rows have stride KF_DECODE_MAXP: build() copies the
+        # decode rows into this persistent buffer (graphs read it at a fixed
+        # address). Device-trimmed query lengths (adaptive verification) excluded.
+        self.kf_decode = (
+            envs.VLLM_KF_DECODE_ATTN
+            and current_platform.is_device_capability(107)
+            and self.flashinfer_trtllm_api_decode_kernel
+            == FlashInferDecodeKernel.TRTLLM_GEN
+            and self.q_data_type_decode == FP8_DTYPE
+            and self.kv_cache_dtype == FP8_DTYPE
+            and self.head_dim == 256
+            and self.num_qo_heads == 16
+            and self.num_kv_heads == 2
+            and self.page_size == 128
+            and not self.use_dcp
+            and not self.use_trtllm_gen_varlen_decode
+        )
+        self._kf_bt: torch.Tensor | None = None
+        if self.kf_decode:
+            self._kf_bt = torch.zeros(
+                (max(1, min(envs.VLLM_KF_DECODE_ATTN_MAX_BL, 32)), KF_DECODE_MAXP),
+                dtype=torch.int32,
+                device=device,
+            )
+        # (data_ptr, rows) of the table last copied, and the draft step being built:
+        # draft steps after the first reuse the first step's block table.
+        self._kf_bt_src = (0, 0)
+        self._kf_draft_index = 0
         self._init_reorder_batch_threshold(
             1,
             supports_spec_as_decode=(
@@ -1670,6 +1944,61 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len.copy_to_gpu(num_reqs)
         return paged_kv_indices
 
+    def _kf_decode_route(
+        self,
+        block_table_tensor: torch.Tensor,
+        qo_indptr_cpu: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        uniform: bool,
+    ) -> tuple[torch.Tensor, int] | None:
+        """VLLM_KF_DECODE_ATTN: whether this step's decode rows run on the Kernel
+        Factory kernel; if so, their block table in the MAXP-stride buffer and Q.
+
+        The kernel reads the decode query as [num_decodes, Q] rows. That holds for a
+        uniform batch and for a graph-padded one (real rows of Q tokens, then
+        zero-length padding requests whose seq_len is 0 and whose rows it skips).
+        """
+        rt = get_kf_decode_runtime(self.device)
+        if rt is None:
+            return None
+        q = num_decode_tokens // num_decodes
+        if not uniform:
+            qo = qo_indptr_cpu[: num_decodes + 1].numpy()
+            lens = qo[1:] - qo[:-1]
+            nreal = int(np.count_nonzero(lens))
+            uniform = (
+                q * num_decodes == num_decode_tokens
+                and nreal > 0
+                and bool((lens[:nreal] == q).all())
+                and not lens[nreal:].any()
+            )
+        assert self._kf_bt is not None
+        width = block_table_tensor.shape[1]
+        if not rt.route(q, num_decodes, uniform and width <= KF_DECODE_MAXP):
+            return None
+        src = (block_table_tensor.data_ptr(), num_decodes)
+        if self._kf_draft_index == 0 or src != self._kf_bt_src:
+            self._kf_bt[:num_decodes, :width].copy_(block_table_tensor[:num_decodes])
+            self._kf_bt_src = src
+        return self._kf_bt[:num_decodes], q
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> FlashInferMetadata:
+        # Draft-model metadata never plans the KF prefill kernel: its prefill rows take
+        # the pruned last-row path (VLLM_MTP_DRAFT_PREFILL_PRUNE) or FlashInfer, and a
+        # second plan per step would only add host time.
+        self._kf_drafting = True
+        self._kf_draft_index = draft_index
+        try:
+            return super().build_for_drafting(common_attn_metadata, draft_index)
+        finally:
+            self._kf_drafting = False
+            self._kf_draft_index = 0
+
     def build(
         self,
         common_prefix_len: int,
@@ -1779,7 +2108,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             causal=causal,
             prefill=None,
             decode=None,
-            block_table=block_table_tensor,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -1892,20 +2220,17 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     qo_indptr_prefill_cpu[1:] - qo_indptr_prefill_cpu[:-1]
                 )
                 max_q_len_prefill = int(query_lens_prefill_cpu.max().item())
+                # Exact on rows still prefilling (CommonAttentionMetadata docs).
+                seq_lens_ub = common_attn_metadata.seq_lens_cpu_upper_bound
                 prefill_block_tables = block_table_tensor[prefill_start:]
                 if (
                     self.q_data_type_prefill != FP8_DTYPE
                     and self.cache_dtype.startswith("fp8")
                 ):
-                    seq_lens_cpu_upper_bound = (
-                        common_attn_metadata.seq_lens_cpu_upper_bound
-                    )
                     max_prefill_seq_len = max_seq_len
-                    if seq_lens_cpu_upper_bound is not None:
+                    if seq_lens_ub is not None:
                         max_prefill_seq_len = int(
-                            seq_lens_cpu_upper_bound[prefill_start:num_reqs]
-                            .max()
-                            .item()
+                            seq_lens_ub[prefill_start:num_reqs].max().item()
                         )
                     # Dequantization allocates one page per table entry and
                     # indexes rows by their logical width.
@@ -1915,12 +2240,34 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         ].contiguous()
                     )
                 gen_sm_count = None
+                kf_plan = None
+                kf_rt = get_runtime(self.device) if self.kf_prefill else None
+                if (
+                    kf_rt is not None
+                    and not self._kf_drafting
+                    and seq_lens_ub is not None
+                    and block_table_tensor.shape[1] <= KF_MAXP
+                    and block_table_tensor.stride(1) == 1
+                ):
+                    # The upper bound is exact only on rows still prefilling: a
+                    # non-uniform decode row (require_uniform split above) carries
+                    # async spec decode's optimistic length. plan() keeps such
+                    # steps (and any row below MIN_KV) on the production path.
+                    is_prefilling = common_attn_metadata.is_prefilling
+                    kf_plan = kf_rt.plan(
+                        query_lens_prefill_cpu.tolist(),
+                        seq_lens_ub[prefill_start:num_reqs].tolist(),
+                        block_table_tensor[prefill_start:num_reqs],
+                        None
+                        if is_prefilling is None
+                        else is_prefilling[prefill_start:num_reqs].tolist(),
+                    )
+                # Kept even with a KF plan: a layer that cannot run KF (forward checks)
+                # then falls back to exactly the production choice.
                 if (
                     self.trtllm_gen_prefill_num_sms
-                    and num_prefills <= _TRTLLM_GEN_PREFILL_MAX_REQS
+                    and num_prefills <= self.trtllm_gen_prefill_max_reqs
                 ):
-                    # Precise for prefill rows (CommonAttentionMetadata docs).
-                    seq_lens_ub = common_attn_metadata.seq_lens_cpu_upper_bound
                     gen_sm_count = trtllm_gen_prefill_sm_count(
                         query_lens=query_lens_prefill_cpu.tolist(),
                         seq_lens=(
@@ -1942,6 +2289,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     max_q_len=max_q_len_prefill,
                     max_seq_len=max_seq_len,
                     gen_sm_count=gen_sm_count,
+                    kf=kf_plan,
                 )
             else:
                 prefill_wrapper = self._get_prefill_wrapper(causal=attn_metadata.causal)
@@ -2075,6 +2423,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         qo_indptr[: num_decodes + 1] if self.use_dcp else None
                     ),
                 )
+                if self.kf_decode:
+                    kf = self._kf_decode_route(
+                        block_table_tensor,
+                        qo_indptr_cpu,
+                        num_decodes,
+                        num_decode_tokens,
+                        q_cu_seq_lens is None,
+                    )
+                    if kf is not None:
+                        decode = attn_metadata.decode
+                        assert isinstance(decode, FlashInferTrtllmAPIDecode)
+                        decode.kf_block_tables, decode.kf_q = kf
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0
@@ -2139,8 +2499,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 
-    def update_draft_decode_metadata(self, _metadata: FlashInferMetadata) -> None:
-        pass
+    def update_draft_decode_metadata(self, metadata: FlashInferMetadata) -> None:
+        # Between draft steps only the positions change, and a pure-decode batch
+        # on the XQA/trtllm-gen path reads everything that depends on them from
+        # persistent device buffers that the draft loop advances in place:
+        # seq_lens (a view of the input buffer), block_tables and slot_mapping
+        # (the block-table buffers). The remaining fields (token and request
+        # counts, max_seq_len, q_len_per_req and the query offsets or mask
+        # derived from it) depend only on the query layout, which is identical
+        # across draft steps. Prefill and native decode metadata hold
+        # host-planned or freshly computed state instead.
+        decode = metadata.decode
+        if (
+            isinstance(decode, FlashInferTrtllmAPIDecode)
+            and decode.kf_block_tables is not None
+        ):
+            # The Kernel Factory decode kernel reads its own MAXP-stride copy of
+            # the block table, which build() fills. A fused draft graph replays
+            # this call instead of build(), so refresh the copy from the
+            # persistent block table here (capture-safe device copy).
+            width = decode.block_tables.shape[1]
+            decode.kf_block_tables[:, :width].copy_(decode.block_tables)
 
 
 class FlashInferImpl(AttentionImpl):
@@ -2223,9 +2602,45 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
-        # Set by the MTP speculator for one draft prefill forward (see
-        # DraftPrefillRows).
-        self.draft_prefill_rows: DraftPrefillRows | None = None
+        # trtllm-gen decode split-KV policy and the worst-case decode batch
+        # that sizes the persistent counter buffer (resolved on first decode,
+        # never regrown after CUDA-graph capture). The KV-per-CTA cap is on by
+        # default only on SM107; an explicit setting applies everywhere.
+        max_kv_per_cta = envs.VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA
+        if max_kv_per_cta is None:
+            max_kv_per_cta = 16384 if current_platform.is_device_capability(107) else 0
+        self.trtllm_decode_max_kv_per_cta = max_kv_per_cta
+        self._trtllm_decode_max_reqs: int | None = None
+        self._trtllm_decode_max_model_len: int | None = None
+        if vllm_config is not None and vllm_config.model_config is not None:
+            sched = vllm_config.scheduler_config
+            self._trtllm_decode_max_reqs = (
+                sched.max_num_batched_tokens or sched.max_num_seqs
+            )
+            self._trtllm_decode_max_model_len = vllm_config.model_config.max_model_len
+        self._device_sm_count: int | None = None
+        # Set by the MTP speculator on its draft attention layer when
+        # VLLM_MTP_DRAFT_PREFILL_PRUNE=1: its last_token_indices buffer, the rows
+        # the draft prefill samples (see _draft_prefill_last_rows). None: off.
+        self.draft_prefill_last_token_indices: torch.Tensor | None = None
+        self.draft_prefill_pruning: DraftPrefillPruning | None = None
+        self._draft_prefill_prune_checks_left = envs.VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK
+        # Kernel Factory prefill kernel: per-layer debug comparisons left
+        # (VLLM_KF_PREFILL_ATTN_CHECK) and the per-call guard that disables it while a
+        # check re-runs this forward on the FlashInfer path.
+        self._kf_checks_left = envs.VLLM_KF_PREFILL_ATTN_CHECK
+        self._kf_off = False
+        # Opt-in routing of eligible FP8 context launches to the trtllm-gen
+        # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
+        # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
+        self._prefill_gen_routing = (
+            PREFILL_GEN_ROUTING_ENABLED
+            and not current_platform.is_device_capability(107)
+        )
+        self._persistent_ctx_kv_counter = envs.VLLM_FI_PERSISTENT_KV_COUNTER
+        # Kernel Factory decode kernel: per-layer debug comparisons left
+        # (VLLM_KF_DECODE_ATTN_CHECK; eager launches only).
+        self._kf_dec_checks_left = envs.VLLM_KF_DECODE_ATTN_CHECK
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.nvfp4_trtllm and vllm_config is not None:
@@ -2247,6 +2662,550 @@ class FlashInferImpl(AttentionImpl):
             self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
         else:
             self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+
+    def _trtllm_gen_decode_launch_config(
+        self,
+        num_reqs: int,
+        max_q_len: int,
+        max_seq_len: int,
+        query: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ) -> tuple[int, torch.Tensor | None]:
+        """Kernel-selection SM count and multi-CTA-KV counter buffer for one
+        trtllm-gen decode launch.
+        """
+        if self._device_sm_count is None:
+            self._device_sm_count = flashinfer_decode.get_device_sm_count(query.device)
+        num_qo_heads = query.size(1)
+        workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+        sm_count = _trtllm_gen_decode_sm_count(
+            num_reqs,
+            max_q_len,
+            max_seq_len,
+            num_qo_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self._device_sm_count,
+            workspace_bytes,
+            self.trtllm_decode_max_kv_per_cta,
+        )
+        if self._trtllm_decode_max_reqs is None:
+            return sm_count, None
+        max_reqs = self._trtllm_decode_max_reqs
+        assert self._trtllm_decode_max_model_len is not None
+        # Worst case: every request split ceil(max_model_len / max_kv_per_cta)
+        # ways (the policy never reports more SMs than that).
+        max_splits = (
+            cdiv(self._trtllm_decode_max_model_len, self.trtllm_decode_max_kv_per_cta)
+            if self.trtllm_decode_max_kv_per_cta > 0
+            else 1
+        )
+        counter_buffer = _get_trtllm_gen_decode_counter_buffer(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                max_reqs,
+                num_qo_heads,
+                max(self._device_sm_count, max_splits * self.num_kv_heads * max_reqs),
+            ),
+            query.device,
+        )
+        needed = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            num_reqs, num_qo_heads, sm_count
+        )
+        if needed > counter_buffer.numel():
+            return sm_count, None
+        return sm_count, counter_buffer
+
+    def _ctx_kv_counter_buffer(
+        self, query: torch.Tensor, batch_size: int
+    ) -> torch.Tensor | None:
+        """Multi-CTA KV counter buffer for one trtllm-gen context launch, or
+        None to let FlashInfer allocate one (see _get_trtllm_ctx_counter_buffer).
+        """
+        if not self._persistent_ctx_kv_counter:
+            return None
+        if self._device_sm_count is None:
+            self._device_sm_count = flashinfer_decode.get_device_sm_count(query.device)
+        return _get_trtllm_ctx_counter_buffer(
+            query.device,
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch_size, query.size(1), self._device_sm_count
+            ),
+        )
+
+    def _draft_prefill_attention(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
+        metadata: "FlashInferMetadata",
+        output: torch.Tensor,
+    ) -> bool:
+        """Compute sampled rows across both backend buckets, after all KV writes."""
+        pruning = self.draft_prefill_pruning
+        if (
+            pruning is None
+            or not metadata.causal
+            or self.dcp_world_size != 1
+            or self.is_kvcache_nvfp4
+            or output.dtype not in (torch.float16, torch.bfloat16)
+            or self.o_sf_scale is not None
+            or self.logits_soft_cap
+            or not self.supports_xqa_or_trtllm_gen_decode
+        ):
+            return False
+        decode = metadata.decode
+        if isinstance(decode, FlashInferTrtllmAPIDecode):
+            kernel = decode.kernel
+        elif isinstance(metadata.prefill, TRTLLMPrefill):
+            kernel = FlashInferDecodeKernel.TRTLLM_GEN
+        else:
+            return False
+        layout = get_flashinfer_layout_string(metadata.kv_cache_layout)
+        if kernel == FlashInferDecodeKernel.TRTLLM_GEN and (
+            layout != "HND" or not current_platform.is_device_capability_family(100)
+        ):
+            return False
+        rows = pruning.rows
+        q = self.maybe_quant_query(
+            query.index_select(0, rows), metadata.q_data_type_decode, layer._q_scale
+        )
+        q = canonicalize_singleton_dim_strides(q.contiguous())
+        block_tables = pruning.block_tables
+        # Use the same raw-cache decode interface as ordinary draft decode.
+        # BF16/E4M3 selects native transformed-K/V cubins in FlashInfer; generic
+        # mixed precision uses its ungrouped GQA-generation selection.
+        bmm1_scale = self.get_xqa_bmm1_scale(layer, q.dtype)
+        bmm2_scale = self.bmm2_scale
+        out_rows = torch.empty(q.shape, dtype=output.dtype, device=output.device)
+        workspace = _get_trtllm_workspace_buffer()
+        if kernel == FlashInferDecodeKernel.XQA:
+            flashinfer_xqa_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache_tuple,
+                workspace_buffer=workspace,
+                block_tables=block_tables,
+                seq_lens=pruning.seq_lens,
+                max_seq_len=pruning.max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=self.window_left,
+                sinks=self.sinks,
+                out=out_rows,
+                kv_layout=layout,
+                q_len_per_req=1,
+            )
+        else:
+            sm_count, counter = self._trtllm_gen_decode_launch_config(
+                rows.numel(), 1, pruning.max_seq_len, q, workspace
+            )
+            with _flashinfer_decode_sm_count(sm_count):
+                trtllm_batch_decode_with_kv_cache(
+                    query=q,
+                    kv_cache=kv_cache_tuple,
+                    workspace_buffer=workspace,
+                    block_tables=block_tables,
+                    seq_lens=pruning.seq_lens,
+                    max_seq_len=pruning.max_seq_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=self.window_left,
+                    sinks=self.sinks,
+                    out=out_rows,
+                    kv_layout=layout,
+                    backend="trtllm-gen",
+                    q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=counter,
+                )
+        out = output.view(-1, self.num_heads, self.head_size)
+        out.zero_()
+        out.index_copy_(0, rows, out_rows)
+        return True
+
+    def _draft_prefill_last_rows(
+        self,
+        prefill_query: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        workspace_buffer: torch.Tensor,
+        prefill: "TRTLLMPrefill",
+        last_token_indices: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        num_prefills: int,
+        out: torch.Tensor,
+        *,
+        block_tables: torch.Tensor | None = None,
+        bmm1_scale: float | None = None,
+        bmm2_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Prefill attention of an MTP draft layer, sampled row of each request
+        only.
+
+        The draft prefill samples one row per request, the speculator's
+        ``last_token_indices`` (the last accepted row: the chunk's last row, or
+        an earlier one when draft tokens were rejected); see
+        ``draft_prefill_rows``. The draft model has a single layer whose KV comes
+        from its input, not from attention outputs, and the other rows' outputs
+        are discarded, so only those rows need attention. They run as one
+        q_len 1 trtllm-gen decode launch over each row's causal KV length with
+        the decode split-KV policy (_trtllm_gen_decode_launch_config); the other
+        prefill rows are zero-filled. Decode rows are not touched. Returns the
+        sampled-row indices into ``out``.
+        """
+        rows, kv_lens = draft_prefill_rows(
+            prefill.cum_seq_lens_q,
+            prefill.seq_lens,
+            last_token_indices,
+            num_decodes,
+            num_decode_tokens,
+            num_prefills,
+        )
+        query_rows = prefill_query.index_select(0, rows)
+        out_rows = torch.empty(
+            (num_prefills, self.num_heads, self.head_size),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        # max_seq_len stays an upper bound of kv_lens.
+        sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
+            num_prefills, 1, prefill.max_seq_len, query_rows, workspace_buffer
+        )
+        with _flashinfer_decode_sm_count(sm_count):
+            trtllm_batch_decode_with_kv_cache(
+                query=query_rows,
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                block_tables=(
+                    prefill.block_tables if block_tables is None else block_tables
+                ),
+                seq_lens=kv_lens,
+                max_seq_len=prefill.max_seq_len,
+                bmm1_scale=self.bmm1_scale if bmm1_scale is None else bmm1_scale,
+                bmm2_scale=self.bmm2_scale if bmm2_scale is None else bmm2_scale,
+                window_left=self.window_left,
+                sinks=self.sinks,
+                out=out_rows,
+                kv_layout="HND",
+                backend="trtllm-gen",
+                q_len_per_req=1,
+                multi_ctas_kv_counter_buffer=counter_buffer,
+            )
+        out.zero_()
+        out.index_copy_(0, rows, out_rows)
+        return rows
+
+    def _check_draft_prefill_last_rows(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: "FlashInferMetadata",
+        out: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        """VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: compare the pruned (sampled) rows
+        with the regular prefill attention (debug only; syncs).
+        """
+        self._draft_prefill_prune_checks_left -= 1
+        ref = torch.empty(
+            (query.shape[0], self.num_heads, self.head_size),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        last_token_indices = self.draft_prefill_last_token_indices
+        self.draft_prefill_last_token_indices = None
+        try:
+            self.forward(layer, query, key, value, kv_cache, attn_metadata, ref)
+        finally:
+            self.draft_prefill_last_token_indices = last_token_indices
+        prefill = attn_metadata.prefill
+        assert isinstance(prefill, TRTLLMPrefill)
+        start = attn_metadata.num_decode_tokens
+        ref_rows = ref[start : start + attn_metadata.num_prefill_tokens][rows]
+        diff = (ref_rows.float() - out[rows].float()).abs()
+        row_max = diff.amax(dim=(1, 2))
+        logger.info(
+            "draft prefill pruning check: num_prefills=%d num_decodes=%d "
+            "max_q=%d max_seq=%d gen_sm_count=%s bitwise_rows=%d/%d "
+            "max_abs=%.3e ref_max=%.3e",
+            attn_metadata.num_prefills,
+            attn_metadata.num_decodes,
+            prefill.max_q_len,
+            prefill.max_seq_len,
+            prefill.gen_sm_count,
+            int((row_max == 0).sum()),
+            row_max.numel(),
+            float(diff.max()),
+            float(ref_rows.float().abs().max()),
+        )
+
+    def _kf_prefill(
+        self,
+        layer: torch.nn.Module,
+        attn_metadata: "FlashInferMetadata",
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: torch.Tensor,
+    ) -> bool:
+        """Run this layer's prefill rows on the Kernel Factory kernel with the step's
+        plan. Returns False (nothing launched) if this layer is outside the kernel's
+        contract; the caller then takes the trtllm-gen path.
+        """
+        prefill = attn_metadata.prefill
+        assert isinstance(prefill, TRTLLMPrefill) and prefill.kf is not None
+        if (
+            out.dtype != torch.bfloat16
+            or query.dtype != FP8_DTYPE
+            or self.window_left != -1
+            or self.sinks is not None
+            or self.logits_soft_cap
+            or not out.is_contiguous()
+            or not kf_supported_kv(kv_cache)
+        ):
+            logger.warning_once(
+                "KF prefill attention: layer outside the kernel contract "
+                "(out %s, q %s, window %s, sinks %s, kv %s %s); using FlashInfer.",
+                out.dtype,
+                query.dtype,
+                self.window_left,
+                self.sinks is not None,
+                tuple(kv_cache.shape),
+                kv_cache.stride(),
+            )
+            return False
+        runtime = get_runtime(query.device)
+        assert runtime is not None
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        return runtime.launch(
+            prefill.kf,
+            query,
+            kv_cache,
+            out.view(out.shape[0], self.num_heads, self.head_size),
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+
+    def _check_kf_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: "FlashInferMetadata",
+        out: torch.Tensor,
+    ) -> None:
+        """VLLM_KF_PREFILL_ATTN_CHECK: re-run this forward on the FlashInfer path and
+        compare both with an fp32 reference on the same FP8 inputs (debug only; syncs).
+        """
+        self._kf_checks_left -= 1
+        ref = torch.empty(
+            (query.shape[0], self.num_heads, self.head_size),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        self._kf_off = True
+        try:
+            self.forward(layer, query, key, value, kv_cache, attn_metadata, ref)
+        finally:
+            self._kf_off = False
+        prefill = attn_metadata.prefill
+        assert isinstance(prefill, TRTLLMPrefill)
+        start = attn_metadata.num_decode_tokens
+        n = attn_metadata.num_prefill_tokens
+        kf_out = out[:n].view(n, self.num_heads, self.head_size).float()
+        fi_out = ref[start : start + n].float()
+        q = self.maybe_quant_query(
+            query[start : start + n],
+            attn_metadata.q_data_type_prefill,
+            layer._q_scale,
+        )
+        kv = kv_cache.permute(*attn_metadata.kv_cache_layout.layer_view_order)
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        exact = _fp32_paged_prefill_reference(
+            q,
+            kv,
+            prefill.block_tables,
+            prefill.cum_seq_lens_q.tolist(),
+            prefill.seq_lens.tolist(),
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+
+        def stats(x: torch.Tensor, y: torch.Tensor) -> tuple[float, float, float]:
+            d = (x - y).abs()
+            i = int(d.argmax())
+            return (
+                float(d.norm() / y.norm().clamp_min(1e-30)),
+                float(d.max()),
+                float(x.flatten()[i].abs()),
+            )
+
+        # Per row (a short row's error is diluted in a long row's launch-wide
+        # relL2): WRONG = KF relL2 > 3x FlashInfer's and > 0.02 vs the fp32
+        # reference. kv_mismatch: rows planned with a length other than the
+        # device seq_lens the reference and FlashInfer use.
+        assert prefill.kf is not None
+        cu = prefill.cum_seq_lens_q.tolist()
+        wrong, worst = 0, (-1.0, 0, 0, 0.0, 0.0)
+        for b, (ql, kv) in enumerate(zip(prefill.kf.query_lens, prefill.kf.seq_lens)):
+            rows = slice(cu[b], cu[b + 1])
+            ref_norm = exact[rows].norm().clamp_min(1e-30)
+            rel_kf = float((kf_out[rows] - exact[rows]).norm() / ref_norm)
+            rel_fi = float((fi_out[rows] - exact[rows]).norm() / ref_norm)
+            wrong += rel_kf > 3 * rel_fi and rel_kf > 0.02
+            if rel_kf / max(rel_fi, 1e-30) > worst[0]:
+                worst = (rel_kf / max(rel_fi, 1e-30), ql, kv, rel_kf, rel_fi)
+        dev_kv = prefill.seq_lens.tolist()
+        logger.info(
+            "KF prefill check: B=%d T=%d max_seq=%d variant=%d | kf~fi relL2 %.3e "
+            "max %.3e | kf~fp32 relL2 %.3e max %.3e at |out| %.3e | fi~fp32 relL2 "
+            "%.3e max %.3e at |out| %.3e | finite %s | rows %d wrong %d worst q=%d "
+            "kv=%d kf %.3e fi %.3e | kv_mismatch %d",
+            attn_metadata.num_prefills,
+            n,
+            prefill.max_seq_len,
+            prefill.kf.variant,
+            *stats(kf_out, fi_out)[:2],
+            *stats(kf_out, exact),
+            *stats(fi_out, exact),
+            bool(torch.isfinite(kf_out).all()),
+            len(prefill.kf.seq_lens),
+            wrong,
+            *worst[1:],
+            sum(a != b for a, b in zip(prefill.kf.seq_lens, dev_kv)),
+        )
+
+    def _kf_decode(
+        self,
+        decode: FlashInferTrtllmAPIDecode,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: Any,
+    ) -> bool:
+        """Run this layer's decode rows on the Kernel Factory kernel (the builder
+        routed the batch: decode.kf_block_tables). Returns False (nothing launched)
+        if this layer is outside the kernel's contract; the caller then takes the
+        trtllm-gen path.
+        """
+        runtime = get_kf_decode_runtime(query.device)
+        assert runtime is not None and decode.kf_block_tables is not None
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.dtype != torch.bfloat16
+            or not out.is_contiguous()
+            or query.dtype != FP8_DTYPE
+            or query.shape[0] != decode.seq_lens.shape[0] * decode.kf_q
+            or self.window_left != -1
+            or self.sinks is not None
+            or self.logits_soft_cap
+            or self.o_sf_scale is not None
+            or self.need_to_return_lse_for_decode
+            or not kf_supported_kv(kv_cache)
+        ):
+            runtime.stats["skip_contract"] += 1
+            logger.warning_once(
+                "KF decode attention: layer outside the kernel contract "
+                "(out %s, q %s %s, window %s, sinks %s, lse %s, kv %s %s); "
+                "using trtllm-gen.",
+                getattr(out, "dtype", None),
+                query.dtype,
+                tuple(query.shape),
+                self.window_left,
+                self.sinks is not None,
+                self.need_to_return_lse_for_decode,
+                tuple(kv_cache.shape),
+                kv_cache.stride(),
+            )
+            return False
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        return runtime.launch(
+            query,
+            kv_cache,
+            decode.kf_block_tables,
+            decode.seq_lens,
+            out,
+            decode.kf_q,
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+
+    def _check_kf_decode(
+        self,
+        decode: FlashInferTrtllmAPIDecode,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: torch.Tensor,
+        trtllm_decode: Any,
+    ) -> None:
+        """VLLM_KF_DECODE_ATTN_CHECK: re-run this layer's decode rows on trtllm-gen
+        and compare both with an fp32 reference on the same FP8 inputs over the
+        real (seq_len > 0) rows (debug only; syncs). ``tail`` is the final-gate
+        rule: KF relL2 <= trtllm-gen's and KF max|d| <= trtllm-gen's + 4 bf16 ulp
+        at max(|KF out at its worst element|, trtllm-gen max|d|).
+        """
+        self._kf_dec_checks_left -= 1
+        seq = decode.seq_lens.tolist()
+        rows = [b for b, s in enumerate(seq) if s > 0]
+        if not rows:
+            return
+        ref = torch.empty_like(out)
+        trtllm_decode(ref)
+        q = decode.kf_q
+        assert decode.kf_block_tables is not None
+        idx = torch.cat([torch.arange(b * q, (b + 1) * q) for b in rows]).to(
+            query.device
+        )
+        kv = kv_cache  # the HND [P, Hkv, page, 2D] view the kernel read
+        assert self.bmm1_scale is not None and self.bmm2_scale is not None
+        exact = _fp32_paged_prefill_reference(
+            query.index_select(0, idx),
+            kv,
+            decode.kf_block_tables[rows],
+            [i * q for i in range(len(rows) + 1)],
+            [seq[b] for b in rows],
+            self.bmm1_scale,
+            self.bmm2_scale,
+        )
+        n = query.shape[0]
+        kf_out = out.view(n, self.num_heads, self.head_size).index_select(0, idx)
+        fi_out = ref.view(n, self.num_heads, self.head_size).index_select(0, idx)
+        kf_out, fi_out = kf_out.float(), fi_out.float()
+
+        def stats(x: torch.Tensor, y: torch.Tensor) -> tuple[float, float, float]:
+            d = (x - y).abs()
+            i = int(d.argmax())
+            return (
+                float(d.norm() / y.norm().clamp_min(1e-30)),
+                float(d.max()),
+                float(x.flatten()[i].abs()),
+            )
+
+        kf_rel, kf_max, kf_at = stats(kf_out, exact)
+        fi_rel, fi_max, fi_at = stats(fi_out, exact)
+        basis = max(kf_at, fi_max)
+        ulp = 2.0 ** (math.floor(math.log2(basis)) - 7) if basis > 0 else 0.0
+        finite = bool(torch.isfinite(kf_out).all())
+        tail = finite and kf_rel <= fi_rel and kf_max <= fi_max + 4 * ulp
+        logger.info(
+            "KF decode check: Q=%d BL=%d real=%d max_seq=%d | kf~fi relL2 %.3e "
+            "max %.3e | kf~fp32 relL2 %.3e max %.3e at |out| %.3e | fi~fp32 relL2 "
+            "%.3e max %.3e at |out| %.3e | finite %s | tail %s",
+            q,
+            len(seq),
+            len(rows),
+            max(seq),
+            *stats(kf_out, fi_out)[:2],
+            kf_rel,
+            kf_max,
+            kf_at,
+            fi_rel,
+            fi_max,
+            fi_at,
+            finite,
+            "PASS" if tail else "FAIL",
+        )
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         if quant_key == kNvfp4Dynamic and self.is_kvcache_nvfp4:
@@ -2308,99 +3267,6 @@ class FlashInferImpl(AttentionImpl):
             return query_quantized.view(num_tokens, num_heads, head_size)
 
         return query
-
-    def draft_prefill_rows_unsupported(self) -> str | None:
-        """Why this layer can never attend only the sampled draft prefill rows
-        (see ``_draft_prefill_attention``), or None."""
-        if not self.supports_xqa_or_trtllm_gen_decode:
-            return "no XQA or trtllm-gen decode for this layer"
-        if self.dcp_world_size > 1:
-            return "decode context parallelism"
-        if self.is_kvcache_nvfp4:
-            return "NVFP4 KV cache"
-        if self.logits_soft_cap:
-            return "logits soft-capping"
-        return None
-
-    def _draft_prefill_attention(
-        self,
-        layer: torch.nn.Module,
-        query: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
-        metadata: FlashInferMetadata,
-        output: torch.Tensor,
-        output_scale: torch.Tensor | None,
-    ) -> bool:
-        """Attention of a draft prefill's sampled rows only.
-
-        The draft prefill samples one row per request (``draft_prefill_rows``).
-        With a single draft attention layer, whose KV comes from its input rather
-        than from attention outputs, the other rows' attention outputs are never
-        used. The sampled rows run as one q_len 1 XQA / trtllm-gen decode launch
-        over each row's causal KV, and every other output row is zeroed. Returns
-        False, leaving ``output`` untouched, when that decode interface does not
-        apply.
-        """
-        draft_rows = self.draft_prefill_rows
-        assert draft_rows is not None
-        kernel: FlashInferDecodeKernel | None = None
-        if isinstance(metadata.decode, FlashInferTrtllmAPIDecode):
-            kernel = metadata.decode.kernel
-        elif isinstance(metadata.prefill, TRTLLMPrefill):
-            kernel = FlashInferDecodeKernel.TRTLLM_GEN
-        kv_layout = get_flashinfer_layout_string(metadata.kv_cache_layout)
-        unsupported: str | None
-        if kernel is None:
-            unsupported = "a step with neither XQA/trtllm-gen decode nor TRTLLM prefill"
-        elif kernel == FlashInferDecodeKernel.TRTLLM_GEN and (
-            kv_layout != "HND" or not current_platform.is_device_capability_family(100)
-        ):
-            unsupported = "trtllm-gen decode needs the HND layout on SM100"
-        elif output_scale is not None or self.o_sf_scale is not None:
-            unsupported = "fused output quantization"
-        elif output.dtype not in (torch.float16, torch.bfloat16):
-            unsupported = f"{output.dtype} output"
-        elif not metadata.causal or metadata.block_table is None:
-            unsupported = "non-causal or block-table-less metadata"
-        else:
-            unsupported = self.draft_prefill_rows_unsupported()
-        if unsupported is not None:
-            logger.warning_once(
-                "prune_draft_prefill_attention: computing full draft prefill "
-                "attention (%s)",
-                unsupported,
-            )
-            return False
-        assert metadata.block_table is not None
-        rows = draft_rows.rows
-        q = self.maybe_quant_query(
-            query.index_select(0, rows), metadata.q_data_type_decode, layer._q_scale
-        )
-        q = canonicalize_singleton_dim_strides(q.contiguous())
-        out_rows = torch.empty(q.shape, dtype=output.dtype, device=output.device)
-        decode_kwargs: dict[str, Any] = dict(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=_get_trtllm_workspace_buffer(),
-            block_tables=metadata.block_table[: rows.shape[0]],
-            seq_lens=draft_rows.seq_lens,
-            max_seq_len=draft_rows.max_seq_len,
-            bmm1_scale=self.get_xqa_bmm1_scale(layer, q.dtype),
-            bmm2_scale=self.bmm2_scale,
-            window_left=self.window_left,
-            sinks=self.sinks,
-            out=out_rows,
-            kv_layout=kv_layout,
-            q_len_per_req=1,
-        )
-        if kernel == FlashInferDecodeKernel.XQA:
-            flashinfer_xqa_batch_decode_with_kv_cache(**decode_kwargs)
-        else:
-            trtllm_batch_decode_with_kv_cache(**decode_kwargs, backend="trtllm-gen")
-        output = output.view(-1, self.num_heads, self.head_size)
-        output.zero_()
-        output.index_copy_(0, rows, out_rows)
-        return True
 
     def forward(
         self,
@@ -2567,16 +3433,46 @@ class FlashInferImpl(AttentionImpl):
         else:
             kv_cache_tuple = kv_cache_permute.split(hs, dim=-1)
 
-        if self.draft_prefill_rows is not None and self._draft_prefill_attention(
-            layer, query, kv_cache_tuple, attn_metadata, output, output_scale
-        ):
-            return output_padded
-
         use_dcp = self.dcp_world_size > 1
         if decode_with_xqa:
             assert not use_dcp
             assert self.o_sf_scale is None
             assert output.dtype != FP4_DTYPE
+
+        if (
+            self.draft_prefill_pruning is not None
+            and output_scale is None
+            and self._draft_prefill_attention(
+                layer, query, kv_cache_tuple, attn_metadata, output
+            )
+        ):
+            if self._draft_prefill_prune_checks_left > 0:
+                pruning = self.draft_prefill_pruning
+                assert pruning is not None
+                last_indices = self.draft_prefill_last_token_indices
+                self.draft_prefill_pruning = None
+                self.draft_prefill_last_token_indices = None
+                self._draft_prefill_prune_checks_left -= 1
+                ref = torch.empty_like(output_padded)
+                try:
+                    self.forward(
+                        layer, query_padded, key, value, kv_cache, attn_metadata, ref
+                    )
+                finally:
+                    self.draft_prefill_pruning = pruning
+                    self.draft_prefill_last_token_indices = last_indices
+                ref_rows = ref.view(-1, self.num_heads, self.head_size)[pruning.rows]
+                out_rows = output.view(-1, self.num_heads, self.head_size)[pruning.rows]
+                logger.info(
+                    "draft prefill pruning check: requests=%d decodes=%d "
+                    "prefills=%d max_abs=%.3e ref_max=%.3e",
+                    pruning.rows.numel(),
+                    attn_metadata.num_decodes,
+                    attn_metadata.num_prefills,
+                    float((ref_rows.float() - out_rows.float()).abs().max()),
+                    float(ref_rows.float().abs().max()),
+                )
+            return output_padded
 
         # Regular attention (common case).
         # Decodes are at the front and prefills are at the back.
@@ -2652,6 +3548,14 @@ class FlashInferImpl(AttentionImpl):
                     else:
                         out_prefill = output[num_decode_tokens:]
 
+                    # FlashInfer multiplies an explicitly supplied Q scale
+                    # even for 16-bit Q; only FP8 queries need dequantization.
+                    prefill_q_scale = (
+                        layer._q_scale_float
+                        if prefill_query.dtype
+                        in (torch.float8_e4m3fn, torch.float8_e5m2)
+                        else 1.0
+                    )
                     if isinstance(
                         prefill_wrapper, BatchAttentionWithAttentionSinkWrapper
                     ):
@@ -2660,7 +3564,7 @@ class FlashInferImpl(AttentionImpl):
                             prefill_query,
                             kv_cache_for_fi,
                             self.sinks,
-                            self.scale * layer._q_scale_float * layer._k_scale_float,
+                            self.get_xqa_bmm1_scale(layer, prefill_query.dtype),
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
                         )
@@ -2668,8 +3572,9 @@ class FlashInferImpl(AttentionImpl):
                         prefill_wrapper.run(
                             prefill_query,
                             kv_cache_for_fi,
-                            # The fa2 NVFP4 query stays in the model dtype.
-                            q_scale=1.0 if self.nvfp4_fa2 else layer._q_scale_float,
+                            # 1.0 unless FP8 (also covers the fa2 NVFP4 query,
+                            # which stays in the model dtype).
+                            q_scale=prefill_q_scale,
                             k_scale=layer._k_scale_float,
                             v_scale=layer._v_scale_float,
                             out=out_prefill,
@@ -2718,6 +3623,8 @@ class FlashInferImpl(AttentionImpl):
                     out = self._nvfp4_fp8_out[:num_prefill_tokens]
 
                 prefill_kv_block_scales = None
+                prefill_bmm1_scale = self.get_xqa_bmm1_scale(layer, prefill_query.dtype)
+                prefill_bmm2_scale = self.bmm2_scale
                 if self.is_kvcache_nvfp4:
                     # NVFP4 trtllm-gen kernel requires FP8 query.
                     assert attn_metadata.q_data_type_prefill == FP8_DTYPE, (
@@ -2753,55 +3660,121 @@ class FlashInferImpl(AttentionImpl):
                     B_kv, H_kv, N_kv = kv_cache_permute.shape[:3]
                     kv_cache_5d = kv_cache_permute.view(B_kv, H_kv, N_kv, 2, hs)
                     kv_cache_5d = kv_cache_5d.permute(0, 3, 1, 2, 4)
+                    dequant_block_tables = _bounded_dequant_block_tables(
+                        block_tables_prefill,
+                        seq_lens_prefill,
+                        attn_metadata.prefill.max_seq_len,
+                        N_kv,
+                    )
                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
                         kv_cache_5d,
-                        block_tables_prefill,
+                        dequant_block_tables,
                         layer._k_scale,
                         layer._v_scale,
                         attn_metadata.q_data_type_prefill,
                     )
+                    # K/V scales are already applied by the dequantization.
+                    prefill_bmm1_scale, prefill_bmm2_scale = self.scale, 1.0
                 else:
                     mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
 
                 gen_sm_count = attn_metadata.prefill.gen_sm_count
                 if (
+                    self.draft_prefill_last_token_indices is not None
+                    and isinstance(out, torch.Tensor)
+                    and out.dtype in (torch.bfloat16, torch.float16)
+                    and not self.is_kvcache_nvfp4
+                    and not use_dcp
+                    and self.supports_xqa_or_trtllm_gen_decode
+                    and current_platform.is_device_capability_family(100)
+                ):
+                    # MTP draft layer: only each prefill request's sampled row
+                    # needs attention (see _draft_prefill_last_rows).
+                    rows = self._draft_prefill_last_rows(
+                        prefill_query,
+                        mock_kv_cache,
+                        workspace_buffer,
+                        attn_metadata.prefill,
+                        self.draft_prefill_last_token_indices,
+                        attn_metadata.num_decodes,
+                        attn_metadata.num_decode_tokens,
+                        attn_metadata.num_prefills,
+                        out,
+                        block_tables=mock_block_table,
+                        bmm1_scale=prefill_bmm1_scale,
+                        bmm2_scale=prefill_bmm2_scale,
+                    )
+                    if self._draft_prefill_prune_checks_left > 0:
+                        self._check_draft_prefill_last_rows(
+                            layer,
+                            query,
+                            key,
+                            value,
+                            kv_cache,
+                            attn_metadata,
+                            out,
+                            rows,
+                        )
+                elif (
+                    attn_metadata.prefill.kf is not None
+                    and not self._kf_off
+                    and mock_kv_cache is kv_cache_tuple
+                    and isinstance(out, torch.Tensor)
+                    and self._kf_prefill(
+                        layer,
+                        attn_metadata,
+                        prefill_query,
+                        kv_cache_permute,
+                        out,
+                    )
+                ):
+                    # Kernel Factory prefill kernel ran (see _kf_prefill).
+                    if self._kf_checks_left > 0:
+                        self._check_kf_prefill(
+                            layer, query, key, value, kv_cache, attn_metadata, out
+                        )
+                elif (
                     gen_sm_count is not None
                     and isinstance(out, torch.Tensor)
                     and out.dtype == torch.bfloat16
                 ):
-                    # Generation kernel with a causal varlen query; gen_sm_count
-                    # sets its KV split.
-                    _trtllm_batch_decode_with_sm_count(
-                        gen_sm_count,
-                        query=prefill_query,
-                        kv_cache=mock_kv_cache,
-                        workspace_buffer=workspace_buffer,
-                        block_tables=mock_block_table,
-                        seq_lens=seq_lens_prefill,
-                        max_seq_len=attn_metadata.prefill.max_seq_len,
-                        bmm1_scale=self.bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
-                        window_left=self.window_left,
-                        sinks=self.sinks,
-                        out=out,
-                        kv_layout="HND",
-                        backend="trtllm-gen",
-                        q_len_per_req=None,
-                        max_q_len=attn_metadata.prefill.max_q_len,
-                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
-                        multi_ctas_kv_counter_buffer=(
-                            _get_trtllm_gen_prefill_counter_buffer(
-                                get_trtllm_gen_multi_ctas_kv_counter_bytes(
-                                    attn_metadata.num_prefills,
-                                    self.num_heads,
-                                    gen_sm_count,
+                    # Generation (spec-decode) kernel with a causal varlen query;
+                    # gen_sm_count selects its KV split (trtllm_gen_prefill_sm_count).
+                    with _flashinfer_decode_sm_count(gen_sm_count):
+                        trtllm_batch_decode_with_kv_cache(
+                            query=prefill_query,
+                            kv_cache=mock_kv_cache,
+                            workspace_buffer=workspace_buffer,
+                            block_tables=mock_block_table,
+                            seq_lens=seq_lens_prefill,
+                            max_seq_len=attn_metadata.prefill.max_seq_len,
+                            bmm1_scale=prefill_bmm1_scale,
+                            bmm2_scale=prefill_bmm2_scale,
+                            window_left=self.window_left,
+                            sinks=self.sinks,
+                            out=out,
+                            kv_layout="HND",  # asserted above
+                            backend="trtllm-gen",
+                            q_len_per_req=None,
+                            max_q_len=attn_metadata.prefill.max_q_len,
+                            cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                            multi_ctas_kv_counter_buffer=(
+                                _get_trtllm_gen_prefill_counter_buffer(
+                                    max(
+                                        gen_sm_count,
+                                        attn_metadata.num_prefills * self.num_heads,
+                                    )
                                 )
-                            )
-                        ),
-                    )
+                            ),
+                        )
                 else:
-                    trtllm_batch_context_with_kv_cache(
+                    trtllm_prefill = (
+                        routed_trtllm_batch_context_with_kv_cache
+                        if self._prefill_gen_routing
+                        else trtllm_batch_context_with_kv_cache
+                    )
+                    trtllm_prefill(
                         query=prefill_query,
                         kv_cache=mock_kv_cache,
                         workspace_buffer=workspace_buffer,
@@ -2809,8 +3782,8 @@ class FlashInferImpl(AttentionImpl):
                         seq_lens=seq_lens_prefill,
                         max_q_len=attn_metadata.prefill.max_q_len,
                         max_kv_len=attn_metadata.prefill.max_seq_len,
-                        bmm1_scale=self.bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
+                        bmm1_scale=prefill_bmm1_scale,
+                        bmm2_scale=prefill_bmm2_scale,
                         batch_size=attn_metadata.num_prefills,
                         cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
                         cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
@@ -2819,6 +3792,9 @@ class FlashInferImpl(AttentionImpl):
                         o_sf_scale=self.o_sf_scale,
                         out=out,
                         kv_cache_sf=prefill_kv_block_scales,
+                        multi_ctas_kv_counter_buffer=self._ctx_kv_counter_buffer(
+                            prefill_query, attn_metadata.num_prefills
+                        ),
                     )
 
                 if needs_fp8_out:
@@ -2856,6 +3832,12 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_for_fi = kv_cache_tuple
                 kv_cache_sf = nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
 
+                decode_q_scale = (
+                    layer._q_scale_float
+                    if decode_query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    else 1.0
+                )
+
                 # NVFP4 kernel only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.nvfp4_trtllm and output.dtype != FP8_DTYPE
@@ -2877,7 +3859,7 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -2895,7 +3877,9 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=1.0 if self.nvfp4_fa2 else layer._q_scale_float,
+                        # FlashInfer multiplies an explicitly supplied Q scale
+                        # even for 16-bit Q (incl. the fa2 NVFP4 query).
+                        q_scale=decode_q_scale,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,
@@ -3021,32 +4005,78 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
-                    query=decode_query,
-                    kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
-                    ),
-                    workspace_buffer=workspace_buffer,
-                    block_tables=block_tables_decode,
-                    seq_lens=seq_lens_decode,
-                    max_seq_len=attn_metadata.decode.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    kv_layout=get_flashinfer_layout_string(kv_cache_layout),
-                    backend=attn_metadata.decode.kernel.value,
-                    q_len_per_req=q_len_per_req,
-                    max_q_len=max_q_len,
-                    cum_seq_lens_q=q_cu_seq_lens,
-                    kv_cache_sf=(
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                    ),
-                    lse=lse,
-                    return_lse=self.need_to_return_lse_for_decode,
+                if q_cu_seq_lens is not None:
+                    decode_batch = q_cu_seq_lens.size(0) - 1
+                    decode_max_q_len = attn_metadata.decode.q_len_per_req
+                else:
+                    assert q_len_per_req is not None
+                    decode_batch = decode_query.size(0) // q_len_per_req
+                    decode_max_q_len = q_len_per_req
+                sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
+                    decode_batch,
+                    decode_max_q_len,
+                    attn_metadata.decode.max_seq_len,
+                    decode_query,
+                    workspace_buffer,
                 )
+                trt_decode = attn_metadata.decode
+
+                def trtllm_decode(o: Any) -> None:
+                    with _flashinfer_decode_sm_count(sm_count):
+                        trtllm_batch_decode_with_kv_cache(
+                            query=decode_query,
+                            kv_cache=(
+                                nvfp4_kv_data
+                                if self.is_kvcache_nvfp4
+                                else kv_cache_tuple
+                            ),
+                            workspace_buffer=workspace_buffer,
+                            block_tables=block_tables_decode,
+                            seq_lens=seq_lens_decode,
+                            max_seq_len=trt_decode.max_seq_len,
+                            bmm1_scale=self.get_xqa_bmm1_scale(
+                                layer, decode_query.dtype
+                            ),
+                            bmm2_scale=self.bmm2_scale,
+                            window_left=self.window_left,
+                            sinks=self.sinks,
+                            o_sf_scale=self.o_sf_scale,
+                            out=o,
+                            kv_layout=get_flashinfer_layout_string(kv_cache_layout),
+                            backend=trt_decode.kernel.value,
+                            q_len_per_req=q_len_per_req,
+                            max_q_len=max_q_len,
+                            cum_seq_lens_q=q_cu_seq_lens,
+                            kv_cache_sf=(
+                                nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                            ),
+                            lse=lse,
+                            return_lse=self.need_to_return_lse_for_decode,
+                            multi_ctas_kv_counter_buffer=counter_buffer,
+                        )
+
+                if (
+                    attn_metadata.decode.kf_block_tables is not None
+                    and not use_dcp
+                    and not needs_fp8_out
+                    and self._kf_decode(
+                        attn_metadata.decode, decode_query, kv_cache_permute, out
+                    )
+                ):
+                    # Kernel Factory decode kernel ran (see _kf_decode).
+                    if (
+                        self._kf_dec_checks_left > 0
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        self._check_kf_decode(
+                            attn_metadata.decode,
+                            decode_query,
+                            kv_cache_permute,
+                            out,
+                            trtllm_decode,
+                        )
+                else:
+                    trtllm_decode(out)
 
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)
@@ -3061,6 +4091,20 @@ class FlashInferImpl(AttentionImpl):
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
         return output_padded
+
+    def kv_cache_write_views(
+        self, kv_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``[blocks, block_size, heads, dim]`` k and v views of this layer's
+        cache that ``do_kv_cache_update`` writes.
+        """
+        if self.is_kvcache_nvfp4:
+            # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
+            #                            (B, N, H, full_dim));
+            # K heads first, then V heads.
+            return kv_cache.transpose(1, 2).split(self.num_kv_heads, dim=-2)
+        # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
+        return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
 
     def do_kv_cache_update(
         self,
@@ -3091,18 +4135,7 @@ class FlashInferImpl(AttentionImpl):
                     kv_layout=kv_layout,
                 )
                 return
-            if self.is_kvcache_nvfp4:
-                # (B, 2*H, N, full_dim) -> ((B, N, H, full_dim),
-                #                            (B, N, H, full_dim));
-                # K heads first, then V heads.
-                k_cache, v_cache = kv_cache.transpose(1, 2).split(
-                    self.num_kv_heads, dim=-2
-                )
-            else:
-                # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
-                k_cache, v_cache = kv_cache.transpose(1, 2).split(
-                    self.head_size, dim=-1
-                )
+            k_cache, v_cache = self.kv_cache_write_views(kv_cache)
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,

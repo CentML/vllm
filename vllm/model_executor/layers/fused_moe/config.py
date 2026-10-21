@@ -1319,6 +1319,10 @@ class FusedMoEConfig:
     # experts that would split a larger call across kernel launches. Negative
     # means unbounded.
     defer_moe_finalize_max_num_tokens: int = -1
+    # Like defer_moe_finalize(), for a consumer that reduces on this rank with
+    # no collective (single-rank MoE). Set by MoERunner when it hands the
+    # deferred output to vllm::moe_finalize. Default False.
+    defer_moe_finalize_local: bool = False
 
     # SwiGLU clamp limit. When set, backends that do not implement the clamp
     # are filtered out by `FusedMoEExperts.is_supported_config` so the oracle
@@ -1474,17 +1478,20 @@ class FusedMoEConfig:
         Evaluated on read rather than in ``__post_init__`` because deferral is
         requested after construction, like ``skip_final_all_reduce``.
         """
-        # The consumer fuses a TP all-reduce. Other parallel modes require a
-        # combine or reduce-scatter after the experts and cannot defer it, and
-        # the consumer has no way to strip hidden-dim padding from GEMM2 rows.
-        return (
-            self._defer_moe_finalize
-            and self.tp_size > 1
-            and self.dp_size == 1
+        # The consumer fuses a TP all-reduce, or (local) runs on a single-rank
+        # MoE. Other parallel modes require a combine or reduce-scatter after
+        # the experts and cannot defer it, and the consumer has no way to strip
+        # hidden-dim padding from GEMM2 rows.
+        no_combine = (
+            self.dp_size == 1
             and self.ep_size == 1
             and self.pcp_size == 1
             and not self.is_sequence_parallel
             and self.hidden_dim == self.hidden_dim_unpadded
+        )
+        return no_combine and (
+            (self._defer_moe_finalize and self.tp_size > 1)
+            or (self.defer_moe_finalize_local and self.tp_size == 1)
         )
 
     def defer_moe_finalize(self, max_num_tokens: int = -1) -> None:

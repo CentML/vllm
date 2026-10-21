@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import array
 import enum
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -24,6 +26,12 @@ from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
+
+# VLLM_PROMPT_TOKEN_ARRAY: build the int32 array of a new request's prompt
+# when the Request is created (EngineCore input thread, off the step's
+# critical path) so the V2 model runner stages it with a memcpy instead of
+# converting the Python list in the step that admits the request.
+PROMPT_TOKEN_ARRAY = os.environ.get("VLLM_PROMPT_TOKEN_ARRAY", "0") == "1"
 
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
@@ -80,6 +88,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         kv_hints: KvHintsEnvelope | None = None,
+        block_hashes: list["BlockHash"] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -157,6 +166,16 @@ class Request:
                 t if is_tok else 0
                 for t, is_tok in zip(self.prompt_token_ids, self.prompt_is_token_ids)
             ]
+        # VLLM_PROMPT_TOKEN_ARRAY: int32 copy of _all_token_ids as created
+        # (prompt only). Valid while _all_token_ids still has exactly these
+        # tokens (see prompt_token_array_if_unchanged); dropped once used.
+        self.prompt_token_array: array.array | None = (
+            array.array("i", self._all_token_ids)
+            if PROMPT_TOKEN_ARRAY
+            and self.prompt_is_token_ids is None
+            and self.prompt_token_ids is not None
+            else None
+        )
 
         # Used in async scheduling.
         self.num_output_placeholders = 0
@@ -222,7 +241,11 @@ class Request:
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
-        self.block_hashes: list[BlockHash] = []
+        # Prompt block hashes may be supplied precomputed (e.g. by the
+        # front-end process); the hasher then only extends them.
+        self.block_hashes: list[BlockHash] = (
+            [] if block_hashes is None else block_hashes
+        )
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -245,6 +268,7 @@ class Request:
         cls,
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
+        block_hashes: list["BlockHash"] | None = None,
     ) -> "Request":
         return cls(
             request_id=request.request_id,
@@ -267,6 +291,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            block_hashes=block_hashes,
         )
 
     def append_output_token_ids(
@@ -290,6 +315,23 @@ class Request:
     @property
     def use_structured_output(self) -> bool:
         return self.structured_output_request is not None
+
+    def take_prompt_token_array(self) -> array.array | None:
+        """VLLM_PROMPT_TOKEN_ARRAY: the int32 prompt array if _all_token_ids
+        still holds exactly the prompt it was built from (no output token and
+        the same length: _all_token_ids is otherwise only appended to, or
+        truncated by streaming updates, which drop the array), else None.
+        The array is released either way: it serves the first admission only.
+        """
+        arr = self.prompt_token_array
+        self.prompt_token_array = None
+        if (
+            arr is None
+            or self._output_token_ids
+            or len(arr) != len(self._all_token_ids)
+        ):
+            return None
+        return arr
 
     @property
     def num_tokens(self) -> int:

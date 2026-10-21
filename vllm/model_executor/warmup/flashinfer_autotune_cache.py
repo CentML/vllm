@@ -55,13 +55,26 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
     output_dir = root / flashinfer_autotune_cache_hash(runner)
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / "autotune_configs.json"
+    cache_file = output_dir / "autotune_configs.json"
+    # VLLM_FLASHINFER_AUTOTUNE_FILE is read by the kernel warmup
+    # (flashinfer_autotune_pin.run_pinned_autotune); it is never copied here.
+    return cache_file
 
 
 def use_flashinfer_autotune_v2(runner: "GPUModelRunner") -> bool:
     from vllm.distributed.parallel_state import get_node_count, get_world_group
+    from vllm.model_executor.warmup.pinned_autotune_cache import PINNED_AUTOTUNE_RO
     from vllm.utils.flashinfer import has_flashinfer_autotune_v2
 
+    # The pinned (VLLM_FLASHINFER_AUTOTUNE_FILE), record
+    # (VLLM_FLASHINFER_AUTOTUNE_RECORD) and read-only pinned (EWARM_AUTOTUNE_RO)
+    # modes validate, record or check the v1 AutoTuner tables.
+    if (
+        envs.VLLM_FLASHINFER_AUTOTUNE_FILE
+        or envs.VLLM_FLASHINFER_AUTOTUNE_RECORD
+        or PINNED_AUTOTUNE_RO
+    ):
+        return False
     # Elastic EP transfers tuning state to joining workers with v1
     # save_configs/load_configs, which do not export managed-store winners.
     if runner.vllm_config.parallel_config.enable_elastic_ep:
@@ -96,13 +109,33 @@ def use_flashinfer_autotune_v2(runner: "GPUModelRunner") -> bool:
 def resolve_flashinfer_autotune_v2_root() -> Path | None:
     """Placement root for FlashInfer's managed autotune store.
 
-    Unlike :func:`resolve_flashinfer_autotune_file`, no vLLM-side identity
-    (config hash, flashinfer version, arch) is folded into the path: the
-    managed store keys entries per op and hashes the software/hardware
-    environment itself. ``None`` selects FlashInfer's default root.
+    Unlike :func:`resolve_flashinfer_autotune_file`, no vLLM config hash,
+    flashinfer version or arch is folded into the path: the managed store keys
+    entries per op and hashes the software/hardware environment itself.
+    ``None`` selects FlashInfer's default root.
+
+    That environment hash does not see vLLM's tactic-changing knobs (e.g. the
+    MXFP8 mid-M split-K runner keeps the stock runner class name but adds
+    tactics the stock runner cannot unpack), so when any of them is set in the
+    environment the store moves to a ``vllm-<hash>`` subdirectory of the root.
     """
+    from vllm.model_executor.warmup.flashinfer_autotune_pin import (
+        TACTIC_ENV_PREFIXES,
+    )
+
     override_dir = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
-    return Path(override_dir).expanduser() if override_dir else None
+    root = Path(override_dir).expanduser() if override_dir else None
+    knobs = sorted(
+        (k, v) for k, v in os.environ.items() if k.startswith(TACTIC_ENV_PREFIXES)
+    )
+    if not knobs:
+        return root
+    if root is None:
+        from flashinfer.autotune_cache import get_default_cache_root
+
+        root = get_default_cache_root()
+    digest = hashlib.sha256(repr(knobs).encode()).hexdigest()[:16]
+    return root / f"vllm-{digest}"
 
 
 def sync_flashinfer_autotune_cache(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -11,7 +12,11 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadataBuilder,
+    GDNDecodeMetadataFusion,
+    GDNFusedDecodeStep,
+)
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
@@ -22,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -36,12 +42,23 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+_MAMBA_METADATA_BUILDERS = (
+    Mamba2AttentionMetadataBuilder,
+    GDNAttentionMetadataBuilder,
+    ShortConvAttentionMetadataBuilder,
+    PleShortConvAttentionMetadataBuilder,
+)
+
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    # Set when all Mamba-family builders are fused GDN builders. They then
+    # share the step: its first build writes every builder's decode metadata,
+    # and num_accepted_tokens is gathered only if a build needs it.
+    gdn_decode: GDNFusedDecodeStep | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
@@ -51,23 +68,23 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
     ) -> dict[str, Any]:
-        if not isinstance(
-            attn_metadata_builder,
-            (
-                Mamba2AttentionMetadataBuilder,
-                GDNAttentionMetadataBuilder,
-                ShortConvAttentionMetadataBuilder,
-                PleShortConvAttentionMetadataBuilder,
-            ),
-        ):
+        if not isinstance(attn_metadata_builder, _MAMBA_METADATA_BUILDERS):
             return {}
+        num_decode_draft_tokens_cpu = (
+            None
+            if self.num_decode_draft_tokens_cpu is None
+            else self.num_decode_draft_tokens_cpu[:num_reqs]
+        )
+        if self.gdn_decode is not None and self.gdn_decode.fuses(attn_metadata_builder):
+            return {
+                "num_decode_draft_tokens_cpu": num_decode_draft_tokens_cpu,
+                "fused_decode": self.gdn_decode,
+            }
         return {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
-            "num_decode_draft_tokens_cpu": None
-            if self.num_decode_draft_tokens_cpu is None
-            else self.num_decode_draft_tokens_cpu[:num_reqs],
+            "num_decode_draft_tokens_cpu": num_decode_draft_tokens_cpu,
         }
 
 
@@ -94,6 +111,11 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        # GDN decode-metadata fusion per set of Mamba-family builders, keyed by
+        # the builders' identities (see _get_gdn_decode_fusion).
+        self._gdn_decode_fusions: dict[
+            tuple[int, ...], GDNDecodeMetadataFusion | None
+        ] = {}
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -218,6 +240,8 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs,
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         ctx.run_fused_precopy(
             num_reqs,
@@ -272,11 +296,25 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
-        if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
-                input_batch.idx_mapping
-            ]
+        gdn_decode = None
+        has_spec_tokens = self.vllm_config.num_speculative_tokens > 0
+        if not for_capture:
+            gdn_decode_fusion = self._get_gdn_decode_fusion(attn_groups)
+            if gdn_decode_fusion is not None:
+                gdn_decode = gdn_decode_fusion.begin_step(
+                    block_tables,
+                    input_batch.idx_mapping,
+                    self.num_accepted_tokens_gpu,
+                    input_batch.num_reqs,
+                    partial(self._gather_num_accepted_tokens, input_batch, num_reqs)
+                    if has_spec_tokens
+                    else None,
+                )
+        if not for_capture and has_spec_tokens:
+            if gdn_decode is None:
+                num_accepted_tokens = self._gather_num_accepted_tokens(
+                    input_batch, num_reqs
+                )
 
             # GDN uses >= 0 to select spec-decode rows, so non-decode rows
             # need the -1 sentinel. Decode rows without drafts stay spec rows:
@@ -321,6 +359,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            gdn_decode=gdn_decode,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -347,6 +386,37 @@ class MambaHybridModelState(DefaultModelState):
             )
         return attn_metadata
 
+    def _gather_num_accepted_tokens(
+        self, input_batch: InputBatch, num_reqs: int
+    ) -> torch.Tensor:
+        """[num_reqs] accepted tokens of each batch row; padded rows get 1."""
+        num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+        num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
+            input_batch.idx_mapping
+        ]
+        return num_accepted_tokens
+
+    def _get_gdn_decode_fusion(
+        self, attn_groups: list[list[AttentionGroup]]
+    ) -> GDNDecodeMetadataFusion | None:
+        """Fusion over the Mamba-family builders of attn_groups, or None."""
+        builders = [
+            (kv_cache_group_id, builder)
+            for kv_cache_group_id, groups in enumerate(attn_groups)
+            for group in groups
+            if isinstance(
+                builder := group.get_metadata_builder(0), _MAMBA_METADATA_BUILDERS
+            )
+        ]
+        if not builders:
+            return None
+        key = tuple(id(builder) for _, builder in builders)
+        if key not in self._gdn_decode_fusions:
+            self._gdn_decode_fusions[key] = GDNDecodeMetadataFusion.create(
+                builders, self.device
+            )
+        return self._gdn_decode_fusions[key]
+
     def postprocess_state(
         self,
         idx_mapping: torch.Tensor,
@@ -355,23 +425,16 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
+        # For tensor num_sampled the model runner's post_update has already
+        # written max(num_sampled, 1) into num_accepted_tokens_gpu.
         num_reqs = idx_mapping.shape[0]
-        if num_reqs:
-            if not isinstance(num_sampled, int):
-                # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
-                # kernel skips them rather than scattering with a host-side gather.
-                _scatter_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    num_sampled,
-                    self.num_accepted_tokens_gpu,
-                )
-            else:
-                # Fill with single value.
-                _fill_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    self.num_accepted_tokens_gpu,
-                    max(num_sampled, 1),
-                )
+        if num_reqs and isinstance(num_sampled, int):
+            # Fill with single value.
+            _fill_num_accepted_kernel[(num_reqs,)](
+                idx_mapping,
+                self.num_accepted_tokens_gpu,
+                max(num_sampled, 1),
+            )
 
         if self.recoverssm is not None:
             self.recoverssm.commit_step(
@@ -400,20 +463,6 @@ class MambaHybridModelState(DefaultModelState):
                 num_computed_tokens,
                 idx_mapping,
             )
-
-
-@triton.jit
-def _scatter_num_accepted_kernel(
-    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
-    num_sampled_ptr,  # [num_reqs]
-    num_accepted_ptr,  # [max_num_reqs]
-):
-    row = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + row)
-    if req_state_idx < 0:
-        return
-    num_sampled = tl.load(num_sampled_ptr + row)
-    tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
 
 
 @triton.jit

@@ -5,7 +5,9 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import functools
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,10 +23,19 @@ from vllm.model_executor.warmup.attention_warmup import (
 from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+from vllm.model_executor.warmup.engine_jit_warmup import (
+    EWARM_ENABLED,
+    log_engine_warmup_done,
+    register_engine_warmups,
+)
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     resolve_flashinfer_autotune_v2_root,
     use_flashinfer_autotune_v2,
+)
+from vllm.model_executor.warmup.flashinfer_autotune_pin import (
+    run_pinned_autotune,
+    run_record_autotune,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -35,6 +46,12 @@ from vllm.model_executor.warmup.kimi_k3_triton_warmup import (
     kimi_k3_triton_warmup,
 )
 from vllm.model_executor.warmup.mamba_triton_warmup import mamba_triton_warmup
+from vllm.model_executor.warmup.pinned_autotune_cache import (
+    PINNED_AUTOTUNE_RO,
+    check_no_startup_tuning,
+    log_read_only_enabled,
+    verify_pinned_autotune_file,
+)
 from vllm.model_executor.warmup.qwen4_exp_qsa_warmup import (
     qwen4_exp_qsa_triton_warmup,
 )
@@ -43,6 +60,7 @@ from vllm.model_executor.warmup.qwen_vl_triton_warmup import qwen_vl_triton_warm
 from vllm.model_executor.warmup.replayssm_warmup import (
     replayssm_autotune_warmup,
 )
+from vllm.model_executor.warmup.spec_sampler_warmup import fused_spec_sampler_warmup
 from vllm.model_executor.warmup.watermark_sample_warmup import (
     watermark_sample_warmup,
 )
@@ -161,6 +179,108 @@ def _autotune_kimi_k3_kda_qkvg(model: torch.nn.Module) -> None:
         module.autotune_kda_qkvg(model)
 
 
+def _autotune_mxfp8_draft_head(runner: "GPUModelRunner") -> None:
+    """Profile the MXFP8 MTP draft lm_head (``Mxfp8DraftLmHead``) inside the
+    autotune context; the dummy runs never reach it. Only when
+    ``VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M`` is set, so the default keeps the
+    previous (fallback-tactic) behavior.
+    """
+    if "VLLM_MTP_DRAFT_LM_HEAD_MXFP8_MAX_M" not in os.environ:
+        return
+    from vllm.model_executor.kernels.linear.mxfp8_draft_head import Mxfp8DraftLmHead
+
+    speculator = getattr(runner, "speculator", None)
+    draft = getattr(speculator, "model", None)
+    if draft is None:
+        return
+    for module in draft.modules():
+        head = getattr(module, "draft_lm_head_mxfp8", None)
+        if isinstance(head, Mxfp8DraftLmHead):
+            ms = head.autotune(module.lm_head.weight)
+            logger.info("Autotuned the MXFP8 MTP draft lm_head at M=%s.", ms)
+
+
+def _kf_prefill_attn_warmup(worker: "Worker") -> None:
+    """Build the KF prefill planner and AOT-compile its kernel forms before serving
+    (vllm/v1/attention/ops/kf_prefill_attn). Only if a FlashInfer metadata builder
+    qualified (``kf_prefill``); the precise (fp32 softmax) forms only if a layer's
+    bmm scales need them.
+    """
+    runner = worker.model_runner
+    builders = [
+        b
+        for groups in getattr(runner, "attn_groups", [])
+        for group in groups
+        for b in group.metadata_builders
+        if getattr(b, "kf_prefill", False)
+    ]
+    if not builders:
+        logger.info("KF prefill attention: no qualifying FlashInfer layer; not used.")
+        return
+    from vllm.v1.attention.backends.flashinfer import (
+        FlashInferImpl,
+        _get_trtllm_workspace_buffer,
+    )
+    from vllm.v1.attention.ops.kf_prefill_attn.runtime import warmup_runtime
+
+    precise = False
+    ctx = runner.vllm_config.compilation_config.static_forward_context
+    for layer in ctx.values():
+        impl = getattr(layer, "impl", None)
+        if isinstance(impl, FlashInferImpl) and hasattr(layer, "_q_scale_float"):
+            bmm1 = impl.scale * layer._q_scale_float * layer._k_scale_float
+            precise |= bmm1 > 0.0625 or layer._v_scale_float > 1.0
+    warmup_runtime(runner.device, _get_trtllm_workspace_buffer(), precise)
+
+
+def _kf_decode_attn_warmup(worker: "Worker") -> None:
+    """AOT-compile and load every reachable form of the KF decode kernel before
+    CUDA-graph capture (vllm/v1/attention/ops/kf_decode_attn): Q in {1, 1 + k}
+    (MTP verify and draft step 1, later draft steps), restricted to
+    VLLM_KF_DECODE_ATTN_QLENS if set, x BL 1..VLLM_KF_DECODE_ATTN_MAX_BL. Only if
+    a FlashInfer metadata builder qualified (``kf_decode``).
+    """
+    runner = worker.model_runner
+    if not any(
+        getattr(b, "kf_decode", False)
+        for groups in getattr(runner, "attn_groups", [])
+        for group in groups
+        for b in group.metadata_builders
+    ):
+        logger.info("KF decode attention: no qualifying FlashInfer layer; not used.")
+        return
+    from vllm.v1.attention.ops.kf_decode_attn.runtime import (
+        parse_qlens,
+        warmup_runtime,
+    )
+
+    spec = runner.vllm_config.speculative_config
+    qlens = {1}
+    if spec is not None and spec.num_speculative_tokens:
+        qlens.add(1 + spec.num_speculative_tokens)
+    allowed = parse_qlens(envs.VLLM_KF_DECODE_ATTN_QLENS)
+    if allowed is not None:
+        qlens &= allowed
+    if not qlens:
+        logger.info("KF decode attention: VLLM_KF_DECODE_ATTN_QLENS routes nothing.")
+        return
+    warmup_runtime(runner.device, qlens)
+
+
+def _locality_lm_head_warmup(worker: "Worker") -> None:
+    """VLLM_LOCALITY_LM_HEAD: launch every domain-kernel specialization the
+    localized target / draft heads can reach (the extension itself was built
+    when the weights were localized at load time)."""
+    from vllm.model_executor.layers.locality import lm_head as loc_lm
+
+    if not loc_lm.enabled():
+        return
+    runner = worker.model_runner
+    spec = getattr(runner, "speculator", None) or getattr(runner, "drafter", None)
+    done = loc_lm.warmup(runner.model, getattr(spec, "model", None))
+    logger.info("Locality lm_head kernels warmed up: %s.", done)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -182,7 +302,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             registry = (
                 worker.model_runner.jit_warmup_registry  # type: ignore[attr-defined]
             )
+            # EWARM=1: extra registrations (top-k/top-p, recorded Triton keys,
+            # FlashInfer GDN chunked prefill) compiled by this warmup pass.
+            ewarm_t0 = register_engine_warmups(registry) if EWARM_ENABLED else None
             registry.warmup()
+            if ewarm_t0 is not None:
+                log_engine_warmup_done(ewarm_t0)
         except Exception:
             logger.exception(
                 "JIT kernel warmup failed after %.2fs.",
@@ -197,6 +322,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
     mamba_triton_warmup(worker.model_runner)
+    from vllm.v1.worker.utils import warmup_copy_kv_cache_block_rows
+
+    warmup_copy_kv_cache_block_rows(worker.model_runner.device)
+    if worker.use_v2_model_runner:
+        fused_spec_sampler_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
@@ -223,6 +353,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         # to the shared JIT warmup infrastructure.
         # https://github.com/vllm-project/vllm/pull/47451
         cutedsl_warmup()
+
+    if envs.VLLM_KF_PREFILL_ATTN:
+        _kf_prefill_attn_warmup(worker)
+    if envs.VLLM_KF_DECODE_ATTN:
+        _kf_decode_attn_warmup(worker)
+    _locality_lm_head_warmup(worker)
 
     if process_local_only:
         return
@@ -405,6 +541,56 @@ def _all_ranks_have_matching_cache(path: Path, group) -> bool:
     return fingerprint is not None and all(f == fingerprint for f in gathered)
 
 
+def _autotune_mxfp8_extra_buckets(runner: "GPUModelRunner") -> None:
+    """VLLM_MXFP8_TUNE_BUCKETS: profile the MXFP8 linears at the extra M
+    buckets. The dummy runs above override the bucket list with the hybrid
+    one, so they never reach these; without this pass every M mapped to an
+    extra bucket would run FlashInfer's fallback tactic.
+    """
+    if not envs.VLLM_MXFP8_TUNE_BUCKETS:
+        return
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer_tune_buckets import (
+        autotune_extra_buckets,
+    )
+
+    autotune_extra_buckets(runner.scheduler_config.max_num_batched_tokens)
+
+
+def _run_flashinfer_autotune_passes(
+    runner: "GPUModelRunner",
+    world,
+    tune_group,
+    autotune_context,
+    *,
+    skip_attn: bool,
+) -> None:
+    """Every tuning pass of the kernel warmup, inside one autotune context."""
+    from flashinfer.autotuner import set_autotune_process_group
+
+    group = tune_group.cpu_group if tune_group.world_size > 1 else None
+    set_autotune_process_group(group)
+    try:
+        with torch.inference_mode(), autotune_context:
+            hisparse_enabled = (
+                runner.vllm_config.attention_config.hisparse_config is not None
+            )
+            skip_attn = skip_attn or hisparse_enabled
+            if hisparse_enabled:
+                # HiSparse hot-buffer attention is bounded by decode batch
+                # size, not the prefill-sized batch used for the full model.
+                autotune_hisparse_flashinfer_attention(runner)
+            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
+            _autotune_mxfp8_extra_buckets(runner)
+            replayssm_autotune_warmup(runner)
+            _autotune_kimi_k3_kda_qkvg(runner.get_model())
+            _autotune_mxfp8_draft_head(runner)
+    finally:
+        set_autotune_process_group(None)
+
+    if world.world_size > 1:
+        world.barrier()
+
+
 def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) -> None:
     """Autotune FlashInfer operations.
     FlashInfer have many implementations for the same operation,
@@ -429,8 +615,15 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
     in, so ranks keep loaded configs only if every rank in the tuning group
     has a matching file and successfully loads it.
 
+    With VLLM_FLASHINFER_AUTOTUNE_FILE the pinned table is validated per
+    entry and DP workers sharing the cache dir tune uncovered keys once
+    (flashinfer_autotune_pin.run_pinned_autotune); with
+    VLLM_FLASHINFER_AUTOTUNE_RECORD every key is profiled with repeated
+    timings and recorded for table generation. Both, and the read-only pinned
+    cache (EWARM_AUTOTUNE_RO), use the legacy (v1) AutoTuner tables.
+
     """
-    from flashinfer.autotuner import AutoTuner, set_autotune_process_group
+    from flashinfer.autotuner import AutoTuner
 
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import (
@@ -454,6 +647,56 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         )
         autotune_kwargs["skip_ops"] = skip_ops
 
+    if envs.VLLM_FLASHINFER_AUTOTUNE_RECORD or envs.VLLM_FLASHINFER_AUTOTUNE_FILE:
+        # Pinned / record modes own the (shared, not per-rank) cache file.
+        run_passes = functools.partial(
+            _run_flashinfer_autotune_passes,
+            runner,
+            world,
+            tune_group,
+            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
+            skip_attn=skip_attn,
+        )
+        if envs.VLLM_FLASHINFER_AUTOTUNE_RECORD:
+            if envs.VLLM_FLASHINFER_AUTOTUNE_FILE:
+                logger.warning(
+                    "VLLM_FLASHINFER_AUTOTUNE_RECORD is set: the pinned file %s "
+                    "and the autotune cache are not used; every key is profiled",
+                    envs.VLLM_FLASHINFER_AUTOTUNE_FILE,
+                )
+            run_record_autotune(
+                runner,
+                tuner=tuner,
+                out_dir=Path(envs.VLLM_FLASHINFER_AUTOTUNE_RECORD).expanduser(),
+                rounds=envs.VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS,
+                run_passes=run_passes,
+            )
+            return
+        if PINNED_AUTOTUNE_RO:
+            logger.warning(
+                "EWARM_AUTOTUNE_RO is ignored with VLLM_FLASHINFER_AUTOTUNE_FILE "
+                "(use VLLM_FLASHINFER_AUTOTUNE_STRICT=1 to forbid start-up tuning)"
+            )
+        cache_path = resolve_flashinfer_autotune_file(runner)
+        if is_leader:
+            logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+        run_pinned_autotune(
+            runner,
+            world=world,
+            tuner=tuner,
+            cache_path=cache_path,
+            pinned_path=Path(envs.VLLM_FLASHINFER_AUTOTUNE_FILE).expanduser(),
+            strict=envs.VLLM_FLASHINFER_AUTOTUNE_STRICT,
+            run_passes=run_passes,
+        )
+        return
+    if envs.VLLM_FLASHINFER_AUTOTUNE_STRICT:
+        logger.warning(
+            "VLLM_FLASHINFER_AUTOTUNE_STRICT has no effect without "
+            "VLLM_FLASHINFER_AUTOTUNE_FILE"
+        )
+
+    # use_flashinfer_autotune_v2 is False under EWARM_AUTOTUNE_RO.
     use_autotune_v2 = use_flashinfer_autotune_v2(runner)
     if use_autotune_v2:
         from flashinfer import autotune_v2, autotune_v2_reload
@@ -481,6 +724,12 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 "--disable-flashinfer-autotune to skip autotuning.",
                 cache_path,
             )
+        if PINNED_AUTOTUNE_RO:
+            # Read-only pinned cache: each rank checks its own file against
+            # the manifest; nothing is written back.
+            log_read_only_enabled()
+            if cache_path.exists():
+                verify_pinned_autotune_file(cache_path, cache_path.read_bytes())
 
         if _all_ranks_have_matching_cache(cache_path, tune_group):
             loaded = tuner.load_configs(str(cache_path))
@@ -494,30 +743,18 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 tuner.clear_cache()
         autotune_context = fi_utils.autotune(tune_mode=True, **autotune_kwargs)
 
-    group = tune_group.cpu_group if tune_group.world_size > 1 else None
-    set_autotune_process_group(group)
-    try:
-        with torch.inference_mode(), autotune_context:
-            hisparse_enabled = (
-                runner.vllm_config.attention_config.hisparse_config is not None
-            )
-            skip_attn = skip_attn or hisparse_enabled
-            if hisparse_enabled:
-                # HiSparse hot-buffer attention is bounded by decode batch
-                # size, not the prefill-sized batch used for the full model.
-                autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
-            replayssm_autotune_warmup(runner)
-            _autotune_kimi_k3_kda_qkvg(runner.get_model())
-    finally:
-        set_autotune_process_group(None)
+    _run_flashinfer_autotune_passes(
+        runner, world, tune_group, autotune_context, skip_attn=skip_attn
+    )
 
-    if world.world_size > 1:
-        world.barrier()
     if use_autotune_v2:
         if world.world_size > 1:
             # All ranks serve the shared store's final state after publishing.
             autotune_v2_reload()
             world.barrier()
+    elif PINNED_AUTOTUNE_RO:
+        # Read-only pinned cache: do not save; fail if anything had to be
+        # tuned at start-up.
+        check_no_startup_tuning(tuner, str(cache_path))
     elif tuner._dirty:
         tuner.save_configs(str(cache_path))

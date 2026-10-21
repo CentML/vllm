@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -11,6 +14,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.flashinfer_exact_routing import (
+    single_cta_routing_covers,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
@@ -37,6 +43,120 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
 logger = init_logger(__name__)
+
+
+# Routing methods FlashInfer serves with routingCustom (Block / DynBlock kernels
+# at T <= 16). DeepSeekV3 qualifies only without expert groups (n_group <= 1);
+# grouped DeepSeekV3 runs routingDeepSeek (Cluster kernel) and Llama4 its own
+# routing, so neither is allowed.
+_SM107_MOE_PDL_ROUTING = frozenset(
+    {
+        RoutingMethodType.Default,
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+        RoutingMethodType.SigmoidRenorm,
+        RoutingMethodType.Sigmoid,
+        RoutingMethodType.MiniMax2,
+        RoutingMethodType.DeepSeekV3,
+    }
+)
+# SigmoidBias policy (DeepSeekV3 with n_group <= 1, MiniMax2): top_k 23-32
+# dispatches to Tier<1024, 32>, whose T = 5..16 calls take the Cluster path.
+_SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K = 22
+
+
+def _sm107_moe_pdl_allowed(
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    routing_method: RoutingMethodType,
+    n_group: int | None,
+    top_k: int,
+    deferred: bool = False,
+) -> bool:
+    """Whether one trtllm-gen MoE call stays on the kernels the SM107 PDL
+    opt-in was validated for (see ``_sm107_moe_pdl``); platform not checked.
+
+    ``deferred``: this call skips FlashInfer's finalize (``do_finalize=False``),
+    so finalizeKernelVecLoad (reads routing outputs before its wait) cannot run
+    and the finalize-grid bound does not apply.
+    """
+    if not (
+        0 < num_tokens <= envs.VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+        and num_experts <= 512
+        and (deferred or (hidden_size + 255) // 256 * num_tokens < 1184)
+        and routing_method in _SM107_MOE_PDL_ROUTING
+    ):
+        return False
+    if routing_method == RoutingMethodType.DeepSeekV3 and (n_group or 0) > 1:
+        return False
+    if num_tokens <= 16:
+        sigmoid_bias = routing_method in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.MiniMax2,
+        )
+        return not sigmoid_bias or top_k <= _SM107_MOE_PDL_SIGMOID_BIAS_MAX_TOP_K
+    # Above 16 tokens the stock permutation is the Cluster / cooperative kernel.
+    # Only calls whose permutation the single-CTA kernel of the patched module
+    # runs instead (flashinfer_exact_routing; hooked in routingCustom with the
+    # Renormalize policy) keep a pipeline of kernels that all wait first:
+    # BlockScores / HistogramScores, single-CTA permutation, FC1, FC2, and
+    # finalizeKernel or no FlashInfer finalize.
+    if routing_method not in (
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+    ):
+        return False
+    return single_cta_routing_covers(num_tokens, num_experts, top_k)
+
+
+@contextlib.contextmanager
+def _sm107_moe_pdl(
+    num_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    routing_method: RoutingMethodType,
+    n_group: int | None,
+    top_k: int,
+    deferred: bool = False,
+):
+    """Opt into PDL for one trtllm-gen MoE call on SM107.
+
+    FlashInfer >= 0.6.18 (PR #4806; still so in 0.7.2) forces ``enable_pdl=False``
+    for the whole trtllm-gen MoE pipeline on CC 10.7 after crashes in Cluster
+    routing. With routingCustom-family routing (no expert groups; top_k <= 22 for the
+    SigmoidBias policy), up to 16 tokens and <= 512 experts, routing runs the
+    Block/DynBlock kernels (not Cluster/Coop) and finalize runs finalizeKernel
+    (not finalizeKernelVecLoad); together with bmm FC1/FC2 they all wait on
+    their producer before reading it. Larger calls qualify only where the
+    single-CTA routing permutation replaces Cluster/Coop (see
+    ``_sm107_moe_pdl_allowed``). Enabled by VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+    (default 0: FlashInfer behaviour).
+    """
+    if not (
+        _sm107_moe_pdl_allowed(
+            num_tokens,
+            num_experts,
+            hidden_size,
+            routing_method,
+            n_group,
+            top_k,
+            deferred=deferred,
+        )
+        and current_platform.is_device_capability(107)
+    ):
+        yield
+        return
+    import flashinfer.fused_moe.core as fi_moe_core
+    from flashinfer.utils import device_support_pdl
+
+    gate = fi_moe_core._device_support_moe_pdl
+    fi_moe_core._device_support_moe_pdl = device_support_pdl
+    try:
+        yield
+    finally:
+        fi_moe_core._device_support_moe_pdl = gate
 
 
 def prepare_deepseek_fp8_x_sf(x: torch.Tensor, x_sf: torch.Tensor) -> torch.Tensor:
@@ -349,6 +469,10 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
     def supports_routing_replay_capture(self) -> bool:
         return True
 
+    def supports_deferred_finalize(self) -> bool:
+        # The MXFP8 path stops after GEMM2 when the config allows it.
+        return self.quant_config.block_shape == [1, 32]
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -374,6 +498,91 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
                 if moe_config.is_act_and_mul
                 else torch.ones_like(self._g1_alphas) / self.quant_config.a2_scale
             )
+
+        # VLLM_MOE_DECODE_MAX_TOKENS > 0: decode calls (MIN_TOKENS <= T <= MAX_TOKENS)
+        # of this MXFP8 configuration run the single-launch kernel of moe_decode_cuda
+        # (built here, before any graph capture).
+        self._moe_decode = None
+        if self._moe_decode_config_ok():
+            from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+            self._moe_decode = moe_decode_cuda.get(
+                torch.accelerator.current_device_index()
+            )
+
+    def _moe_decode_config_ok(self) -> bool:
+        from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+        cfg = self.moe_config
+        return (
+            moe_decode_cuda.MAX_TOKENS > 0
+            and self.quant_config.block_shape == [1, 32]
+            and current_platform.is_cuda()
+            and current_platform.has_device_capability(100)
+            and self.routing_method_type
+            in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive)
+            and cfg.num_experts == moe_decode_cuda.E
+            and self.local_num_experts == moe_decode_cuda.E
+            and self.topk == moe_decode_cuda.TOPK
+            and self.hidden_dim == moe_decode_cuda.H
+            and self.intermediate_size_per_partition == moe_decode_cuda.INTER
+            and cfg.activation == MoEActivation.SILU
+            and self.gemm1_alpha is None
+            and self.gemm1_beta is None
+            and self.gemm1_clamp_limit is None
+        )
+
+    def _try_moe_decode(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor,
+        num_expert_group: int | None,
+        e_score_correction_bias: torch.Tensor | None,
+        routed_scaling_factor: float | None,
+        routing_replay_out: torch.Tensor | None,
+    ) -> UnfinalizedMoEOutput | None:
+        """The single-launch decode MoE, or None if this call does not qualify."""
+        from vllm.model_executor.layers.fused_moe import moe_decode_cuda
+
+        num_tokens = hidden_states.shape[0]
+        if not (
+            self._moe_decode is not None
+            and moe_decode_cuda.MIN_TOKENS
+            <= num_tokens
+            <= min(moe_decode_cuda.MAX_TOKENS, moe_decode_cuda.MAXT)
+            and self.moe_config.should_defer_moe_finalize(num_tokens)
+            and expert_map is None
+            and e_score_correction_bias is None
+            and routed_scaling_factor in (None, 1.0)
+            and (num_expert_group or 0) <= 1
+            # The decode kernel does not write routed expert ids.
+            and routing_replay_out is None
+            and router_logits.dtype in (torch.bfloat16, torch.float32)
+            and router_logits.is_contiguous()
+            and hidden_states.dtype == torch.float8_e4m3fn
+            and hidden_states.is_contiguous()
+            and a1q_scale.is_contiguous()
+            and a1q_scale.numel() == num_tokens * (moe_decode_cuda.H // 32)
+        ):
+            return None
+        rows, weights, idx = self._moe_decode(
+            router_logits,
+            hidden_states,
+            a1q_scale,
+            w1,
+            self.quant_config.w1_scale,
+            w2,
+            self.quant_config.w2_scale,
+        )
+        return UnfinalizedMoEOutput(
+            gemm2_permuted=rows,
+            expert_weights=weights,
+            expanded_idx_to_permuted_idx=idx,
+        )
 
     @staticmethod
     def _supports_quant_scheme(
@@ -449,7 +658,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
         routing_replay_out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
         import flashinfer
         from flashinfer.fused_moe import Fp8QuantizationType, WeightLayout
 
@@ -467,6 +676,22 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         assert global_num_experts <= 512
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
+
+        if self._moe_decode is not None:
+            decoded = self._try_moe_decode(
+                hidden_states,
+                w1,
+                w2,
+                router_logits,
+                expert_map,
+                a1q_scale,
+                num_expert_group,
+                e_score_correction_bias,
+                routed_scaling_factor,
+                routing_replay_out,
+            )
+            if decoded is not None:
+                return decoded
 
         is_mxfp8 = self.quant_config.block_shape == [1, 32]
         if is_mxfp8:
@@ -515,7 +740,25 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         )
         if is_mxfp8 or activation == MoEActivation.RELU2_NO_MUL:
             kwargs["activation_type"] = activation_type
-        result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        num_tokens = hidden_states.shape[0]
+        # FlashInfer's 0-token call keeps the finalized (empty) form.
+        defer = is_mxfp8 and self.moe_config.should_defer_moe_finalize(num_tokens)
+        if defer:
+            kwargs["do_finalize"] = False
+        with _sm107_moe_pdl(
+            num_tokens,
+            global_num_experts,
+            hidden_states.shape[-1],
+            self.routing_method_type,
+            n_group,
+            self.topk,
+            deferred=defer,
+        ):
+            result = flashinfer.fused_moe.trtllm_fp8_block_scale_moe(**kwargs)
+        if defer:
+            return convert_flashinfer_moe_output(
+                result, do_finalize=False, num_tokens=num_tokens, top_k=self.topk
+            )
         return result
 
     def _apply_per_tensor(
@@ -592,7 +835,7 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
         routing_replay_out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
         if self.quant_config.block_shape is not None:
             return self._apply_block_scale(
                 hidden_states,

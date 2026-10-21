@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 
-from vllm.config.compilation import CUDAGraphMode
+from vllm import envs
+from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
     TargetDependentARSpeculator,
@@ -19,12 +21,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# VLLM_MTP_DRAFT_PREFILL_ROWS=1: after its attention (which writes the draft KV
+# of every row), the MTP layer of the draft prefill runs only on each request's
+# last accepted row, the one the speculator samples (o_proj, MoE and norms at
+# M = requests instead of M = verified tokens). Off by default.
+MTP_DRAFT_PREFILL_ROWS = os.environ.get("VLLM_MTP_DRAFT_PREFILL_ROWS", "0") == "1"
+
 
 class MTPSpeculator(TargetDependentARSpeculator):
     share_mtp_topk_indices: bool = False
-    # Attention impl that computes only the sampled draft prefill rows
-    # (SpeculativeConfig.prune_draft_prefill_attention), or None.
-    draft_prefill_attn_impl: "FlashInferImpl | None" = None
 
     def load_draft_model(
         self,
@@ -47,43 +52,29 @@ class MTPSpeculator(TargetDependentARSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
-        if spec_config is not None and spec_config.prune_draft_prefill_attention:
-            self.draft_prefill_attn_impl = self._get_draft_prefill_attn_impl(
-                draft_model
+        self._draft_prefill_prune_layer: Attention | None = None
+        self._draft_prefill_prune_group_id: int | None = None
+        if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
+            # Under prefill context parallelism the draft prefill is re-laid
+            # out, so last_token_indices does not index the attention's rows.
+            # The PCP manager is attached after model load; read the config.
+            pcp = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+            self._draft_prefill_prune_layer = _enable_draft_prefill_prune(
+                draft_model, None if pcp else self.last_token_indices
             )
+        if MTP_DRAFT_PREFILL_ROWS:
+            if getattr(draft_model, "supports_draft_out_rows", False) and (
+                self.dp_size == 1
+            ):
+                self.enable_draft_out_rows()
+                logger.info("MTP draft prefill row pruning on")
+            else:
+                logger.warning(
+                    "MTP draft prefill row pruning off: needs a draft model "
+                    "with out_rows support (%s) and no data parallelism",
+                    type(draft_model).__name__,
+                )
         return draft_model
-
-    def _get_draft_prefill_attn_impl(
-        self, draft_model: nn.Module
-    ) -> "FlashInferImpl | None":
-        """The draft's attention impl if its prefill can attend only the sampled
-        rows, else None.
-
-        The draft prefill samples one row per request. If its only stateful
-        layer is one attention layer, that layer's KV comes from its input,
-        not from attention outputs, so the other rows' attention outputs are
-        never used. A deeper draft would feed them into a later layer's KV or
-        state.
-        """
-        layers = [m for m in draft_model.modules() if isinstance(m, AttentionLayerBase)]
-        layer = layers[0] if len(layers) == 1 else None
-        reason: str | None
-        if self.vllm_config.parallel_config.prefill_context_parallel_size > 1:
-            # The draft prefill is re-laid out across ranks, so
-            # last_token_indices does not index the attention's rows.
-            reason = "prefill context parallelism"
-        elif not isinstance(layer, Attention) or not hasattr(
-            layer.impl, "draft_prefill_rows_unsupported"
-        ):
-            reason = "the draft needs exactly one FlashInfer attention layer"
-        else:
-            impl = cast("FlashInferImpl", layer.impl)
-            reason = impl.draft_prefill_rows_unsupported()
-            if reason is None:
-                logger.info("MTP draft prefill attention pruning enabled")
-                return impl
-        logger.warning("prune_draft_prefill_attention is ignored: %s", reason)
-        return None
 
     def _prefill(
         self,
@@ -95,20 +86,50 @@ class MTPSpeculator(TargetDependentARSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
-        impl = self.draft_prefill_attn_impl
+        layer = self._draft_prefill_prune_layer
+        impl = cast("FlashInferImpl", layer.impl) if layer is not None else None
+        saved_indices = (
+            impl.draft_prefill_last_token_indices if impl is not None else None
+        )
+        if impl is not None and self.pcp_manager is not None:
+            impl.draft_prefill_last_token_indices = None
         if (
-            impl is not None
+            layer is not None
+            and impl is not None
+            and num_reqs > 0
+            and attn_metadata is not None
+            and self.pcp_manager is None
             and cudagraph_runtime_mode != CUDAGraphMode.FULL
             and not torch.cuda.is_current_stream_capturing()
         ):
-            from vllm.v1.attention.backends.flashinfer import DraftPrefillRows
+            from vllm.v1.attention.backends.flashinfer import DraftPrefillPruning
 
-            rows = self.last_token_indices[:num_reqs]
-            impl.draft_prefill_rows = DraftPrefillRows(
-                rows=rows,
-                seq_lens=(self.input_buffers.positions[rows] + 1).to(torch.int32),
-                max_seq_len=self.draft_max_seq_len,
-            )
+            # Resolve the actual draft layer's cache group, not the target's
+            # first group (Qwen's target has both linear and full attention).
+            group_id = self._draft_prefill_prune_group_id
+            if group_id is None:
+                group_id = next(
+                    (
+                        i
+                        for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                        if layer.layer_name in group.layer_names
+                    ),
+                    -1,
+                )
+                self._draft_prefill_prune_group_id = group_id
+            if group_id >= 0:
+                rows = self.last_token_indices[:num_reqs]
+                impl.draft_prefill_pruning = DraftPrefillPruning(
+                    rows=rows,
+                    seq_lens=(self.input_buffers.positions[rows] + 1).to(torch.int32),
+                    block_tables=self.block_tables.input_block_tables[group_id][
+                        :num_reqs
+                    ],
+                    max_seq_len=self.draft_max_seq_len,
+                )
+            else:
+                # Do not use the bucket-local fallback with an unknown group.
+                impl.draft_prefill_last_token_indices = None
         try:
             super()._prefill(
                 num_reqs,
@@ -121,7 +142,8 @@ class MTPSpeculator(TargetDependentARSpeculator):
             )
         finally:
             if impl is not None:
-                impl.draft_prefill_rows = None
+                impl.draft_prefill_pruning = None
+                impl.draft_prefill_last_token_indices = saved_indices
 
     def on_prefill_begin(self, num_reqs: int) -> None:
         # Step 0 computes its own top-k. Unconditional, so a step that died
@@ -145,3 +167,36 @@ class MTPSpeculator(TargetDependentARSpeculator):
     def on_multi_step_decode_end(self, num_reqs: int) -> None:
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
+
+
+def _enable_draft_prefill_prune(
+    draft_model: nn.Module, last_token_indices: torch.Tensor | None
+) -> Attention | None:
+    """Enable sampled-row attention for a single safe MTP draft layer.
+
+    ``last_token_indices`` is the speculator's persistent buffer of those rows,
+    written before every draft prefill; None keeps pruning off. The draft
+    prefill samples only those rows, and with a single attention layer the
+    draft KV comes from the layer input, not from attention outputs. A deeper
+    draft would feed every row's attention output into the next layer's KV, so
+    pruning stays off there (and for non-FlashInfer layers).
+    """
+    if last_token_indices is None:
+        logger.warning(
+            "MTP draft prefill attention pruning off: not supported with prefill "
+            "context parallelism"
+        )
+        return None
+    layers = [m for m in draft_model.modules() if isinstance(m, Attention)]
+    if len(layers) != 1 or not hasattr(
+        layers[0].impl, "draft_prefill_last_token_indices"
+    ):
+        logger.warning(
+            "MTP draft prefill attention pruning off: needs exactly one FlashInfer "
+            "draft attention layer, got %s",
+            [(m.layer_name, type(m.impl).__name__) for m in layers],
+        )
+        return None
+    layers[0].impl.draft_prefill_last_token_indices = last_token_indices
+    logger.info("MTP draft prefill attention pruning on for %s", layers[0].layer_name)
+    return layers[0]

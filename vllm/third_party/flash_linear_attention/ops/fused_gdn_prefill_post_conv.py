@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 
 @triton.jit
@@ -140,7 +140,9 @@ def _fused_post_conv_kernel(
         g_vals = -tl.exp(A_log_val) * sp
 
         if OUTPUT_G_EXP:
-            g_vals = tl.exp(g_vals)
+            # libdevice expf: bitwise equal to the torch.exp this replaces
+            # (tl.exp lowers to ex2.approx, a few ulp off).
+            g_vals = tldevice.exp(g_vals)
 
         beta_vals = tl.sigmoid(b_vals)
 

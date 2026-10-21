@@ -150,6 +150,18 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         return kMxfp8Dynamic
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # sm_107: keep FlashInfer's CuTe-DSL mm_mxfp8 on the Sm100 runner and add
+        # the K=64 Sm107 tactics to its autotuner (VLLM_FLASHINFER_MXFP8_K64; no-op
+        # elsewhere, once per process). Then the mid-M split-K tactics
+        # (VLLM_MXFP8_SPLITK_MIDM; default off), wrapping the K=64 runner.
+        from vllm.model_executor.layers.quantization.utils import (
+            flashinfer_mxfp8_k64,
+            flashinfer_mxfp8_splitk,
+        )
+
+        flashinfer_mxfp8_k64.maybe_install()
+        flashinfer_mxfp8_splitk.maybe_install()
+
         weight = layer.weight.data  # [N, K]
         N, K = weight.shape
 
@@ -160,6 +172,14 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         # Store weight column-major [K, N] as mm_mxfp8 expects for operand B.
         replace_parameter(layer, "weight", weight.contiguous().t())
         replace_parameter(layer, "weight_scale", weight_scale_swizzled.contiguous())
+
+        # VLLM_MXFP8_TUNE_BUCKETS: extra mm_mxfp8 autotune buckets (no-op unset).
+        from .flashinfer_tune_buckets import maybe_install
+
+        out_dtype = getattr(layer, "params_dtype", torch.bfloat16)
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            out_dtype = torch.bfloat16
+        maybe_install(layer, out_dtype)
 
     def apply_weights(
         self,
@@ -182,20 +202,56 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
                 x.view(-1, K), is_sf_swizzled_layout=True
             )
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight,
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cute-dsl",
-        )
+        output = self._gemm(input_mxfp8, weight, input_scale, weight_scale, out_dtype)
 
         if bias is not None:
             output = output + bias
 
         output_shape = (*input_shape[:-1], N)
         return output.view(output_shape)
+
+    def _gemm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return vllm_flashinfer.mm_mxfp8(
+            a, b, a_scale, b_scale, out_dtype=out_dtype, backend="cute-dsl"
+        )
+
+
+class FlashInferCutedslSm107Mxfp8LinearKernel(FlashInferCutedslMxfp8LinearKernel):
+    """Opt-in native SM107 MXFP8 GEMM with the existing scale/weight layout."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not (
+            current_platform.is_cuda() and current_platform.is_device_capability(107)
+        ):
+            return False, "requires sm_107"
+        if not has_flashinfer_cutedsl():
+            return False, "requires FlashInfer CuTe-DSL module"
+        from .flashinfer_sm107 import sm107_mxfp8_support_reason
+
+        reason = sm107_mxfp8_support_reason()
+        return reason is None, reason
+
+    def _gemm(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        from .flashinfer_sm107 import mm_mxfp8_sm107
+
+        return mm_mxfp8_sm107(a, b, a_scale, b_scale, out_dtype)
 
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):

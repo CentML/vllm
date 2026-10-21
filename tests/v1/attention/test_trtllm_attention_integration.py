@@ -34,7 +34,6 @@ if not current_platform.is_device_capability_family(100):
     )
 
 from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
-    DraftPrefillRows,
     FlashInferDecodeKernel,
     FlashInferImpl,
     FlashInferMetadataBuilder,
@@ -268,12 +267,9 @@ def _create_nvfp4_hnd_kv_cache(
     return nvfp4_cache
 
 
-def _run_trtllm_integration(
-    batch_spec, kv_cache_dtype="auto", model_name=MODEL, sampled_rows=None
-):
+def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL):
     """Run TRTLLM attention through the full FlashInfer pipeline
-    and compare against an SDPA reference. With `sampled_rows` (one token index
-    per request), run draft prefill pruning and compare those rows only."""
+    and compare against an SDPA reference."""
     set_random_seed(42)
     device = torch.device(f"{DEVICE_TYPE}:0")
 
@@ -475,19 +471,6 @@ def _run_trtllm_integration(
             )
             mock_layer._q_scale_float = 1.0 / q_s
 
-        if sampled_rows is not None:
-            positions = torch.cat(
-                [
-                    torch.arange(s_len - q_len, s_len)
-                    for s_len, q_len in zip(batch_spec.seq_lens, batch_spec.query_lens)
-                ]
-            )
-            impl.draft_prefill_rows = DraftPrefillRows(
-                rows=torch.tensor(sampled_rows, device=device),
-                seq_lens=(positions[sampled_rows] + 1).to(device, torch.int32),
-                max_seq_len=max(batch_spec.seq_lens),
-            )
-
         output = impl.forward(
             mock_layer,
             query_vllm,
@@ -503,15 +486,7 @@ def _run_trtllm_integration(
         atol, rtol = 1.0, 1.0  # nvfp4 has higher quantization error
     else:
         atol, rtol = 1e-2, 1e-2
-    if sampled_rows is None:
-        torch.testing.assert_close(output, sdpa_output, atol=atol, rtol=rtol)
-        return
-    sampled = torch.zeros(output.shape[0], dtype=torch.bool, device=device)
-    sampled[sampled_rows] = True
-    torch.testing.assert_close(
-        output[sampled], sdpa_output[sampled], atol=atol, rtol=rtol
-    )
-    assert torch.count_nonzero(output[~sampled]) == 0
+    torch.testing.assert_close(output, sdpa_output, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize(
@@ -539,18 +514,6 @@ def test_trtllm_gen_nvfp4_kv_integration(batch_spec_name: str):
         kv_cache_dtype="nvfp4",
         model_name=MODEL_NVFP4,
     )
-
-
-@pytest.mark.parametrize(
-    "batch_spec_name,sampled_rows",
-    [("mixed", [0, 1, 7, 25]), ("prefill_only", [15, 40, 63])],
-)
-@torch.inference_mode()
-def test_trtllm_gen_draft_prefill_sampled_rows(batch_spec_name, sampled_rows):
-    """Draft prefill pruning attends each request's sampled row over that row's
-    causal KV, across decode and prefill rows and before the chunk end where
-    draft tokens were rejected, and zeroes every other row."""
-    _run_trtllm_integration(BATCH_SPECS[batch_spec_name], sampled_rows=sampled_rows)
 
 
 @torch.inference_mode()

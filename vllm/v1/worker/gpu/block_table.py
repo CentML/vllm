@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -12,6 +14,15 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
+
+# Up to this many programs per KV-cache group pad the slot mappings (1024
+# tokens each per iteration) instead of one serial loop; same writes.
+_MAX_PAD_PROGRAMS = 32
+
+
+# GB300 lowc2: skip the per-step num_blocks re-copy when no block ids were appended.
+_NUM_BLOCKS_DIRTY_GATE = os.environ.get("VLLM_SAMPLER_STATE_DIRTY", "0") == "1"
 
 
 class BlockTables:
@@ -61,6 +72,12 @@ class BlockTables:
         assert len(sliding_window_reach) == self.num_kv_cache_groups
         self._sliding_window_reach = sliding_window_reach
         self.has_sliding_window_groups = any(r > 0 for r in sliding_window_reach)
+        # Host mirror of one KV group's block ids per request (KV-cache block ids,
+        # unexpanded; -1 = none); only kept with VLLM_PREFIX_SPREAD=1
+        # (prefix_front.py).
+        self.key_gid: int | None = None
+        self.key_rows_np = np.empty((0, 0), dtype=np.int32)
+        self.key_nblk_np = np.empty(0, dtype=np.int64)
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
@@ -142,6 +159,23 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+            if i == self.key_gid:
+                kids = new_block_ids[i]
+                old_len = int(self.key_nblk_np[req_index])
+                kstart = 0 if overwrite else old_len
+                klen = kstart + len(kids)
+                if overwrite and old_len > klen:
+                    self.key_rows_np[req_index, klen:old_len] = -1
+                self.key_rows_np[req_index, kstart:klen] = kids
+                self.key_nblk_np[req_index] = klen
+        self._lowc2_nb_dirty = True
+
+    def enable_key_tracking(self, gid: int, max_num_blocks: int) -> None:
+        self.key_gid = gid
+        self.key_rows_np = np.full(
+            (self.max_num_reqs, max_num_blocks), -1, dtype=np.int32
+        )
+        self.key_nblk_np = np.zeros(self.max_num_reqs, dtype=np.int64)
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -155,6 +189,13 @@ class BlockTables:
             self.fused_writer.apply(
                 self.block_tables, self.block_table_ptrs, self.block_table_strides
             )
+        if _NUM_BLOCKS_DIRTY_GATE:
+            # GB300 lowc2 (VLLM_SAMPLER_STATE_DIRTY=1): num_blocks.np changes only
+            # in append_block_ids; skip re-copying it into the next pool slot on
+            # steps without block-table writes (exact, as for the sampler state).
+            if not getattr(self, "_lowc2_nb_dirty", True):
+                return
+            self._lowc2_nb_dirty = False
         self.num_blocks.copy_to_uva()
 
     def gather_block_tables(
@@ -207,6 +248,8 @@ class BlockTables:
             self.block_sizes_tensor,
             MASK_SLIDING_WINDOW=mask_sliding_window,
             BLOCK_SIZE=1024,  # type: ignore
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
 
@@ -239,7 +282,10 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
-        _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
+        num_pad_programs = max(
+            min(_MAX_PAD_PROGRAMS, triton.cdiv(slot_mappings.shape[1], 1024)), 1
+        )
+        _compute_slot_mappings_kernel[(num_groups, num_reqs + num_pad_programs)](
             slot_mappings.shape[1],
             idx_mapping,
             query_start_loc,
@@ -256,6 +302,9 @@ class BlockTables:
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
+            NUM_PAD_PROGRAMS=num_pad_programs,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -285,7 +334,11 @@ def _gather_block_tables_kernel(
     block_sizes_ptr,  # [num_kv_cache_groups]
     MASK_SLIDING_WINDOW: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
@@ -348,19 +401,31 @@ def _compute_slot_mappings_kernel(
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    # The last NUM_PAD_PROGRAMS programs along axis 1 pad; the rest are requests.
+    NUM_PAD_PROGRAMS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     # kv cache group id
     group_id = tl.program_id(0)
     batch_idx = tl.program_id(1)
     slot_mapping_ptr = slot_mappings_ptr + group_id * slot_mappings_stride
 
-    if batch_idx == tl.num_programs(1) - 1:
+    num_reqs = tl.num_programs(1) - NUM_PAD_PROGRAMS
+    if batch_idx >= num_reqs:
         # Pad remaining slots to -1. This is needed for CUDA graphs.
         # Start from actual token count (not padded) to cover the gap
         # between actual tokens and padded tokens that can contain stale
         # valid slot IDs from previous chunks during chunked prefill.
-        actual_num_tokens = tl.load(query_start_loc + batch_idx)
-        for i in range(actual_num_tokens, max_num_tokens, TRITON_BLOCK_SIZE):
+        actual_num_tokens = tl.load(query_start_loc + num_reqs)
+        pad_idx = batch_idx - num_reqs
+        for i in range(
+            actual_num_tokens + pad_idx * TRITON_BLOCK_SIZE,
+            max_num_tokens,
+            NUM_PAD_PROGRAMS * TRITON_BLOCK_SIZE,
+        ):
             offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
             tl.store(slot_mapping_ptr + offset, PAD_ID, mask=offset < max_num_tokens)
         return

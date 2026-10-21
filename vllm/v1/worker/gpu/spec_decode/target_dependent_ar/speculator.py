@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -9,12 +10,16 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import one_graph
 from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
@@ -48,6 +53,48 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+
+        # Draft prefill row pruning (enable_draft_out_rows): every draft model
+        # call passes ``out_rows``, the rows its layer keeps after attention.
+        self.draft_out_rows = False
+        self._draft_row_ids: torch.Tensor | None = None
+
+        # VLLM_DRAFT_ONE_GRAPH (one_graph.py); set by capture_one_graphs().
+        self._one_graphs: one_graph.DraftOneGraphs | None = None
+
+    def enable_draft_out_rows(self) -> None:
+        """Draft prefill: the draft model runs everything after its attention
+        only on the rows the speculator samples (each request's last accepted
+        row), instead of on every verified row. Its attention still writes the
+        draft KV of every row. Draft decode steps keep all rows (identity).
+        Requires a model whose forward takes ``out_rows``.
+        """
+        self.draft_out_rows = True
+        self._draft_row_ids = torch.arange(
+            max(self.max_num_tokens, self.max_num_reqs),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def _uses_draft_out_rows(self) -> bool:
+        return self.draft_out_rows and self.pcp_manager is None
+
+    def _prefill_out_rows(
+        self, num_reqs: int, num_tokens: int, cudagraph_runtime_mode: CUDAGraphMode
+    ) -> int:
+        """Rows the draft prefill keeps (a prefix of last_token_indices, whose
+        tail past the real requests is zero-padded).
+        """
+        if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            # Piecewise graphs are captured per token count, so the row count
+            # must follow the (padded) token count, not the request count.
+            return min(num_tokens, self.max_num_reqs)
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            # The graph's (padded) request count.
+            return num_reqs
+        # Eager. At least 2 rows: torch.compile specializes a dynamic dim seen
+        # as 1 on the compiling call.
+        return min(max(num_reqs, 2), self.max_num_reqs)
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -161,6 +208,35 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 
+    def capture_one_graphs(
+        self, target_tokens_padded: Callable[[int], int | None]
+    ) -> None:
+        """VLLM_DRAFT_ONE_GRAPH: capture the single-graph draft (after capture())."""
+        if not one_graph.ENABLED:
+            return
+        reason = one_graph.unsupported_reason(self)
+        if reason is not None:
+            logger.warning("VLLM_DRAFT_ONE_GRAPH not applied: %s", reason)
+            return
+        graphs = one_graph.DraftOneGraphs(self)
+        graphs.capture(target_tokens_padded)
+        if not graphs.graphs:
+            return
+        self._one_graphs = graphs
+        # Compile the COPY_REJECTED variant of _copy_idx_mapping_kernel now
+        # (same argument dtypes as InputBatch: int64 idx_mapping, int32
+        # num_rejected); every propose() launches it from here on, so it must
+        # not JIT during inference.
+        self._copy_request_inputs(
+            1,
+            torch.zeros(1, dtype=torch.int64, device=self.device),
+            self.temperature,
+            self.seeds,
+            num_rejected=graphs.num_rejected[:1],
+            num_rejected_out=graphs.num_rejected,
+        )
+        torch.accelerator.synchronize()
+
     @torch.inference_mode()
     def propose(
         self,
@@ -214,12 +290,16 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+        one = self._one_graphs
         self._copy_request_inputs(
             num_reqs,
             input_batch.idx_mapping,
             temperature,
             seeds,
             dummy_run=dummy_run,
+            # VLLM_DRAFT_ONE_GRAPH: static num_rejected, same launch.
+            num_rejected=num_rejected if one is not None else None,
+            num_rejected_out=one.num_rejected if one is not None else None,
         )
 
         # Get the input ids and last token indices for the speculator.
@@ -272,6 +352,40 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
 
         self._prepare_eplb_forward(num_tokens)
+
+        if (
+            one is not None
+            and not (dummy_run or is_profile)
+            and dp_sync_state is None
+            and num_speculative_tokens == self.num_speculative_steps
+            and self.pcp_manager is None
+            and input_batch.seq_lens.data_ptr()
+            == self.target_input_buffers.seq_lens.data_ptr()
+            and (hit := one.lookup(num_reqs, prefill_batch_desc)) is not None
+        ):
+            graph, _ = hit
+            self.on_prefill_begin(num_reqs)
+            # The eager part of the stock FULL draft decode (the kernel block
+            # table mapping), hoisted before the draft prefill: it reads only
+            # the step's block tables, which the draft never writes.
+            self._map_decode_kernel_block_tables()
+            get_offloader().sync_prev_onload()
+            graph.replay()
+            one.replays += 1
+            if one.replays == 1:
+                logger.info("Draft one-graph: first replay (%d requests)", num_reqs)
+            self.on_prefill_end(num_reqs)
+            self.on_multi_step_decode_begin(num_reqs)
+            self.on_multi_step_decode_end(num_reqs)
+            if self.draft_vocab_head is not None:
+                draft_vocab_head.observe_target(
+                    self.draft_vocab_head,
+                    last_sampled,
+                    input_batch.idx_mapping,
+                    num_sampled,
+                )
+                draft_vocab_head.maybe_log(self.draft_vocab_head)
+            return self.draft_tokens[:num_reqs]
 
         self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -366,6 +480,14 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             num_speculative_tokens,
         )
         self.on_multi_step_decode_end(num_reqs)
+        if self.draft_vocab_head is not None and not (dummy_run or is_profile):
+            draft_vocab_head.observe_target(
+                self.draft_vocab_head,
+                last_sampled,
+                input_batch.idx_mapping,
+                num_sampled,
+            )
+            draft_vocab_head.maybe_log(self.draft_vocab_head)
 
         return self.draft_tokens[:num_reqs]
 
@@ -378,6 +500,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        out_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_buffers: InputBatch | InputBuffers = self.input_buffers
         is_padding = None
@@ -417,6 +540,13 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                 hidden_states=self.hidden_states[:num_tokens],
                 inputs_embeds=inputs_embeds,
             )
+            if self._uses_draft_out_rows():
+                # Every call passes out_rows (one compiled graph): draft decode
+                # steps keep all rows.
+                assert self._draft_row_ids is not None
+                if out_rows is None:
+                    out_rows = self._draft_row_ids[:num_tokens]
+                model_inputs["out_rows"] = out_rows
             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
                 # chosen inside run_pw_graph.
@@ -454,6 +584,11 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        out_rows = None
+        if self._uses_draft_out_rows():
+            out_rows = self.last_token_indices[
+                : self._prefill_out_rows(num_reqs, num_tokens, cudagraph_runtime_mode)
+            ]
         last_hidden_states, hidden_states = self._run_model(
             num_tokens,
             attn_metadata,
@@ -461,13 +596,20 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            out_rows=out_rows,
         )
         if self.pcp_manager is not None:
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
 
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        if out_rows is not None:
+            # Row i of the output is already row last_token_indices[i].
+            sample_hidden_states = last_hidden_states[:num_reqs]
+            sampled_feedback = hidden_states[:num_reqs]
+        else:
+            sample_hidden_states = last_hidden_states[last_token_indices]
+            sampled_feedback = None
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
             sample_src_positions,
@@ -477,7 +619,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             self.current_draft_step,
             self.draft_logits,
         )
-        if last_hidden_states is hidden_states:
+        if sampled_feedback is not None:
+            self.hidden_states[:num_reqs] = sampled_feedback
+        elif last_hidden_states is hidden_states:
             self.hidden_states[:num_reqs] = sample_hidden_states
         else:
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
@@ -536,6 +680,15 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
                     num_speculative_steps=num_speculative_steps,
                 )
 
+    def _map_decode_kernel_block_tables(self) -> None:
+        """Map the step's block tables into the draft groups' kernel block
+        tables, which the FULL draft decode graph reads."""
+        for groups in self.attn_groups:
+            for group in groups:
+                group.map_to_kernel_block_table(
+                    self.block_tables.input_block_tables[group.kv_cache_group_id]
+                )
+
     def _fused_multi_step_decode(
         self,
         num_reqs: int,
@@ -550,11 +703,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         idx_mapping = self.idx_mapping[:num_reqs]
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            for groups in self.attn_groups:
-                for group in groups:
-                    group.map_to_kernel_block_table(
-                        self.block_tables.input_block_tables[group.kv_cache_group_id]
-                    )
+            self._map_decode_kernel_block_tables()
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
             return
@@ -696,7 +845,11 @@ def _prepare_prefill_inputs_kernel(
     seq_lens_ptr,
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
@@ -795,6 +948,8 @@ def prepare_prefill_inputs(
         input_batch.seq_lens,
         max_num_reqs,
         BLOCK_SIZE=1024,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
     return last_token_indices
 
@@ -814,7 +969,11 @@ def _prepare_decode_inputs_kernel(
     max_num_reqs,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
     num_reqs = tl.num_programs(0) - 1
     if req_idx == num_reqs:
@@ -879,6 +1038,8 @@ def prepare_decode_inputs(
         max_num_reqs,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )
 
 
@@ -901,7 +1062,11 @@ def _update_draft_inputs_kernel(
     num_speculative_steps,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     req_idx = tl.program_id(0)
 
     # Write the sampled draft token into self.draft_tokens[req_idx, step].
@@ -986,4 +1151,6 @@ def update_draft_inputs(
         num_speculative_steps,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
+        GLUE_PDL=glue_pdl(),
+        launch_pdl=glue_pdl(),
     )

@@ -472,3 +472,145 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+## Qwen MLPerf Runner Optimizations
+
+The Qwen MLPerf integration in this fork uses the following controls. Sampling
+controls apply to the V2 GPU model runner. Eligibility checks retain the ordinary
+backend when a shape, layout, sampling mode, or platform is unsupported.
+
+| Control | Default | Behavior |
+| --- | --- | --- |
+| `VLLM_LOWM_BF16_GEMM` | `1` | TinyGEMM for eligible small BF16 projections and measured larger-M plans on SM107. SM100 and SM103 additionally require `VLLM_LOWM_BF16_GEMM_SM100=1`. |
+| `VLLM_LOWM_BF16_GEMM_PDL` | `0` | Programmatic dependent launch for TinyGEMM. Availability is checked and warmed before capture. |
+| `VLLM_LOWM_BF16_GEMM_SM100` | `0` | Opts SM100 and SM103 into TinyGEMM for eligible small BF16 projections; requires `VLLM_LOWM_BF16_GEMM=1`. Graph-changing, so it is part of the compilation cache key. |
+| `VLLM_GDN_PREFILL_CHECKPOINT` | `0` | Internal GDN tail export. Requires align mode and retention interval `0`. |
+| `VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS` | `0` | Without the initial-state copy capability (GDN with prefill lookahead at most one, and KDA's flashkda backend), also stops an exporting prefill at its reusable replay/extension boundaries (sibling reuse at the cost of extra prefill steps). |
+| `VLLM_GDN_FUSED_CONV_PREP` | `1` | Fused convolution, state update, and post-conv preparation, including batches exceeding 64 prefill sequences. |
+| `VLLM_MTP_DRAFT_PREFILL_PRUNE` | `0` | Attention computes sampled draft-prefill rows across decode and prefill buckets after writing every scheduled KV row. |
+| `VLLM_MTP_DRAFT_PREFILL_ROWS` | `0` | Post-attention MTP computation uses only sampled rows. This graph-changing setting separates compilation cache entries. |
+| `VLLM_SAMPLER_SPLIT_ROW_TOPK` | `1` | Enables eligible split-row top-k paths. Setting `0` also disables compact rejection, fused preparation, and sparse verification. |
+| `VLLM_FUSED_REJECTION_SAMPLER` | `1` | Prefers compact fused rejection when eligible. Setting `0` leaves separately enabled preparation/sparse fallbacks available. |
+| `VLLM_SAMPLER_FUSED_PREP` | `1` | Fuses copy, penalties, and temperature with split-row top-k on supported rejection fallbacks. |
+| `VLLM_SPARSE_VERIFY_SAMPLING` | `0` | Sparse standard one-hot verification, including raw logprobs/logits; compact rejection remains preferred when eligible. |
+| `VLLM_KV_COW_ONE_LAUNCH` | `1` | Copies eligible disjoint cache rows across storages in one launch. |
+| `VLLM_FUSED_KV_BLOCK_COPY` | `1` | Direct per-storage fallback when the one-launch plan is unavailable. Set both copy controls to `0` for gather/scatter. |
+
+### GEMM and Copy Boundaries
+
+Generic TinyGEMM covers `1 <= M <= 64`, positive `N % 16 == 0`, and
+`K % 64 == 0`, including TP-sharded `N=32`, on SM107 by default and on SM100
+and SM103 with `VLLM_LOWM_BF16_GEMM_SM100=1`. SM107 retains its larger measured
+windows for the router, GDN BA projection, and shared-expert gate. Inputs,
+weights, and destinations must satisfy the backend's dtype, device, contiguity,
+and alignment requirements. Unsupported cases retain the baseline without a
+hidden layout-copy conversion. TinyGEMM and row-dot accumulation can differ in
+the last BF16 bit from the baseline GEMM.
+
+The one-launch CoW plan requires its existing 16-byte alignment proof. The
+per-storage fallback accepts safe dense 4-byte-aligned rows, including mixed-page
+layer-outer regions. Both direct paths require unique destinations disjoint from
+sources; overlapping physical rows and subword layouts retain gather/scatter.
+The index upload is shared across storages, and warmup covers the direct kernel's
+alignment specializations.
+
+### Checkpoint Coverage and Scheduling
+
+An internal tail export does not generally provide the full-block state that a
+sibling with a shorter shared prefix, or a block-aligned resend, needs.
+
+Without the initial-state copy capability (GDN with MTP lookahead of at most
+one, e.g. single-module MTP, and KDA's flashkda backend), a prefill whose tail
+export is valid runs to its end in one chunk by default. This is correct: the
+export never aliases a block-aligned, shareable initial state, and boundaries
+the chunk runs through are not hashed. A chunk that starts mid-block and could
+still be shortened afterwards, by an encoder input in its window that may not be
+schedulable or by multi-module MTP's lookahead reservation, stops at the next
+block boundary instead: the shortened chunk would not export, and its untouched
+initial column would otherwise be hashed as that boundary's state. Siblings with
+a shorter shared prefix miss the unmaterialized full-block states.
+`VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS=1` instead retains distinct
+replay/extension stops, keeping the fast path only when the export itself
+supplies the boundary or safely reuses a private mid-block initial state. An
+export that would then overwrite a block-aligned initial state requires a
+tail-boundary split. For example, without EAGLE-style block drop, a cold
+5,000-token GDN prompt with block size 2,176 and hash unit 32 runs as one chunk
+by default; with reuse stops it ends chunks at 4,352, 4,992, and 5,000,
+retaining both reusable states at the cost of two additional prefill steps (a
+cold 4,608-token prompt at block size 1,152 takes three: 3,456, 4,576, 4,608).
+With EAGLE-style block drop (EAGLE/EAGLE3/MTP speculators), the replay and
+extension stops back off one block and the tail checkpoint is
+`floor(N / h) * h - h` (the whole prompt is readable before the drop, so a
+prompt that is a multiple of the hash unit `h` checkpoints at `N - h`): the
+5,000-token prompt ends chunks at 2,176 and 5,000 (tail export at 4,960), and
+the 4,608-token one at 3,456, 4,576, and 4,608.
+
+GDN with MTP lookahead greater than one can instead preserve the initial state
+in an immutable CoW snapshot before reusing its physical column for the internal
+export. Cached hits are privatized before mutation. Retained snapshots and own
+pins consume cache pages in addition to the running table. Copy-capable align-mode
+memory budgeting reserves four extra snapshot pages: two replay/extension states,
+one junction, and the original prompt tail when a request resumes after generating
+output tokens. These holds are released when the request is freed. A near-tail
+query whose desired checkpoint equals its start may export the next full boundary
+strictly inside the query instead.
+The scheduler, metadata builder, and cache manager use the same boundary selector.
+An exporter-ineligible query retains ordinary partial-tail caching.
+
+Eagle's block/hash drops still apply. A sibling admitted before a producer exports
+its state may legitimately start cold; prefix hits are not retroactively applied
+to running requests. Very small prefill budgets below one Mamba block can still
+stall an unaligned near-tail MTP chunk. This restoration does not relax the
+alignment guards for that pre-existing case.
+
+### Draft and Sampling Limits
+
+Draft attention pruning retains single-attention-layer and distributed-layout
+safety gates. Eligible FP16/BF16 outputs and BF16-query/FP8-KV generation use the
+ordinary decode interface and query-dtype-aware scales. Generation pruning does
+not duplicate the full KV cache. A prefill/capture fallback that requires KV
+dequantization limits its table to the needed context width and clears stale
+per-request tail page IDs.
+
+Fused sampling preparation preserves full processed-logit consumers and supports
+eligible logprob, probabilistic-draft, block, synthetic, watermark, and adaptive
+fallbacks. Other active logits transformations can still require ordinary
+preparation. Sparse verification requires temperatures exactly `1`, one-hot
+drafts, standard verification, and no processed-score consumer or
+watermark/adaptive mode. It preserves the dense path's reduction geometry and
+request/position/token-keyed RNG.
+
+### Rubin FlashInfer Source Compatibility
+
+FlashInfer 0.7.2 (the pinned release) ships the SM107 dense block-scaled GEMM
+with FlashInfer's own SM100 parent, the CuTe DSL 4.8 scheduler interface, and
+the NamedBarrier attributes the SM107 subclass needs, so no source backport is
+applied to Rubin images. The `vllm/lcd_pdl` GEMM overlays replace a FlashInfer
+module only when its source matches an approved base (sha256 guard); other
+revisions are left alone. Do not disable the guard to force an unapproved
+source. SM107 overrides the persistent kernel, so parent compatibility is not a
+native-SM107 weight-prefetch implementation.
+
+### Targeted Verification
+
+Use a built development environment and the normal test dependencies:
+
+```bash
+python -m pytest -q tests/test_envs.py \
+  tests/kernels/test_lowm_bf16_gemm_optin.py \
+  tests/v1/core/test_mamba_checkpointed_chunk_cache.py \
+  tests/v1/attention/test_draft_prefill_rows.py
+
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/kernels/test_lowm_bf16_gemm.py \
+  tests/kernels/mamba/test_gdn_fused_conv_prep.py \
+  tests/v1/worker/test_kv_cow_copy.py \
+  tests/v1/worker/test_gpu_fused_rejection.py \
+  tests/v1/attention/test_flashinfer_draft_decode_update.py
+```
+
+Native SM100/SM103/SM107 cases skip on other GPUs. Overlay compatibility tests in
+`tests/tools/test_lcd_pdl_overlay.py` accept the real pinned source fixtures via
+`VLLM_TEST_FLASHINFER_SOURCES` and the Rubin CuTe DSL dependencies; the fixtures
+are checked against the overlay's approved base hashes. Numerical/kernel checks do not
+replace a full MLPerf accuracy and throughput run on the target hardware.

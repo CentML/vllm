@@ -230,7 +230,6 @@ def fused_sigmoid_gating_delta_rule_update(
         o = q.new_empty(NK, *v.shape)
     else:
         assert out.is_contiguous() and out.numel() == v.numel()
-        assert out.dtype == q.dtype
         o = out.view(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state

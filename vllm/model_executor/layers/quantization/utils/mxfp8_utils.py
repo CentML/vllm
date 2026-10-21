@@ -289,6 +289,13 @@ direct_register_custom_op(
     fake_impl=mxfp8_e4m3_quantize_fake,
 )
 
+# The fused (add +) RMSNorm and attention gate producers replace
+# vllm::mxfp8_quantize in compiled graphs. Register them with the quant op, so
+# graphs loaded from the compile cache (which skip the fusion passes) resolve
+# them.
+import vllm.model_executor.layers.fusion.attn_gate_mxfp8_quant  # noqa: E402, F401
+import vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant  # noqa: E402, F401
+
 
 def xpu_mxfp8_quantize(
     x: torch.Tensor, dtype: torch.dtype | None = None

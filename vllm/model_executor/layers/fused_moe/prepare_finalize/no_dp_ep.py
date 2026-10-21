@@ -9,13 +9,23 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 
 
 def _quantize_input(
-    a1: torch.Tensor,
+    a1: "torch.Tensor | QuantizedActivation",
     quant_config: FusedMoEQuantConfig,
     defer_input_quant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if isinstance(a1, QuantizedActivation):
+        # Already quantized by the post-attention norm; the MoE runner only
+        # passes this for the linear-layout MXFP8 input of experts that
+        # quantize here.
+        assert not defer_input_quant
+        assert quant_config.quant_dtype == "mxfp8"
+        assert not quant_config.is_scale_swizzled
+        return a1.data, a1.scale
+
     # Defer input quant to moe kernel for backends (e.g. AITER, FI)
     # which use a single kernel call for quant + experts.
     if defer_input_quant:

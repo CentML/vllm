@@ -5,12 +5,25 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+from typing import Any, NamedTuple
+
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
+    GDN_HOST_TRIM,
+    arch_support_pdl,
+    launcher,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+# Launch config of _causal_conv1d_fwd_kernel. BLOCK_M must match the
+# metadata builders (compute_causal_conv1d_metadata builds BLOCK_M=8).
+_FWD_BLOCK_M = 8
+_FWD_BLOCK_N = 256
+_FWD_NUM_WARPS = 4
 
 
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
@@ -112,6 +125,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
 
+    # The BLOCK_M tokens of this chunk are convolved as one [BLOCK_M, BLOCK_N]
+    # tile. Tap j of row m reads the token (KERNEL_WIDTH - 1 - j) positions
+    # back; in chunk 0 the positions before the sequence come from the
+    # initial conv state: prior_j[m] = conv_state[m + j] (or zeros).
+    tl.static_assert(KERNEL_WIDTH >= 2 and KERNEL_WIDTH <= 4)
+    offs_m = tl.arange(0, BLOCK_M)
+    mask_w = idx_feats < dim
+    prior0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=x_ptr.dtype.element_ty)
+    prior1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=x_ptr.dtype.element_ty)
+    prior2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=x_ptr.dtype.element_ty)
+
     # Does 2 things:
     # 1. READ prior-block init-state data - [done by every Triton programs]
     # 2. update conv_state with new data [only by the Triton program handles chunk_offset=0]
@@ -119,44 +143,27 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         # read from conv_states
         load_init_state = tl.load(has_initial_states_ptr + idx_seq).to(tl.int1)
         if load_init_state:
-            # load from conv_states
-            prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
-            mask_w = idx_feats < dim
-            if KERNEL_WIDTH == 2:
-                conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-            if KERNEL_WIDTH == 3:
-                conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-            if KERNEL_WIDTH == 4:
-                conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-            if KERNEL_WIDTH == 5:
-                conv_states_ptrs = prior_tokens  # [BLOCK_N]
-                col3 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 1 * stride_conv_state_tok  # [BLOCK_N]
-                col2 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 2 * stride_conv_state_tok  # [BLOCK_N]
-                col1 = tl.load(conv_states_ptrs, mask_w, 0.0)
-                conv_states_ptrs = prior_tokens - 3 * stride_conv_state_tok  # [BLOCK_N]
-                col0 = tl.load(conv_states_ptrs, mask_w, 0.0)
-        else:
-            # prior-tokens are zeros
-            if KERNEL_WIDTH >= 2:  # STRATEGY1
-                # first chunk and does not have prior-token, so just set to 0
-                col0 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
-            if KERNEL_WIDTH >= 3:  # STRATEGY1
-                col1 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
-            if KERNEL_WIDTH >= 4:  # STRATEGY1
-                col2 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
-            if KERNEL_WIDTH >= 5:  # STRATEGY1
-                col3 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
+            # load from conv_states (before this program overwrites them below)
+            prior_rows = conv_states_base[None, :] + (
+                offs_m[:, None] * stride_conv_state_tok
+            )
+            prior0 = tl.load(
+                prior_rows,
+                (offs_m < state_len)[:, None] & mask_w[None, :],
+                0.0,
+            )
+            if KERNEL_WIDTH >= 3:
+                prior1 = tl.load(
+                    prior_rows + stride_conv_state_tok,
+                    (offs_m + 1 < state_len)[:, None] & mask_w[None, :],
+                    0.0,
+                )
+            if KERNEL_WIDTH >= 4:
+                prior2 = tl.load(
+                    prior_rows + 2 * stride_conv_state_tok,
+                    (offs_m + 2 < state_len)[:, None] & mask_w[None, :],
+                    0.0,
+                )
 
         # STEP 2:
         # here prepare data for updating conv_state
@@ -263,36 +270,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 ]
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
-    else:  # chunk_offset > 0
-        # read prior-token data from `x`
-        load_init_state = True
-        prior_tokens = x_base + (token_offset - 1) * stride_x_token
-        mask_w = idx_feats < dim
-        if KERNEL_WIDTH == 2:
-            conv_states_ptrs = prior_tokens  # [BLOCK_N]
-            col0 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-        if KERNEL_WIDTH == 3:
-            conv_states_ptrs = prior_tokens  # [BLOCK_N]
-            col1 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 1 * stride_x_token  # [BLOCK_N]
-            col0 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-        if KERNEL_WIDTH == 4:
-            conv_states_ptrs = prior_tokens  # [BLOCK_N]
-            col2 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 1 * stride_x_token  # [BLOCK_N]
-            col1 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 2 * stride_x_token  # [BLOCK_N]
-            col0 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-        if KERNEL_WIDTH == 5:
-            # ruff: noqa: F841
-            conv_states_ptrs = prior_tokens  # [BLOCK_N]
-            col3 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 1 * stride_x_token  # [BLOCK_N]
-            col2 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 2 * stride_x_token  # [BLOCK_N]
-            col1 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
-            conv_states_ptrs = prior_tokens - 3 * stride_x_token  # [BLOCK_N]
-            col0 = tl.load(conv_states_ptrs, mask_w, 0.0, cache_modifier=".ca")
+    # chunk_offset > 0: every tap reads `x` (the prior tokens precede this
+    # chunk).
 
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
@@ -306,78 +285,52 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     x_base_1d = x_base + token_offset * stride_x_token  # starting of chunk
 
     # PRE-LOAD WEIGHTS
-    mask_w = idx_feats < dim
-    if KERNEL_WIDTH >= 2:
-        w_ptrs = w_base + (0 * stride_w_width)  # [BLOCK_N] tensor
-        w_col0 = tl.load(w_ptrs, mask_w, other=0.0)
-        w_ptrs = w_base + (1 * stride_w_width)  # [BLOCK_N] tensor
-        w_col1 = tl.load(w_ptrs, mask_w, other=0.0)
+    w_col0 = tl.load(w_base, mask_w, other=0.0)
+    w_col1 = tl.load(w_base + 1 * stride_w_width, mask_w, other=0.0)
     if KERNEL_WIDTH >= 3:
-        w_ptrs = w_base + (2 * stride_w_width)  # [BLOCK_N] tensor
-        w_col2 = tl.load(w_ptrs, mask_w, other=0.0)
+        w_col2 = tl.load(w_base + 2 * stride_w_width, mask_w, other=0.0)
     if KERNEL_WIDTH >= 4:
-        w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
-        w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
-    mask_x_1d = idx_feats < dim
+        w_col3 = tl.load(w_base + 3 * stride_w_width, mask_w, other=0.0)
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
-    for idx_token in range(segment_len):
-        acc = acc_preload
-
-        matrix_w = w_col0
-        matrix_x = col0
-        for j in tl.static_range(KERNEL_WIDTH):
-            if KERNEL_WIDTH == 2:
-                if j == 1:  # KERNEL_WIDTH-1:
-                    matrix_w = w_col1
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 3:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-            elif KERNEL_WIDTH == 4:
-                if j == 1:
-                    matrix_w = w_col1
-                    matrix_x = col1
-                elif j == 2:
-                    matrix_w = w_col2
-                    matrix_x = col2
-                elif j == 3:
-                    matrix_w = w_col3
-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
-
-            acc += matrix_x * matrix_w  # [BLOCK_N]
-
-        if KERNEL_WIDTH == 2:
-            col0 = matrix_x
-        elif KERNEL_WIDTH == 3:
-            col0 = col1
-            col1 = matrix_x
-        elif KERNEL_WIDTH == 4:
-            col0 = col1
-            col1 = col2
-            col2 = matrix_x
-
-        if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < segment_len) & (
-            idx_feats < dim
-        )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+    # Same per-element arithmetic as the per-token loop it replaces:
+    # acc = bias, then acc += x_j * w_j for j = 0..KERNEL_WIDTH-1 in order.
+    rows_valid = offs_m < segment_len
+    x_rows = x_base_1d[None, :] + (offs_m * stride_x_token)[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) + acc_preload[None, :]
+    for j in tl.static_range(KERNEL_WIDTH):
+        back = KERNEL_WIDTH - 1 - j  # tap j reads the token `back` positions back
+        pos = token_offset + offs_m - back  # position in the sequence
+        tap = tl.load(
+            x_rows - back * stride_x_token,
+            (rows_valid & (pos >= 0))[:, None] & mask_w[None, :],
+            0.0,
         )
+        if j == 0:
+            tap = tl.where((pos < 0)[:, None], prior0, tap)
+            w_tap = w_col0
+        elif j == 1:
+            if back > 0:
+                tap = tl.where((pos < 0)[:, None], prior1, tap)
+            w_tap = w_col1
+        elif j == 2:
+            if back > 0:
+                tap = tl.where((pos < 0)[:, None], prior2, tap)
+            w_tap = w_col2
+        else:
+            w_tap = w_col3
+        acc += tap * w_tap[None, :]  # [BLOCK_M, BLOCK_N]
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+    if SILU_ACTIVATION:
+        acc = acc / (1 + tl.exp(-acc))
+    o_ptrs = (
+        o_ptr
+        + ((sequence_start_index + token_offset + offs_m) * stride_o_token)[:, None]
+        + (idx_feats * stride_o_dim)[None, :]
+    )
+    tl.store(o_ptrs, acc, mask=rows_valid[:, None] & mask_w[None, :])
 
 
 def causal_conv1d_fn(
@@ -444,6 +397,16 @@ def causal_conv1d_fn(
     x = x.to(conv_states.dtype)
     out = torch.empty_like(x)
     if metadata is not None:
+        if (
+            metadata.batch_ptr is None
+            and getattr(metadata, "conv1d_metadata_fn", None) is not None
+        ):
+            # VLLM_GDN_HOST_TRIM2: the step's metadata is built on first use.
+            (
+                metadata.nums_dict,
+                metadata.batch_ptr,
+                metadata.token_chunk_offset_ptr,
+            ) = metadata.conv1d_metadata_fn()
         nums_dict = metadata.nums_dict
         args = nums_dict
         batch_ptr = metadata.batch_ptr
@@ -475,7 +438,7 @@ def causal_conv1d_fn(
     stride_istate_dim = 0
     stride_istate_token = 0
     num_cache_lines = 0
-    BLOCK_M = 8
+    BLOCK_M = _FWD_BLOCK_M
     if conv_states is not None:
         # extensions to support vLLM:
         # 1. conv_states is used to replaced initial_states
@@ -627,7 +590,8 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_N=_FWD_BLOCK_N,
+        num_warps=_FWD_NUM_WARPS,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
@@ -952,6 +916,9 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+_conv1d_update_launch = launcher(_causal_conv1d_update_kernel)
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1009,7 +976,8 @@ def causal_conv1d_update(
         assert activation in ["silu", "swish"]
 
     original_x_dtype = x.dtype
-    x = x.to(conv_state.dtype)
+    if not GDN_HOST_TRIM or original_x_dtype != conv_state.dtype:
+        x = x.to(conv_state.dtype)
     if out is None:
         out = x
     else:
@@ -1075,13 +1043,22 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
-    def grid(META):
-        return (
-            batch,
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+    grid: Any
+    if GDN_HOST_TRIM:
+        grid = (batch, triton.cdiv(dim, 256))
+        launch_pdl = arch_support_pdl()
+    else:
 
-    _causal_conv1d_update_kernel[grid](
+        def grid_fn(META):
+            return (
+                batch,
+                triton.cdiv(dim, META["BLOCK_N"]),
+            )
+
+        grid = grid_fn
+        launch_pdl = current_platform.is_arch_support_pdl()
+
+    _conv1d_update_launch[grid](
         # Pointers to matrices
         x,
         weight,
@@ -1121,11 +1098,232 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
-        launch_pdl=current_platform.is_arch_support_pdl(),
+        launch_pdl=launch_pdl,
     )
     if unsqueeze:
         out = out.squeeze(-1)
+    if GDN_HOST_TRIM and out.dtype == original_x_dtype:
+        return out
     return out.to(original_x_dtype)
+
+
+class _SpecConvLaunch(NamedTuple):
+    """A bound spec-row ``_causal_conv1d_update_kernel`` launch (see
+    ``causal_conv1d_update_spec_step``).
+    """
+
+    key: tuple
+    # (conv_state_indices, num_accepted_tokens, query_start_loc, max_query_len)
+    indices: tuple
+    kernel: Any
+    grid: tuple[int, int]
+    values: list
+    # Positions of the per-layer tensors in ``values``.
+    i_x: int
+    i_w: int
+    i_bias: int
+    i_state: int
+    i_out: int
+
+
+_spec_conv_fast: list = []
+
+
+def _spec_conv_key(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+) -> tuple:
+    """Everything the launch arguments and the kernel specialization depend
+    on besides the step's index tensors: dtypes, shapes, strides and 16-byte
+    alignment of the per-layer tensors.
+    """
+    return (
+        x.dtype,
+        x.dim(),
+        x.stride(),
+        x.size(1),
+        x.data_ptr() % 16 == 0,
+        conv_state.dtype,
+        conv_state.shape,
+        conv_state.stride(),
+        conv_state.data_ptr() % 16 == 0,
+        weight.dtype,
+        weight.shape,
+        weight.stride(),
+        weight.data_ptr() % 16 == 0,
+        None if bias is None else (bias.dtype, bias.data_ptr() % 16 == 0),
+        activation,
+    )
+
+
+def _bind_spec_conv_launch(
+    key: tuple,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+) -> _SpecConvLaunch | None:
+    """The launch ``causal_conv1d_update`` makes for these arguments (varlen
+    spec decoding, ``out=None``, default ``null_block_id``), bound once; None
+    if that form does not apply or the kernel is not compiled yet.
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation is True else None
+    if (
+        activation not in ("silu", "swish")
+        or x.dim() != 2
+        or x.dtype != conv_state.dtype
+    ):
+        return None
+    batch = conv_state_indices.size(0)
+    dim = x.size(1)
+    seqlen = max_query_len
+    _, width = weight.shape
+    num_cache_lines, _, _ = conv_state.size()
+    stride_w_dim, stride_w_width = weight.stride()
+    stride_x_token, stride_x_dim = x.stride()
+    stride_state_seq, stride_state_dim, stride_state_token = conv_state.stride()
+    # num_accepted_tokens is set: the effective state length.
+    state_len = width - 1 + (seqlen - 1)
+    if not _spec_conv_fast:
+        from vllm.triton_utils.fast_launch import FastLaunch, launch_bound
+
+        fast = FastLaunch(_causal_conv1d_update_kernel)
+        _spec_conv_fast.extend((fast, launch_bound))
+    bound = _spec_conv_fast[0].bind(
+        x,
+        weight,
+        bias,
+        conv_state,
+        conv_state_indices,
+        num_accepted_tokens,
+        query_start_loc,
+        x,  # out = x
+        batch,
+        dim,
+        seqlen,
+        state_len,
+        num_cache_lines,
+        0,
+        stride_x_dim,
+        stride_x_token,
+        stride_w_dim,
+        stride_w_width,
+        stride_state_seq,
+        stride_state_dim,
+        stride_state_token,
+        conv_state_indices.stride(0),
+        0,
+        stride_x_dim,
+        stride_x_token,
+        NULL_BLOCK_ID,
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=True,
+        IS_VARLEN=True,
+        IS_SPEC_DECODING=True,
+        NP2_STATELEN=triton.next_power_of_2(state_len),
+        HAS_NULL_BLOCK=NULL_BLOCK_ID is not None,
+        BLOCK_N=256,
+        launch_pdl=arch_support_pdl(),
+    )
+    if bound is None:
+        return None
+    kernel, names, values = bound
+    return _SpecConvLaunch(
+        key=key,
+        indices=(
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+        ),
+        kernel=kernel,
+        grid=(batch, triton.cdiv(dim, 256)),
+        values=values,
+        i_x=names.index("x_ptr"),
+        i_w=names.index("w_ptr"),
+        i_bias=names.index("bias_ptr"),
+        i_state=names.index("conv_state_ptr"),
+        i_out=names.index("o_ptr"),
+    )
+
+
+def causal_conv1d_update_spec_step(
+    md: Any,
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool | str | None,
+    conv_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+) -> torch.Tensor:
+    """VLLM_GDN_HOST_TRIM3 (HOIST_CONV): ``causal_conv1d_update(x,
+    conv_state, weight, bias, activation, conv_state_indices=...,
+    num_accepted_tokens=..., query_start_loc=..., max_query_len=...,
+    validate_data=False)`` for the spec rows of the step whose metadata is
+    ``md``. The first GDN layer of the step binds the launch (compiled kernel
+    and argument list); every layer whose tensors have the same key and
+    whose index tensors are the same objects relaunches it with its own x,
+    weight, bias and conv state: the same kernel with the same arguments as
+    the wrapper's launch. Anything else takes the wrapper. Returns x (updated
+    in place, as the wrapper does when x has the conv state's dtype).
+    """
+    key = _spec_conv_key(x, conv_state, weight, bias, activation)
+    launch = md.__dict__.get("_htrim3_spec_conv")
+    if launch is None:
+        launch = _bind_spec_conv_launch(
+            key,
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+            max_query_len,
+        )
+        md.__dict__["_htrim3_spec_conv"] = launch or False
+    if (
+        launch
+        and launch.key == key
+        and launch.indices[0] is conv_state_indices
+        and launch.indices[1] is num_accepted_tokens
+        and launch.indices[2] is query_start_loc
+        and launch.indices[3] == max_query_len
+    ):
+        values = launch.values.copy()
+        values[launch.i_x] = x
+        values[launch.i_out] = x
+        values[launch.i_w] = weight
+        values[launch.i_bias] = bias
+        values[launch.i_state] = conv_state
+        _spec_conv_fast[1](launch.kernel, launch.grid, values)
+        return x
+    return causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation,
+        conv_state_indices=conv_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        query_start_loc=query_start_loc,
+        max_query_len=max_query_len,
+        validate_data=False,
+    )
 
 
 if current_platform.is_cpu():

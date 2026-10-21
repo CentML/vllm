@@ -461,8 +461,11 @@ class BaseRenderer(ABC, Generic[_T]):
         if not token_ids or tokenizer is None:
             return
 
-        max_input_id = max(token_ids)
-        min_input_id = min(token_ids)
+        # VLLM_FEH_MEMO=1: one exact int32 pass shared with front-end block
+        # hashing, which reuses the array for the same prompt list (same values).
+        from vllm.v1.engine.frontend_block_hashing import prompt_id_min_max
+
+        min_input_id, max_input_id = prompt_id_min_max(token_ids)
 
         # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
         # self.model_config.get_vocab_size() is the model’s vocab size.

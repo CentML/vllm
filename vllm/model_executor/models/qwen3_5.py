@@ -427,6 +427,13 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        # VLLM_LOCALITY_LM_HEAD: domain-local BF16 head for small M (set by
+        # locality.lm_head.maybe_enable after loading; None otherwise)
+        loc_head = getattr(self, "locality_lm_head", None)
+        if loc_head is not None:
+            logits = loc_head(hidden_states)
+            if logits is not None:
+                return logits
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_logits_local(
@@ -472,6 +479,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
+    # With multimodal ingress disabled, Qwen3.5 uses the same sequential
+    # position IDs for every M-RoPE channel.
+    supports_linear_text_mrope = True
 
     hf_to_vllm_mapper = (
         Qwen3VLForConditionalGeneration.hf_to_vllm_mapper

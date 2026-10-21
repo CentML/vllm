@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Warm up Qwen Triton kernels from the loaded model's compile keys."""
 
+import itertools
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,6 +49,12 @@ class _QwenGDNWarmupConfig:
     dt_bias: torch.Tensor
     state_stride_token: int
     state_dtype: torch.dtype
+    # The FlashInfer prefill path makes the post-conv kernel emit exp(g).
+    post_conv_output_g_exp: bool = False
+    # out_proj consumes the MXFP8 activation written by the core op.
+    gdn_out_mxfp8: bool = False
+    # Prefill updates the SSM state pool in place (FlashInfer state_indices).
+    state_in_place: bool = False
 
     @property
     def conv_dim(self) -> int:
@@ -136,6 +144,17 @@ def _qwen_gdn_warmup_config(
             dt_bias=layer.dt_bias,
             state_stride_token=int(ssm_state.stride(0)),
             state_dtype=ssm_state.dtype,
+            post_conv_output_g_exp=bool(
+                getattr(
+                    getattr(layer, "chunk_gated_delta_rule", None),
+                    "expects_exp_g",
+                    False,
+                )
+            ),
+            gdn_out_mxfp8=bool(getattr(layer, "gdn_out_mxfp8", False)),
+            state_in_place=bool(
+                layer.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype)
+            ),
         )
 
     if found_layer:
@@ -145,27 +164,307 @@ def _qwen_gdn_warmup_config(
     return None
 
 
+def _warm_mxfp8_producers(runner: "GPUModelRunner", device: torch.device) -> None:
+    """Every launch config of the SiLU-and-mul and attention-gate MXFP8
+    producers: their tile and warp counts switch with the token count, so the
+    dummy runs alone leave mixed-batch sizes to compile at runtime.
+    """
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.fusion.quant_activation import get_input_quant_key
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Dynamic,
+    )
+
+    act_dtype = runner.model_config.dtype
+    silu_producers: dict[int, tuple[torch.nn.Module, torch.nn.Module]] = {}
+    gate_shapes: set[tuple[int, int]] = set()
+    for module in runner.get_model().modules():
+        down_proj = getattr(module, "down_proj", None)
+        if (
+            isinstance(getattr(module, "act_fn", None), SiluAndMul)
+            and down_proj is not None
+            and get_input_quant_key(down_proj) == kMxfp8Dynamic
+        ):
+            silu_producers.setdefault(
+                down_proj.input_size_per_partition, (module.act_fn, down_proj)
+            )
+        if getattr(module, "attn_gate_mxfp8", False):
+            gate_shapes.add((module.num_heads, module.head_dim))
+    bf16 = torch.bfloat16
+    if silu_producers:
+        from vllm.model_executor.layers.fusion import silu_mul_mxfp8_quant as silu
+
+        for d, (act_fn, down_proj) in silu_producers.items():
+            for num_tokens in silu.LAUNCH_CONFIG_TOKEN_COUNTS:
+                x = torch.zeros((num_tokens, 2 * d), dtype=act_dtype, device=device)
+                # Serving falls back to the plain activation for these inputs.
+                if not silu.silu_mul_mxfp8_supported(act_fn, x, down_proj):
+                    break
+                silu.silu_mul_mxfp8_quant(x)
+    if gate_shapes:
+        from vllm.model_executor.layers.fusion import attn_gate_mxfp8_quant as gate
+
+        for heads, head_dim in gate_shapes:
+            for num_tokens in gate.LAUNCH_CONFIG_TOKEN_COUNTS:
+                shape = (num_tokens, heads, head_dim)
+                attn = torch.zeros(shape, dtype=bf16, device=device)
+                # The gate half of q_gate, read strided as the layer does.
+                q_gate = torch.zeros(
+                    (num_tokens, heads, 2, head_dim), dtype=bf16, device=device
+                )
+                gate.attn_gate_mxfp8_quant(attn, q_gate[:, :, 1])
+
+
 def _warm_gated_rms_norm_kernel(
     device: torch.device,
     config: _QwenGDNWarmupConfig,
     max_num_tokens: int,
     x_dtype: torch.dtype,
 ) -> None:
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_norm_launch_config,
+    )
     from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
         warmup_layer_norm_fwd,
     )
 
-    warmup_layer_norm_fwd(
-        max_num_tokens=max_num_tokens,
-        rows_per_token=config.hv,
-        group_size=config.v,
-        x_dtype=x_dtype,
-        weight_dtype=config.norm_weight_dtype,
-        device=device,
-        norm_before_gate=config.norm_before_gate,
-        is_rms_norm=True,
-        activation=config.norm_activation,
+    # Decode-only batches normalize T * HV rows of V; batches with prefill
+    # normalize T rows of HV * V (one group per head), with the layer's launch
+    # config.
+    for rows_per_token in (config.hv, 1):
+        launch_config = None
+        if rows_per_token == 1:
+            launch_config = partial(gdn_norm_launch_config, device=device)
+        warmup_layer_norm_fwd(
+            max_num_tokens=max_num_tokens,
+            rows_per_token=rows_per_token,
+            group_size=config.v,
+            x_dtype=x_dtype,
+            weight_dtype=config.norm_weight_dtype,
+            device=device,
+            norm_before_gate=config.norm_before_gate,
+            is_rms_norm=True,
+            activation=config.norm_activation,
+            launch_config=launch_config,
+        )
+
+
+def _warm_gdn_gated_norm_mxfp8_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig, x_dtype: torch.dtype
+) -> None:
+    if not config.gdn_out_mxfp8:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        gdn_gated_norm_mxfp8,
+        gdn_mxfp8_scale_numel,
     )
+
+    hidden = config.hv * config.v
+    weight = torch.ones(config.v, dtype=config.norm_weight_dtype, device=device)
+    # Both num_warps classes, with the valid row count as a host int (mixed
+    # batches) and as a device scalar (decode-only batches).
+    for num_rows in (1, 1024):
+        x = torch.zeros((num_rows, config.hv, config.v), dtype=x_dtype, device=device)
+        q = torch.empty((num_rows, hidden), dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty(
+            gdn_mxfp8_scale_numel(num_rows, hidden), dtype=torch.uint8, device=device
+        )
+        for num_valid in (
+            num_rows,
+            torch.full((1,), num_rows, dtype=torch.int32, device=device),
+        ):
+            gdn_gated_norm_mxfp8(
+                x,
+                x,
+                weight,
+                1e-6,
+                config.norm_activation,
+                q,
+                scale,
+                (0, num_rows),
+                num_valid,
+            )
+
+
+def _warm_zero_fresh_state_rows_kernel(
+    device: torch.device, config: _QwenGDNWarmupConfig
+) -> None:
+    if not config.state_in_place:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+
+    pool = torch.empty(
+        (1, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
+    )
+    # Serving passes slices of the batch's index and flag tensors (offset by
+    # prefill_row_start / num_decodes), so either pointer may miss Triton's
+    # 16-byte divisibility specialization: compile all four variants. The
+    # flags are set, so nothing is written.
+    indices = torch.zeros(2, dtype=torch.int32, device=device)
+    flags = torch.ones(2, dtype=torch.bool, device=device)
+    for indices_offset, flags_offset in itertools.product((0, 1), repeat=2):
+        zero_fresh_state_rows(
+            pool,
+            indices[indices_offset : indices_offset + 1],
+            flags[flags_offset : flags_offset + 1],
+        )
+    from vllm.model_executor.layers.mamba.ops.gdn_host_trim import GDN_HOST_TRIM3
+
+    if not GDN_HOST_TRIM3:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        StatePoolGroup,
+        zero_fresh_state_rows_layers,
+    )
+
+    # The one-launch zeroing of a layer group, same four variants.
+    other = torch.empty_like(pool)  # alive for the launches (held weakly)
+    group = StatePoolGroup((pool, other))
+    for indices_offset, flags_offset in itertools.product((0, 1), repeat=2):
+        zero_fresh_state_rows_layers(
+            group,
+            indices[indices_offset : indices_offset + 1],
+            flags[flags_offset : flags_offset + 1],
+        )
+
+
+def _warm_gdn_mtp_recurrence_kernel(
+    runner: "GPUModelRunner",
+    device: torch.device,
+    config: _QwenGDNWarmupConfig,
+    x_dtype: torch.dtype,
+) -> None:
+    """Every launch config of the Triton spec-decode recurrence (batches of at
+    most GDN_MTP_TRITON_MAX_REQUESTS requests). Graph capture compiles it only
+    when the decode graphs run it; with the fused one-launch decode
+    (VLLM_GDN_FUSED_DECODE_MAX_REQS) only eager mixed batches do, at runtime.
+    No request has an accepted source state, so nothing is read from or
+    written to the state.
+    """
+    speculative_config = getattr(runner, "speculative_config", None)
+    num_spec = (
+        0
+        if speculative_config is None
+        else int(speculative_config.num_speculative_tokens or 0)
+    )
+    if num_spec <= 0:
+        return
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        GDN_MTP_TRITON_MAX_REQUESTS,
+    )
+    from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import (
+        gdn_mtp_launch_config,
+        gdn_mtp_recurrence,
+    )
+
+    width = num_spec + 1
+    state = torch.empty(
+        (1, config.hv, config.v, config.k), dtype=config.state_dtype, device=device
+    )
+    launch_configs = set()
+    for num_requests in range(1, GDN_MTP_TRITON_MAX_REQUESTS + 1):
+        launch_config = gdn_mtp_launch_config(num_requests)
+        if launch_config in launch_configs:
+            continue
+        launch_configs.add(launch_config)
+        num_tokens = num_requests * width
+        mixed_qkv = torch.zeros(
+            (num_tokens, config.conv_dim), dtype=config.conv_dtype, device=device
+        )
+        a = torch.zeros((num_tokens, config.hv), dtype=config.conv_dtype, device=device)
+        gdn_mtp_recurrence(
+            mixed_qkv,
+            a,
+            torch.zeros_like(a),
+            config.a_log,
+            config.dt_bias,
+            torch.zeros((num_requests, width), dtype=torch.int32, device=device),
+            torch.arange(0, num_tokens + 1, width, dtype=torch.int32, device=device),
+            torch.zeros(num_requests, dtype=torch.int32, device=device),
+            state,
+            torch.empty(
+                (num_tokens, config.hv, config.v), dtype=x_dtype, device=device
+            ),
+            scale=config.k**-0.5,
+        )
+
+
+def _warm_prefill_checkpoint_kernels(
+    device: torch.device, config: _QwenGDNWarmupConfig
+) -> None:
+    """The copy kernels of GDN internal prefill checkpoints and the builder's
+    slot kernel, for every BLOCK variant a step can use (<= 64 sequences).
+    """
+    import vllm.envs as envs
+
+    if not envs.VLLM_GDN_PREFILL_CHECKPOINT:
+        return
+    from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
+        copy_state_rows,
+        gather_prefill_rows,
+        store_conv_checkpoint,
+    )
+    from vllm.v1.attention.backends.gdn_attn import _gdn_checkpoint_slots_kernel
+
+    i32 = torch.int32
+    one = torch.ones(1, dtype=torch.int64, device=device) * config.conv_kernel_size
+    # Slot 0 is the null block: writing it is harmless.
+    store_conv_checkpoint(
+        torch.zeros(
+            (config.conv_kernel_size, config.conv_dim),
+            dtype=config.conv_dtype,
+            device=device,
+        ),
+        config.conv_state,
+        config.conv_kernel_size - 1,
+        one,
+        torch.zeros(1, dtype=i32, device=device),
+    )
+    pool = torch.zeros(
+        (2, config.hv, config.k, config.v), dtype=config.state_dtype, device=device
+    )
+    copy_state_rows(
+        pool,
+        torch.ones(1, dtype=i32, device=device),
+        torch.zeros(1, dtype=i32, device=device),
+    )
+    gather_prefill_rows(
+        torch.zeros(1, dtype=torch.int64, device=device),
+        *(
+            torch.zeros((1, 2, *shape), dtype=dtype, device=device)
+            for shape, dtype in (
+                ((config.h, config.k), config.conv_dtype),
+                ((config.h, config.k), config.conv_dtype),
+                ((config.hv, config.v), config.conv_dtype),
+                ((config.hv,), torch.float32),
+                ((config.hv,), torch.float32),
+            )
+        ),
+    )
+    block_table = torch.zeros((2, 4), dtype=i32, device=device)
+    # 2 prefills, prefill 0 checkpointed in block column 1.
+    plan = torch.tensor([0, 1, 0, 2, 0], dtype=torch.int64, device=device)
+    blocks = (16, 32, 64)
+    for block_ckpt, block_split in itertools.product(blocks, blocks):
+        if block_ckpt > block_split:
+            continue
+        _gdn_checkpoint_slots_kernel[(1,)](
+            block_table,
+            block_table.stride(0),
+            block_table[:, 0],
+            block_table.stride(0),
+            torch.ones(2, dtype=torch.bool, device=device),
+            plan,
+            torch.empty(4, dtype=i32, device=device),
+            torch.empty(4, dtype=torch.bool, device=device),
+            2,
+            1,
+            2,
+            BLOCK_CKPT=block_ckpt,
+            BLOCK_SPLIT=block_split,
+        )
 
 
 def _warm_causal_conv1d_fwd_kernel(
@@ -185,24 +484,32 @@ def _warm_causal_conv1d_fwd_kernel(
         dtype=config.conv_dtype,
         device=device,
     )
-    cache_indices = torch.full((1,), NULL_BLOCK_ID, dtype=torch.int32, device=device)
-    has_initial_state = torch.empty(1, dtype=torch.bool, device=device)
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
-
-    causal_conv1d_fn(
-        x,
-        weight,
-        None,
-        config.conv_state,
-        query_start_loc,
-        cache_indices=cache_indices,
-        has_initial_state=has_initial_state,
-        activation="silu",
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
-        metadata=None,
-        validate_data=False,
-    )
+    # Triton specializes pointers on 16-byte alignment. In spec-decode batches
+    # the prefill's has_initial_state (and possibly its state indices) are
+    # slices of per-batch tensors at a row offset, so warm the unaligned
+    # variants too (offset 1 element), or they JIT at the first such batch.
+    for state_offset, index_offset in itertools.product((0, 1), (0, 1)):
+        cache_indices = torch.full(
+            (2,), NULL_BLOCK_ID, dtype=torch.int32, device=device
+        )[index_offset : index_offset + 1]
+        has_initial_state = torch.zeros(2, dtype=torch.bool, device=device)[
+            state_offset : state_offset + 1
+        ]
+        causal_conv1d_fn(
+            x,
+            weight,
+            None,
+            config.conv_state,
+            query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation="silu",
+            pad_slot_id=PAD_SLOT_ID,
+            null_block_id=NULL_BLOCK_ID,
+            metadata=None,
+            validate_data=False,
+        )
 
 
 def _warm_fused_post_conv_kernel(
@@ -230,7 +537,7 @@ def _warm_fused_post_conv_kernel(
             config.k,
             config.v,
             apply_l2norm=True,
-            output_g_exp=False,
+            output_g_exp=config.post_conv_output_g_exp,
         )
 
 
@@ -275,6 +582,144 @@ def _warm_fused_sigmoid_gating_delta_rule_update_kernel(
     )
 
 
+# Sequence counts of the FlashInfer GDN prefill warmup in the state-pool form.
+# FlashInfer specializes its context-parallel (CP) fixup kernel on indexed
+# state I/O and on its CTA shape, which it picks from num_seqs * heads (one
+# CTA wave or more), so cover single and multi-sequence CP batches.
+_FI_GDN_POOL_WARMUP_NUM_SEQS = (1, 2, 3, 4, 8, 16)
+_FI_GDN_POOL_WARMUP_MULTI_SEQ_LEN = 1024
+
+
+def _warm_fi_gdn_prefill_state_pool(runner: "GPUModelRunner") -> None:
+    """Run FlashInfer GDN prefill as serving does: through the layer's op with
+    ``state_indices`` into a scratch pool with the live pool's layout.
+
+    The layer's own warmup runs during profiling, before the state pool exists,
+    and passes a fresh state without ``state_indices``; the CP fixup kernel of
+    the indexed form then JIT-compiles at the first long prefill under load.
+    Nothing in the live cache is touched.
+    """
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        _gdn_fi_non_cp_max_tokens,
+    )
+    from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (  # noqa: E501
+        fused_post_conv_prep,
+    )
+
+    for layer in _iter_qwen_gdn_layers(
+        runner.compilation_config.static_forward_context
+    ):
+        cache = _split_qwen_gdn_cache(getattr(layer, "kv_cache", None))
+        if cache is not None:
+            pool = cache[1]
+            break
+    else:
+        return
+    op = getattr(layer, "chunk_gated_delta_rule", None)
+    if op is None or not op.updates_state_in_place(pool.dtype):
+        return
+
+    device = pool.device
+    dtype = runner.model_config.dtype
+    h = int(layer.num_k_heads) // int(layer.tp_size)
+    hv = int(layer.num_v_heads) // int(layer.tp_size)
+    k_dim, v_dim = int(layer.head_k_dim), int(layer.head_v_dim)
+    # One FLA chunk (non-CP), one sequence over the non-CP limit (CP; the
+    # limit is higher once the layer warmup enabled V-split), then
+    # multi-sequence batches (CP while FlashInfer's heuristic picks it).
+    batches = [[64]]
+    non_cp_max_tokens = _gdn_fi_non_cp_max_tokens()
+    if non_cp_max_tokens > 0:
+        batches.append([non_cp_max_tokens + 64])
+    batches += [
+        [_FI_GDN_POOL_WARMUP_MULTI_SEQ_LEN] * n
+        for n in _FI_GDN_POOL_WARMUP_NUM_SEQS
+        if n > 1
+    ]
+    max_seqs = max(len(lens) for lens in batches)
+    scratch = torch.empty_strided(
+        (max_seqs + 1,) + tuple(pool.shape[1:]),
+        pool.stride(),
+        dtype=pool.dtype,
+        device=device,
+    )
+    scratch.zero_()
+    for lens in batches:
+        num_tokens = sum(lens)
+        mixed_qkv = torch.randn(
+            num_tokens, 2 * h * k_dim + hv * v_dim, device=device, dtype=dtype
+        )
+        a = torch.randn(num_tokens, hv, device=device, dtype=dtype)
+        b = torch.randn_like(a)
+        q, k, v, g, beta = fused_post_conv_prep(
+            conv_output=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            num_k_heads=h,
+            head_k_dim=k_dim,
+            head_v_dim=v_dim,
+            apply_l2norm=True,
+            output_g_exp=op.expects_exp_g,
+        )
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(lens)], dtype=torch.int32, device=device
+        )
+        state_indices = torch.arange(1, len(lens) + 1, dtype=torch.int32, device=device)
+        out = torch.empty(num_tokens, hv, v_dim, dtype=v.dtype, device=device)
+        op(
+            q=q.unsqueeze(0),
+            k=k.unsqueeze(0),
+            v=v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            initial_state=scratch,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            core_attn_out=out,
+            state_indices=state_indices,
+        )
+    _synchronize_device(device)
+    logger.info(
+        "Warmed FlashInfer GDN prefill (state-pool form) for batches %s.",
+        [(len(lens), lens[0]) for lens in batches],
+    )
+
+
+def _warm_gdn_layer_graphs(
+    runner: "GPUModelRunner", config: _QwenGDNWarmupConfig, x_dtype: torch.dtype
+) -> None:
+    """VLLM_GDN_LAYER_GRAPHS: the Triton variants only the layer graphs launch
+    (pack, padded-bucket spec conv update, ROWS_FROM_PTR norm).
+    """
+    from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+
+    # The graphs need out_proj's MXFP8 activation; else they never engage.
+    if not gdn_layer_graphs.ENABLED or not config.gdn_out_mxfp8:
+        return
+    layer = next(
+        (
+            layer
+            for layer in _iter_qwen_gdn_layers(
+                runner.compilation_config.static_forward_context
+            )
+            if _split_qwen_gdn_cache(getattr(layer, "kv_cache", None)) is not None
+        ),
+        None,
+    )
+    if layer is None:
+        return
+    speculative_config = getattr(runner, "speculative_config", None)
+    num_spec = (
+        0
+        if speculative_config is None
+        else int(speculative_config.num_speculative_tokens or 0)
+    )
+    gdn_layer_graphs.warm_triton_kernels(layer, num_spec, x_dtype)
+
+
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.accelerator.synchronize(device)
@@ -293,19 +738,29 @@ def qwen_triton_warmup(
         return
 
     device = runner.device
+    _warm_mxfp8_producers(runner, device)
     logger.info("Warming up Qwen GDN Triton kernels for model_type=%s.", model_type)
 
     gdn_config = _qwen_gdn_warmup_config(
         runner.compilation_config.static_forward_context
     )
     if gdn_config is None:
+        _synchronize_device(device)
         return
 
     max_num_tokens = max(1, int(runner.max_num_tokens))
     _warm_gated_rms_norm_kernel(device, gdn_config, max_num_tokens, model_config.dtype)
+    _warm_gdn_gated_norm_mxfp8_kernel(device, gdn_config, model_config.dtype)
+    _warm_zero_fresh_state_rows_kernel(device, gdn_config)
+    if not runner.is_pooling_model:
+        _warm_gdn_mtp_recurrence_kernel(runner, device, gdn_config, model_config.dtype)
+    _warm_prefill_checkpoint_kernels(device, gdn_config)
     _warm_causal_conv1d_fwd_kernel(device, gdn_config)
     _warm_fused_post_conv_kernel(device, gdn_config)
     # Pooling only runs full prefills; the decode update kernel is unused.
     if not runner.is_pooling_model:
         _warm_fused_sigmoid_gating_delta_rule_update_kernel(device, gdn_config)
+    _warm_fi_gdn_prefill_state_pool(runner)
+    if not runner.is_pooling_model:
+        _warm_gdn_layer_graphs(runner, gdn_config, model_config.dtype)
     _synchronize_device(device)

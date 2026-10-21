@@ -130,6 +130,12 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
+    VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD: int = 8192
+    VLLM_GDN_PREFILL_CHECKPOINT: bool = False
+    VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS: bool = False
+    VLLM_GDN_VSPLIT_CG0SPLIT: bool = False
+    VLLM_GDN_VSPLIT_C1REORDER: bool = False
+    VLLM_GDN_FI_VSPLIT_V1: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
@@ -218,10 +224,39 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_FILE: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_STRICT: bool = False
+    VLLM_FLASHINFER_AUTOTUNE_RECORD: str | None = None
+    VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS: int = 15
+    VLLM_FLASHINFER_MXFP8_K64: bool = True
+    VLLM_FLASHINFER_MXFP8_K64_TACTICS: str = "512,256,256,2;256,256,256,2;256,128,256,2"
+    VLLM_FLASHINFER_MXFP8_K64_MIN_M: int = 256
+    VLLM_MXFP8_SPLITK_MIDM: bool = False
+    VLLM_MXFP8_SPLITK_MIDM_TACTICS: str = "64,2;64,4;128,2;128,4"
+    VLLM_MXFP8_SPLITK_MIDM_MAX_M: int = 2048
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int | None = None
+    VLLM_FLASHINFER_TRTLLM_GEN_PREFILL: bool = True
+    VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
+    VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
+    VLLM_FI_PERSISTENT_KV_COUNTER_BYTES: int = 1 << 20
+    VLLM_KF_PREFILL_ATTN: bool = False
+    VLLM_KF_PREFILL_ATTN_MIN_KV: int = 4096
+    VLLM_KF_PREFILL_ATTN_SEARCH: str = "r3"
+    VLLM_KF_PREFILL_ATTN_CHECK: int = 0
+    VLLM_KF_PREFILL_ATTN_PRECISE: bool = False
+    VLLM_KF_PREFILL_ATTN_LOG_EVERY: int = 4096
+    VLLM_KF_DECODE_ATTN: bool = False
+    VLLM_KF_DECODE_ATTN_MAX_BL: int = 8
+    VLLM_KF_DECODE_ATTN_QLENS: str = ""
+    VLLM_KF_DECODE_ATTN_CHECK: int = 0
+    VLLM_KF_DECODE_ATTN_LOG_EVERY: int = 0
+    VLLM_MXFP8_TUNE_BUCKETS: str | None = None
+    VLLM_MTP_DRAFT_PREFILL_PRUNE: bool = False
+    VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK: int = 0
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -253,9 +288,16 @@ if TYPE_CHECKING:
         Literal["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"]
         | None
     ) = None
+    VLLM_KV_COW_ONE_LAUNCH: bool = True
+    VLLM_FUSED_KV_BLOCK_COPY: bool = True
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+    VLLM_SAMPLER_SPLIT_ROW_TOPK: bool = True
+    VLLM_DRAFT_SPLIT_ROW_ARGMAX: bool = True
+    VLLM_FUSED_REJECTION_SAMPLER: bool = True
+    VLLM_SAMPLER_FUSED_PREP: bool = True
+    VLLM_SPARSE_VERIFY_SAMPLING: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
@@ -304,9 +346,17 @@ if TYPE_CHECKING:
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_MTP_DRAFT_LM_HEAD_MXFP8: bool = False
+    VLLM_FI_SM107_MOE_PDL_MAX_TOKENS: int = 0
+    VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE: str = ""
+    VLLM_MOE_PDL_FC: bool = False
+    VLLM_LOWM_BF16_GEMM: bool = True
+    VLLM_LOWM_BF16_GEMM_PDL: bool = False
+    VLLM_LOWM_BF16_GEMM_SM100: bool = False
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_MROPE_TEXT_ONLY_FAST_PATH: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1228,6 +1278,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ["cuda", "triton"],
         case_sensitive=False,
     ),
+    # Run the GDN in_proj_ba GEMM on the aux CUDA stream, overlapped with
+    # in_proj_qkvz, for batches of at most this many tokens; 0 disables.
+    "VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_GDN_BA_STREAM_TOKEN_THRESHOLD", "8192")
+    ),
+    # GDN prefix caching ("align" mode): export the prompt's partial-tail
+    # Mamba checkpoint from inside the prefill forward instead of splitting
+    # the prefill into an extra chunk that ends at the checkpoint.
+    "VLLM_GDN_PREFILL_CHECKPOINT": lambda: bool(
+        int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT", "0"))
+    ),
+    # Align-mode Mamba prefill checkpoints without the copy-initial capability
+    # (GDN with VLLM_GDN_PREFILL_CHECKPOINT and prefill lookahead <= 1, and
+    # KDA's flashkda backend): a prefill whose tail export is valid runs to
+    # its end in one chunk. 1 also stops it at the block-aligned replay and
+    # extension boundaries, so siblings with a shorter shared prefix can reuse
+    # those full-block states, at the cost of extra prefill steps (three for a
+    # cold 4608-token prompt at block size 1152).
+    "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS": lambda: bool(
+        int(os.getenv("VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS", "0"))
+    ),
+    # V-split GDN chunked-prefill kernel (third_party/flashinfer_gdn_vsplit),
+    # launches with an initial state only. CG0SPLIT: v_split=2 launches run the
+    # two V-slice CTAs of a head as a 2-CTA cluster that splits the
+    # V-independent WY prep (A_inv / W_qkv) by chunk pair and shares it over
+    # DSMEM. C1REORDER: issue the state-update GEMM before the output GEMM and
+    # drain chunk c's output after state c+1 is published. Both are meant to
+    # keep the output unchanged; this is not verified bitwise.
+    "VLLM_GDN_VSPLIT_CG0SPLIT": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_CG0SPLIT", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_C1REORDER": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_C1REORDER", "0"))
+    ),
+    # Run the non-CP GDN state-pool prefill steps that the V-split rule leaves
+    # at v_split=1 on the vendored V-split kernel instead of FlashInfer's
+    # (bitwise identical output and final state).
+    "VLLM_GDN_FI_VSPLIT_V1": lambda: bool(
+        int(os.getenv("VLLM_GDN_FI_VSPLIT_V1", "0"))
+    ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
@@ -1787,6 +1877,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.getenv(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", None
     ),
+    # Pinned FlashInfer autotune table (vllm/model_executor/warmup/
+    # flashinfer_autotune_pin.py). Every entry is checked against this
+    # process's fingerprint (FlashInfer build, GPU, runner source, kernel and
+    # overlay sources, tactic list at the entry's shape, relevant envs) before
+    # use; stale entries are rejected and logged, never applied. Keys it does
+    # not cover autotune at start-up; DP workers sharing a cache dir tune them
+    # once (file lock) and load the same table.
+    "VLLM_FLASHINFER_AUTOTUNE_FILE": lambda: os.getenv(
+        "VLLM_FLASHINFER_AUTOTUNE_FILE", None
+    ),
+    # With VLLM_FLASHINFER_AUTOTUNE_FILE: fail start-up if any FlashInfer
+    # autotune key is not covered by a valid pinned entry (CI). Default off.
+    "VLLM_FLASHINFER_AUTOTUNE_STRICT": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_AUTOTUNE_STRICT", "0"))
+    ),
+    # Generation mode for pinned tables: profile every FlashInfer autotune key
+    # (pinned file and cache ignored) with repeated measurements and write the
+    # per-tactic samples of this worker to this directory. Merge the records of
+    # several workers with
+    # `python -m vllm.model_executor.warmup.flashinfer_autotune_pin merge`.
+    "VLLM_FLASHINFER_AUTOTUNE_RECORD": lambda: os.getenv(
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD", None
+    ),
+    # Timed CUDA-graph replays per (key, tactic) in generation mode.
+    "VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS", "15")
+    ),
+    # sm_107 only: add K=64 (Sm107 kernel) tactics to FlashInfer's autotuned
+    # CuTe-DSL mm_mxfp8 (vllm/model_executor/layers/quantization/utils/
+    # flashinfer_mxfp8_k64.py). Default on; "0", "false" or "off" disables.
+    # No effect on other architectures.
+    "VLLM_FLASHINFER_MXFP8_K64": lambda: os.getenv(
+        "VLLM_FLASHINFER_MXFP8_K64", "1"
+    )
+    not in ("0", "false", "off"),
+    # ";"-separated "tiler_m,tile_n,inst_m,cluster_m" K=64 tactics.
+    "VLLM_FLASHINFER_MXFP8_K64_TACTICS": lambda: os.getenv(
+        "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
+        "512,256,256,2;256,256,256,2;256,128,256,2",
+    ),
+    # Smallest M (rows) for which K=64 tactics are offered.
+    "VLLM_FLASHINFER_MXFP8_K64_MIN_M": lambda: int(
+        os.getenv("VLLM_FLASHINFER_MXFP8_K64_MIN_M", "256")
+    ),
+    # Add split-K tactics with tile N 64/128 for 32 < M <= MAX_M to
+    # FlashInfer's autotuned CuTe-DSL mm_mxfp8 (vllm/model_executor/layers/
+    # quantization/utils/flashinfer_mxfp8_splitk.py). Default off.
+    "VLLM_MXFP8_SPLITK_MIDM": lambda: os.getenv("VLLM_MXFP8_SPLITK_MIDM", "0")
+    in ("1", "true", "on"),
+    # ";"-separated "tile_n,split_k" mid-M split-K tactics.
+    "VLLM_MXFP8_SPLITK_MIDM_TACTICS": lambda: os.getenv(
+        "VLLM_MXFP8_SPLITK_MIDM_TACTICS", "64,2;64,4;128,2;128,4"
+    ),
+    # Largest M (rows) for which mid-M split-K tactics are offered.
+    "VLLM_MXFP8_SPLITK_MIDM_MAX_M": lambda: int(
+        os.getenv("VLLM_MXFP8_SPLITK_MIDM_MAX_M", "2048")
+    ),
     # Comma-separated FlashInfer op names to exclude from autotuning, using
     # the heuristic fallback tactic instead. Unset: skip "fp4_gemm" when the
     # CuTe-DSL NVFP4 linear kernel is selected. Empty: skip nothing.
@@ -1814,6 +1961,107 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the installed FlashInfer MoeAlltoAll kernel supports it.
     "VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE", "0"))
+    ),
+    # Upper bound on KV tokens per CTA for FlashInfer trtllm-gen decode
+    # attention: raises the split-KV CTA count to ceil(max_seq_len / value)
+    # when FlashInfer's one-wave heuristic would split less. 0 keeps
+    # FlashInfer's heuristic. Unset: 16384 on SM107, 0 elsewhere.
+    "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: maybe_convert_int(
+        os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA")
+    ),
+    # Run chunked prefills over a long cached prefix on the trtllm-gen generation
+    # kernel when its wave/KV-split model predicts a gain (SM107, FP8 Q/KV,
+    # head_dim 256, GQA 8). Set to 0 to always use the trtllm-gen context kernel.
+    "VLLM_FLASHINFER_TRTLLM_GEN_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_TRTLLM_GEN_PREFILL", "1"))
+    ),
+    # Most prefill requests one generation-kernel prefill launch may cover (the
+    # launch is varlen; see trtllm_gen_prefill_sm_count). 1 = single-request
+    # chunks only.
+    "VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS", "64")
+    ),
+    # Pass one persistent, zero-initialized multi-CTA KV counter buffer per
+    # device to the trtllm-gen context kernel instead of letting FlashInfer
+    # allocate and zero a fresh one on every eager call (the kernel resets its
+    # semaphores at the end of every launch). Never created during graph capture.
+    "VLLM_FI_PERSISTENT_KV_COUNTER": lambda: bool(
+        int(os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER", "0"))
+    ),
+    # Size in bytes of that buffer; launches needing more keep FlashInfer's own.
+    "VLLM_FI_PERSISTENT_KV_COUNTER_BYTES": lambda: int(
+        os.getenv("VLLM_FI_PERSISTENT_KV_COUNTER_BYTES", str(1 << 20))
+    ),
+    # Kernel Factory paged-FP8 prefill attention (v1/attention/ops/kf_prefill_attn):
+    # replaces the trtllm-gen prefill kernels on SM107 (FP8 Q/KV, head_dim 256, GQA 8,
+    # page 128, BF16 out) for steps whose prefill rows all have at least
+    # VLLM_KF_PREFILL_ATTN_MIN_KV tokens and an exact KV length (per-row gate; any
+    # other step, e.g. one with an async-spec decode row, stays on the production
+    # path; 0 keeps only the exact-length rule). Its host planner (C++) runs once
+    # per step; VLLM_KF_PREFILL_ATTN_SEARCH picks its search space: r3 (default,
+    # ~0.2 ms/step) or r2 / full (the solution's own search, ~2 ms/step).
+    # VLLM_KF_PREFILL_ATTN_CHECK=N: for the first N launches per layer also run the
+    # FlashInfer path and an fp32 reference and log the errors (debug only, slow).
+    # VLLM_KF_PREFILL_ATTN_PRECISE=1: always use the kernel's precise forms (FP32
+    # exp/sum; the solution picks them only above bmm1 1/16 or bmm2 1; slower).
+    # VLLM_KF_PREFILL_ATTN_LOG_EVERY=N: log plan/launch counts and the per-step host
+    # time of plan() every N plans (0 = never).
+    "VLLM_KF_PREFILL_ATTN": lambda: bool(int(os.getenv("VLLM_KF_PREFILL_ATTN", "0"))),
+    "VLLM_KF_PREFILL_ATTN_MIN_KV": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_MIN_KV", "4096")
+    ),
+    "VLLM_KF_PREFILL_ATTN_SEARCH": lambda: os.getenv(
+        "VLLM_KF_PREFILL_ATTN_SEARCH", "r3"
+    ),
+    "VLLM_KF_PREFILL_ATTN_CHECK": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_CHECK", "0")
+    ),
+    "VLLM_KF_PREFILL_ATTN_PRECISE": lambda: bool(
+        int(os.getenv("VLLM_KF_PREFILL_ATTN_PRECISE", "0"))
+    ),
+    "VLLM_KF_PREFILL_ATTN_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_KF_PREFILL_ATTN_LOG_EVERY", "4096")
+    ),
+    # Kernel Factory paged-FP8 decode attention (v1/attention/ops/kf_decode_attn):
+    # replaces the trtllm-gen decode kernel on SM107 (FP8 Q/KV, head_dim 256, 16 q /
+    # 2 kv heads, page 128, BF16 out) for uniform decode batches (MTP verify, draft
+    # steps; graph-padded rows allowed) of at most VLLM_KF_DECODE_ATTN_MAX_BL
+    # launched requests; larger batches keep trtllm-gen. Its KV split comes from the
+    # device seq_lens (FULL CUDA graph safe); no host plan.
+    # VLLM_KF_DECODE_ATTN_QLENS: comma list of query widths routed to the kernel
+    # (empty = 1 and 1 + num_speculative_tokens). VLLM_KF_DECODE_ATTN_CHECK=N: for
+    # the first N eager launches per layer also run trtllm-gen and an fp32 reference
+    # and log the errors (debug only, slow; graph replays are never checked).
+    # VLLM_KF_DECODE_ATTN_LOG_EVERY=N: log routing counts every N decode steps.
+    "VLLM_KF_DECODE_ATTN": lambda: bool(int(os.getenv("VLLM_KF_DECODE_ATTN", "0"))),
+    "VLLM_KF_DECODE_ATTN_MAX_BL": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_MAX_BL", "8")
+    ),
+    "VLLM_KF_DECODE_ATTN_QLENS": lambda: os.getenv("VLLM_KF_DECODE_ATTN_QLENS", ""),
+    "VLLM_KF_DECODE_ATTN_CHECK": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_CHECK", "0")
+    ),
+    "VLLM_KF_DECODE_ATTN_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_KF_DECODE_ATTN_LOG_EVERY", "0")
+    ),
+    # Extra FlashInfer cute-dsl mm_mxfp8 autotune M buckets, joined to the
+    # hybrid ones (runtime M rounds up to the union), profiled by the kernel
+    # warmup before CUDA-graph capture. Comma list of N, LO-HI:STEP or
+    # capture[:LO-HI] (CUDA-graph capture sizes), e.g. "272-512:16".
+    # Unset/empty = FlashInfer's buckets. Bitwise for buckets > 32 (only the
+    # split-K tactics, M <= 32, change the K order).
+    # See vllm/model_executor/kernels/linear/mxfp8/flashinfer_tune_buckets.py.
+    "VLLM_MXFP8_TUNE_BUCKETS": lambda: os.getenv("VLLM_MXFP8_TUNE_BUCKETS") or None,
+    # MTP draft prefill: compute the FlashInfer prefill attention of the draft
+    # layer only for the row each prefill request samples (the speculator's
+    # last_token_indices); the other rows' outputs are discarded.
+    "VLLM_MTP_DRAFT_PREFILL_PRUNE": lambda: bool(
+        int(os.getenv("VLLM_MTP_DRAFT_PREFILL_PRUNE", "0"))
+    ),
+    # Debug: for the first N pruned draft prefill calls (per layer), also run
+    # the regular prefill attention and log the difference on the kept rows.
+    "VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK": lambda: int(
+        os.getenv("VLLM_MTP_DRAFT_PREFILL_PRUNE_CHECK", "0")
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
@@ -1873,6 +2121,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None,
         ["LBNHC", "LBHNC", "LHBNC", "NHD", "HND", "BLHNC", "BLNHC", "BHLNC"],
     ),
+    # Copy prefix-hit (copy-on-write) KV/state blocks of every cache storage
+    # in one vectorized launch. Set to 0 to copy storage by storage.
+    "VLLM_KV_COW_ONE_LAUNCH": lambda: bool(
+        int(os.getenv("VLLM_KV_COW_ONE_LAUNCH", "1"))
+    ),
+    # Direct per-storage row copies when the one-launch plan is unavailable.
+    # Set both copy flags to 0 to use the gather/scatter baseline.
+    "VLLM_FUSED_KV_BLOCK_COPY": lambda: bool(
+        int(os.getenv("VLLM_FUSED_KV_BLOCK_COPY", "1"))
+    ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
     # - DS: (dim, state_len) — TP-sharded dim on dim1,
@@ -1891,6 +2149,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # also enables the NaN computation required to detect them.
     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+    ),
+    # Model Runner V2: exact top-k/top-p kernel for batches whose every row
+    # has 1 <= top_k <= 64. 0 falls back to the generic (Qrita) top-k/top-p.
+    "VLLM_SAMPLER_SPLIT_ROW_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SAMPLER_SPLIT_ROW_TOPK", "1"))
+    ),
+    # Model Runner V2: greedy draft tokens via the vocab-split argmax kernel.
+    # 0 falls back to torch.argmax.
+    "VLLM_DRAFT_SPLIT_ROW_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_DRAFT_SPLIT_ROW_ARGMAX", "1"))
+    ),
+    # Model Runner V2: single fused kernel for spec-decode verification of
+    # one-hot drafts with only penalties/temperature/bounded top-k/top-p.
+    # 0 uses the unfused sampling + rejection path.
+    "VLLM_FUSED_REJECTION_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_FUSED_REJECTION_SAMPLER", "1"))
+    ),
+    # Fuse logits preparation into split-row top-k on rejection fallbacks.
+    # SPLIT_ROW_TOPK=0 also disables this path.
+    "VLLM_SAMPLER_FUSED_PREP": lambda: bool(
+        int(os.getenv("VLLM_SAMPLER_FUSED_PREP", "1"))
+    ),
+    # Opt-in sparse verification, including raw-logprob output. Requires
+    # SPLIT_ROW_TOPK=1; compact fused rejection remains preferred when eligible.
+    "VLLM_SPARSE_VERIFY_SAMPLING": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_VERIFY_SAMPLING", "0"))
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": lambda: int(
@@ -2110,6 +2394,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
+    # Qwen3.5/3.6 MTP drafter: run the draft lm_head (greedy draft argmax
+    # only) as an MXFP8 GEMM on a quantized copy of the BF16 head. Changes
+    # which tokens are proposed (acceptance), never the target distribution.
+    "VLLM_MTP_DRAFT_LM_HEAD_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_MTP_DRAFT_LM_HEAD_MXFP8", "0"))
+    ),
+    # SM107 only: launch the FlashInfer trtllm-gen MoE pipeline with PDL for
+    # calls of at most this many tokens (0 = FlashInfer default, which disables
+    # MoE PDL on SM107). Applies only to routingCustom-family routing (no expert
+    # groups; top_k <= 22 for DeepSeekV3 / MiniMax2), where up to 16 tokens the
+    # pipeline runs Block/DynBlock routing, bmm FC1/FC2 and finalizeKernel,
+    # which all wait on their producer before reading it. Larger calls also
+    # need the single-CTA routing permutation (GS2_ROUTE,
+    # flashinfer_exact_routing) to replace Cluster/Coop for them; calls it does
+    # not cover keep PDL off.
+    "VLLM_FI_SM107_MOE_PDL_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_FI_SM107_MOE_PDL_MAX_TOKENS", "0")
+    ),
+    # 1: build the trtllm-gen MoE module with routing kernels never
+    # PDL-launched and let FC1/FC2 use PDL on SM107 at every token count
+    # (flashinfer_exact_routing). Ignored when VLLM_FI_SM107_MOE_PDL_MAX_TOKENS
+    # > 0 or GS2_ROUTE_PREBUILT is set.
+    "VLLM_MOE_PDL_FC": lambda: os.getenv("VLLM_MOE_PDL_FC", "0") == "1",
+    # Persistent directory for the JIT-built exact-routing FlashInfer MoE module
+    # (GS2_ROUTE, flashinfer_exact_routing), keyed by a hash of its build
+    # inputs; ignored with GS2_ROUTE_PREBUILT. Empty = no cache.
+    "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE": lambda: os.getenv(
+        "VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE", ""
+    ),
+    # Small unquantized BF16 projections use TinyGEMM on SM107, and on
+    # SM100/SM103 with VLLM_LOWM_BF16_GEMM_SM100=1. SM107 also has measured
+    # larger-M plans and a shared-gate rowdot kernel.
+    # Set to 0 to keep the default unquantized GEMM.
+    "VLLM_LOWM_BF16_GEMM": lambda: bool(int(os.getenv("VLLM_LOWM_BF16_GEMM", "1"))),
+    # Opt-in programmatic dependent launch for the TinyGEMM backend.
+    "VLLM_LOWM_BF16_GEMM_PDL": lambda: bool(
+        int(os.getenv("VLLM_LOWM_BF16_GEMM_PDL", "0"))
+    ),
+    # Opt SM100/SM103 into TinyGEMM for the same small BF16 projections.
+    # Requires VLLM_LOWM_BF16_GEMM=1. Changes the traced op, so it is hashed.
+    "VLLM_LOWM_BF16_GEMM_SM100": lambda: bool(
+        int(os.getenv("VLLM_LOWM_BF16_GEMM_SM100", "0"))
+    ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
@@ -2134,6 +2461,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # V2 model runner, M-RoPE models with multimodal ingress: compute the
+    # positions of requests without multimodal features in the position kernel
+    # instead of staging per-request [num_dims, prompt_len] tables on the host.
+    "VLLM_MROPE_TEXT_ONLY_FAST_PATH": lambda: os.getenv(
+        "VLLM_MROPE_TEXT_ONLY_FAST_PATH", "1"
+    ).lower()
+    not in ("0", "false"),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2349,6 +2683,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
+        # Model Runner V2 sampler / drafter kernel choices, made outside
+        # the compiled model; not part of traced graphs.
+        "VLLM_SAMPLER_SPLIT_ROW_TOPK",
+        "VLLM_DRAFT_SPLIT_ROW_ARGMAX",
+        "VLLM_FUSED_REJECTION_SAMPLER",
+        "VLLM_SAMPLER_FUSED_PREP",
+        "VLLM_SPARSE_VERIFY_SAMPLING",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # Location-only derived paths: where a cache/config directory lives
@@ -2388,7 +2729,36 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
+        "VLLM_FLASHINFER_AUTOTUNE_FILE",
+        "VLLM_FLASHINFER_AUTOTUNE_STRICT",
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD",
+        "VLLM_FLASHINFER_AUTOTUNE_RECORD_ROUNDS",
+        # Opaque custom-op GEMM tactic sources; not part of traced graphs.
+        "VLLM_FLASHINFER_MXFP8_K64",
+        "VLLM_FLASHINFER_MXFP8_K64_TACTICS",
+        "VLLM_FLASHINFER_MXFP8_K64_MIN_M",
+        "VLLM_MXFP8_SPLITK_MIDM",
+        "VLLM_MXFP8_SPLITK_MIDM_TACTICS",
+        "VLLM_MXFP8_SPLITK_MIDM_MAX_M",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        # Launch choice inside the low-M GEMM custom op.
+        "VLLM_LOWM_BF16_GEMM_PDL",
+        # Worker-side KV block copy path; not part of traced graphs.
+        "VLLM_KV_COW_ONE_LAUNCH",
+        "VLLM_FUSED_KV_BLOCK_COPY",
+        # Variants of the custom-op GDN prefill kernel; not part of traced graphs.
+        "VLLM_GDN_VSPLIT_CG0SPLIT",
+        "VLLM_GDN_VSPLIT_C1REORDER",
+        "VLLM_GDN_FI_VSPLIT_V1",
+        # Scheduler chunking policy; not part of traced graphs.
+        "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS",
+        # Kernel choice inside the attention op (KF decode attention);
+        # not part of traced graphs.
+        "VLLM_KF_DECODE_ATTN",
+        "VLLM_KF_DECODE_ATTN_MAX_BL",
+        "VLLM_KF_DECODE_ATTN_QLENS",
+        "VLLM_KF_DECODE_ATTN_CHECK",
+        "VLLM_KF_DECODE_ATTN_LOG_EVERY",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
@@ -2476,5 +2846,23 @@ def compile_factors() -> dict[str, object]:
 
     for var in ray_noset_env_vars:
         factors[var] = normalize_value(os.getenv(var))
+
+    # Graph-changing knobs read through os.environ (not registered above), so
+    # they would otherwise not enter the key and a shared or seeded compile
+    # cache could serve one config's graph to another. Salted only when set to
+    # the non-default value, so caches built without the knob stay valid.
+    # VLLM_GDN_BA_LATE_JOIN=1: QwenGatedDeltaNetAttention.forward_cuda passes
+    # the aux-stream BA GEMM input (ba_src) to the fused GDN core op.
+    # VLLM_MTP_DRAFT_PREFILL_ROWS=1: the MTP draft forward gathers sampled
+    # rows after attention, changing the compiled graph's inputs and outputs.
+    # (The other os.environ kernel knobs act inside custom ops or the runner,
+    # not in the traced forward: VLLM_GDN_MIXED_FORK, VLLM_ROWDOT_PDL,
+    # VLLM_GDN_MTP_CUDA_PDL, VLLM_GDN_MTP_CUDA_TUNE, VLLM_GDN_MTP_FUSED_QUANT,
+    # VLLM_GDN_HOST_TRIM2, VLLM_GDN_HOST_TRIM3, VLLM_KV_COW_LAYOUT_CACHE,
+    # VLLM_GDN_FUSED_DECODE_MAX_TOKENS, VLLM_STAGED_WRITE_CHUNKED.)
+    if os.environ.get("VLLM_GDN_BA_LATE_JOIN", "0") == "1":
+        factors["VLLM_GDN_BA_LATE_JOIN"] = "1"
+    if os.environ.get("VLLM_MTP_DRAFT_PREFILL_ROWS", "0") == "1":
+        factors["VLLM_MTP_DRAFT_PREFILL_ROWS"] = "1"
 
     return factors

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -26,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
@@ -33,6 +35,9 @@ logger = init_logger(__name__)
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
+# Opt-in: plan the align/postprocess state copies in one program and copy from
+# a compact work list (see _plan_mamba_copies_kernel). Default off.
+MAMBA_COPY_COMPACT = os.environ.get("VLLM_MAMBA_COPY_COMPACT", "0") == "1"
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -414,6 +419,7 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
@@ -426,6 +432,9 @@ def postprocess_mamba_fused_kernel(
     The kernel indexes directly into pre-flattened metadata arrays using
     program_id(1). The grid dimensions encode the total state count.
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -511,6 +520,7 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -524,6 +534,9 @@ def preprocess_mamba_align_fused_kernel(
          when a block boundary is crossed (so the migrated state, now at the
          start of the new block, is read with the neutral bias).
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_reqs
     req_indices = tl.load(idx_mapping_ptr + offsets, mask=mask, other=0)
@@ -571,6 +584,7 @@ def precopy_mamba_align_fused_kernel(
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -586,6 +600,9 @@ def precopy_mamba_align_fused_kernel(
     batch-to-state idx_mapping; V1 already stores the staged arrays in batch
     order and uses HAS_IDX_MAPPING=False.
     """
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
     tile_idx = tl.program_id(2)
@@ -628,6 +645,157 @@ def precopy_mamba_align_fused_kernel(
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
     )
+
+
+# Compact mamba state copies (VLLM_MAMBA_COPY_COMPACT=1). The fused kernels
+# above launch num_reqs x num_states x _TEMPORAL_TILES programs that each
+# re-derive the per-request decision, although only a few requests cross a
+# block boundary per step: at 71 requests, 60 states and 16 tiles that is
+# 68,160 mostly empty programs, ~35 us per launch on VR. Here one program
+# makes every decision and writes a compact work list (deterministic order:
+# batch order), and the copy kernel's num_states x _TEMPORAL_TILES x
+# _COMPACT_SLOTS programs exit after one load when the list is empty. The
+# copies themselves (``_copy_mamba_state_block``) and the decisions are the
+# fused kernels' own, so the results are identical.
+_COMPACT_SLOTS = 4
+# Work entry: (block-table row = request state slot, src column, dst column,
+# token bias). Like the fused kernels, the state copies read the per-request
+# slot block tables, so the row is the request index in both modes.
+_COMPACT_ENTRY = 4
+# Requests per plan iteration. A constant, so the plan kernel compiles once (in
+# the warmup dummy runs) instead of once per power-of-two batch size during
+# serving (jit_monitor caught that on the first perf run).
+_COMPACT_PLAN_BLOCK = 256
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def _plan_mamba_copies_kernel(
+    # precopy decision inputs
+    mamba_state_idx_ptr,  # precopy: post-advance dst column; post: src column
+    src_col_ptr,  # precopy only
+    token_bias_ptr,  # precopy only
+    # postprocess decision inputs
+    num_accepted_tokens_ptr,
+    num_scheduled_tokens_ptr,
+    num_computed_tokens_ptr,
+    num_draft_tokens_ptr,
+    num_accepted_tokens_out_ptr,
+    idx_mapping_ptr,
+    work_ptr,  # int32 [max_reqs, _COMPACT_ENTRY]
+    count_ptr,  # int32 [1]
+    num_reqs,
+    block_size,
+    IS_PRECOPY: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
+    PRECOMPUTED_NEW_COMPUTED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    base = tl.full((), 0, tl.int32)
+    for start in range(0, num_reqs, BLOCK):
+        batch = start + tl.arange(0, BLOCK)
+        valid = batch < num_reqs
+        if HAS_IDX_MAPPING:
+            req = tl.load(idx_mapping_ptr + batch, mask=valid, other=-1)
+            valid = valid & (req >= 0)
+            req = tl.maximum(req, 0)
+        else:
+            req = batch
+        if IS_PRECOPY:
+            # precopy_mamba_align_fused_kernel's decision.
+            src = tl.load(src_col_ptr + req, mask=valid, other=-1)
+            dst = tl.load(mamba_state_idx_ptr + req, mask=valid, other=-1)
+            bias = tl.load(token_bias_ptr + req, mask=valid, other=0)
+            need = valid & (src >= 0) & (src != dst)
+            bt_row = req
+        else:
+            # postprocess_mamba_fused_kernel's decision.
+            num_accepted = tl.load(num_accepted_tokens_ptr + req, mask=valid, other=1)
+            src = tl.load(mamba_state_idx_ptr + req, mask=valid, other=0)
+            if PRECOMPUTED_NEW_COMPUTED:
+                new_computed = tl.load(
+                    num_computed_tokens_ptr + req, mask=valid, other=0
+                )
+                running = new_computed - num_accepted + 1
+            else:
+                num_scheduled = tl.load(
+                    num_scheduled_tokens_ptr + req, mask=valid, other=0
+                )
+                num_computed = tl.load(
+                    num_computed_tokens_ptr + req, mask=valid, other=0
+                )
+                num_draft = tl.load(num_draft_tokens_ptr + req, mask=valid, other=0)
+                running = num_computed + num_scheduled - num_draft
+                new_computed = running + num_accepted - 1
+            aligned = (new_computed // block_size) * block_size
+            needs_copy = valid & (aligned >= running)
+            bias = aligned - running
+            dst = aligned // block_size - 1
+            tl.store(
+                num_accepted_tokens_out_ptr + req,
+                tl.full((BLOCK,), 1, tl.int32),
+                mask=needs_copy & (src == dst),
+            )
+            need = needs_copy & ~((src == dst) & (bias == 0))
+            bt_row = req
+        need_i = need.to(tl.int32)
+        pos = base + tl.cumsum(need_i, 0) - need_i
+        entry = work_ptr + pos * 4
+        tl.store(entry, bt_row.to(tl.int32), mask=need)
+        tl.store(entry + 1, src.to(tl.int32), mask=need)
+        tl.store(entry + 2, dst.to(tl.int32), mask=need)
+        tl.store(entry + 3, bias.to(tl.int32), mask=need)
+        base += tl.sum(need_i, 0)
+    tl.store(count_ptr, base)
+
+
+@triton.jit
+def _compact_mamba_copy_kernel(
+    work_ptr,
+    count_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    """Grid (num_states, TEMPORAL_TILES, SLOTS): slot s copies work entries
+    s, s + SLOTS, ... of the list written by ``_plan_mamba_copies_kernel``.
+    """
+    state_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    count = tl.load(count_ptr)
+    for w in range(tl.program_id(2), count, SLOTS):
+        entry = work_ptr + w * 4
+        _copy_mamba_state_block(
+            state_idx,
+            tl.load(entry),
+            tl.load(entry + 1),
+            tl.load(entry + 2),
+            tl.load(entry + 3),
+            block_table_ptrs_ptr,
+            block_table_stride_req,
+            state_base_addrs_ptr,
+            state_block_strides_ptr,
+            state_elem_sizes_ptr,
+            state_inner_sizes_ptr,
+            state_conv_widths_ptr,
+            state_group_indices_ptr,
+            state_dim_row_count_ptr,
+            state_dim_row_stride_ptr,
+            tile_idx,
+            COPY_BLOCK_SIZE,
+            CONV_STATE_DIM_FIRST,
+            TEMPORAL_TILES,
+        )
 
 
 @triton.jit
@@ -825,6 +993,10 @@ class MambaSpecDecodeGPUContext:
     num_draft_tokens_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
+    # VLLM_MAMBA_COPY_COMPACT=1: work list [max_num_reqs, _COMPACT_ENTRY] and
+    # its length for _plan_mamba_copies_kernel / _compact_mamba_copy_kernel.
+    compact_work: torch.Tensor | None = None
+    compact_count: torch.Tensor | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -919,6 +1091,14 @@ class MambaSpecDecodeGPUContext:
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            compact_work=torch.zeros(
+                (max_num_reqs, _COMPACT_ENTRY), dtype=torch.int32, device=device
+            )
+            if MAMBA_COPY_COMPACT
+            else None,
+            compact_count=torch.zeros(1, dtype=torch.int32, device=device)
+            if MAMBA_COPY_COMPACT
+            else None,
             is_initialized=False,
         )
 
@@ -1140,6 +1320,68 @@ class MambaSpecDecodeGPUContext:
         )
         return self.aligned_state_indices[:, :num_reqs]
 
+    def _run_compact_copies(
+        self,
+        num_reqs: int,
+        mamba_state_idx_gpu: torch.Tensor,
+        idx_mapping: torch.Tensor | None,
+        *,
+        is_precopy: bool,
+        src_col_gpu: torch.Tensor | None = None,
+        token_bias_gpu: torch.Tensor | None = None,
+        num_accepted_tokens_gpu: torch.Tensor | None = None,
+        num_scheduled_tokens_gpu: torch.Tensor | None = None,
+        num_computed_tokens_gpu: torch.Tensor | None = None,
+        num_draft_tokens_gpu: torch.Tensor | None = None,
+        num_accepted_tokens_out: torch.Tensor | None = None,
+        precomputed_new_computed: bool = False,
+    ) -> None:
+        """VLLM_MAMBA_COPY_COMPACT: the fused kernels' decisions in one program
+        (``_plan_mamba_copies_kernel``), then the same per-(state, tile) copies
+        over the compact work list (``_compact_mamba_copy_kernel``).
+        """
+        assert self.compact_work is not None and self.compact_count is not None
+        assert num_reqs <= self.compact_work.shape[0]
+        dummy = self.compact_count
+        _plan_mamba_copies_kernel[(1,)](
+            mamba_state_idx_gpu,
+            dummy if src_col_gpu is None else src_col_gpu,
+            dummy if token_bias_gpu is None else token_bias_gpu,
+            dummy if num_accepted_tokens_gpu is None else num_accepted_tokens_gpu,
+            dummy if num_scheduled_tokens_gpu is None else num_scheduled_tokens_gpu,
+            dummy if num_computed_tokens_gpu is None else num_computed_tokens_gpu,
+            dummy if num_draft_tokens_gpu is None else num_draft_tokens_gpu,
+            dummy if num_accepted_tokens_out is None else num_accepted_tokens_out,
+            dummy if idx_mapping is None else idx_mapping,
+            self.compact_work,
+            self.compact_count,
+            num_reqs,
+            self.block_size,
+            IS_PRECOPY=is_precopy,
+            HAS_IDX_MAPPING=idx_mapping is not None,
+            PRECOMPUTED_NEW_COMPUTED=precomputed_new_computed,
+            BLOCK=_COMPACT_PLAN_BLOCK,
+            num_warps=4,
+        )
+        _compact_mamba_copy_kernel[(self.num_states, _TEMPORAL_TILES, _COMPACT_SLOTS)](
+            self.compact_work,
+            self.compact_count,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            COPY_BLOCK_SIZE=1024,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+            SLOTS=_COMPACT_SLOTS,
+        )
+
     def run_fused_postprocess(
         self,
         num_reqs: int,
@@ -1170,6 +1412,20 @@ class MambaSpecDecodeGPUContext:
         self.num_accepted_tokens_out[:num_reqs].copy_(
             num_accepted_tokens_gpu[:num_reqs]
         )
+
+        if self.compact_work is not None:
+            self._run_compact_copies(
+                num_reqs,
+                mamba_state_idx_gpu,
+                None,
+                is_precopy=False,
+                num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+                num_scheduled_tokens_gpu=num_scheduled_tokens_gpu,
+                num_computed_tokens_gpu=num_computed_tokens_gpu,
+                num_draft_tokens_gpu=num_draft_tokens_gpu,
+                num_accepted_tokens_out=self.num_accepted_tokens_out,
+            )
+            return
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
@@ -1221,6 +1477,16 @@ class MambaSpecDecodeGPUContext:
         """
         if num_reqs == 0 or not self.is_initialized:
             return
+        if self.compact_work is not None:
+            self._run_compact_copies(
+                num_reqs,
+                state_idx_gpu,
+                idx_mapping,
+                is_precopy=True,
+                src_col_gpu=src_col_gpu,
+                token_bias_gpu=token_bias_gpu,
+            )
+            return
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         precopy_mamba_align_fused_kernel[grid](
@@ -1243,6 +1509,8 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
 
     def run_fused_postprocess_align(
@@ -1271,6 +1539,19 @@ class MambaSpecDecodeGPUContext:
         num_accepted_tokens_snapshot = self.num_accepted_tokens_out
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
+        if self.compact_work is not None:
+            self._run_compact_copies(
+                num_reqs,
+                state_idx_gpu,
+                idx_mapping,
+                is_precopy=False,
+                num_accepted_tokens_gpu=num_accepted_tokens_snapshot,
+                num_computed_tokens_gpu=new_num_computed_tokens_gpu,
+                num_accepted_tokens_out=num_accepted_tokens_gpu,
+                precomputed_new_computed=True,
+            )
+            return
+
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
@@ -1298,6 +1579,8 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
         )
 
 
