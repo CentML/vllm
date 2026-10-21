@@ -126,6 +126,8 @@ def resolve_sm107_shared_mode(
     megakernel runs. A fallback runs ``separate``, with no megakernel SM budget
     unless ``VLLM_FI_MEGA_MOE_MAX_SM_COUNT`` is an explicit count.
     """
+    if requested == "pre":
+        return ("pre", None) if has_side_stream else ("separate", "no CUDA side stream")
     if requested != "overlap":
         return requested, None
     if not replicated_shared:
@@ -133,6 +135,24 @@ def resolve_sm107_shared_mode(
     if not has_side_stream:
         return "separate", "no CUDA side stream"
     return "overlap", None
+
+
+# VLLM_FI_MEGA_MOE_SHARED=pre: the shared-experts runner records the event that
+# marks its aux-stream shared MLP done; the next SM107 megakernel launch on the
+# main stream waits for it (after its input staging), so the persistent
+# megakernel never shares the GPU with the shared MLP.
+_PENDING_SHARED_EXPERTS_EVENT: torch.cuda.Event | None = None
+
+
+def set_pending_shared_experts_event(event: torch.cuda.Event) -> None:
+    global _PENDING_SHARED_EXPERTS_EVENT
+    _PENDING_SHARED_EXPERTS_EVENT = event
+
+
+def _take_pending_shared_experts_event() -> torch.cuda.Event | None:
+    global _PENDING_SHARED_EXPERTS_EVENT
+    event, _PENDING_SHARED_EXPERTS_EVENT = _PENDING_SHARED_EXPERTS_EVENT, None
+    return event
 
 
 # Side stream of VLLM_FI_MEGA_MOE_SHARED=overlap, private to it (not the global
@@ -697,6 +717,7 @@ class FlashInferMoeEp:
         # inside a CUDA-graph capture).
         self._shared_stream: torch.cuda.Stream | None = None
         self._shared_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self._pre_shared = self._sm107 and shared_mode == "pre"
         if self._sm107 and shared_mode == "overlap":
             self._shared_stream = _shared_experts_stream()
             self._shared_events = (torch.cuda.Event(), torch.cuda.Event())
@@ -806,6 +827,14 @@ class FlashInferMoeEp:
         return_view = self._return_workspace_view and getattr(
             self._mega_layer, "supports_output_view", False
         )
+        if workspace is not None and self._pre_shared:
+            # Stage on the main stream (next to the aux-stream shared MLP),
+            # then wait for the shared MLP before the persistent megakernel.
+            self._mega_layer.stage_inputs(tensors, workspace=workspace)
+            event = _take_pending_shared_experts_event()
+            if event is not None:
+                torch.cuda.current_stream().wait_event(event)
+            return self._mega_layer.compute_staged(output=None)
         if workspace is not None:
             # SM107: the step's capacity profile.
             return self._mega_layer.forward(
