@@ -74,6 +74,11 @@ class SharedExperts(torch.nn.Module):
         # shared experts run serially unless the experts overlap them
         # themselves (MK_INTERNAL_OVERLAPPED).
         self._pin_no_overlap = _flashinfer_moe_ep_on_sm107(moe_config)
+        # VLLM_FI_MEGA_MOE_SHARED=pre: the aux-stream overlap is allowed, and
+        # the megakernel launch waits for the shared MLP (no co-running).
+        self._pre_megakernel = (
+            self._pin_no_overlap and envs.VLLM_FI_MEGA_MOE_SHARED == "pre"
+        )
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -127,6 +132,8 @@ class SharedExperts(torch.nn.Module):
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         if self._pin_no_overlap:
+            if self._pre_megakernel and self._stream is not None:
+                return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
             return SharedExpertsOrder.NO_OVERLAP
 
         should_run_shared_in_aux_stream = (
@@ -160,6 +167,12 @@ class SharedExperts(torch.nn.Module):
             self._input_ready_event[idx].wait(self._stream)
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
+        if self._pre_megakernel:
+            from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
+                set_pending_shared_experts_event,
+            )
+
+            set_pending_shared_experts_event(self._output_ready_event[idx])
         return True
 
     def wait(self) -> None:
