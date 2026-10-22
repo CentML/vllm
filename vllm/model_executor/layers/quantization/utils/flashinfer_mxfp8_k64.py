@@ -31,7 +31,9 @@ side effects.
 Env (``vllm/envs.py``):
 
 - ``VLLM_FLASHINFER_MXFP8_K64`` (default on; any value except ``0`` / ``false``
-  / ``off`` enables): only has an effect on sm_107.
+  / ``off`` enables): only has an effect on sm_107. With it off, sm_107
+  ``mm_mxfp8`` calls still stay on the Sm100 runner (no K=64 tactics), as on
+  FlashInfer < 0.7, so its split-K / ``lcd_pdl`` paths keep applying.
 - ``VLLM_FLASHINFER_MXFP8_K64_TACTICS`` (default
   ``512,256,256,2;256,256,256,2;256,128,256,2``): ``;``-separated
   ``tiler_m,tile_n,inst_m,cluster_m``.
@@ -53,7 +55,12 @@ _COMPILED: dict = {}
 # gemm_base attributes replaced by install() -> their originals (uninstall()).
 _ORIG: dict[str, Any] = {}
 STATS = {"k64_calls": 0, "k64_fallback": 0, "compiles": 0, "tactic_offers": 0}
-_STATE: dict[str, Any] = {"installed": False, "tactics": [], "min_m": 256}
+_STATE: dict[str, Any] = {
+    "installed": False,
+    "tactics": [],
+    "min_m": 256,
+    "sm100_route": False,
+}
 
 
 def parse_tactics(spec: str) -> list[tuple[int, ...]]:
@@ -243,8 +250,17 @@ def _get_compiled(dev, n, k, t, out_dtype):
 
 def _never_sm107_runner(major, minor, a, b, out) -> bool:
     """``gemm_base._use_sm107_mxfp8_cute_dsl`` replacement: keep sm_107 on the
-    Sm100 runner, which carries the K=64 tactics."""
+    Sm100 runner, which carries the K=64, split-K and ``lcd_pdl`` paths."""
     return False
+
+
+def keep_sm107_on_sm100_runner(gb) -> None:
+    """FlashInfer >= 0.7 routes aligned sm_107 cute-dsl ``mm_mxfp8`` calls to its
+    native SM107 runner, which has none of the Sm100 runner's wrappers."""
+    orig_route = getattr(gb, "_use_sm107_mxfp8_cute_dsl", None)
+    if orig_route is not None and orig_route is not _never_sm107_runner:
+        _ORIG.setdefault("_use_sm107_mxfp8_cute_dsl", orig_route)
+        gb._use_sm107_mxfp8_cute_dsl = _never_sm107_runner
 
 
 def install(gb, tactics, min_m: int) -> None:
@@ -254,12 +270,7 @@ def install(gb, tactics, min_m: int) -> None:
 
     orig_factory = gb._cute_dsl_gemm_mxfp8_runner
     _ORIG.setdefault("_cute_dsl_gemm_mxfp8_runner", orig_factory)
-    # FlashInfer >= 0.7 routes aligned sm_107 calls to its native SM107 runner,
-    # which would never reach the factory below.
-    orig_route = getattr(gb, "_use_sm107_mxfp8_cute_dsl", None)
-    if orig_route is not None and orig_route is not _never_sm107_runner:
-        _ORIG.setdefault("_use_sm107_mxfp8_cute_dsl", orig_route)
-        gb._use_sm107_mxfp8_cute_dsl = _never_sm107_runner
+    keep_sm107_on_sm100_runner(gb)
     cache: dict = {}
 
     def factory(sm_major, sm_minor, enable_pdl, out_dtype):
@@ -355,23 +366,41 @@ def uninstall(gb) -> None:
         setattr(gb, name, orig)
     _ORIG.clear()
     _COMPILED.clear()
-    _STATE.update(installed=False, tactics=[], min_m=256)
+    _STATE.update(installed=False, tactics=[], min_m=256, sm100_route=False)
 
 
 def maybe_install() -> bool:
     """Install the K=64 tactics once per process.
 
     Only on sm_107 and when ``VLLM_FLASHINFER_MXFP8_K64`` is on. Returns
-    whether they are installed. Never raises: any failure is logged and the
-    stock tactics stay in use.
+    whether they are installed. With it off, sm_107 calls are still kept on the
+    Sm100 runner. Never raises: any failure is logged and the stock tactics
+    stay in use.
     """
     if _STATE["installed"]:
         return True
-    if not envs.VLLM_FLASHINFER_MXFP8_K64:
-        return False
     from vllm.platforms import current_platform
 
     if not (current_platform.is_cuda() and current_platform.is_device_capability(107)):
+        return False
+    if not envs.VLLM_FLASHINFER_MXFP8_K64:
+        with _LOCK:
+            if not _STATE["sm100_route"]:
+                try:
+                    import flashinfer.gemm.gemm_base as gb
+
+                    keep_sm107_on_sm100_runner(gb)
+                except Exception as e:
+                    logger.warning(
+                        "FlashInfer sm_107 mm_mxfp8 not kept on the Sm100 runner: %r",
+                        e,
+                    )
+                    return False
+                _STATE["sm100_route"] = True
+                logger.info(
+                    "FlashInfer sm_107 mm_mxfp8 kept on the Sm100 runner "
+                    "(K=64 tactics off)"
+                )
         return False
     with _LOCK:
         if _STATE["installed"]:

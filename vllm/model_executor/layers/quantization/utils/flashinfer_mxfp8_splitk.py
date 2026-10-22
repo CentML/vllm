@@ -35,9 +35,8 @@ wave. The wrapped runner keeps the base runner's class name, so autotune file
 keys do not change; a file that contains a ``1072`` tactic needs this module
 enabled (a managed ``autotune_v2`` store is shared by every process of the
 same software/hardware environment, whatever this module's setting). On
-sm_107 the Sm100 runner, hence these tactics, serves aligned shapes only while
-the K=64 tactics (``flashinfer_mxfp8_k64``) are installed; otherwise
-FlashInfer runs aligned sm_107 shapes on its native SM107 runner.
+sm_107 ``flashinfer_mxfp8_k64`` keeps aligned shapes on the Sm100 runner,
+hence on these tactics, whether or not its K=64 tactics are on.
 
 Installed explicitly by :func:`maybe_install` from the FlashInfer CuTe-DSL
 MXFP8 linear kernels' ``process_weights_after_loading`` (after the K=64
