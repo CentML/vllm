@@ -241,6 +241,9 @@ class FixFunctionalizationPass(VllmInductorPass):
             ):
                 mutated_args = {1: "x"}
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
+            # [l2-x] L2X-A ordering anchors: the op never writes x; defunctionalize so no clone is emitted
+            elif at_target in _l2x_targets():
+                self.defunctionalize(graph, node, mutated_args={1: "x"})
             else:
                 continue  # skip the count
 
@@ -359,3 +362,13 @@ class FixFunctionalizationPass(VllmInductorPass):
             user = users[0]
             user.replace_all_uses_with(fn_node)
             self._remove(user)
+
+
+def _l2x_targets() -> tuple:
+    """[l2-x] torch.ops.vllm.l2x_site / l2x_join overloads, registered only when VLLM_L2X=1."""
+    ops = getattr(torch.ops, "vllm", None)
+    out = []
+    for name in ("l2x_site", "l2x_join"):
+        if ops is not None and hasattr(ops, name):
+            out.append(getattr(ops, name).default)
+    return tuple(out)
