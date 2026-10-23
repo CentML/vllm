@@ -134,6 +134,12 @@ if TYPE_CHECKING:
     VLLM_GDN_VSPLIT_CG0SPLIT: bool = False
     VLLM_GDN_VSPLIT_C1REORDER: bool = False
     VLLM_GDN_FI_VSPLIT_V1: bool = False
+    VLLM_GDN_VSPLIT_STAGED_STORE: bool = False
+    VLLM_GDN_VSPLIT_STAGED_LOAD: bool = False
+    VLLM_GDN_VSPLIT_VEC_STATE: bool = False
+    VLLM_GDN_VSPLIT_EARLY_RELINQUISH: bool = False
+    VLLM_GDN_VSPLIT_PDL: bool = False
+    VLLM_GDN_VSPLIT_HEAD_MAJOR: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1296,6 +1302,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (bitwise identical output and final state).
     "VLLM_GDN_FI_VSPLIT_V1": lambda: bool(
         int(os.getenv("VLLM_GDN_FI_VSPLIT_V1", "0"))
+    ),
+    # Exact prefill memory/scheduling variants. Independent, default OFF;
+    # staged loads require staged stores, and vector state requires v_split=1.
+    "VLLM_GDN_VSPLIT_STAGED_STORE": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_STAGED_STORE", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_STAGED_LOAD": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_STAGED_LOAD", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_VEC_STATE": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_VEC_STATE", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_EARLY_RELINQUISH": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_EARLY_RELINQUISH", "0"))
+    ),
+    # PDL producer/consumer pairing is enabled only in the layer-graph core;
+    # eager prefill may have intervening recurrent/zeroing kernels.
+    "VLLM_GDN_VSPLIT_PDL": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_PDL", "0"))
+    ),
+    "VLLM_GDN_VSPLIT_HEAD_MAJOR": lambda: bool(
+        int(os.getenv("VLLM_GDN_VSPLIT_HEAD_MAJOR", "0"))
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
@@ -2658,6 +2686,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_GDN_VSPLIT_CG0SPLIT",
         "VLLM_GDN_VSPLIT_C1REORDER",
         "VLLM_GDN_FI_VSPLIT_V1",
+        "VLLM_GDN_VSPLIT_STAGED_STORE",
+        "VLLM_GDN_VSPLIT_STAGED_LOAD",
+        "VLLM_GDN_VSPLIT_VEC_STATE",
+        "VLLM_GDN_VSPLIT_EARLY_RELINQUISH",
+        "VLLM_GDN_VSPLIT_PDL",
+        "VLLM_GDN_VSPLIT_HEAD_MAJOR",
         # Scheduler chunking policy; not part of traced graphs.
         "VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS",
         # Kernel choice inside the attention op (KF decode attention);
