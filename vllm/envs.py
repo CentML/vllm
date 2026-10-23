@@ -235,6 +235,10 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int | None = None
+    FI_DECODE_SPLITKV: str = "off"
+    FI_DECODE_SPLITKV_CTAS_PER_SM: float = 16.0
+    FI_DECODE_SPLITKV_MAX_SPLITS: int = 16
+    FI_DECODE_VSM_SCALE: float = 0.0
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL: bool = True
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
     VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
@@ -1886,6 +1890,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: maybe_convert_int(
         os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA")
     ),
+    # Opt-in virtual-SM policy replaces rather than compounds the KV-per-CTA cap.
+    "FI_DECODE_SPLITKV": lambda: os.getenv("FI_DECODE_SPLITKV", "off").strip().lower(),
+    "FI_DECODE_SPLITKV_CTAS_PER_SM": lambda: float(
+        os.getenv("FI_DECODE_SPLITKV_CTAS_PER_SM", "16")
+    ),
+    "FI_DECODE_SPLITKV_MAX_SPLITS": lambda: int(
+        os.getenv("FI_DECODE_SPLITKV_MAX_SPLITS", "16")
+    ),
+    "FI_DECODE_VSM_SCALE": lambda: float(os.getenv("FI_DECODE_VSM_SCALE", "0") or 0),
     # Run chunked prefills over a long cached prefix on the trtllm-gen generation
     # kernel when its wave/KV-split model predicts a gain (SM107, FP8 Q/KV,
     # head_dim 256, GQA 8). Set to 0 to always use the trtllm-gen context kernel.
