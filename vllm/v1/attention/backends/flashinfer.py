@@ -1198,6 +1198,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.trtllm_gen_prefill_num_sms = (
             torch.cuda.get_device_properties(device).multi_processor_count
             if envs.VLLM_FLASHINFER_TRTLLM_GEN_PREFILL
+            and not (envs.VLLM_FLASHINFER_F1_PREFILL and PREFILL_GEN_ROUTING_ENABLED)
             and current_platform.is_device_capability(107)
             and self.q_data_type_prefill == FP8_DTYPE
             and self.kv_cache_dtype == FP8_DTYPE
@@ -2466,12 +2467,11 @@ class FlashInferImpl(AttentionImpl):
         # check re-runs this forward on the FlashInfer path.
         self._kf_checks_left = envs.VLLM_KF_PREFILL_ATTN_CHECK
         self._kf_off = False
-        # Opt-in routing of eligible FP8 context launches to the trtllm-gen
-        # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
-        # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
-        self._prefill_gen_routing = (
-            PREFILL_GEN_ROUTING_ENABLED
-            and not current_platform.is_device_capability(107)
+        # SM107 keeps its metadata gen-prefill model unless explicitly
+        # replaced by the opt-in router. Other devices keep the existing route.
+        self._prefill_gen_routing = PREFILL_GEN_ROUTING_ENABLED and (
+            not current_platform.is_device_capability(107)
+            or envs.VLLM_FLASHINFER_F1_PREFILL
         )
         self._persistent_ctx_kv_counter = envs.VLLM_FI_PERSISTENT_KV_COUNTER
         # Kernel Factory decode kernel: per-layer debug comparisons left

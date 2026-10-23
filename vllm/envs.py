@@ -235,6 +235,21 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA: int | None = None
+    VLLM_FLASHINFER_F1_PREFILL: bool = False
+    FMHA107: bool = False
+    FMHA107_LOG: bool = False
+    FMHA107_MAX_B: int = 1000000
+    FMHA_GEN: bool = False
+    FMHA_GEN_MAX_T: int = 1000000000
+    FMHA_GEN_RULE: str = "rubin"
+    FMHA_GEN_TARGET: float = 768.0
+    FMHA_GEN_B1_STOCK_Q: int = 800
+    FMHA_GEN_MULTI_MAX_T: int = 1280
+    FMHA_GEN_MULTI_MAX_MEANQ: int = 96
+    FMHA_GEN_MAX_S: int = 8
+    FMHA_GEN_MAX_VSM: int | None = None
+    FMHA_GEN_REAL_B1_MAXQ: int = 512
+    FMHA_GEN_PDL: bool = False
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL: bool = True
     VLLM_FLASHINFER_TRTLLM_GEN_PREFILL_MAX_REQS: int = 64
     VLLM_FI_PERSISTENT_KV_COUNTER: bool = False
@@ -1886,6 +1901,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA": lambda: maybe_convert_int(
         os.getenv("VLLM_FLASHINFER_TRTLLM_DECODE_MAX_KV_PER_CTA")
     ),
+    # Replace the SM107 metadata gen-prefill model only with explicit opt-in.
+    # FMHA107 must also be enabled; off-SM107 routing is unchanged.
+    "VLLM_FLASHINFER_F1_PREFILL": lambda: (
+        os.getenv("VLLM_FLASHINFER_F1_PREFILL", "0") == "1"
+    ),
+    "FMHA107": lambda: os.getenv("FMHA107", "0") == "1",
+    "FMHA107_LOG": lambda: os.getenv("FMHA107_LOG", "0") == "1",
+    "FMHA107_MAX_B": lambda: int(os.getenv("FMHA107_MAX_B", "1000000")),
+    "FMHA_GEN": lambda: os.getenv("FMHA_GEN", "0") == "1",
+    "FMHA_GEN_MAX_T": lambda: int(os.getenv("FMHA_GEN_MAX_T", "1000000000")),
+    "FMHA_GEN_RULE": lambda: os.getenv("FMHA_GEN_RULE", "rubin").strip().lower(),
+    "FMHA_GEN_TARGET": lambda: float(
+        os.getenv(
+            "FMHA_GEN_TARGET",
+            "450"
+            if os.getenv("FMHA_GEN_RULE", "rubin").strip().lower() == "gb300"
+            else "768",
+        )
+    ),
+    "FMHA_GEN_B1_STOCK_Q": lambda: int(os.getenv("FMHA_GEN_B1_STOCK_Q", "800")),
+    "FMHA_GEN_MULTI_MAX_T": lambda: int(os.getenv("FMHA_GEN_MULTI_MAX_T", "1280")),
+    "FMHA_GEN_MULTI_MAX_MEANQ": lambda: int(os.getenv("FMHA_GEN_MULTI_MAX_MEANQ", "96")),
+    "FMHA_GEN_MAX_S": lambda: int(os.getenv("FMHA_GEN_MAX_S", "8")),
+    "FMHA_GEN_MAX_VSM": lambda: maybe_convert_int(os.getenv("FMHA_GEN_MAX_VSM")),
+    "FMHA_GEN_REAL_B1_MAXQ": lambda: int(os.getenv("FMHA_GEN_REAL_B1_MAXQ", "512")),
+    "FMHA_GEN_PDL": lambda: os.getenv("FMHA_GEN_PDL", "0") == "1",
     # Run chunked prefills over a long cached prefix on the trtllm-gen generation
     # kernel when its wave/KV-split model predicts a gain (SM107, FP8 Q/KV,
     # head_dim 256, GQA 8). Set to 0 to always use the trtllm-gen context kernel.
