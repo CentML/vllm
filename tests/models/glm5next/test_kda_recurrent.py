@@ -303,6 +303,8 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
     layer.kda_lower_bound = -5.0
     layer.kda_prefill_backend = "flashkda"
     layer.kda_decode_backend = layer.kda_spec_decode_backend = "triton"
+    layer._flashkda_max_prefills = 0
+    layer._flashkda_reserved = False
     layer._norm_in_forward = False
     layer._conv_state_dim_first = dim_first
     layer._merged_conv_weight = torch.randn(width, 4, device=device) * 0.1

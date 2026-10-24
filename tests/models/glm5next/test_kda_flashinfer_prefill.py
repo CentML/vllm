@@ -155,6 +155,48 @@ def test_prefill_step_matches_triton_and_reference(monkeypatch, num_heads, state
     torch.testing.assert_close(state_f[untouched], fresh[untouched], atol=0, rtol=0)
 
 
+@pytest.mark.usefixtures("workspace_init")
+@pytest.mark.parametrize("num_prefills", [2, 3], ids=["routed", "not-routed"])
+@torch.inference_mode()
+def test_few_prefills_route_to_flashkda(monkeypatch, num_prefills):
+    """With FlashInfer prefill, a step with at most ``_flashkda_max_prefills``
+    sequences runs FlashKDA (FlashInfer's few-sequence route is slower) and a
+    larger one keeps FlashInfer; each matches that backend bit for bit."""
+    num_heads = 64
+    _require_flashinfer_prefill(num_heads, torch.float32)
+    if _resolve_kda_prefill_backend("auto", D, torch.bfloat16, LOWER_BOUND) != (
+        "flashkda"
+    ):
+        pytest.skip("FlashKDA is not available")
+    import vllm._flashkda_C  # noqa: F401
+
+    query_lens = [40, 70, 17][:num_prefills]
+    slots = [3, 8, 21][:num_prefills]
+    has_state = [False, True, True][:num_prefills]
+    meta = _non_spec_metadata(query_lens, 0, slots, has_state)
+    T, N = sum(query_lens), len(query_lens)
+    workspace = torch.ops._flashkda_C.get_workspace_size(T, num_heads, N)
+
+    def run(backend, max_prefills):
+        layer = _prefill_layer(num_heads, torch.float32, backend)
+        layer._flashkda_max_prefills = max_prefills
+        layer._flashkda_buffer_specs = (
+            ((N, num_heads, D, D), torch.float32),
+            ((N, num_heads, D, D), torch.float32),
+            ((workspace,), torch.uint8),
+            ((1, T, num_heads, D), torch.bfloat16),
+        )
+        out = _run(layer, meta, _make_inputs(num_heads, T), monkeypatch)
+        return out, layer.kv_cache[1]
+
+    out, state = run("flashinfer", 2)
+    expected_out, expected_state = run(
+        "flashkda" if num_prefills <= 2 else "flashinfer", 0
+    )
+    torch.testing.assert_close(out, expected_out, atol=0, rtol=0)
+    torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+
+
 @torch.inference_mode()
 def test_one_token_prefill_step(monkeypatch):
     """A step whose only prefill row is one token takes the recurrent kernel
@@ -234,6 +276,43 @@ def test_prefill_with_spec_verify_rows(monkeypatch):
         out[backend] = (_run(layer, meta, inputs, monkeypatch), layer.kv_cache)
     out_f, out_t = out["flashinfer"][0].float(), out["triton"][0].float()
     assert (out_f - out_t).norm() < 1e-2 * out_t.norm()
+    torch.testing.assert_close(
+        out["flashinfer"][1][1][1:], out["triton"][1][1][1:], atol=1e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.usefixtures("workspace_init")
+@torch.inference_mode()
+def test_routed_flashkda_prefill_with_spec_verify_rows(monkeypatch):
+    """A step with draft-verify rows routed from FlashInfer to FlashKDA writes
+    the prefill rows to a new buffer (the reserved one holds one token)."""
+    num_heads, num_spec = 32, 2
+    _require_flashinfer_prefill(num_heads, torch.float32)
+    if _resolve_kda_prefill_backend("auto", D, torch.bfloat16, LOWER_BOUND) != (
+        "flashkda"
+    ):
+        pytest.skip("FlashKDA is not available")
+    import vllm._flashkda_C  # noqa: F401
+
+    slots = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [11, 11, 11], [14, 14, 14]]
+    meta = _spec_metadata(num_spec, [1, 2, 3], [25, 9], 3, slots)
+    out = {}
+    for backend in ("triton", "flashinfer"):
+        layer = _make_layer(num_heads, num_spec, torch.float32, False, "triton")
+        layer.kda_prefill_backend = backend
+        if backend == "flashinfer":
+            workspace = torch.ops._flashkda_C.get_workspace_size(34, num_heads, 2)
+            layer._flashkda_max_prefills = 2
+            layer._flashkda_buffer_specs = (
+                ((2, num_heads, D, D), torch.float32),
+                ((2, num_heads, D, D), torch.float32),
+                ((workspace,), torch.uint8),
+                ((1, 1, num_heads, D), torch.bfloat16),
+            )
+        inputs = _make_inputs(num_heads, meta.num_actual_tokens)
+        out[backend] = (_run(layer, meta, inputs, monkeypatch), layer.kv_cache)
+    out_r, out_t = out["flashinfer"][0].float(), out["triton"][0].float()
+    assert (out_r - out_t).norm() < 1e-2 * out_t.norm()
     torch.testing.assert_close(
         out["flashinfer"][1][1][1:], out["triton"][1][1][1:], atol=1e-2, rtol=1e-2
     )

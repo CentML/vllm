@@ -630,15 +630,41 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self._fi_conv_weight: torch.Tensor | None = None
         self._fi_norm_weight: torch.Tensor | None = None
 
+        # FlashInfer's prefill takes a slower two-kernel route when its
+        # (sequence, head) walks fit in one wave (2 * sequences * heads <= SMs).
+        # FlashKDA is faster there, so such steps use it when it is available.
+        self._flashkda_max_prefills = 0
+        if (
+            self.kda_prefill_backend == "flashinfer"
+            and _resolve_kda_prefill_backend(
+                "auto",
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.kda_lower_bound,
+            )
+            == "flashkda"
+        ):
+            sm_count = current_platform.num_compute_units(
+                torch.accelerator.current_device_index()
+            )
+            self._flashkda_max_prefills = sm_count // (2 * self.local_num_heads)
+        self._flashkda_reserved = False
+
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
-        if self.kda_prefill_backend == "flashkda":
+        if self.kda_prefill_backend == "flashkda" or self._flashkda_max_prefills:
             import vllm._flashkda_C  # noqa: F401
 
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             max_seqs = vllm_config.scheduler_config.max_num_seqs
+            # Steps routed from FlashInfer hold at most _flashkda_max_prefills
+            # sequences and pass their own output buffer.
+            out_tokens = max_tokens
+            if self.kda_prefill_backend == "flashinfer":
+                max_seqs = min(max_seqs, self._flashkda_max_prefills)
+                out_tokens = 1
             workspace_size = torch.ops._flashkda_C.get_workspace_size(
                 max_tokens, self.local_num_heads, max_seqs
             )
@@ -655,10 +681,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 # Output buffer for steps that also carry spec-decode tokens:
                 # the non-spec tokens are then scattered by non_spec_token_indx.
                 (
-                    (1, max_tokens, self.local_num_heads, self.head_dim),
+                    (1, out_tokens, self.local_num_heads, self.head_dim),
                     vllm_config.model_config.dtype,
                 ),
             )
+        if self.kda_prefill_backend == "flashkda":
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter(
                 state_len=self.conv_size - 1
             )
@@ -894,6 +921,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         g2: torch.Tensor,
     ) -> None:
+        if self._flashkda_max_prefills and not self._flashkda_reserved:
+            # Claim the routed FlashKDA buffers in the profiling run: a step
+            # with few enough prefills may first come after the workspace locks.
+            assert self._flashkda_buffer_specs is not None
+            current_workspace_manager().get_simultaneous(*self._flashkda_buffer_specs)
+            self._flashkda_reserved = True
+
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
@@ -1182,7 +1216,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 v_ns = v_ns[num_fused_decodes:]
                 g1_ns = g1_ns[:, num_fused_decodes:]
                 beta_ns = beta_ns[:, num_fused_decodes:]
-            if self.kda_prefill_backend == "flashinfer":
+            prefill_backend = self.kda_prefill_backend
+            if prefill_backend == "flashinfer" and (
+                num_prefills <= self._flashkda_max_prefills
+            ):
+                prefill_backend = "flashkda"
+            if prefill_backend == "flashinfer":
                 core_attn_out_non_spec = ns_out = self._flashinfer_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
@@ -1201,15 +1240,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 initial_state = gather_initial_states(
                     recurrent_state, prefill_state_indices, prefill_has_initial_state
                 )
-            if self.kda_prefill_backend == "flashkda":
+            if prefill_backend == "flashkda":
                 # Non-spec step: write straight into the layer output buffer
                 # (dense token order, no merge copy). Step with spec-decode
-                # tokens: write to the workspace buffer and scatter below.
-                ns_out = (
-                    None
-                    if use_spec
-                    else core_attn_out[:, num_fused_decodes:num_actual_tokens]
-                )
+                # tokens: write to the workspace buffer (a new buffer when
+                # routed from FlashInfer) and scatter below.
+                ns_out = core_attn_out[:, num_fused_decodes:num_actual_tokens]
+                if use_spec:
+                    ns_out = (
+                        torch.empty_like(_rearr(q_ns))
+                        if self.kda_prefill_backend == "flashinfer"
+                        else None
+                    )
                 core_attn_out_non_spec, last_recurrent_state = self._flashkda_prefill(
                     q=_rearr(q_ns),
                     k=_rearr(k_ns),
@@ -1219,12 +1261,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     initial_state=initial_state,
                     cu_seqlens=prefill_query_start_loc,
                     out=ns_out,
-                    checkpoint=attn_metadata_narrowed.checkpoint,
+                    # FlashInfer mode reserves no checkpoint blocks.
+                    checkpoint=attn_metadata_narrowed.checkpoint
+                    if self.kda_prefill_backend == "flashkda"
+                    else None,
                     raw_qkv=raw_qkv_ns,
                     conv_state=conv_state,
                     recurrent_state=recurrent_state,
                 )
-            elif self.kda_prefill_backend == "triton":
+            elif prefill_backend == "triton":
                 (
                     core_attn_out_non_spec,
                     last_recurrent_state,
@@ -1245,7 +1290,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     safe_gate=safe_gate,
                     lower_bound=lower_bound,
                 )
-            if self.kda_prefill_backend != "flashinfer":
+            if prefill_backend != "flashinfer":
                 # Init cache
                 scatter_states(
                     recurrent_state,

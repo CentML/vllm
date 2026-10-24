@@ -67,6 +67,8 @@ def _make_layer(
     layer.kda_safe_gate, layer.kda_lower_bound = True, LOWER_BOUND
     layer.kda_prefill_backend = "triton"
     layer._flashkda_buffer_specs = None
+    layer._flashkda_max_prefills = 0
+    layer._flashkda_reserved = False
     layer._checkpoint_exporter = None
     layer._conv_state_dim_first = dim_first
     for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
