@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.flashinfer import FlashInferImpl
+    from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
@@ -53,7 +54,9 @@ class MTPSpeculator(TargetDependentARSpeculator):
             and hasattr(draft_model.model, "compact_topk_indices")
         )
         self._draft_prefill_prune_layer: Attention | None = None
-        self._draft_prefill_prune_group_id: int | None = None
+        # The draft attention group holding that layer; False until resolved,
+        # None when the layer is in no draft group.
+        self._draft_prefill_prune_group: AttentionGroup | None | bool = False
         if envs.VLLM_MTP_DRAFT_PREFILL_PRUNE:
             # Under prefill context parallelism the draft prefill is re-laid
             # out, so last_token_indices does not index the attention's rows.
@@ -104,27 +107,36 @@ class MTPSpeculator(TargetDependentARSpeculator):
         ):
             from vllm.v1.attention.backends.flashinfer import DraftPrefillPruning
 
-            # Resolve the actual draft layer's cache group, not the target's
-            # first group (Qwen's target has both linear and full attention).
-            group_id = self._draft_prefill_prune_group_id
-            if group_id is None:
-                group_id = next(
+            # Resolve the draft layer's own attention group (the cache group
+            # holding it, not the target's first group: Qwen's target has both
+            # linear and full attention).
+            group = self._draft_prefill_prune_group
+            if group is False:
+                group = next(
                     (
-                        i
-                        for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
-                        if layer.layer_name in group.layer_names
+                        g
+                        for groups in self.attn_groups
+                        for g in groups
+                        if layer.layer_name in g.layer_names
                     ),
-                    -1,
+                    None,
                 )
-                self._draft_prefill_prune_group_id = group_id
-            if group_id >= 0:
+                self._draft_prefill_prune_group = group
+            if group is not None:
+                assert not isinstance(group, bool)
                 rows = self.last_token_indices[:num_reqs]
                 impl.draft_prefill_pruning = DraftPrefillPruning(
                     rows=rows,
                     seq_lens=(self.input_buffers.positions[rows] + 1).to(torch.int32),
-                    block_tables=self.block_tables.input_block_tables[group_id][
-                        :num_reqs
-                    ],
+                    # BlockTables holds KV-manager block ids; the layer's KV
+                    # cache is viewed in kernel blocks (128 tokens under the
+                    # hybrid ~1152-token manager block), so map the rows the
+                    # same way the draft decode does.
+                    block_tables=group.map_to_kernel_block_table(
+                        self.block_tables.input_block_tables[group.kv_cache_group_id][
+                            :num_reqs
+                        ]
+                    ),
                     max_seq_len=self.draft_max_seq_len,
                 )
             else:
