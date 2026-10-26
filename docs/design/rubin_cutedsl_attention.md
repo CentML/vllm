@@ -39,12 +39,13 @@ these strides. No full-cache conversion is performed.
 ### Enabling it
 
 `VLLM_RUBIN_CUTEDSL_PREFILL=1` is the only switch; it is off by default and no
-artifact-path variable turns it on. The exports come from the FlashInfer
-artifact manifest or from `FLASHINFER_DSL_FMHA_LOCAL_DIR`:
+artifact-path variable turns it on. The exports come from FlashInfer's pinned
+cute-dsl artifact collection (`ArtifactPath.DSL_FMHA`), or from
+`FLASHINFER_DSL_FMHA_LOCAL_DIR` when it is set:
 
 ```bash
 export VLLM_RUBIN_CUTEDSL_PREFILL=1
-export FLASHINFER_DSL_FMHA_LOCAL_DIR=/path/to/exports    # if not published
+export FLASHINFER_DSL_FMHA_LOCAL_DIR=/path/to/exports    # if not in the pin
 export VLLM_RUBIN_CUTEDSL_PREFILL_POLICY=tuned           # optional, see below
 ```
 
@@ -58,9 +59,9 @@ export VLLM_RUBIN_CUTEDSL_PREFILL_POLICY=tuned           # optional, see below
 `tuned` needs a FlashInfer that exports `rubin_paged_prefill_query_layout` and
 `RUBIN_GQA_TUNED_POLICY`; with an older FlashInfer, vLLM warns and uses
 `legacy`. It also needs the matching exports for every layout a batch can
-select. They are not part of the published artifacts, so a missing one raises
-at the first batch that needs it. The builder copies the prefill query lengths
-from `query_start_loc_cpu` (no device sync). The options are cached per
+select, in FlashInfer's pinned collection or the local directory; a missing one
+raises at the first batch that needs it. The builder copies the prefill query
+lengths from `query_start_loc_cpu` (no device sync). The options are cached per
 (lengths, output dtype), so the selection runs once per batch, not per layer.
 
 ### CUDA graphs
@@ -98,11 +99,14 @@ load during serving. That is a one-time cost, visible in FlashInfer's
 
 ## Artifact and validation requirements
 
-The MR199 artifact collection supplies ViT D72/D80, but does not supply the new
-HND, corrected multi-sequence ragged, or fused-NVFP4 GQA exports. Build those with
-the paired exporter changes and use `FLASHINFER_DSL_FMHA_LOCAL_DIR`, or publish
-them and update the FlashInfer artifact manifest before enabling GQA. Missing
-artifacts and kernel ABI errors propagate; they are not silently caught.
+FlashInfer loads every export from its pinned cute-dsl collection, or from
+`FLASHINFER_DSL_FMHA_LOCAL_DIR` (a directory of exports, for example a
+cubin_publishing build that is not published yet). The MR199 collection
+(a10580e7) supplies ViT D72/D80, but not the HND, corrected multi-sequence
+ragged, fused-NVFP4 or tuned GQA exports, nor the persistent ViT ones. Enable
+GQA, the tuned policy or the persistent ViT only with a FlashInfer pinned to a
+collection that carries them, or with the local directory. Missing artifacts and
+kernel ABI errors propagate; they are not silently caught.
 
 This branch stages source integration, not an E2E correctness/performance claim.
 Before deployment, run FlashInfer kernel numerical and CUDA-graph replay tests,
@@ -118,6 +122,8 @@ The host contract tests are:
 
 Look for `Rubin CuTeDSL ViT active` and `Rubin CuTeDSL paged prefill active` in
 the worker logs. `Rubin CuTeDSL paged prefill policy: legacy` or `... tuned`
-records the policy. With `FLASHINFER_DSL_FMHA_LOCAL_DIR`, FlashInfer logs
-`Loading DSL FMHA kernel variant <name>` once for each export it loads. An
-opt-in alone is not evidence that every attention call used the new kernel.
+records the policy. FlashInfer logs `Loading DSL FMHA kernel variant <name>`
+once for each export it loads (from the pin or the local directory), at INFO on
+the `flashinfer.attention.cute_dsl.fmha` logger; that logger has no handler by
+default, so the line appears only if it is configured. An opt-in alone is not
+evidence that every attention call used the new kernel.

@@ -1800,7 +1800,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With VLLM_RUBIN_CUTEDSL_VIT: run the persistent ViT kernel (at most one
     # CTA per SM over the valid Q tiles, dynamic Work-ID queue for large
     # encoder graphs) instead of one CTA per max_seqlen tile, slot and head.
-    # Needs FlashInfer's persistent ViT exports (FLASHINFER_DSL_FMHA_LOCAL_DIR).
+    # Needs FlashInfer's persistent ViT exports, from its pinned cute-dsl
+    # artifact collection or from FLASHINFER_DSL_FMHA_LOCAL_DIR.
     "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT": lambda: bool(
         int(os.getenv("VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT", "0"))
     ),
@@ -1813,8 +1814,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kernel policy of the opted-in Rubin CuTeDSL paged prefill:
     # "legacy" loads the original packed-Q export; "tuned" picks the query
     # layout per batch and passes FlashInfer's RUBIN_GQA_TUNED_POLICY.
-    # "tuned" needs the matching exports (FLASHINFER_DSL_FMHA_LOCAL_DIR) and
-    # falls back to "legacy" on FlashInfer without the tuned API.
+    # "tuned" needs the matching exports (FlashInfer's pinned cute-dsl
+    # collection or FLASHINFER_DSL_FMHA_LOCAL_DIR) and falls back to
+    # "legacy" on FlashInfer without the tuned API.
     "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY": env_with_choices(
         "VLLM_RUBIN_CUTEDSL_PREFILL_POLICY", "legacy", ["legacy", "tuned"]
     ),

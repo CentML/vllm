@@ -483,7 +483,8 @@ class MMEncoderAttention(CustomOp):
                     raise ValueError(
                         "VLLM_RUBIN_CUTEDSL_VIT_PERSISTENT needs a FlashInfer "
                         "with the persistent Rubin ViT interface and its "
-                        "exports (FLASHINFER_DSL_FMHA_LOCAL_DIR)."
+                        "exports (pinned cute-dsl artifacts or "
+                        "FLASHINFER_DSL_FMHA_LOCAL_DIR)."
                     ) from exc
         if mm_cfg is None or mm_cfg.mm_encoder_attn_dtype != "fp8":
             return
