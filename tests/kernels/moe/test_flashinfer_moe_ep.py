@@ -389,3 +389,220 @@ def test_adapter_kwargs_match_installed_flashinfer(
     assert workspaces == (
         fi_ep.sm107_capacity_profiles(MAX_TOKENS_PER_RANK) if sm107 else []
     )
+
+
+# GLM-5.3-Flash routed experts: the SM107 MegaMoE path with a non-DSv4 router
+# (grouped sigmoid top-k with correction bias), clamped SwiGLU (limit 10) and
+# routing weights applied after FC2. The tests below fake FlashInfer's
+# megakernel layer, so they run on any device.
+GLM53 = Geometry("glm-5.3-flash", 4096, 2048, 288, 8)
+
+
+class _FakeSm107MegaLayer:
+    """Records workspaces and launches; the "kernel" doubles its input rows."""
+
+    def __init__(self, *args) -> None:
+        self.args = args
+        self.workspaces: list[int] = []
+        self.calls: list[tuple] = []
+        self._staged = None
+
+    def create_workspace(self, capacity: int) -> int:
+        self.workspaces.append(capacity)
+        return capacity
+
+    def forward(self, tensors, *, workspace, return_workspace_view):
+        self.calls.append(("forward", workspace, tensors.hidden_states.shape[0]))
+        return tensors.hidden_states * 2
+
+    def stage_inputs(self, tensors, *, workspace) -> None:
+        self.calls.append(("stage", workspace, tensors.hidden_states.shape[0]))
+        self._staged = tensors.hidden_states
+
+    def compute_staged(self, *, output):
+        self.calls.append(("compute",))
+        return self._staged * 2
+
+    def destroy(self) -> None:
+        pass
+
+
+def _sm107_glm53_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    max_num_tokens: int = MAX_TOKENS_PER_RANK,
+    dp_size: int = 1,
+    shared_mode: str = "separate",
+) -> tuple[FlashInferMoeEp, _FakeSm107MegaLayer]:
+    moe_ep = pytest.importorskip("flashinfer.moe_ep")
+    if not hasattr(moe_ep, "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig"):
+        pytest.skip("The installed FlashInfer has no SM107 NVFP4 MegaMoE")
+    layers: list[_FakeSm107MegaLayer] = []
+
+    def make_layer(*args):
+        layers.append(_FakeSm107MegaLayer(*args))
+        return layers[-1]
+
+    monkeypatch.setattr(moe_ep, "MoEEpMegaLayer", make_layer)
+    monkeypatch.setattr(moe_ep, "MoEEpTensors", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(fi_ep, "is_sm107_device", lambda: True)
+    monkeypatch.setattr(
+        fi_ep,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=0, device_group=None),
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    moe = SimpleNamespace(
+        moe_backend=FLASHINFER_MOE_EP_CUTEDSL,
+        num_experts=GLM53.num_experts,
+        experts_per_token=GLM53.top_k,
+        hidden_dim=GLM53.hidden_size,
+        intermediate_size=GLM53.intermediate_size,
+        max_num_tokens=max_num_tokens,
+        swiglu_limit=10.0,
+        routing_method=RoutingMethodType.DeepSeekV3,
+        dp_size=dp_size,
+    )
+    weight = torch.zeros(1, dtype=torch.bfloat16)
+    adapter = FlashInferMoeEp(
+        moe,
+        FlashInferMoeEpWeights(w13=weight, w2=weight),
+        apply_topk_in_fc1=apply_topk_in_fc1(moe),
+        shared_mode=shared_mode,
+    )
+    (layer,) = layers
+    return adapter, layer
+
+
+@pytest.mark.parametrize(
+    ("max_num_tokens", "capacity_cap"),
+    [(MAX_TOKENS_PER_RANK, "0"), (65536, "0"), (65536, "8192")],
+    ids=("decode", "agg-uncapped", "agg-capped"),
+)
+def test_sm107_glm53_config_and_capacity_ladder(
+    monkeypatch: pytest.MonkeyPatch, max_num_tokens: int, capacity_cap: str
+):
+    """GLM-5.3's clamp, top-k and late routing weights reach the SM107 config,
+    and VLLM_FI_MEGA_MOE_MAX_CAPACITY caps the workspace ladder."""
+    monkeypatch.setenv("VLLM_FI_MEGA_MOE_MAX_CAPACITY", capacity_cap)
+    adapter, layer = _sm107_glm53_adapter(monkeypatch, max_num_tokens=max_num_tokens)
+    megakernel = layer.args[3].megakernel
+    assert megakernel.intermediate_size == GLM53.intermediate_size
+    assert megakernel.top_k == GLM53.top_k
+    assert megakernel.gate_up_clamp == 10.0
+    assert megakernel.apply_topk_in_fc1 is False
+    assert megakernel.knobs == "cache"
+    cap = int(capacity_cap) or max_num_tokens
+    assert layer.workspaces == fi_ep.sm107_capacity_profiles(min(max_num_tokens, cap))
+    # apply() copies the result right away, so SM107 returns the workspace view.
+    assert adapter._return_workspace_view
+
+
+def _set_dp_tokens(monkeypatch: pytest.MonkeyPatch, tokens: list[int]) -> None:
+    import vllm.forward_context as forward_context
+
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(tokens))
+    )
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+
+
+@pytest.mark.parametrize(
+    ("local_tokens", "expected_rows"),
+    [(600, [256, 256, 88]), (300, [256, 44, 0])],
+    ids=("largest-rank", "smaller-rank"),
+)
+def test_sm107_steps_above_the_cap_run_rank_consistent_chunks(
+    monkeypatch: pytest.MonkeyPatch, local_tokens: int, expected_rows: list[int]
+):
+    """A step above the largest profile runs ceil(max over DP / cap) launches of
+    that profile on every rank (empty ones where a rank runs out of tokens),
+    and every row is computed exactly once."""
+    monkeypatch.setenv("VLLM_FI_MEGA_MOE_MAX_CAPACITY", "256")
+    adapter, layer = _sm107_glm53_adapter(monkeypatch, max_num_tokens=1024, dp_size=2)
+    _set_dp_tokens(monkeypatch, [600, 300])
+    hidden = torch.randn(local_tokens, GLM53.hidden_size, dtype=torch.bfloat16)
+    ids = torch.zeros(local_tokens, GLM53.top_k, dtype=torch.int32)
+    weights = torch.ones(local_tokens, GLM53.top_k)
+
+    output = adapter(hidden, ids, weights)
+
+    assert [(c[1], c[2]) for c in layer.calls] == [(256, n) for n in expected_rows]
+    torch.testing.assert_close(output, hidden * 2, rtol=0, atol=0)
+
+
+def test_sm107_pre_shared_mode_waits_for_the_shared_mlp_before_compute(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """VLLM_FI_MEGA_MOE_SHARED=pre: stage on the main stream, wait for the
+    shared MLP's event, then launch the megakernel; the event is consumed."""
+    adapter, layer = _sm107_glm53_adapter(monkeypatch, shared_mode="pre")
+    waited: list[object] = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(wait_event=lambda event: waited.append(event)),
+    )
+    event = object()
+    fi_ep.set_pending_shared_experts_event(event)
+    hidden = torch.randn(4, GLM53.hidden_size, dtype=torch.bfloat16)
+    ids = torch.zeros(4, GLM53.top_k, dtype=torch.int32)
+    weights = torch.ones(4, GLM53.top_k)
+
+    adapter(hidden, ids, weights)
+    assert [c[0] for c in layer.calls] == ["stage", "compute"]
+    assert waited == [event]
+
+    adapter(hidden, ids, weights)
+    assert waited == [event], "the event must be consumed by one launch"
+
+
+def test_sm107_resolve_pre_shared_mode():
+    assert fi_ep.resolve_sm107_shared_mode(
+        "pre", replicated_shared=False, has_side_stream=True
+    ) == ("pre", None)
+    mode, reason = fi_ep.resolve_sm107_shared_mode(
+        "pre", replicated_shared=True, has_side_stream=False
+    )
+    assert mode == "separate" and reason
+
+
+@pytest.mark.parametrize("mask_padding", [True, False])
+@pytest.mark.parametrize("skip_padding_env", ["1", "0"])
+def test_kernel_routes_mask_padding_rows(
+    monkeypatch: pytest.MonkeyPatch, mask_padding: bool, skip_padding_env: str
+):
+    """Padding rows (CUDA-graph / DP padding) become masked slots (-1, 0), so
+    FlashInfer's route check never sees what a non-DSv4 router computed from
+    their garbage hidden states (here NaN weights and duplicate ids)."""
+    from vllm.model_executor.layers.fused_moe.experts import (
+        flashinfer_moe_ep as experts_mod,
+    )
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", skip_padding_env)
+    is_padding = torch.tensor([False, False, True, True, True])  # padded buffer
+    monkeypatch.setattr(experts_mod, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        experts_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(is_padding=is_padding),
+    )
+    ids = torch.arange(4 * GLM53.top_k, dtype=torch.int64).view(4, GLM53.top_k)
+    ids[2:] = 7  # duplicate ids, as a router may produce on garbage rows
+    weights = torch.rand(4, GLM53.top_k)
+    weights[2:] = float("nan")
+
+    out_ids, out_weights = experts_mod._kernel_routes(
+        ids, weights, mask_padding=mask_padding
+    )
+
+    assert out_ids.dtype == torch.int32
+    torch.testing.assert_close(out_ids[:2], ids[:2].to(torch.int32))
+    torch.testing.assert_close(out_weights[:2], weights[:2])
+    if mask_padding and skip_padding_env == "1":
+        assert (out_ids[2:] == -1).all()
+        assert (out_weights[2:] == 0).all()
+    else:
+        torch.testing.assert_close(out_ids[2:], ids[2:].to(torch.int32))
+        assert out_weights[2:].isnan().all()
