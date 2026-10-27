@@ -4,6 +4,11 @@
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
+from vllm.config.kernel import (
+    FLASHINFER_MOE_EP_BACKENDS,
+    NATIVE_MEGA_MOE_BACKENDS,
+    PASSTHROUGH_ALL2ALL_BACKEND,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import get_draft_load_config
 from vllm.models.deepseek_v4.common.eplb_util import dspark_draft_supports_eplb
@@ -69,6 +74,40 @@ def _get_dspark_parallel_config(
     )
 
 
+def _check_draft_moe_backend(
+    moe_backend: str,
+    target_parallel_config: ParallelConfig,
+    draft_parallel_config: ParallelConfig,
+) -> None:
+    """Reject a draft MoE backend that the EP group cannot serve. The draft
+    shares the target's EP group, whose all2all manager follows the target's
+    all2all backend."""
+    target_all2all = target_parallel_config.all2all_backend
+    if moe_backend in FLASHINFER_MOE_EP_BACKENDS:
+        if target_all2all not in (
+            "allgather_reducescatter",
+            PASSTHROUGH_ALL2ALL_BACKEND,
+        ):
+            raise ValueError(
+                f"The DSpark draft's moe_backend={moe_backend!r} dispatches and "
+                f"combines itself and cannot run while the target uses "
+                f"all2all_backend={target_all2all!r}."
+            )
+    elif (
+        target_all2all == PASSTHROUGH_ALL2ALL_BACKEND
+        and moe_backend not in NATIVE_MEGA_MOE_BACKENDS
+        and draft_parallel_config.use_all2all
+    ):
+        supported = sorted(NATIVE_MEGA_MOE_BACKENDS | FLASHINFER_MOE_EP_BACKENDS)
+        raise ValueError(
+            f"The DSpark draft's moe_backend={moe_backend!r} needs the EP "
+            f"all-to-all, but the target's MoE backend dispatches and combines "
+            f"itself, so the EP group has none (all2all_backend="
+            f"{PASSTHROUGH_ALL2ALL_BACKEND!r}). Use one of {supported} for the "
+            f"draft."
+        )
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -112,6 +151,16 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         ),
         load_config=get_pp_safe_draft_load_config(get_draft_load_config(vllm_config)),
     )
+    if speculative_config.moe_backend is not None:
+        _check_draft_moe_backend(
+            speculative_config.moe_backend,
+            vllm_config.parallel_config,
+            draft_vllm_config.parallel_config,
+        )
+        # Applies moe_backend and drops an all2all backend that only the
+        # target's MoE backend can use. The attention backend and KV cache
+        # dtype resolved above are re-applied unchanged.
+        draft_vllm_config = speculative_config.apply_draft_overrides(draft_vllm_config)
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
     draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
