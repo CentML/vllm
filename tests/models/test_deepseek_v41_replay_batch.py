@@ -60,7 +60,10 @@ REPLAY_ROWS = [0, *range(301 - WINDOW, 301), *range(301, 401)]
 
 @pytest.fixture
 def state(monkeypatch, request):
-    """A DeepseekV41ModelState whose attention builds are recorded, not run."""
+    """A DeepseekV41ModelState whose attention builds are recorded, not run.
+    ``request.param`` is the PCP size, or ``(pcp_size, enable_expert_parallel)``."""
+    param = getattr(request, "param", 1)
+    pcp_size, enable_ep = param if isinstance(param, tuple) else (param, False)
     cfg = MagicMock()
     cfg.model_config.enable_prompt_embeds = False
     cfg.model_config.uses_mrope = False
@@ -68,8 +71,8 @@ def state(monkeypatch, request):
     cfg.scheduler_config.max_num_seqs = 16
     cfg.scheduler_config.max_num_batched_tokens = 1024
     cfg.parallel_config.data_parallel_size = 1
-    cfg.parallel_config.enable_expert_parallel = False
-    cfg.parallel_config.prefill_context_parallel_size = getattr(request, "param", 1)
+    cfg.parallel_config.enable_expert_parallel = enable_ep
+    cfg.parallel_config.prefill_context_parallel_size = pcp_size
     cfg.aux_output_config.enable_return_routed_experts = False
     cfg.compilation_config.fast_moe_cold_start = False
     cfg.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -178,7 +181,10 @@ def test_replay_batch_keeps_each_request_window(state):
         "swa_first": first.attn_metadata,
     }
     assert torch.equal(context.slot_mapping["mla"], _slot_mappings(401)[1, rows])
-    assert context.dp_metadata is None and context.is_padding is None
+    assert context.dp_metadata is None
+    # The replay context replaces the batch's: it carries the kept rows' mask.
+    assert context.is_padding is sub.is_padding
+    assert context.is_padding.tolist() == [False] * len(REPLAY_ROWS)
 
 
 def test_replay_context_restores_tp_routing_rows(state):
@@ -186,7 +192,7 @@ def test_replay_context_restores_tp_routing_rows(state):
     batch = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
     replay, _ = _prepare(state, batch, CUDAGraphMode.NONE)
     context = replay.forward_context
-    assert context.is_padding is None and context.dp_metadata is None
+    assert not context.is_padding.any() and context.dp_metadata is None
     count = len(REPLAY_ROWS)
     assert context.batch_descriptor.num_tokens == count
     capturer = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
@@ -285,9 +291,8 @@ def test_prompt_logprobs_requests_keep_their_rows(state):
                 ]
 
 
-@pytest.mark.parametrize("state", [2], indirect=True)
-def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
-    """The 128-row tail spans two owners; early segments keep no rows."""
+def _use_pcp_rank(monkeypatch, rank: int) -> None:
+    """Run as ``rank`` of a PCP group of 2 whose all_gather repeats its input."""
     import vllm.models.deepseek_v41.nvidia.model_state as module
     from vllm.distributed.device_communicators.pynccl_wrapper import ncclDataTypeEnum
 
@@ -295,6 +300,25 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
         ncclDataTypeEnum.from_torch(tensor.dtype)
         return torch.cat([tensor] * 2, dim=dim)
 
+    monkeypatch.setattr(
+        module,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=rank, all_gather=all_gather),
+    )
+
+
+# PCP 2 without EP, where the MoE routes every rank's rows, and with EP.
+PCP2 = [pytest.param((2, False), id="pcp2"), pytest.param((2, True), id="pcp2-ep")]
+
+
+def _moe_gathers_tokens(state) -> bool:
+    return not state.vllm_config.parallel_config.enable_expert_parallel
+
+
+@pytest.mark.parametrize("state", PCP2, indirect=True)
+def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
+    """The 128-row tail spans two owners; early segments keep no rows."""
+    gathers = _moe_gathers_tokens(state)
     # A decode and a 513-token prefill from a 1024-token prefix hit.
     global_batch = replace(
         _input_batch([1, 513], [400, 1537], [False, True]),
@@ -302,14 +326,9 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
         prefill_len_np=np.array([10, 1537], dtype=np.int32),
     )
     state._replay_start_np[1] = 1024
+    masks = []
     for rank, expected_rows in ((0, [0, *range(130, 256)]), (1, [256, 257])):
-        monkeypatch.setattr(
-            module,
-            "get_pcp_group",
-            lambda rank=rank: SimpleNamespace(
-                rank_in_group=rank, all_gather=all_gather
-            ),
-        )
+        _use_pcp_rank(monkeypatch, rank)
         manager = PCPManager(
             pcp_world_size=2,
             pcp_rank=rank,
@@ -317,6 +336,8 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
             shard_decode_requests=True,
             max_num_reqs=16,
             max_num_tokens=1024,
+            # Without EP the batch's mask spans both ranks' rows, as the MoE's.
+            moe_gathers_tokens=gathers,
         )
         batch = manager.partition_batch(
             global_batch, BatchExecutionDescriptor(CUDAGraphMode.NONE, 514, None)
@@ -336,7 +357,14 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
             slots[0, rank * batch.num_tokens_after_padding + replay.rows],
         )
         assert (local_slots[:, len(expected_rows) :] == -1).all()
-        assert replay.forward_context.is_padding.sum() == 2 * (129 - len(expected_rows))
+        # Each rank's kept rows are real, its other rows padding; without EP
+        # the mask holds both ranks' rows.
+        is_padding = replay.forward_context.is_padding
+        masks.append(is_padding)
+        rank_mask = [False] * len(expected_rows) + [True] * (129 - len(expected_rows))
+        assert is_padding.tolist() == rank_mask * (2 if gathers else 1)
+    # Refilled in place, so a replay graph reads every step's mask.
+    assert masks[0].data_ptr() == masks[1].data_ptr()
     # No request trims: every rank keeps the whole batch.
     state._keeps_rows_np[1] = True
     state.prepare_attn(batch, CUDAGraphMode.NONE, BLOCK_TABLES, slots, [], GROUPS)
@@ -449,14 +477,31 @@ def test_dp_ranks_replay_together(dp_state):
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [200, 300]
 
 
-def test_idle_dp_rank_dummy_trims_with_its_peers(dp_state):
-    """An idle rank's dummy keeps one row, so peers do not wait on its replay."""
+def _idle_dummy(num_mask_ranks: int = 1) -> InputBatch:
+    """An idle DP rank's dummy batch: context-free decodes, all padding. Without
+    EP, a PCP runner's mask spans every rank's rows."""
     dummy = _input_batch([256, 256], [256, 256], [False, False])
+    return replace(
+        dummy,
+        is_padding=torch.ones(num_mask_ranks * 512, dtype=torch.bool, device=DEVICE),
+    )
+
+
+@pytest.mark.parametrize("state", [pytest.param(1, id="pcp1"), *PCP2], indirect=True)
+def test_idle_dp_rank_dummy_trims_with_its_peers(dp_state, monkeypatch):
+    """An idle rank's dummy keeps one row, so peers do not wait on its replay;
+    the row stays padding, so the replay layers' MoE routes it to no expert."""
+    pcp_size = dp_state.pcp_size
+    if pcp_size > 1:
+        _use_pcp_rank(monkeypatch, 1)
+    moe_ranks = pcp_size if _moe_gathers_tokens(dp_state) else 1
     dp_state.other = (True, 129)
-    replay, _ = _prepare(dp_state, dummy, CUDAGraphMode.NONE)
+    replay, _ = _prepare(dp_state, _idle_dummy(moe_ranks), CUDAGraphMode.NONE)
     assert replay is not None and replay.rows.shape[0] == 1
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [1, 129]
+    # The row of every PCP rank whose rows the MoE routes.
+    assert replay.forward_context.is_padding.tolist() == [True] * moe_ranks
 
 
 def test_zero_prefix_window_warms_gather_and_skips_pad(monkeypatch):
@@ -536,7 +581,8 @@ def test_zero_prefix_window_warms_gather_and_skips_pad(monkeypatch):
 
 
 def test_dp_ranks_pad_to_one_replay_graph(dp_state):
-    """Every rank pads its replay batch to the graph fitting the largest rank's."""
+    """Every rank pads its replay batch to the graph fitting the largest rank's.
+    The graph's padding rows hold undefined activations: they are padding."""
     dp_state.replay_cudagraphs = MagicMock()
     dp_state.replay_cudagraphs.dispatch.return_value = BatchExecutionDescriptor(
         CUDAGraphMode.PIECEWISE, 512, None
@@ -548,3 +594,36 @@ def test_dp_ranks_pad_to_one_replay_graph(dp_state):
     assert replay.forward_context.batch_descriptor.num_tokens == 512
     dp_metadata = replay.forward_context.dp_metadata
     assert dp_metadata.num_tokens_across_dp_cpu.tolist() == [512, 512]
+    num_kept = len(REPLAY_ROWS)
+    is_padding = replay.forward_context.is_padding
+    assert is_padding.tolist() == [False] * num_kept + [True] * (512 - num_kept)
+
+
+def test_replay_graphs_read_the_mask_each_step_refills(dp_state):
+    """The replay graphs are captured on the replay batch's mask, and every
+    replay step refills that buffer: its kept rows keep the batch's flags, the
+    graph's padding rows and an idle rank's dummy row are padding."""
+    num_padded = 512
+    desc = BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, num_padded, None)
+    dp_state.replay_cudagraphs = MagicMock()
+    dp_state.replay_cudagraphs.dispatch.return_value = desc
+    # A first step sizes the replay buffers, as the main graphs' capture does.
+    _prepare(dp_state, _input_batch([100], [100], [True]), CUDAGraphMode.NONE)
+    block_tables = MagicMock()
+    block_tables.get_dummy_block_tables.return_value = BLOCK_TABLES
+    block_tables.get_dummy_slot_mappings.side_effect = _slot_mappings
+    dp_state.capture_inner_cudagraphs(
+        InputBuffers(16, 1024, DEVICE), block_tables, [], GROUPS
+    )
+    (prepare,) = dp_state.replay_cudagraphs.capture_replay_graphs.call_args.args
+    prepare(desc)
+    captured = dp_state.decoder_replay_layers.replay_batch.forward_context.is_padding
+    assert captured.tolist() == [True] * num_padded
+
+    dp_state.other = (True, 300)
+    real = _input_batch(QUERY_LENS, SEQ_LENS, PREFILLING)
+    for batch, num_kept in ((real, len(REPLAY_ROWS)), (_idle_dummy(), 0)):
+        replay, _ = _prepare(dp_state, batch, CUDAGraphMode.NONE)
+        assert replay.forward_context.is_padding.data_ptr() == captured.data_ptr()
+        expected = [False] * num_kept + [True] * (num_padded - num_kept)
+        assert captured.tolist() == expected

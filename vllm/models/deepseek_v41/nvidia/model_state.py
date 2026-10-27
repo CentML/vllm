@@ -108,11 +108,13 @@ def _gather_replay_batch_kernel(
     seq_lens_ptr,  # [num_reqs]
     replay_start_ptr,  # [num_reqs] the encoder-side replay start
     positions_ptr,
+    is_padding_ptr,  # [num_tokens]
     slot_mappings_ptr,  # [num_groups, num_tokens]
     slot_mappings_stride,
     rows_ptr,  # out: [num_kept] batch row of every kept row
     kept_query_start_loc_ptr,  # out: [num_reqs + 1]
     kept_positions_ptr,  # out: [num_kept]
+    kept_is_padding_ptr,  # out: [num_kept]
     kept_slot_mappings_ptr,  # out: [num_groups, num_kept]
     kept_slot_mappings_stride,
     kept_kv_start_ptr,  # out: [num_reqs]
@@ -146,6 +148,11 @@ def _gather_replay_batch_kernel(
         tl.store(
             kept_positions_ptr + offs,
             tl.load(positions_ptr + row, mask=mask),
+            mask=mask,
+        )
+        tl.store(
+            kept_is_padding_ptr + offs,
+            tl.load(is_padding_ptr + row, mask=mask),
             mask=mask,
         )
         for g in tl.static_range(NUM_GROUPS):
@@ -234,9 +241,9 @@ class DeepseekV41ModelState(DefaultModelState):
             self._keeps_rows_np = np.zeros(self.max_num_reqs, dtype=np.bool_)
             self._dropped_before = UvaBufferPool(max_local_reqs + 1, torch.int32)
             # The replay batch's inputs: its rows of the batch, query offsets,
-            # positions, slot mappings (sized with the KV cache groups on first
-            # use) and the position from which each request holds replay-layer
-            # window KV.
+            # positions, padding mask, slot mappings (sized with the KV cache
+            # groups on first use) and the position from which each request
+            # holds replay-layer window KV.
             self._kept_rows = torch.zeros(
                 self.max_num_tokens, dtype=torch.int64, device=device
             )
@@ -246,6 +253,19 @@ class DeepseekV41ModelState(DefaultModelState):
             self._kept_positions = torch.zeros(
                 self.max_num_tokens, dtype=torch.int64, device=device
             )
+            self._kept_is_padding = torch.ones(
+                self.max_num_tokens, dtype=torch.bool, device=device
+            )
+            # Without EP the MoE routes every PCP rank's rows: their masks,
+            # gathered rank-major.
+            self._kept_pcp_is_padding: torch.Tensor | None = None
+            if (
+                self.pcp_size > 1
+                and not vllm_config.parallel_config.enable_expert_parallel
+            ):
+                self._kept_pcp_is_padding = torch.ones(
+                    self.pcp_size * self.max_num_tokens, dtype=torch.bool, device=device
+                )
             self._kept_slot_mappings: torch.Tensor | None = None
             self._kept_kv_start = torch.zeros(
                 max_local_reqs, dtype=torch.int32, device=device
@@ -468,11 +488,13 @@ class DeepseekV41ModelState(DefaultModelState):
             input_batch.seq_lens,
             self._replay_start,
             input_batch.positions,
+            input_batch.is_padding,
             slot_mappings,
             slot_mappings.stride(0),
             self._kept_rows,
             self._kept_query_start_loc,
             self._kept_positions,
+            self._kept_is_padding,
             self._kept_slot_mappings,
             self._kept_slot_mappings.stride(0),
             self._kept_kv_start,
@@ -496,7 +518,11 @@ class DeepseekV41ModelState(DefaultModelState):
         """Set the replay layers' batch for this forward, or none. Eager steps trim;
         captures and PIECEWISE graphs at the trim threshold or above break out to a
         replay batch, trimmed or not; FULL and smaller PIECEWISE graphs keep the
-        whole batch. Under DP every rank replays if any does."""
+        whole batch. Under DP every rank replays if any does.
+
+        Its forward context replaces the batch's, padding mask included: the kept
+        rows keep the batch's flags and the rows padding the replay batch, whose
+        activations nothing defines, are padding, so MoE routers skip them."""
         layers = self.decoder_replay_layers
         assert layers is not None
         layers.replay_batch = None
@@ -623,7 +649,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 slot_mapping=build_slot_mappings_by_layer(
                     kept_slot_mappings, kv_cache_config
                 ),
-                is_padding=kept_batch.is_padding if self.pcp_size > 1 else None,
+                is_padding=kept_batch.is_padding,
             ),
             run_graph,
             num_padded if self.pcp_size > 1 else None,
@@ -665,7 +691,7 @@ class DeepseekV41ModelState(DefaultModelState):
         num_padded: int,
     ) -> tuple[InputBatch, torch.Tensor]:
         """Build the sub-``InputBatch`` of each request's last ``kept_lens``
-        rows, and its slot mappings.
+        rows, padded to ``num_padded`` rows, and its slot mappings.
 
         The kept rows follow the device boundaries minus the rows trimmed before
         them: adaptive verification resizes the decodes on the GPU alone, and
@@ -680,23 +706,31 @@ class DeepseekV41ModelState(DefaultModelState):
             input_batch.query_start_loc_np[: num_reqs + 1] - kept_query_start_loc_np
         )
         assert self._kept_slot_mappings is not None
+        batch_is_padding = input_batch.is_padding
         if self.pcp_size > 1:
-            slot_mappings = slot_mappings.chunk(self.pcp_size, dim=1)[
-                get_pcp_group().rank_in_group
-            ]
+            pcp_rank = get_pcp_group().rank_in_group
+            slot_mappings = slot_mappings.chunk(self.pcp_size, dim=1)[pcp_rank]
+            if batch_is_padding.numel() > input_batch.num_tokens_after_padding:
+                # Without EP the runner's mask spans every rank's rows, rank-major.
+                batch_is_padding = batch_is_padding.view(self.pcp_size, -1)[pcp_rank]
         kept_slot_mappings = self._kept_slot_mappings[:, :num_padded]
         kept_slot_mappings[:, num_tokens:].fill_(PAD_SLOT_ID)
+        # Kept rows take the batch's flags (an idle DP rank's dummy row stays
+        # padding); the rest are padding. Refilled in place for the replay graphs.
+        is_padding = self._kept_is_padding[:num_padded].fill_(True)
         _gather_replay_batch_kernel[(num_reqs,)](
             input_batch.query_start_loc,
             dropped_before,
             input_batch.seq_lens,
             replay_start,
             input_batch.positions,
+            batch_is_padding,
             slot_mappings,
             slot_mappings.stride(0),
             self._kept_rows,
             self._kept_query_start_loc,
             self._kept_positions,
+            is_padding,
             kept_slot_mappings,
             kept_slot_mappings.stride(0),
             self._kept_kv_start,
@@ -707,17 +741,15 @@ class DeepseekV41ModelState(DefaultModelState):
         # Adaptive verification may lengthen the decodes on the device, up to
         # the batch's bound.
         max_query_len = max(int(kept_lens.max()), input_batch.max_query_len or 0)
-        is_padding = input_batch.is_padding
         if self.pcp_size > 1:
             self._kept_positions[num_tokens:num_padded].zero_()
-            is_padding = torch.arange(num_padded, device=self.device) >= num_tokens
             kept_slot_mappings = get_pcp_group().all_gather(
                 kept_slot_mappings.contiguous(), dim=1
             )
-            if not self.vllm_config.parallel_config.enable_expert_parallel:
-                is_padding = (
-                    get_pcp_group().all_gather(is_padding.to(torch.uint8), dim=0).bool()
-                )
+            if self._kept_pcp_is_padding is not None:
+                is_padding = self._kept_pcp_is_padding[
+                    : self.pcp_size * num_padded
+                ].copy_(get_pcp_group().all_gather(is_padding.view(torch.uint8), dim=0))
         kept_batch = replace(
             input_batch,
             num_tokens=num_tokens,
