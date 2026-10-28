@@ -422,6 +422,159 @@ def test_flashinfer_autotune_buckets_cover_drafter_tokens():
     ]
 
 
+_TRTLLM_MOE_OP = "flashinfer::trtllm_fp4_block_scale_moe"
+
+
+def _hybrid_buckets(max_tokens):
+    """FlashInfer's hybrid bucket grid above 4096: powers of two, then max."""
+    buckets = [4096 * 2**i for i in range(8) if 4096 * 2**i < max_tokens]
+    return (*buckets, max_tokens)
+
+
+def _make_dp_moe(*, dp_size: int, max_tokens: int):
+    """Create a fake MoE layer as seen by fi_moe_largest_bucket."""
+    moe = _FakeMoERunner()
+    moe.moe_config = SimpleNamespace(
+        max_num_tokens=max_tokens,
+        dp_size=dp_size,
+        elastic_ep_max_dp_size=None,
+        hidden_dim=4096,
+        intermediate_size_per_partition=2048,
+        experts_per_token=8,
+    )
+    return moe
+
+
+@pytest.mark.parametrize(
+    "dp_size,max_tokens,expected",
+    [
+        (1, 65536, ()),
+        (2, 65536, (131072,)),
+        (4, 16384, (32768, 65536)),
+        # Off-grid max_num_batched_tokens: serving maps to 16384 and 24000.
+        (2, 12000, (16384, 24000)),
+    ],
+)
+def test_dp_moe_tuning_buckets_cover_dp_dispatched_tokens(
+    dp_size, max_tokens, expected
+):
+    """Buckets span (max_num_batched_tokens, fi_moe_largest_bucket] only."""
+    runner = _make_runner(
+        [object(), _make_dp_moe(dp_size=dp_size, max_tokens=max_tokens)],
+        max_tokens=max_tokens,
+    )
+
+    with (
+        patch("vllm.model_executor.layers.fused_moe.MoERunner", _FakeMoERunner),
+        patch(
+            "vllm.utils.flashinfer.flashinfer_get_hybrid_num_tokens_buckets",
+            side_effect=_hybrid_buckets,
+        ),
+    ):
+        buckets, bytes_per_token = warmup._flashinfer_dp_moe_tuning_buckets(runner)
+
+    assert buckets == expected
+    assert bytes_per_token == (4 * 4096 + 2 * 8 * (4096 + 2048) if expected else 0)
+
+
+def _run_dp_moe_pass(monkeypatch, *, rank, ranks_state, max_tokens=16384):
+    """Run the DP MoE pass on ``rank`` of a group with per-rank local state.
+
+    ``ranks_state`` holds each rank's (tuned ops, free bytes); a rank sees only
+    its own entry locally and every entry through ``all_gather_object``.
+    """
+    runner = _make_runner(
+        [_make_dp_moe(dp_size=4, max_tokens=max_tokens)], max_tokens=max_tokens
+    )
+    tuned_ops, free_bytes = ranks_state[rank]
+    tuner = SimpleNamespace(
+        stats=SimpleNamespace(tuned_op_total_configs=dict.fromkeys(tuned_ops, 1))
+    )
+    group = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.autotuner",
+        SimpleNamespace(
+            AutoTuner=SimpleNamespace(get=lambda: tuner),
+            get_autotune_process_group=lambda: group,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (free_bytes, 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda g: len(ranks_state))
+
+    def gather(out, value, *, group):
+        assert value == (set(tuned_ops), free_bytes)
+        out[:] = [(set(ops), free) for ops, free in ranks_state]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.MoERunner", _FakeMoERunner
+    )
+    monkeypatch.setattr(
+        fi_utils, "flashinfer_get_hybrid_num_tokens_buckets", _hybrid_buckets
+    )
+    autotune = Mock(side_effect=lambda **kwargs: nullcontext())
+    monkeypatch.setattr(fi_utils, "autotune", autotune)
+
+    warmup._run_flashinfer_dp_moe_autotune_dummy_run(runner, {})
+    return autotune, runner._dummy_run
+
+
+def test_dp_moe_pass_is_rank_identical_and_profiles_only_trtllm_moe(monkeypatch):
+    """Ranks with different local ops and free memory tune the same buckets.
+
+    FlashInfer all-reduces every tactic timing over the tune group, so a rank
+    whose bucket list or skipped ops differ would deadlock the others.
+    """
+    bytes_per_token = 4 * 4096 + 2 * 8 * (4096 + 2048)
+    ranks_state = [
+        ({"fp4_gemm", _TRTLLM_MOE_OP}, 10 * 65536 * bytes_per_token),
+        # Too little memory for the 65536 bucket; it must be dropped everywhere.
+        ({"bmm_fp8", _TRTLLM_MOE_OP}, 40000 * bytes_per_token),
+    ]
+
+    calls = [
+        _run_dp_moe_pass(monkeypatch, rank=rank, ranks_state=ranks_state)
+        for rank in range(len(ranks_state))
+    ]
+
+    for autotune, dummy_run in calls:
+        assert autotune.call_args_list == [
+            call(
+                tuning_buckets=(32768,),
+                round_up=True,
+                skip_ops={"fp4_gemm", "bmm_fp8"},
+            )
+        ]
+        assert dummy_run.call_args_list == [
+            call(
+                num_tokens=16384,
+                skip_eplb=True,
+                is_profile=True,
+                randomize_inputs=True,
+            )
+        ]
+
+
+@pytest.mark.parametrize(
+    "tuned_ops,free_tokens",
+    [({"fp4_gemm", "flashinfer::cutlass_fused_moe"}, 10**6), ({_TRTLLM_MOE_OP}, 1)],
+    ids=["no-trtllm-moe-op", "no-memory"],
+)
+def test_dp_moe_pass_skipped_without_trtllm_moe_or_memory(
+    monkeypatch, tuned_ops, free_tokens
+):
+    bytes_per_token = 4 * 4096 + 2 * 8 * (4096 + 2048)
+    autotune, dummy_run = _run_dp_moe_pass(
+        monkeypatch, rank=0, ranks_state=[(tuned_ops, free_tokens * bytes_per_token)]
+    )
+
+    autotune.assert_not_called()
+    dummy_run.assert_not_called()
+
+
 class _AutotuneGroup:
     def __init__(self, run, ranks):
         self.run = run

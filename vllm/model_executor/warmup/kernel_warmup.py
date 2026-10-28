@@ -384,6 +384,112 @@ def _run_flashinfer_autotune_dummy_runs(
                 **dummy_run_kwargs,
             )
 
+    _run_flashinfer_dp_moe_autotune_dummy_run(runner, dummy_run_kwargs)
+
+
+def _is_flashinfer_trtllm_moe_op(custom_op: str) -> bool:
+    return custom_op.startswith("flashinfer::trtllm_") and custom_op.endswith("_moe")
+
+
+def _flashinfer_dp_moe_tuning_buckets(
+    runner: "GPUModelRunner",
+) -> tuple[tuple[int, ...], int]:
+    """Return the MoE buckets above max_num_batched_tokens that DP can reach.
+
+    The buckets are those in (max_num_batched_tokens, fi_moe_largest_bucket],
+    the runtime bucket cap vLLM passes to FlashInfer. Also returns an upper
+    bound of the bytes that profiling one token of them allocates: the
+    synthesized op inputs plus the FC1/FC2 outputs of every routed slot.
+    """
+    import vllm.utils.flashinfer as fi_utils
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+
+    max_tokens = runner.scheduler_config.max_num_batched_tokens
+    largest_bucket = 0
+    bytes_per_token = 0
+    for module in runner.get_model().modules():
+        if not isinstance(module, MoERunner):
+            continue
+        moe_config = module.moe_config
+        largest_bucket = max(largest_bucket, fi_moe_largest_bucket(moe_config))
+        hidden = moe_config.hidden_dim
+        intermediate = moe_config.intermediate_size_per_partition
+        bytes_per_token = max(
+            bytes_per_token,
+            4 * hidden + 2 * moe_config.experts_per_token * (hidden + intermediate),
+        )
+    if largest_bucket <= max_tokens:
+        return (), 0
+    buckets = fi_utils.flashinfer_get_hybrid_num_tokens_buckets(largest_bucket)
+    return tuple(b for b in buckets if b > max_tokens), bytes_per_token
+
+
+def _run_flashinfer_dp_moe_autotune_dummy_run(
+    runner: "GPUModelRunner", dummy_run_kwargs: dict
+) -> None:
+    """Tune FlashInfer TRT-LLM MoE ops for DP-dispatched token counts.
+
+    With DP, a rank's MoE runs on up to dp_size * max_num_batched_tokens
+    tokens, but the passes above tune only up to max_num_batched_tokens, so
+    larger calls fall back to FlashInfer's default tactic. Profile the missing
+    buckets for the TRT-LLM MoE ops only; other ops run their fallback in this
+    pass. FlashInfer averages tactic timings across its tune group, so the
+    buckets and skipped ops come from config and group-wide reductions and
+    match on every rank, never from the local token count.
+    """
+    import vllm.utils.flashinfer as fi_utils
+
+    buckets, bytes_per_token = _flashinfer_dp_moe_tuning_buckets(runner)
+    if not buckets:
+        return
+
+    from flashinfer.autotuner import AutoTuner, get_autotune_process_group
+
+    tuned_ops = set(AutoTuner.get().stats.tuned_op_total_configs)
+    free_bytes = torch.cuda.mem_get_info()[0]
+    free_bytes += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    group = get_autotune_process_group()
+    if group is not None:
+        gathered: list[tuple[set[str], int] | None] = [None] * (
+            torch.distributed.get_world_size(group)
+        )
+        torch.distributed.all_gather_object(
+            gathered, (tuned_ops, free_bytes), group=group
+        )
+        tuned_ops = set().union(*(entry[0] for entry in gathered if entry))
+        free_bytes = min(entry[1] for entry in gathered if entry)
+    if not any(_is_flashinfer_trtllm_moe_op(op) for op in tuned_ops):
+        return
+
+    fitting = tuple(b for b in buckets if b * bytes_per_token <= free_bytes)
+    if len(fitting) < len(buckets):
+        logger.warning(
+            "Skipping FlashInfer MoE autotune buckets %s: profiling them needs "
+            "more than the %.2f GiB of free device memory.",
+            buckets[len(fitting) :],
+            free_bytes / 2**30,
+        )
+    if not fitting:
+        return
+
+    num_tokens = runner.scheduler_config.max_num_batched_tokens
+    skip_ops = {op for op in tuned_ops if not _is_flashinfer_trtllm_moe_op(op)}
+    logger.info(
+        "Running FlashInfer MoE autotune for DP-dispatched token buckets %s.",
+        fitting,
+    )
+    with fi_utils.autotune(
+        tuning_buckets=fitting, round_up=True, skip_ops=skip_ops or None
+    ):
+        runner._dummy_run(
+            num_tokens=num_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            randomize_inputs=True,
+            **dummy_run_kwargs,
+        )
+
 
 def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
     """Identify a saved autotune file by its FlashInfer metadata and size."""
