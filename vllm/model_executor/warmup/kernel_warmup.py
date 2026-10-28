@@ -399,6 +399,7 @@ def _run_flashinfer_autotune_dummy_runs(
     dp_size = parallel_config.data_parallel_size
     if (
         envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING
+        and envs.VLLM_FLASHINFER_MOE_DP_TUNING_PASS
         and parallel_config.enable_expert_parallel
         and dp_size > 1
     ):
@@ -521,6 +522,8 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
         )
         if envs.VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING:
             ep_aware += "_balroute"
+        if not envs.VLLM_FLASHINFER_MOE_DP_TUNING_PASS:
+            ep_aware += "_nodppass"
         cache_path = cache_path.with_name(
             f"{cache_path.stem}{ep_aware}_dp{dp_rank}_rank{world.rank_in_group}"
             f"{cache_path.suffix}"

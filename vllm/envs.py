@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_MOE_EP_AWARE_TUNING: bool = False
     VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS: int = 0
     VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING: bool = False
+    VLLM_FLASHINFER_MOE_DP_TUNING_PASS: bool = True
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
@@ -1830,6 +1831,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model's routing of random token ids (FlashInfer replays the call's ids).
     "VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING", "0"))
+    ),
+    # With VLLM_FLASHINFER_MOE_EP_AWARE_TUNING: run the extra MoE-only pass
+    # with buckets up to dp_size * max_num_batched_tokens (0 = skip it, e.g.
+    # to rely on FlashInfer serving larger rows from the top tuned bucket).
+    "VLLM_FLASHINFER_MOE_DP_TUNING_PASS": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_MOE_DP_TUNING_PASS", "1"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(
