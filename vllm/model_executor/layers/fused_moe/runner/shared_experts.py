@@ -22,6 +22,18 @@ from vllm.v1.worker.ubatching import (
 logger = init_logger(__name__)
 
 
+def _flashinfer_moe_ep_on_sm107(moe_config: FusedMoEConfig) -> bool:
+    from vllm.config.kernel import FLASHINFER_MOE_EP_BACKENDS
+
+    if getattr(moe_config, "moe_backend", None) not in FLASHINFER_MOE_EP_BACKENDS:
+        return False
+    from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
+        is_sm107_device,
+    )
+
+    return is_sm107_device()
+
+
 class SharedExpertsOrder(IntEnum):
     # No shared experts.
     NONE = (0,)
@@ -56,6 +68,17 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+
+        # FlashInfer MoE-EP on SM107: the persistent megakernel is not budgeted
+        # for a shared MLP running next to it on the global aux stream, so the
+        # shared experts run serially unless the experts overlap them
+        # themselves (MK_INTERNAL_OVERLAPPED).
+        self._pin_no_overlap = _flashinfer_moe_ep_on_sm107(moe_config)
+        # VLLM_FI_MEGA_MOE_SHARED=pre: the aux-stream overlap is allowed, and
+        # the megakernel launch waits for the shared MLP (no co-running).
+        self._pre_megakernel = (
+            self._pin_no_overlap and envs.VLLM_FI_MEGA_MOE_SHARED == "pre"
+        )
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -108,6 +131,11 @@ class SharedExperts(torch.nn.Module):
         if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
+        if self._pin_no_overlap:
+            if self._pre_megakernel and self._stream is not None:
+                return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+            return SharedExpertsOrder.NO_OVERLAP
+
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
             and self._stream is not None
@@ -139,6 +167,12 @@ class SharedExperts(torch.nn.Module):
             self._input_ready_event[idx].wait(self._stream)
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
+        if self._pre_megakernel:
+            from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
+                set_pending_shared_experts_event,
+            )
+
+            set_pending_shared_experts_event(self._output_ready_event[idx])
         return True
 
     def wait(self) -> None:

@@ -8,11 +8,16 @@ combines in one launch, so it is paired with a pass-through prepare/finalize.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -25,7 +30,11 @@ from vllm.model_executor.layers.fused_moe.flashinfer_moe_ep import (
     FlashInferMoeEpWeights,
     apply_topk_in_fc1,
     flashinfer_moe_ep_unsupported_reasons,
+    resolve_sm107_shared_mode,
+    sm107_max_sm_count,
+    sm107_nvfp4_epilogue,
     supports_current_device,
+    uses_sm107_megakernel,
     validate_flashinfer_moe_ep_layer,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -42,6 +51,8 @@ from vllm.model_executor.utils import replace_parameter
 if TYPE_CHECKING:
     pass
 
+logger = init_logger(__name__)
+
 # Layer parameters the megakernel reads. After ``process_weights_after_loading``
 # they alias the megakernel's own tensors, so EPLB permutes exactly what it uses.
 KERNEL_WEIGHT_NAMES = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
@@ -54,6 +65,37 @@ _supported_weight_quant_schemes: frozenset[QuantKey] = frozenset(
 _supported_activations: frozenset[MoEActivation] = frozenset((MoEActivation.SILU,))
 
 
+def _kernel_routes(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    mask_padding: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """int32 routes for the megakernel, with padding rows masked out.
+
+    FlashInfer checks every route on device (ids in [-1, E), unique per row,
+    finite weights) behind a sticky device assert, and dispatches every valid
+    route. Routers other than DSv4's (e.g. GLM-5.3's grouped top-k) route the
+    CUDA-graph and DP padding rows on whatever those rows hold, so the forward
+    context's padding mask turns them into masked slots (-1, weight 0): they
+    are neither validated as live nor sent to a peer. Rows map 1:1 to the
+    forward context's tokens only without sequence parallelism.
+    """
+    topk_ids = topk_ids.to(torch.int32)
+    if not (mask_padding and envs.VLLM_MOE_SKIP_PADDING):
+        return topk_ids, topk_weights
+    if not is_forward_context_available():
+        return topk_ids, topk_weights
+    is_padding = get_forward_context().is_padding
+    if is_padding is None or is_padding.shape[0] < topk_ids.shape[0]:
+        return topk_ids, topk_weights
+    is_padding = is_padding[: topk_ids.shape[0]].unsqueeze(1)
+    return (
+        topk_ids.masked_fill(is_padding, -1),
+        topk_weights.masked_fill(is_padding, 0.0),
+    )
+
+
 class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -62,6 +104,37 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         super().__init__(moe_config, quant_config)
         self._adapter: FlashInferMoeEp | None = None
+        # Shared experts next to the SM107 megakernel (VLLM_FI_MEGA_MOE_SHARED):
+        # "separate" runs them serially before the routed experts (the runner),
+        # "overlap" on a side stream inside apply_overlapping_shared_experts,
+        # with the megakernel capped at max_sm_count SMs.
+        self._shared_mode = "separate"
+        self._max_sm_count: int | None = None
+        self._mask_padding = not moe_config.is_sequence_parallel
+        if uses_sm107_megakernel(moe_config.moe_backend):
+            replicated_shared = (
+                moe_config.is_sequence_parallel
+                or get_tensor_model_parallel_world_size() == 1
+            )
+            self._shared_mode, fallback = resolve_sm107_shared_mode(
+                envs.VLLM_FI_MEGA_MOE_SHARED,
+                replicated_shared=replicated_shared,
+                has_side_stream=torch.cuda.is_available(),
+            )
+            if fallback is not None:
+                logger.warning_once(
+                    "VLLM_FI_MEGA_MOE_SHARED=overlap runs as separate, with no "
+                    "megakernel SM budget unless VLLM_FI_MEGA_MOE_MAX_SM_COUNT is "
+                    "an explicit count. Reason: %s.",
+                    fallback,
+                )
+            self._max_sm_count = sm107_max_sm_count(
+                envs.VLLM_FI_MEGA_MOE_MAX_SM_COUNT, self._shared_mode
+            )
+
+    @property
+    def overlaps_shared_experts(self) -> bool:
+        return self._shared_mode == "overlap"
 
     @staticmethod
     def is_supported_config(
@@ -138,9 +211,19 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
 
         The oracle has already put the weights in kernel format; the per-expert
         weight global scales arrive through the quant config and become the
-        epilogue alphas.
+        epilogue alphas. On SM107 the NVFP4 checkpoint's input scales also set
+        the activation and FC1-output quantization grids (sm107_nvfp4_epilogue).
         """
         validate_flashinfer_moe_ep_layer(layer)  # type: ignore[arg-type]
+        epilogue = epilogue_from_quant_config(self.quant_config)
+        if epilogue.fc1_alpha is not None and uses_sm107_megakernel(
+            self.moe_config.moe_backend
+        ):
+            epilogue = sm107_nvfp4_epilogue(
+                epilogue,
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+            )
         adapter = FlashInferMoeEp(
             self.moe_config,
             FlashInferMoeEpWeights(
@@ -149,11 +232,13 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
                 w13_scale=getattr(layer, "w13_weight_scale", None),
                 w2_scale=getattr(layer, "w2_weight_scale", None),
             ),
-            epilogue_from_quant_config(self.quant_config),
+            epilogue,
             apply_topk_in_fc1=apply_topk_in_fc1(
                 self.moe_config,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
             ),
+            shared_mode=self._shared_mode,
+            max_sm_count=self._max_sm_count,
         )
         adapter.warmup()
         for name, tensor in zip(KERNEL_WEIGHT_NAMES, adapter.kernel_weights()):
@@ -180,8 +265,41 @@ class FlashInferMoeEpExperts(mk.FusedMoEExpertsModular):
     ) -> None:
         if self._adapter is None:
             raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
-        output.copy_(
-            self._adapter(hidden_states, topk_ids.to(torch.int32), topk_weights)
+        topk_ids, topk_weights = _kernel_routes(
+            topk_ids, topk_weights, mask_padding=self._mask_padding
+        )
+        output.copy_(self._adapter(hidden_states, topk_ids, topk_weights))
+
+    def apply_overlapping_shared_experts(
+        self,
+        run_shared_experts: Callable[[], None],
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        if self._adapter is None:
+            raise RuntimeError("FlashInfer MoE-EP weights have not been processed")
+        topk_ids, topk_weights = _kernel_routes(
+            topk_ids, topk_weights, mask_padding=self._mask_padding
+        )
+        self._adapter.forward_overlapping_shared_experts(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            run_shared_experts,
+            output=output,
         )
 
 
