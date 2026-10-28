@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+from vllm.model_executor.layers.fused_moe import moe_route_diag
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
     has_flashinfer_situ_activation,
@@ -348,6 +349,17 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         else:
             block_scale, per_token_scale = a1q_scale, None
         output1_scale_gate_scalar = self.quant_config.g1_alphas
+
+        if moe_route_diag.enabled():
+            moe_route_diag.dump_expert_rows(
+                self,
+                topk_ids,
+                dict(
+                    ep_rank=self.ep_rank,
+                    local_num_experts=self.local_num_experts,
+                    global_num_experts=global_num_experts,
+                ),
+            )
 
         # Invoke kernel.
         flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(

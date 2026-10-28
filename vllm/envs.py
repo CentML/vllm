@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_MOE_EP_AWARE_TUNING: bool = False
     VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS: int = 0
+    VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING: bool = False
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
@@ -1823,6 +1824,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # trtllm-gen MoE profiles with fewer rows than this (0 = tune all).
     "VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_FLASHINFER_MOE_TUNE_MIN_TOKENS", "0")
+    ),
+    # FlashInfer autotune dummy runs route tokens uniformly at random, so the
+    # MoE tactics are profiled on a balanced expert load instead of the
+    # model's routing of random token ids (FlashInfer replays the call's ids).
+    "VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING", "0"))
     ),
     # Flashinfer fused allreduce backend.
     "VLLM_FLASHINFER_ALLREDUCE_BACKEND": env_with_choices(

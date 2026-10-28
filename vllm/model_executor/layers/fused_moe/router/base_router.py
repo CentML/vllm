@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.model_executor.layers.fused_moe import moe_route_diag
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -156,6 +158,37 @@ else:
         return topk_ids
 
 
+# Set by ``balanced_routing()``: route every token to top_k distinct experts
+# drawn uniformly at random. Used only for FlashInfer autotune dummy runs.
+_balanced_routing = False
+
+
+@contextlib.contextmanager
+def balanced_routing() -> Iterator[None]:
+    """Route tokens uniformly at random (top_k distinct experts per token).
+
+    FlashInfer's MoE autotuner profiles with the caller's own top-k ids (a
+    prefix of them for buckets below the call's row count). In vLLM's
+    autotune dummy run those ids come from the model on random token ids,
+    which need not resemble serving routing. Inside this context every
+    router returns a balanced uniform routing instead; model outputs are
+    meaningless, so use it only around tuning dummy runs.
+    """
+    global _balanced_routing
+    previous = _balanced_routing
+    _balanced_routing = True
+    try:
+        yield
+    finally:
+        _balanced_routing = previous
+
+
+def _uniform_topk_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    num_tokens, top_k = topk_ids.shape
+    scores = torch.rand(num_tokens, num_experts, device=topk_ids.device)
+    return scores.topk(top_k, dim=-1).indices.to(topk_ids.dtype)
+
+
 class BaseRouter(FusedMoERouter):
     """Base class providing common functionality for all router implementations.
 
@@ -291,6 +324,11 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+        if _balanced_routing:
+            topk_ids = _uniform_topk_ids(topk_ids, self.global_num_experts)
+
+        if moe_route_diag.enabled():
+            moe_route_diag.dump_router_stats(self, router_logits, topk_ids)
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

@@ -5,6 +5,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+import contextlib
 import json
 import sys
 import time
@@ -25,6 +26,9 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     resolve_flashinfer_autotune_file,
     resolve_flashinfer_autotune_v2_root,
     use_flashinfer_autotune_v2,
+)
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    balanced_routing,
 )
 from vllm.model_executor.warmup.flashinfer_moe_tactics import (
     trtllm_moe_only_tuning,
@@ -515,6 +519,8 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
             if envs.VLLM_FLASHINFER_MOE_EP_AWARE_TUNING
             else ""
         )
+        if envs.VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING:
+            ep_aware += "_balroute"
         cache_path = cache_path.with_name(
             f"{cache_path.stem}{ep_aware}_dp{dp_rank}_rank{world.rank_in_group}"
             f"{cache_path.suffix}"
@@ -553,7 +559,14 @@ def flashinfer_autotune(runner: "GPUModelRunner", *, skip_attn: bool = False) ->
                 # HiSparse hot-buffer attention is bounded by decode batch
                 # size, not the prefill-sized batch used for the full model.
                 autotune_hisparse_flashinfer_attention(runner)
-            _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
+            # FlashInfer profiles MoE tactics on the dummy run's own top-k
+            # ids; optionally make that routing balanced (uniform random).
+            with (
+                balanced_routing()
+                if envs.VLLM_FLASHINFER_MOE_TUNE_BALANCED_ROUTING
+                else contextlib.nullcontext()
+            ):
+                _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
             replayssm_autotune_warmup(runner)
             _autotune_kimi_k3_kda_qkvg(runner.get_model())
     finally:
