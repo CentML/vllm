@@ -349,6 +349,161 @@ def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ..
     return tuple(dict.fromkeys(token_counts))
 
 
+def _is_trtllm_moe_op(custom_op: str) -> bool:
+    """FlashInfer trtllm-gen MoE ops: ``flashinfer::trtllm_<dtype>_moe``."""
+    return custom_op.startswith("flashinfer::trtllm_") and custom_op.endswith("_moe")
+
+
+def _flashinfer_moe_tuning_bytes_per_row(runner: "GPUModelRunner") -> int:
+    """Upper bound on the bytes one row adds while profiling a MoE bucket.
+
+    Counts bf16 activations, the expanded FC1 output (2 x intermediate) and the
+    expanded FC2 output of every top-k slot, for the widest MoE layer. The
+    trtllm-gen kernels keep the FC1 output in FP4/FP8 and finalize in place,
+    so this overestimates (roughly 2x for an NVFP4 model).
+    """
+    from vllm.model_executor.layers.fused_moe import MoERunner
+
+    per_row = 0
+    for module in runner.get_model().modules():
+        if not isinstance(module, MoERunner):
+            continue
+        cfg = module.moe_config
+        hidden = cfg.hidden_dim
+        inter = max(cfg.intermediate_size_per_partition, 0)
+        per_row = max(
+            per_row, 2 * (2 * hidden + cfg.experts_per_token * (2 * inter + hidden))
+        )
+    return per_row
+
+
+def _flashinfer_moe_dp_tuning_buckets(
+    runner: "GPUModelRunner", tuned_max_tokens: int, free_bytes: int
+) -> tuple[int, ...]:
+    """Token buckets for tuning the MoE at the row counts DP dispatch creates.
+
+    Under data parallelism the MoE of a rank runs on the rows of every DP rank
+    (all-to-all receive buffer or all-gather): up to ``fi_moe_largest_bucket``
+    = ``dp_size * max_num_batched_tokens`` rows, which is also the cap of the
+    trtllm-gen MoE bucket mapper at run time. The full-model passes only tune
+    buckets up to ``max_num_batched_tokens``.
+
+    Buckets above ``tuned_max_tokens`` are kept only while their estimated
+    profiling memory fits 80% of ``free_bytes``. Returns an empty tuple when
+    no bucket above ``tuned_max_tokens`` remains.
+    """
+    import vllm.utils.flashinfer as fi_utils
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+
+    largest = max(
+        (
+            fi_moe_largest_bucket(module.moe_config)
+            for module in runner.get_model().modules()
+            if isinstance(module, MoERunner)
+        ),
+        default=0,
+    )
+    if largest <= tuned_max_tokens:
+        return ()
+    buckets = tuple(fi_utils.flashinfer_get_hybrid_num_tokens_buckets(largest))
+    per_row = _flashinfer_moe_tuning_bytes_per_row(runner)
+    budget = int(free_bytes * 0.8)
+    fitting = tuple(
+        b for b in buckets if b <= tuned_max_tokens or b * per_row <= budget
+    )
+    top = max((b for b in fitting if b > tuned_max_tokens), default=tuned_max_tokens)
+    if fitting != buckets:
+        logger.warning(
+            "FlashInfer MoE autotune for DP-dispatched rows: %d rows need an "
+            "estimated %.1f GiB but %.1f GiB are free; tuning up to %d rows. "
+            "Larger MoE calls use FlashInfer's fallback for untuned sizes.",
+            buckets[-1],
+            buckets[-1] * per_row / 2**30,
+            free_bytes / 2**30,
+            top,
+        )
+    if top <= tuned_max_tokens:
+        return ()
+    return fitting
+
+
+def _tuning_group_min_free_bytes() -> int:
+    """Free device memory of the most constrained rank of the tuning group.
+
+    Every rank must profile the same buckets (per-tactic timings are reduced
+    across the group, see ``set_autotune_process_group``), so memory-based
+    bucket limits use the group minimum.
+    """
+    from vllm.distributed.parallel_state import (
+        get_pp_group,
+        get_tp_group,
+        get_world_group,
+    )
+
+    free, _ = torch.cuda.mem_get_info()
+    # Blocks cached by the allocator can back the profiling tensors too.
+    free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    group = get_tp_group() if get_pp_group().world_size > 1 else get_world_group()
+    if group.world_size > 1:
+        free_t = torch.tensor([free], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            free_t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        free = int(free_t.item())
+    return free
+
+
+def _run_flashinfer_moe_dp_tuning(
+    runner: "GPUModelRunner",
+    tuned_max_tokens: int,
+    dummy_run_kwargs: dict,
+) -> None:
+    """Tune the trtllm-gen MoE ops for DP-dispatched row counts.
+
+    One more dummy run with ``max_num_batched_tokens`` tokens per rank, whose
+    MoE layers see the dispatched ``dp_size * tokens`` rows, profiles only the
+    buckets above ``tuned_max_tokens``: every other op tuned by the full-model
+    passes is passed as ``skip_ops`` (a skipped op runs its fallback in this
+    dummy run, which does not change the cache).
+    """
+    dp_size = runner.vllm_config.parallel_config.data_parallel_size
+    if dp_size <= 1:
+        return
+
+    from flashinfer.autotuner import AutoTuner
+
+    import vllm.utils.flashinfer as fi_utils
+
+    tuned_ops = set(AutoTuner.get().stats.tuned_op_total_configs)
+    if not any(_is_trtllm_moe_op(op) for op in tuned_ops):
+        return
+    tuning_buckets = _flashinfer_moe_dp_tuning_buckets(
+        runner, tuned_max_tokens, _tuning_group_min_free_bytes()
+    )
+    if not tuning_buckets:
+        return
+    skip_ops = {op for op in tuned_ops if not _is_trtllm_moe_op(op)}
+    num_tokens = runner.scheduler_config.max_num_batched_tokens
+    logger.info(
+        "Running FlashInfer trtllm-gen MoE autotune for DP-dispatched rows "
+        "(%d tokens per rank x DP %d), token buckets up to %d.",
+        num_tokens,
+        dp_size,
+        tuning_buckets[-1],
+    )
+    with fi_utils.autotune(
+        tuning_buckets=tuning_buckets, round_up=True, skip_ops=skip_ops or None
+    ):
+        runner._dummy_run(
+            num_tokens=num_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            randomize_inputs=True,
+            **dummy_run_kwargs,
+        )
+
+
 def _run_flashinfer_autotune_dummy_runs(
     runner: "GPUModelRunner", *, skip_attn: bool = False
 ) -> None:
@@ -425,6 +580,12 @@ def _run_flashinfer_autotune_dummy_runs(
                 randomize_inputs=True,
                 **dummy_run_kwargs,
             )
+
+    # Study-only gate: the upstream pass (aot/glm53-upstream-moe-tune-dp).
+    if envs.VLLM_DIAG_UPSTREAM_MOE_DP_PASS:
+        _run_flashinfer_moe_dp_tuning(
+            runner, runner.scheduler_config.max_num_batched_tokens, dummy_run_kwargs
+        )
 
 
 def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:

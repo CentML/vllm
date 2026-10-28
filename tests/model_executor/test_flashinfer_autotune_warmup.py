@@ -52,6 +52,7 @@ def _make_runner(modules, *, max_tokens: int = 8192):
                 nnodes=1,
                 pipeline_parallel_size=1,
                 data_parallel_rank=0,
+                data_parallel_size=1,
             ),
         ),
         get_model=Mock(
@@ -680,3 +681,158 @@ def test_autotune_cache_key_normalizes_kv_init_fields():
         _normalize_cache_config_for_hash(resolved).compute_hash()
         != fresh.compute_hash()
     )
+
+
+def _make_dp_runner(dp_size: int, *, max_tokens: int = 8192):
+    """A DP runner with one MoE layer (hidden 4096, intermediate 2048, top-8)."""
+    moe = _FakeMoERunner()
+    moe.moe_config = SimpleNamespace(
+        hidden_dim=4096,
+        intermediate_size_per_partition=2048,
+        experts_per_token=8,
+        use_deferred_moe_finalize=False,
+        defer_moe_finalize_max_num_tokens=-1,
+        dp_size=dp_size,
+        max_num_tokens=max_tokens,
+    )
+    runner = _make_runner([object(), moe], max_tokens=max_tokens)
+    runner.vllm_config.parallel_config.data_parallel_size = dp_size
+    return runner
+
+
+def _pow2_buckets(n: int) -> tuple[int, ...]:
+    return tuple(1 << i for i in range(n.bit_length()) if 1 << i <= n)
+
+
+@contextmanager
+def _moe_dp_patches():
+    with (
+        patch("vllm.model_executor.layers.fused_moe.MoERunner", _FakeMoERunner),
+        patch(
+            "vllm.model_executor.layers.fused_moe.utils.fi_moe_largest_bucket",
+            lambda cfg: max(cfg.dp_size * cfg.max_num_tokens, 8192),
+        ),
+        patch(
+            "vllm.utils.flashinfer.flashinfer_get_hybrid_num_tokens_buckets",
+            _pow2_buckets,
+        ),
+    ):
+        yield
+
+
+# 147456 bytes per row for the layer above (bf16 upper bound).
+_MOE_ROW_BYTES = 2 * (2 * 4096 + 8 * (2 * 2048 + 4096))
+
+
+def test_moe_dp_tuning_buckets_extend_to_dp_rows():
+    runner = _make_dp_runner(2)
+    with _moe_dp_patches():
+        buckets = warmup._flashinfer_moe_dp_tuning_buckets(runner, 8192, 1 << 40)
+    assert buckets == _pow2_buckets(16384)
+
+
+def test_moe_dp_tuning_buckets_empty_without_dp_rows_above_tuned_range():
+    runner = _make_dp_runner(1)
+    with _moe_dp_patches():
+        assert warmup._flashinfer_moe_dp_tuning_buckets(runner, 8192, 1 << 40) == ()
+
+
+def test_moe_dp_tuning_buckets_drop_what_does_not_fit_memory():
+    runner = _make_dp_runner(4)
+    # 16384 rows fit in 80% of the free memory, 32768 rows do not.
+    free = int(16384 * _MOE_ROW_BYTES / 0.8) + 1
+    with _moe_dp_patches():
+        buckets = warmup._flashinfer_moe_dp_tuning_buckets(runner, 8192, free)
+        assert buckets == _pow2_buckets(16384)
+        # Nothing above the tuned range fits: no extra pass.
+        assert warmup._flashinfer_moe_dp_tuning_buckets(runner, 8192, free // 4) == ()
+
+
+def _fake_autotuner(monkeypatch, tuned_ops):
+    autotuner = ModuleType("flashinfer.autotuner")
+    stats = SimpleNamespace(tuned_op_total_configs=dict.fromkeys(tuned_ops, 1))
+    monkeypatch.setattr(
+        autotuner,
+        "AutoTuner",
+        SimpleNamespace(get=lambda: SimpleNamespace(stats=stats)),
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", autotuner)
+
+
+@pytest.mark.parametrize("skip_attn", [False, True])
+def test_moe_dp_tuning_profiles_only_trtllm_moe_ops(monkeypatch, skip_attn):
+    runner = _make_dp_runner(2)
+    _fake_autotuner(
+        monkeypatch,
+        ["flashinfer::trtllm_fp4_block_scale_moe", "fp4_gemm", "trtllm_mla_decode"],
+    )
+    monkeypatch.setattr(warmup, "_tuning_group_min_free_bytes", lambda: 1 << 40)
+    autotune = Mock(side_effect=lambda **kwargs: nullcontext())
+    monkeypatch.setattr(fi_utils, "autotune", autotune)
+    kwargs = {"skip_attn": True} if skip_attn else {}
+
+    with _moe_dp_patches():
+        warmup._run_flashinfer_moe_dp_tuning(runner, 8192, kwargs)
+
+    assert autotune.call_args_list == [
+        call(
+            tuning_buckets=_pow2_buckets(16384),
+            round_up=True,
+            skip_ops={"fp4_gemm", "trtllm_mla_decode"},
+        )
+    ]
+    assert runner._dummy_run.call_args_list == [
+        call(
+            num_tokens=8192,
+            skip_eplb=True,
+            is_profile=True,
+            randomize_inputs=True,
+            **kwargs,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "dp_size,tuned_ops",
+    [(1, ["flashinfer::trtllm_fp4_block_scale_moe"]), (2, ["fp4_gemm"]), (2, [])],
+)
+def test_moe_dp_tuning_skipped(monkeypatch, dp_size, tuned_ops):
+    """No extra pass without DP or without a tuned trtllm-gen MoE op."""
+    runner = _make_dp_runner(dp_size)
+    _fake_autotuner(monkeypatch, tuned_ops)
+    monkeypatch.setattr(warmup, "_tuning_group_min_free_bytes", lambda: 1 << 40)
+    autotune = Mock(side_effect=lambda **kwargs: nullcontext())
+    monkeypatch.setattr(fi_utils, "autotune", autotune)
+
+    with _moe_dp_patches():
+        warmup._run_flashinfer_moe_dp_tuning(runner, 8192, {})
+
+    autotune.assert_not_called()
+    runner._dummy_run.assert_not_called()
+
+
+def test_moe_dp_tuning_uses_group_minimum_free_memory(monkeypatch):
+    """Every rank of the tuning group sizes its buckets from the same value."""
+    world = SimpleNamespace(world_size=2, cpu_group=object())
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_world_group", lambda: world
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (10 << 30, 0))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 3 << 30)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 1 << 30)
+    reduced = []
+
+    def all_reduce(tensor, op, group):
+        assert op == torch.distributed.ReduceOp.MIN and group is world.cpu_group
+        reduced.append(int(tensor.item()))
+        tensor.fill_(5 << 30)  # the other rank has less free memory
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    assert warmup._tuning_group_min_free_bytes() == 5 << 30
+    assert reduced == [12 << 30]
