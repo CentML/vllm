@@ -21,6 +21,10 @@ from vllm.distributed import (
     initialize_model_parallel,
 )
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    BaseRouter,
+    uniform_routing_for_tuning,
+)
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
@@ -319,3 +323,38 @@ def test_runner_prepares_monolithic_logits(monkeypatch, device):
     assert passed.device == logits.device
     assert torch.all((passed >= -1) & (passed <= 0))
     assert torch.all(logits == 7)
+
+
+class _SameExpertsRouter(BaseRouter):
+    """Routes every token to experts 0..top_k-1, like a degenerate dummy run."""
+
+    @property
+    def routing_method_type(self) -> RoutingMethodType:
+        return RoutingMethodType.Renormalize
+
+    def _compute_routing(self, hidden_states, router_logits, indices_type, **kwargs):
+        num_tokens = hidden_states.shape[0]
+        topk_ids = torch.arange(self.top_k, dtype=torch.int32).repeat(num_tokens, 1)
+        topk_ids[-1] = -1
+        return torch.ones(num_tokens, self.top_k), topk_ids
+
+
+def test_uniform_routing_for_tuning_replaces_dummy_routing():
+    """Tuning must not profile MoE kernels on a dummy forward's routing."""
+    num_tokens, num_experts, top_k = 512, 64, 8
+    router = _SameExpertsRouter(top_k=top_k, global_num_experts=num_experts)
+    hidden_states = torch.randn(num_tokens, 16)
+    router_logits = torch.randn(num_tokens, num_experts)
+
+    with uniform_routing_for_tuning():
+        _, topk_ids = router.select_experts(hidden_states, router_logits)
+
+    assert topk_ids.dtype == torch.int32
+    assert (topk_ids[-1] == -1).all()
+    routed = topk_ids[:-1]
+    assert routed.min() >= 0 and routed.max() < num_experts
+    assert all(row.unique().numel() == top_k for row in routed)
+    assert routed.unique().numel() == num_experts
+
+    _, topk_ids = router.select_experts(hidden_states, router_logits)
+    assert (topk_ids[0] == torch.arange(top_k)).all()

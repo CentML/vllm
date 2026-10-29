@@ -92,14 +92,19 @@ def test_flashinfer_autotune_token_counts_are_bounded_and_deduplicated():
 
 @pytest.mark.parametrize("skip_attn", [False, True])
 def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
+    import vllm.model_executor.layers.fused_moe.router.base_router as base_router
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
 
     runner = _make_runner([])
     dummy_run_signature = signature((V2Runner if skip_attn else V1Runner)._dummy_run)
-    runner._dummy_run.side_effect = lambda **kwargs: dummy_run_signature.bind(
-        None, **kwargs
-    )
+    uniform_routing = []
+
+    def dummy_run(**kwargs):
+        uniform_routing.append(base_router._uniform_routing_for_tuning)
+        return dummy_run_signature.bind(None, **kwargs)
+
+    runner._dummy_run.side_effect = dummy_run
     max_buckets = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 8192)
     deferred_buckets = (1, 2, 4, 8, 16, 32, 64, 128)
 
@@ -117,6 +122,8 @@ def test_flashinfer_autotune_uses_token_buckets_for_each_dummy_run(skip_attn):
     ):
         _run_flashinfer_autotune_dummy_runs(runner, skip_attn=skip_attn)
 
+    assert uniform_routing == [True, True]
+    assert not base_router._uniform_routing_for_tuning
     assert get_buckets.call_args_list == [call(8192), call(128)]
     assert autotune.call_args_list == [
         call(tuning_buckets=max_buckets, round_up=True),

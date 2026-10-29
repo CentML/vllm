@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import torch
 
@@ -171,6 +172,33 @@ def get_moe_padding_mask(num_tokens: int) -> torch.Tensor | None:
     return None
 
 
+_uniform_routing_for_tuning = False
+
+
+@contextmanager
+def uniform_routing_for_tuning() -> Iterator[None]:
+    """Route every token to uniformly random experts while kernels are tuned.
+
+    Autotuners that replay the caller's precomputed top-k ids (FlashInfer
+    trtllm-gen MoE) would otherwise profile the routing of a dummy forward,
+    which can send all tokens to the same experts. Monolithic kernels route
+    from logits inside the kernel and are not affected.
+    """
+    global _uniform_routing_for_tuning
+    prev, _uniform_routing_for_tuning = _uniform_routing_for_tuning, True
+    try:
+        yield
+    finally:
+        _uniform_routing_for_tuning = prev
+
+
+def _uniform_topk_ids(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Distinct uniformly random experts per row; padding rows keep id -1."""
+    scores = torch.rand(topk_ids.shape[0], num_experts, device=topk_ids.device)
+    ids = scores.topk(topk_ids.shape[1], dim=-1).indices.to(topk_ids.dtype)
+    return ids.masked_fill(topk_ids < 0, -1)
+
+
 class BaseRouter(FusedMoERouter):
     """Base class providing common functionality for all router implementations.
 
@@ -306,6 +334,8 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+        if _uniform_routing_for_tuning:
+            topk_ids = _uniform_topk_ids(topk_ids, router_logits.shape[-1])
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

@@ -347,6 +347,9 @@ def _run_flashinfer_autotune_dummy_runs(
     runner: "GPUModelRunner", *, skip_attn: bool = False
 ) -> None:
     import vllm.utils.flashinfer as fi_utils
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        uniform_routing_for_tuning,
+    )
 
     dummy_run_kwargs = {"skip_attn": True} if skip_attn else {}
     for num_tokens in _flashinfer_autotune_token_counts(runner):
@@ -375,7 +378,12 @@ def _run_flashinfer_autotune_dummy_runs(
         )
         # Round M up to match serving-time bucket selection for non-bucket M.
         # See https://github.com/flashinfer-ai/flashinfer/issues/5450
-        with fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True):
+        # The dummy forward can route all tokens to the same experts, and the
+        # MoE tuners profile with the routing they are called with.
+        with (
+            fi_utils.autotune(tuning_buckets=tuning_buckets, round_up=True),
+            uniform_routing_for_tuning(),
+        ):
             runner._dummy_run(
                 num_tokens=num_tokens,
                 skip_eplb=True,
