@@ -46,6 +46,7 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
+from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import kda_causal_conv1d_planar
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -161,6 +162,18 @@ def _resolve_kda_prefill_backend(
             "and a bounded KDA gate."
         )
     return "flashkda" if supported and backend != "triton" else "triton"
+
+
+def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> bool:
+    """Whether chunked prefill runs the q|k|v short conv through
+    ``kda_causal_conv1d_planar`` (dense q/k/v planes, width 4 only) instead of
+    ``causal_conv1d_fn``. ``conv`` comes from
+    ``additional_config.kda_prefill_conv`` (causal_conv1d / planar)."""
+    if conv not in ("causal_conv1d", "planar"):
+        raise ValueError(f"Unsupported KDA prefill conv: {conv}")
+    if conv == "planar" and conv_size != 4:
+        raise ValueError(f"kda_prefill_conv=planar needs width 4, got {conv_size}")
+    return conv == "planar"
 
 
 def _fused_qkv_conv1d(
@@ -357,6 +370,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.head_dim,
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
+        )
+        self._planar_prefill_conv = _resolve_kda_prefill_conv(
+            additional_config.get("kda_prefill_conv", "causal_conv1d")
+            if isinstance(additional_config, dict)
+            else "causal_conv1d",
+            self.conv_size,
         )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
@@ -621,7 +640,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
-        if attn_metadata_narrowed.num_prefills > 0:
+        if attn_metadata_narrowed.num_prefills > 0 and self._planar_prefill_conv:
+            assert qkv_ns is not None
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
+            # Planar [3, T, P] output: q, k and v are each dense.
+            q_ns, k_ns, v_ns = kda_causal_conv1d_planar(
+                qkv_ns,
+                conv_weights,
+                conv_bias,
+                conv_state,
+                query_start_loc=non_spec_query_start_loc,
+                cache_indices=non_spec_state_indices_tensor,
+                has_initial_state=has_initial_state,
+            ).unbind(0)
+        elif attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
             qkv_ns = causal_conv1d_fn(
                 qkv_ns.transpose(0, 1),
