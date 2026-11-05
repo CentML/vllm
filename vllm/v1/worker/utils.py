@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     create_kv_cache_views,
 )
+from vllm.v1.worker import die_local_kv
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
@@ -420,7 +421,9 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    buf = die_local_kv.allocate_backing(kv_cache_config, device, buf_size)
+    if buf is None:
+        buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:

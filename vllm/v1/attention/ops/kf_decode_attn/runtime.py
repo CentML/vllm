@@ -24,6 +24,7 @@ Contract (checked by the FlashInfer backend before each launch; else trtllm-gen)
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -33,6 +34,20 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _h105_pdl() -> bool:
+    """VLLM_H105_PDL: launch with PDL (griddepcontrol.wait before the first
+    K/V/Q load and global store), while the MXFP8 early-trigger policy holds
+    (every PDL-launched kernel waits before its first load)."""
+    if os.environ.get("VLLM_H105_PDL", "0") != "1":
+        return False
+    from vllm.model_executor.layers.fusion.mxfp8_pdl import (
+        mxfp8_producer_early_trigger,
+    )
+    from vllm.platforms import current_platform
+
+    return current_platform.is_arch_support_pdl() and mxfp8_producer_early_trigger()
 
 HQ, HKV, HDIM, PAGE, GROUP, MAXP = 16, 2, 256, 128, 8, 2057
 MAX_Q = 8  # PagedDecodeAttn asserts Q <= 8 (8 query rows per TMEM lane group)
@@ -83,6 +98,7 @@ class KfDecodeAttn:
         self.steps_by_form: dict[tuple[int, int], int] = {}
         self.log_every = envs.VLLM_KF_DECODE_ATTN_LOG_EVERY
         self._since_log = 0
+        self.pdl = _h105_pdl()
 
     def form_args(self, q: int, bl: int) -> tuple[Any, ...]:
         """(fn, po, pml, cnt) for one form: the solution's setup() with shared
@@ -91,7 +107,10 @@ class KfDecodeAttn:
         r = q * GROUP
         po = self.po[: self.grid * r * HDIM].view(self.grid, r, HDIM)
         pml = self.pml[: r * self.grid * 2].view(r, self.grid, 2)
-        fn = self.k._compile(q, bl, self.grid, bl == 1, False)
+        if self.pdl:
+            fn = self.k._compile(q, bl, self.grid, bl == 1, False, True)
+        else:
+            fn = self.k._compile(q, bl, self.grid, bl == 1, False)
         return fn, po, pml, self.cnt[: bl * HKV]
 
     def warmup(self) -> None:
@@ -126,6 +145,10 @@ class KfDecodeAttn:
             t1 - t0,
             time.perf_counter() - t1,
         )
+        if self.pdl:
+            logger.info(
+                "H105 PDL on (VLLM_H105_PDL=1): KF decode attention launches with PDL."
+            )
 
     def route(self, q: int, bl: int, uniform: bool) -> bool:
         """Builder: whether this step's decode rows run here (counts the outcome)."""

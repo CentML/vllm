@@ -11,6 +11,13 @@ from vllm.distributed.kv_events import (
     KVCacheEvent,
 )
 from vllm.logger import init_logger
+from vllm.v1.core.die_local_kv import (
+    DieFreeBlockQueue,
+    DieLocalPolicy,
+    DieStripePolicy,
+    die_split,
+    stripe_enabled,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -192,6 +199,28 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # VLLM_DIE_LOCAL_KV: per-die free queues (see enable_die_local).
+        self.die_local: DieLocalPolicy | None = None
+
+    def enable_die_local(self) -> None:
+        """Give each die its own free queue (vllm/v1/core/die_local_kv.py).
+
+        Called right after construction, while every block but the null block
+        is free.
+        """
+        free = [b for b in self.blocks if not b.is_null]
+        assert len(free) == self.free_block_queue.num_free_blocks
+        queue = DieFreeBlockQueue(free, die_split(self.num_gpu_blocks))
+        self.free_block_queue = queue  # type: ignore[assignment]
+        # VLLM_DIE_LOCAL_KV_STRIPE: requests striped over the dies, not homed.
+        policy = DieStripePolicy if stripe_enabled() else DieLocalPolicy
+        self.die_local = policy(queue, self.num_gpu_blocks)
+        logger.info(
+            "die-local KV: block ids [0, %d) on die 0, [%d, %d) on die 1",
+            queue.split,
+            queue.split,
+            self.num_gpu_blocks,
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -657,13 +686,17 @@ class BlockPool:
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, dies: list[int] | None = None
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            dies: VLLM_DIE_LOCAL_KV_STRIPE only: the die of each new block
+                (``DieStripePolicy.dies_for``); None: the pool's own order.
 
         Returns:
             A list of new block.
@@ -672,7 +705,11 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if dies is None:
+            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            assert len(dies) == num_blocks
+            ret = self.free_block_queue.popleft_dies(dies)  # type: ignore[attr-defined]
 
         if self._reuse_watchers:
             self._notify_reuse(ret)

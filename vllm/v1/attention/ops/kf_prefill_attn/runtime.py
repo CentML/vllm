@@ -24,10 +24,19 @@ pick, so nothing compiles while serving; a missing form makes ``plan()`` return
 None (the caller keeps FlashInfer). ``plan()`` also returns None unless every
 prefill row has an exact KV length and at least VLLM_KF_PREFILL_ATTN_MIN_KV
 tokens (per-row gate; the step then stays exactly on the production path).
+
+``VLLM_KF_PLAN_EARLY=1`` (default off): the model runner calls ``submit_early()``
+at the start of ``execute_model`` with the query and KV lengths of the batch's
+trailing prefilling rows, which starts the C++ planner on a worker thread
+(``planner.build_async``, no GIL) into the ring slot ``plan()`` will use. ``plan()``
+waits for it and takes its result when the builder's lengths are the same lists
+(the planner is a pure function of them), else plans on the main thread as
+before. Either way the slot holds the same plan.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -48,6 +57,7 @@ _CNT_INTS = 16384
 # The packed (fast) kernel forms cover bmm1 <= 1/16 and bmm2 <= 1 (the solution's
 # run() switches to its precise form above that).
 _UNIT_BMM1 = 0.0625
+PLAN_EARLY = os.environ.get("VLLM_KF_PLAN_EARLY", "0") == "1"
 
 
 @dataclass
@@ -104,6 +114,17 @@ def reachable_variants(nops: int, precise: bool) -> list[int]:
         if precise:
             out += [b + 3, nops + b + 3, 2 * nops + b + 3]
     return sorted(out)
+
+
+def pad_bins(starts: torch.Tensor, n: int, total: int) -> int:
+    """Extend a planner start-offset table (``bins`` or ``mbin``: ``n`` entries,
+    the last one the end of the final bin) to ``total`` entries with empty bins,
+    so every CTA of a grid larger than the planned one finds no work. Returns the
+    new entry count.
+    """
+    if n < total:
+        starts[n:total] = starts[n - 1]
+    return max(n, total)
 
 
 class KfPrefillAttn:
@@ -166,6 +187,15 @@ class KfPrefillAttn:
         # Host time per plan() call (whole call / C++ planner only), current window.
         self._win_total_us: list[float] = []
         self._win_planner_us: list[float] = []
+        # VLLM_KF_PLAN_EARLY: the async planner module (warmup()), the
+        # submitted (query_lens, seq_lens, slot, planned grid) and the worker's
+        # planner time of the taken plans (current window).
+        self._amod: Any = None
+        self._early: tuple[list[int], list[int], int, int] | None = None
+        self._win_early_us: list[float] = []
+        if PLAN_EARLY:
+            # taken / planned again on the main thread / taken after waiting
+            self.stats.update(early_hit=0, early_miss=0, early_wait=0)
 
     def _partials(self, nslot: int) -> tuple[torch.Tensor, torch.Tensor]:
         mrow = self.k.MROW
@@ -188,6 +218,19 @@ class KfPrefillAttn:
 
         t0 = time.perf_counter()
         self.planner.build()
+        if PLAN_EARLY and self._amod is None:
+            try:
+                self._amod = self.planner.build_async()
+                logger.info(
+                    "KF prefill attention: early planner on a worker thread "
+                    "(VLLM_KF_PLAN_EARLY=1)."
+                )
+            except Exception:
+                logger.warning(
+                    "KF prefill attention: early planner unavailable; plans stay "
+                    "on the main thread.",
+                    exc_info=True,
+                )
         t1 = time.perf_counter()
         k = self.k
         dev = self.device
@@ -251,6 +294,7 @@ class KfPrefillAttn:
         seq_lens: list[int],
         block_tables: torch.Tensor,
         exact_kv: list[bool] | None,
+        nsm: int = 0,
     ) -> KfPrefillPlan | None:
         """Plan one step's prefill launch; None keeps FlashInfer for this step.
         ``block_tables``: the prefill rows' ``[B, W]`` int32 block table, W <= MAXP.
@@ -263,7 +307,15 @@ class KfPrefillAttn:
         length is an async-spec decode row's optimistic upper bound (the batch
         split puts non-uniform decode rows in the prefill section): planning it
         makes the kernel attend past the row's real end (rejected-draft KV).
+
+        ``nsm`` (0 = every SM): plan the work for that many persistent CTAs
+        (rounded down to even, at least 2) while the kernel keeps its compiled grid:
+        the CTAs past the plan's grid get empty work and merge bins and exit, so
+        the SMs they would hold stay free for concurrent work (VLLM_ATTN_MIXED_FORK).
         """
+        # VLLM_KF_PLAN_EARLY: the worker's plan of this step, waited for
+        # before any return (it writes the ring slot's pinned buffers).
+        early = self._take_early() if self._early is not None else None
         if not self.compiled:
             return None
         if exact_kv is None or not all(exact_kv):
@@ -283,9 +335,16 @@ class KfPrefillAttn:
             ev.synchronize()  # this pinned slot's H2D (RING steps ago) has finished
         hp, hb, hm, hmb = self.host[i]
         t0 = time.perf_counter()
-        res = self.planner.plan_into(
-            query_lens, seq_lens, self.nsm, hp, hb, hm, hmb, *self.grids
-        )
+        plan_nsm = self.nsm if nsm <= 0 or nsm >= self.nsm else max(2, nsm - nsm % 2)
+        res = None
+        if early is not None:
+            # Taken only if the worker planned the same lists on the same grid
+            # (VLLM_ATTN_MIXED_FORK_KF_SMS plans a mixed step on fewer SMs).
+            res = self._early_result(early, i, query_lens, seq_lens, plan_nsm)
+        if res is None:
+            res = self.planner.plan_into(
+                query_lens, seq_lens, plan_nsm, hp, hb, hm, hmb, *self.grids
+            )
         t_planned = time.perf_counter()
         self.plan_us += (t_planned - t0) * 1e6
         nwork, nbins, nmrg, nmbin, nslot, ngrp, variant, precise_variant = res[:8]
@@ -295,6 +354,9 @@ class KfPrefillAttn:
         if (precise_variant if self.force_precise else variant) not in self.compiled:
             self.stats["fallback_variant"] += 1
             return None
+        if plan_nsm < self.nsm:
+            nbins = pad_bins(hb, nbins, self.nsm + 1)
+            nmbin = pad_bins(hmb, nmbin, self.nsm + 1)
         bt = self._block_tables(block_tables)
         dp, db, dm, dmb = self.dev[i]
         dp[:nwork].copy_(hp[:nwork], non_blocking=True)
@@ -307,7 +369,9 @@ class KfPrefillAttn:
         self.slot = (i + 1) % _RING
         self.stats["plans"] += 1
         self._win_planner_us.append((t_planned - t0) * 1e6)
-        self._win_total_us.append((time.perf_counter() - t_start) * 1e6)
+        self._win_total_us.append(
+            (time.perf_counter() - t_start) * 1e6 + (early[4] if early else 0.0)
+        )
         if self.log_every > 0 and len(self._win_total_us) >= self.log_every:
             self._log_window()
         po, pml = self._partials(nslot)
@@ -326,6 +390,85 @@ class KfPrefillAttn:
             query_lens=query_lens,
             seq_lens=seq_lens,
         )
+
+    def submit_early(
+        self, query_lens: list[int], seq_lens: list[int], nsm: int = 0
+    ) -> None:
+        """VLLM_KF_PLAN_EARLY: start planning these prefill rows on the worker
+        thread into the ring slot ``plan()`` uses next (the builder's lists
+        are not known yet; ``plan()`` takes this plan only if they are equal).
+        ``nsm``: the SM budget ``plan()`` is expected to get (0 = every SM),
+        mapped to a grid by plan()'s rule.
+        """
+        if self._amod is None:
+            return
+        if self._early is not None:
+            self._take_early()  # an unclaimed plan: its slot is free again
+        if (
+            not self.compiled
+            or not query_lens
+            or any(kv < self.min_kv for kv in seq_lens)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        i = self.slot
+        ev = self.events[i]
+        if ev is not None:
+            ev.synchronize()  # this pinned slot's H2D (RING steps ago) has finished
+        hp, hb, hm, hmb = self.host[i]
+        plan_nsm = self.nsm if nsm <= 0 or nsm >= self.nsm else max(2, nsm - nsm % 2)
+        try:
+            self.planner.plan_submit(
+                query_lens, seq_lens, plan_nsm, hp, hb, hm, hmb, *self.grids
+            )
+        except Exception:
+            logger.warning(
+                "KF prefill attention: early planner failed; plans stay on the "
+                "main thread.",
+                exc_info=True,
+            )
+            self._amod = None
+            return
+        self._early = (query_lens, seq_lens, i, plan_nsm)
+
+    def _take_early(self) -> tuple:
+        """(query_lens, seq_lens, slot, plan_wait() result, wait us, planned
+        grid) of the submitted plan; it is no longer pending.
+        """
+        assert self._early is not None
+        query_lens, seq_lens, i, plan_nsm = self._early
+        self._early = None
+        t = time.perf_counter()
+        res = self.planner.plan_wait()
+        wait_us = (time.perf_counter() - t) * 1e6
+        return query_lens, seq_lens, i, res, wait_us, plan_nsm
+
+    def _early_result(
+        self,
+        early: tuple,
+        i: int,
+        query_lens: list[int],
+        seq_lens: list[int],
+        plan_nsm: int,
+    ) -> tuple | None:
+        """The worker's plan_into result if it planned these lists on grid
+        ``plan_nsm`` into slot ``i``, else None (plan on the main thread).
+        """
+        q, kv, slot, res, _, nsm = early
+        if (
+            res[11]
+            or slot != i
+            or nsm != plan_nsm
+            or q != query_lens
+            or kv != seq_lens
+        ):
+            self.stats["early_miss"] += 1
+            return None
+        self.stats["early_hit"] += 1
+        if res[10]:
+            self.stats["early_wait"] += 1
+        self._win_early_us.append(res[12])
+        return res
 
     def _block_tables(self, bt: torch.Tensor) -> torch.Tensor:
         """The kernel hard-codes the block-table row stride MAXP (2057, vLLM's width
@@ -395,6 +538,12 @@ class KfPrefillAttn:
         )
         self._win_total_us.clear()
         self._win_planner_us.clear()
+        if self._win_early_us:
+            logger.info(
+                "KF prefill attention: early planner (worker thread) host ms: %s",
+                pct(self._win_early_us),
+            )
+            self._win_early_us.clear()
 
 
 _RUNTIME: dict[int, KfPrefillAttn | None] = {}

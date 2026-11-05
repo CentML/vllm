@@ -71,6 +71,7 @@ class GDNTileSchedulerParams:
         num_heads_fdd: cute.FastDivmodDivisor = None,
         *,
         v_split: int = 1,
+        seq_major: bool = False,
         loc=None,
         ip=None,
     ):
@@ -83,6 +84,10 @@ class GDNTileSchedulerParams:
         self.num_o_heads = num_q_heads if is_GQA else num_v_heads
         # V-split: each (seq, head) is split into v_split value-row slices
         self.v_split = v_split
+        # seq_major (non-persistent only): grid (heads * v_split, sequences, 1),
+        # so the hardware dispatches every tile of one grid row before the next
+        # (the kernel maps the row through its sequence map).
+        self.seq_major = seq_major
         if total_tiles is None:
             self.total_tiles = num_seqs * self.num_o_heads * v_split
         else:
@@ -136,7 +141,10 @@ class GDNTileSchedulerParams:
             values = values[n_items:]
 
         return GDNTileSchedulerParams(
-            *(tuple(obj_list)), v_split=self.v_split, loc=self._loc
+            *(tuple(obj_list)),
+            v_split=self.v_split,
+            seq_major=self.seq_major,
+            loc=self._loc,
         )
 
     @dsl_user_op
@@ -146,6 +154,8 @@ class GDNTileSchedulerParams:
         if cutlass.const_expr(self.is_persistent):
             return (min(self.total_tiles, max_active_clusters), 1, 1)
         else:
+            if cutlass.const_expr(self.seq_major):
+                return (self.num_o_heads * self.v_split, self.num_seqs, 1)
             return (self.num_seqs, self.num_o_heads, 1)
 
 
@@ -259,6 +269,15 @@ class GDNTileScheduler:
                 self._current_work_linear_idx, loc=loc, ip=ip
             )
         # Non-persistent: 2D grid -> blockIdx.x = batch, blockIdx.y = head.
+        if cutlass.const_expr(self.params.seq_major):
+            # Sequence-major: blockIdx.x = head * v_split + v_slice, .y = row.
+            hx, batch_idx, _ = self.block_idx
+            head_idx = hx // self.params.v_split
+            v_slice = hx - head_idx * self.params.v_split
+            return WorkTileInfo(
+                (Int32(batch_idx), Int32(head_idx), Int32(v_slice)),
+                cutlass.Boolean(self.is_valid),
+            )
         batch_idx, head_idx, _ = self.block_idx
         return WorkTileInfo(
             (batch_idx, head_idx, self.block_idx[2]), cutlass.Boolean(self.is_valid)

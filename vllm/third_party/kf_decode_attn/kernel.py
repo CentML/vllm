@@ -405,11 +405,16 @@ NUM_SM_THREADS = SM_WARPS * 32
 
 
 class PagedDecodeAttn:
-    def __init__(self, Q: int, BL: int, grid: int, bl1: bool = False, unsplit: bool = False):
+    def __init__(self, Q: int, BL: int, grid: int, bl1: bool = False, unsplit: bool = False, pdl: bool = False):
         self.BL = BL
         self.grid = grid
         self.Q = Q
         self.unsplit = unsplit
+        # H105 (vLLM edit, not KF's): programmatic dependent launch. griddepcontrol.wait precedes the first K/V/Q
+        # load and every global store; before it only seq_lens / block tables (written by kernels that completed
+        # before the producer's own wait) are read and L2 prefetches are issued. No early trigger (the attention
+        # gate's CTAs would then wait beside the split merge).
+        self.pdl = pdl
         self.bl1 = bl1                           # BL == 1 specialization (speculative start)
         # BL >= 2: each request's first-page block-table entries are loaded with seq_lens and staged in
         # the (idle) merge-weight table, so the first K/V loads need no table round trip after the split
@@ -510,6 +515,7 @@ class PagedDecodeAttn:
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            **({"use_pdl": True} if self.pdl else {}),
         )
 
     @cute.kernel
@@ -612,6 +618,8 @@ class PagedDecodeAttn:
                     # j-th page (j < SPEC) is k + j * half and exists iff that index is < pages
                     sp_np = (sl0 + (PAGE - 1)) // PAGE
                     sp_k = bid // HKV
+                    if const_expr(self.pdl):
+                        cute.arch.griddepcontrol_wait()
                     for sp in cutlass.range_constexpr(SPEC):
                         if const_expr(sp > 0 and SPEC_GAP > 0):
                             # let every CTA's first page into the DRAM queues before the second ones
@@ -672,6 +680,8 @@ class PagedDecodeAttn:
         cnt_lines = (mCnt.shape[0] * 4 + 127) // 128
         if tidx == 192 and bid < cnt_lines:
             prefetch_l2(mCnt.iterator.toint() + Int64(bid) * 128)
+        if const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
 
         # ------------------------------------------------------------------ work assignment
         half = G // HKV
@@ -1341,8 +1351,8 @@ class PagedDecodeAttn:
 _COMPILED = {}
 
 
-def _compile(Q: int, BL: int, grid: int, bl1: bool, unsplit: bool = False):
-    key = (Q, BL, grid, bl1, unsplit)
+def _compile(Q: int, BL: int, grid: int, bl1: bool, unsplit: bool = False, pdl: bool = False):
+    key = (Q, BL, grid, bl1, unsplit) + ((True,) if pdl else ())
     if key in _COMPILED:
         return _COMPILED[key]
     R = Q * GROUP
@@ -1359,7 +1369,7 @@ def _compile(Q: int, BL: int, grid: int, bl1: bool, unsplit: bool = False):
     pml_f = make_fake_compact_tensor(Float32, (R, gmax, 2), stride_order=(2, 1, 0), assumed_align=16)
     ncnt = 1 if unsplit else BL * HKV
     cnt_f = make_fake_compact_tensor(Int32, (ncnt,), assumed_align=16)
-    k = PagedDecodeAttn(Q, BL, grid, bl1, unsplit)
+    k = PagedDecodeAttn(Q, BL, grid, bl1, unsplit, pdl)
     fn = cute.compile(k, q_f, kv_f, bt_f, sl_f, out_f, po_f, pml_f, cnt_f, Float32(0.0625), Float32(1.0),
                       Int32(1), Int64(EVICT_NORMAL), make_fake_stream(use_tvm_ffi_env_stream=True),
                       options="--enable-tvm-ffi")

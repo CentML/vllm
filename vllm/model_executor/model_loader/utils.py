@@ -3,6 +3,7 @@
 """Utilities for selecting and loading models."""
 
 import inspect
+import os
 import warnings
 from contextlib import contextmanager, nullcontext
 from typing import Any
@@ -156,6 +157,13 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+
+    # VLLM_MOE_DIE_SPLIT=1: home each TRT-LLM-Gen MXFP8 MoE layer's expert
+    # halves on the two memory locality domains (target and draft models).
+    if os.environ.get("VLLM_MOE_DIE_SPLIT", "0") == "1":
+        from vllm.model_executor.layers.fused_moe import moe_die_split
+
+        moe_die_split.localize_model(model, target_device)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

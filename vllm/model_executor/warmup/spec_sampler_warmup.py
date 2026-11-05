@@ -97,7 +97,36 @@ def fused_spec_sampler_warmup(runner: "GPUModelRunner") -> None:
         pen.output_bin_counts,
     )
     combos = _warmup_combos(runner, _MODE)
+    h53 = getattr(rs, "h53", None)
     for max_top_k, use_top_p, use_penalties in combos:
+        if h53 is not None:
+            # VLLM_H53_DRAFT_PARITY verifies with this instead (it only reads
+            # the drafter's q cache).
+            from vllm.v1.worker.gpu.spec_decode import draft_parity
+
+            draft_parity.rejection_sample(
+                h53,
+                logits,
+                buffers.input_ids[:num_logits],
+                buffers.positions[:num_logits],
+                logits_indices,
+                cu_num_logits,
+                idx_mapping,
+                buffers.seq_lens[:1],
+                expanded_idx_mapping,
+                expanded_local_pos,
+                sampler.req_states.prefill_len.gpu,
+                states.temperature.gpu,
+                states.seeds.gpu,
+                states.top_k.gpu,
+                states.top_p.gpu,
+                penalties if use_penalties else None,
+                max_top_k,
+                use_top_p,
+                rs.num_speculative_steps,
+                use_fp64=sampler.use_fp64_gumbel,
+                count=False,
+            )
         fused_rejection_sample(
             logits,
             buffers.input_ids[:num_logits],

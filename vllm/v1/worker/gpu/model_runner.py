@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -44,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     bind_routed_experts_capturer,
 )
 from vllm.model_executor.layers.mamba.gdn import gdn_layer_graphs
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -85,6 +87,7 @@ from vllm.v1.watermarking.spec_decode import (
     create_speculative_target_watermarker,
     speculative_target_watermark_key,
 )
+from vllm.v1.worker import die_local_kv, die_local_stats
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import sample_graph
@@ -101,7 +104,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
-from vllm.v1.worker.gpu import prefix_front
+from vllm.v1.worker.gpu import kv_len_order, prefix_front
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
 from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
@@ -154,7 +157,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
-from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode import draft_parity, init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
@@ -191,6 +194,10 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+# VLLM_KF_PLAN_EARLY: start the KF prefill planner on its worker thread at the
+# start of execute_model (kf_prefill_attn/runtime.py).
+_KF_PLAN_EARLY = os.environ.get("VLLM_KF_PLAN_EARLY", "0") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -528,6 +535,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
                 )
+                draft_parity.bind(
+                    self.speculator, self.sampler, self.rejection_sampler
+                )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
@@ -727,6 +737,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for g in kv_cache_config.kv_cache_groups
                 ],
             )
+        # Longest-KV-first decode ordering (VLLM_DIE_LOCAL_KV_LPT=1; default off),
+        # composed with the shared-prefix runs when prefix_front is on.
+        self._kv_len_order = kv_len_order.engage(self._prefix_front)
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
             self.device,
@@ -991,6 +1004,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        # VLLM_DIE_LOCAL_KV: its buffers exist before the memory profile ends.
+        die_local_kv.reserve(self.device, self.max_num_reqs)
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -1321,6 +1336,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
             )
 
+    def _kf_plan_early(self, batch_req_state: "BatchReqState") -> None:
+        """VLLM_KF_PLAN_EARLY: the FlashInfer builder plans the KF prefill
+        launch of the prefill rows (the trailing rows in batch order); submit
+        the query and KV lengths of the trailing prefilling rows now so the
+        planner runs while this step's inputs are prepared. The builder takes
+        the result only if its lengths are the same lists.
+        """
+        is_prefilling = batch_req_state.is_prefilling_np
+        n = len(is_prefilling)
+        start = n - int(is_prefilling.sum())
+        if start >= n or not is_prefilling[start:].all():
+            return
+        from vllm.v1.attention.ops.kf_prefill_attn.runtime import get_runtime
+
+        rt = get_runtime(self.device)
+        if rt is None:
+            return
+        num_scheduled = batch_req_state.num_scheduled_tokens[start:]
+        num_computed = self.req_states.num_computed_tokens_np[
+            batch_req_state.idx_mapping_np[start:]
+        ]
+        rt.submit_early(
+            num_scheduled.tolist(), (num_computed + num_scheduled).tolist()
+        )
+
     def gather_batch_req_state(
         self, scheduler_output: SchedulerOutput, dummy_run: bool
     ) -> tuple["BatchReqState | None", int | None]:
@@ -1352,6 +1392,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.req_id_to_index,
                 self.block_tables.key_rows_np,
                 self.block_tables.key_nblk_np,
+            )
+        if getattr(self, "_kv_len_order", False):
+            req_ids = kv_len_order.reorder(
+                req_ids,
+                num_tokens_per_req,
+                draft_tokens,
+                self.decode_query_len,
+                self.req_states.req_id_to_index,
+                self.req_states.num_computed_tokens_np,
+                self.block_tables.key_rows_np if self._prefix_front else None,
             )
 
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
@@ -1782,6 +1832,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        gdn_mtp_cuda.defer_join()
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1804,6 +1855,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
+        if _KF_PLAN_EARLY and batch_req_state is not None:
+            self._kf_plan_early(batch_req_state)
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
             if self.pcp_manager is not None:
@@ -1847,6 +1900,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+        if die_local_stats.ON:
+            die_local_stats.step_begin(
+                dummy_run,
+                batch_desc.cg_mode.name,
+                num_reqs,
+                num_toks,
+                uniform_tok_count,
+                batch_desc.num_tokens,
+                batch_desc.num_reqs,
+            )
 
         cudagraph_stats = None
         if not dummy_run:
@@ -1952,6 +2015,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            # VLLM_GDN_MTP_RING: dummy steps must not touch request state
+            self.model_state.is_dummy_step = dummy_run
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -2329,6 +2394,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
+
+        # VLLM_GDN_MTP_DEFER_STREAM: the side-stream GDN snapshot commit overlapped
+        # the draft proposal; later GPU work waits for it.
+        gdn_mtp_cuda.defer_join()
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

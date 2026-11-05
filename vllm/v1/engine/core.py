@@ -73,6 +73,8 @@ from vllm.v1.engine import (
     UtilityResult,
     frontend_block_hashing,
     gc_admit,
+    ingest_gate,
+    packed_prompt_ids,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
@@ -1032,6 +1034,10 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        # VLLM_PACKED_PROMPT_IDS: int32 bytes -> the same list (and its array).
+        prompt_token_array = None
+        if packed_prompt_ids.is_packed(request.prompt_token_ids):
+            prompt_token_array = packed_prompt_ids.unpack_request(request)
         # Prompt block hashes computed by the front-end process (FEH=1). Used
         # only for requests without multimodal inputs whose hashes match the
         # engine's hash block size and prompt length; otherwise the request
@@ -1072,7 +1078,10 @@ class EngineCore:
         # With shipped prompt hashes the hasher only covers blocks beyond them
         # (none for a fresh prompt); it stays attached for generated tokens.
         req = Request.from_engine_core_request(
-            request, self.request_block_hasher, block_hashes=prompt_block_hashes
+            request,
+            self.request_block_hasher,
+            block_hashes=prompt_block_hashes,
+            prompt_token_array=prompt_token_array,
         )
         if req.use_structured_output:
             # Note on thread safety: no race condition.
@@ -1143,6 +1152,8 @@ class EngineCoreProc(EngineCore):
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
+    # VLLM_INGEST_GATE (vllm/v1/engine/ingest_gate.py); None: no gate.
+    _ingest_gate: ingest_gate.IngestGate | None = None
 
     @instrument(span_name="EngineCoreProc init")
     def __init__(
@@ -1227,6 +1238,7 @@ class EngineCoreProc(EngineCore):
             # and to overlap some serialization/deserialization with the
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            self._ingest_gate = ingest_gate.create()
             ready_event = threading.Event()
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
@@ -1552,8 +1564,12 @@ class EngineCoreProc(EngineCore):
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
+        gate = self._ingest_gate
         waited = False
         while not self.has_work() and self.is_running():
+            if gate is not None:
+                # VLLM_INGEST_GATE: idle, so new requests are ingested freely.
+                gate.open("idle")
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             gc_admit.on_idle()
@@ -1575,6 +1591,11 @@ class EngineCoreProc(EngineCore):
 
         if waited:
             logger.debug("EngineCore loop active.")
+
+        if gate is not None:
+            # VLLM_INGEST_GATE: every ADD received so far is queued before this
+            # drain (admitted now); the gate stays closed while the step runs.
+            gate.catch_up()
 
         # Handle any more client requests.
         while not self.input_queue.empty():
@@ -1820,6 +1841,7 @@ class EngineCoreProc(EngineCore):
         ready_event: threading.Event,
     ):
         """Input socket IO thread."""
+        gate = self._ingest_gate
         # Msgpack serialization decoding with optional tensor IPC receiver.
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
@@ -1882,18 +1904,45 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        if gate is not None:
+                            # VLLM_INGEST_GATE: decode and preprocess only while
+                            # the main thread waits without the GIL.
+                            gate.enter()
                         try:
-                            request = self.preprocess_add_request(req)
-                        except MultiModalCacheMissError as e:
-                            # P0/P1 shadow drift -- return a retryable signal (P0
-                            # drops the stale entry, client resends with data).
-                            self._handle_mm_cache_miss(req, e)
-                            continue
-                        except Exception:
-                            self._handle_request_preproc_error(req)
-                            continue
-                        gc_admit.on_admit()
+                            if packed_prompt_ids.TIME:
+                                t_ingest = time.perf_counter()
+                            req: EngineCoreRequest = add_request_decoder.decode(
+                                data_frames
+                            )
+                            if packed_prompt_ids.TIME:
+                                packed = packed_prompt_ids.is_packed(
+                                    req.prompt_token_ids
+                                )
+                            try:
+                                request = self.preprocess_add_request(req)
+                                if packed_prompt_ids.TIME:
+                                    packed_prompt_ids.record_ingest(
+                                        time.perf_counter() - t_ingest,
+                                        request[0].num_prompt_tokens,
+                                        packed,
+                                    )
+                            except MultiModalCacheMissError as e:
+                                # P0/P1 shadow drift -- return a retryable signal
+                                # (P0 drops the stale entry, client resends with
+                                # data).
+                                self._handle_mm_cache_miss(req, e)
+                                continue
+                            except Exception:
+                                self._handle_request_preproc_error(req)
+                                continue
+                            gc_admit.on_admit()
+                            if gate is not None:
+                                # Queued before leave(): catch_up counts it.
+                                self.input_queue.put_nowait((request_type, request))
+                                continue
+                        finally:
+                            if gate is not None:
+                                gate.leave()
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -763,6 +764,82 @@ def _post_update_kernel(
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
 
 
+@triton.jit
+def _h159_post_update_kernel(
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    last_sampled_tokens_ptr,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    sampled_tokens_ptr,
+    sampled_tokens_stride,
+    num_sampled_ptr,
+    num_rejected_ptr,
+    query_start_loc_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    total_len_ptr,
+    num_accepted_ptr=None,
+    MAX_SAMPLED: tl.constexpr = 1,
+    GLUE_PDL: tl.constexpr = False,
+):
+    """_post_update_kernel with a request's sampled tokens as one vector: the
+    same stores, and the output-count increments as atomic adds (the same
+    integers; a repeated token adds up as in the stock loop)."""
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    req_id = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + req_id)
+    if req_state_idx < 0:
+        return
+    num_sampled = tl.load(num_sampled_ptr + req_id)
+    total_len = tl.load(total_len_ptr + req_state_idx)
+    num_rejected = tl.load(num_rejected_ptr + req_id)
+    if num_accepted_ptr is not None:
+        tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
+    k = tl.arange(0, MAX_SAMPLED)
+    sampled = k < num_sampled
+    token_ids = tl.load(
+        sampled_tokens_ptr + req_id * sampled_tokens_stride + k, mask=sampled, other=0
+    )
+    if num_sampled > 0:
+        tl.store(
+            last_sampled_tokens_ptr + req_state_idx,
+            tl.sum(tl.where(k == num_sampled - 1, token_ids, 0)),
+        )
+        tl.store(total_len_ptr + req_state_idx, total_len + num_sampled)
+    tl.store(
+        all_token_ids_ptr + req_state_idx * all_token_ids_stride + total_len + k,
+        token_ids,
+        mask=sampled,
+    )
+    if output_bin_counts_ptr is not None:
+        tl.atomic_add(
+            output_bin_counts_ptr + req_state_idx * output_bin_counts_stride + token_ids,
+            1,
+            mask=sampled,
+            sem="relaxed",
+        )
+
+    if query_start_loc_ptr is None:
+        query_len = 0
+    else:
+        query_start = tl.load(query_start_loc_ptr + req_id)
+        query_end = tl.load(query_start_loc_ptr + req_id + 1)
+        query_len = query_end - query_start
+    computed_delta = query_len - num_rejected
+    if computed_delta != 0:
+        num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+        tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+
+
+# VLLM_H159_TAIL: post_update of spec-decode steps (several sampled tokens per
+# request) through _h159_post_update_kernel.
+_H159_POST_UPDATE = os.environ.get("VLLM_H159_TAIL", "0") == "1"
+_h159_post_update_logged = False
+
+
 def post_update(
     # [num_reqs] batch_idx -> req_state_idx; negative index means skip.
     idx_mapping: torch.Tensor,
@@ -788,6 +865,38 @@ def post_update(
     num_accepted: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if _H159_POST_UPDATE and sampled_tokens.shape[1] > 1:
+        global _h159_post_update_logged
+        if not _h159_post_update_logged:
+            from vllm.logger import init_logger
+
+            _h159_post_update_logged = True
+            init_logger(__name__).info(
+                "H159 vectorized post_update on (VLLM_H159_TAIL=1, %d sampled "
+                "tokens per request)",
+                sampled_tokens.shape[1],
+            )
+        _h159_post_update_kernel[(num_reqs,)](
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            output_bin_counts,
+            output_bin_counts.stride(0) if output_bin_counts is not None else 0,
+            sampled_tokens,
+            sampled_tokens.stride(0),
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            all_token_ids,
+            all_token_ids.stride(0),
+            total_len,
+            num_accepted,
+            MAX_SAMPLED=triton.next_power_of_2(sampled_tokens.shape[1]),
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
+            num_warps=1,
+        )
+        return
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,

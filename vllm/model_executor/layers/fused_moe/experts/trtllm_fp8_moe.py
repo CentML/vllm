@@ -663,6 +663,27 @@ class TrtLlmFp8ExpertsMonolithic(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsMonolit
         # TODO: fuse into the quant kernel.
         assert a1q_scale is not None
 
+        # VLLM_MOE_DIE_SPLIT=1: this layer's experts are homed per die; every
+        # call (the single-launch decode kernel included) runs once per die.
+        die_split = getattr(self, "die_split", None)
+        if die_split is not None and hidden_states.shape[0] > 0:
+            from vllm.model_executor.layers.fused_moe import moe_die_split
+
+            return moe_die_split.apply(
+                self,
+                die_split,
+                hidden_states,
+                router_logits,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                num_expert_group,
+                e_score_correction_bias,
+                routed_scaling_factor,
+                topk_group,
+            )
+
         if self._moe_decode is not None:
             decoded = self._try_moe_decode(
                 hidden_states,

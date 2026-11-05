@@ -22,7 +22,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
-from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.moe_output import (
+    SplitUnfinalizedMoEOutput,
+    UnfinalizedMoEOutput,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -1569,7 +1572,7 @@ class FusedMoEKernelMonolithicImpl:
             topk_group=topk_group,
         )
 
-        if isinstance(fused_out, UnfinalizedMoEOutput):
+        if isinstance(fused_out, (UnfinalizedMoEOutput, SplitUnfinalizedMoEOutput)):
             if not self.prepare_finalize.supports_deferred_moe_finalize():
                 raise RuntimeError(
                     f"{type(self.prepare_finalize).__name__} cannot pass through "

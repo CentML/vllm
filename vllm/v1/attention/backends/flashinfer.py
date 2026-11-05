@@ -3,7 +3,8 @@
 """Attention layer with FlashInfer."""
 
 import math
-from collections.abc import Iterator, Sequence
+import os
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -81,6 +82,7 @@ from vllm.v1.attention.backends.utils import (
     log2_lse_to_ln,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops import die_verify_attn
 from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
@@ -110,6 +112,7 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker import die_local_kv, die_local_stats
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
@@ -207,6 +210,113 @@ _TRTLLM_GEN_PREFILL_MIN_KV_PER_SPLIT = 8192
 _TRTLLM_GEN_PREFILL_ROWS_PER_CTA = 128
 
 trtllm_gen_prefill_counter_buffer = None
+
+
+# VLLM_ATTN_MIXED_FORK, VLLM_ATTN_MIXED_FORK_KF_SMS, VLLM_ATTN_MIXED_FORK_MODEL and
+# VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM, read here: a source overlay cannot change
+# vllm/envs.py.
+def _attn_mixed_fork_enabled() -> bool:
+    return bool(int(os.getenv("VLLM_ATTN_MIXED_FORK", "0")))
+
+
+def _attn_mixed_fork_kf_sms_env() -> int:
+    return int(os.getenv("VLLM_ATTN_MIXED_FORK_KF_SMS", "0"))
+
+
+def _attn_mixed_fork_model() -> tuple[float, float, float, float] | None:
+    """The KF_SMS=-1 cost model's parameters, which depend on the GPU and have no
+    defaults: VLLM_ATTN_MIXED_FORK_MODEL="base_us,us_per_gwork,dec_tbps" and
+    VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM. None when either is unset or malformed.
+    """
+    try:
+        base_us, us_per_gwork, dec_tbps = (
+            float(v) for v in os.environ["VLLM_ATTN_MIXED_FORK_MODEL"].split(",")
+        )
+        dec_gbps_per_sm = float(os.environ["VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM"])
+    except (KeyError, ValueError):
+        return None
+    if not dec_tbps > 0:
+        return None
+    return base_us, us_per_gwork, dec_tbps, dec_gbps_per_sm
+
+
+# Engagement lines, once per process: the first forked KF launch and the first
+# step planned on a reduced KF grid.
+_attn_mixed_fork_logged: set[str] = set()
+
+
+def _attn_mixed_fork_log_once(key: str, msg: str, *args: object) -> None:
+    if key not in _attn_mixed_fork_logged:
+        _attn_mixed_fork_logged.add(key)
+        logger.info(msg, *args)
+
+
+# VLLM_ATTN_MIXED_FORK: high-priority side stream for the KF prefill rows plus the
+# fork/join events (one set per process; every layer joins before the next forks).
+_attn_mixed_fork_state: list[
+    tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]
+] = []
+
+
+def _attn_mixed_fork_streams() -> tuple[
+    torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event
+]:
+    if not _attn_mixed_fork_state:
+        _, high = torch.cuda.Stream.priority_range()
+        _attn_mixed_fork_state.append(
+            (torch.cuda.Stream(priority=high), torch.cuda.Event(), torch.cuda.Event())
+        )
+    return _attn_mixed_fork_state[0]
+
+
+# VLLM_ATTN_MIXED_FORK_KF_SMS=-1 cost model (per full-attention layer, us), with the
+# parameters of _attn_mixed_fork_model. KF prefill on all SMs: base_us +
+# us_per_gwork x work, work = sum_rows q * (kv - q / 2) in 1e9 token^2. trtllm-gen
+# decode: 1 KiB of FP8 K|V per cached token at dec_tbps.
+
+
+def _attn_mixed_fork_kf_sms(
+    query_lens: list[int],
+    seq_lens: list[int],
+    decode_kv_tokens: int,
+    num_sms: int,
+) -> int:
+    """KF prefill SM budget of a forked mixed step (VLLM_ATTN_MIXED_FORK_KF_SMS):
+    N > 0 as given, 0 = every SM, -1 = the N (multiple of 8, >= 64) minimising the
+    modelled layer time: the KF prefill alone on N SMs (time x num_sms / N) while the
+    decode streams its KV on the other SMs at VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM
+    each (capped at the full decode rate), then the decode's rest on every SM.
+    Returns 0 when no split beats running both on every SM, and when the model's
+    parameters are not set (logged once).
+    """
+    n = _attn_mixed_fork_kf_sms_env()
+    if n >= 0:
+        return n
+    model = _attn_mixed_fork_model()
+    if model is None:
+        _attn_mixed_fork_log_once(
+            "model",
+            "VLLM_ATTN_MIXED_FORK_KF_SMS=%d without a valid "
+            "VLLM_ATTN_MIXED_FORK_MODEL and VLLM_ATTN_MIXED_FORK_DEC_GBPS_PER_SM: "
+            "the KF prefill keeps every SM (no split).",
+            n,
+        )
+        return 0
+    base_us, us_per_gwork, dec_tbps, dec_gbps_per_sm = model
+    work = sum(q * (kv - q / 2) for q, kv in zip(query_lens, seq_lens)) / 1e9
+    tp = base_us + us_per_gwork * work
+    td = decode_kv_tokens * 1024 / (dec_tbps * 1e6)
+    per_sm = dec_gbps_per_sm / 1e3
+    best_n, best_t = 0, tp + td
+    for cand in range(num_sms - num_sms % 8, 63, -8):
+        if cand >= num_sms:
+            continue
+        t1 = tp * num_sms / cand
+        frac = min(1.0, (num_sms - cand) * per_sm / dec_tbps)
+        t = t1 + max(0.0, td - t1 * frac)
+        if t < best_t:
+            best_n, best_t = cand, t
+    return best_n
 
 
 def _get_trtllm_gen_prefill_counter_buffer(sm_count: int) -> torch.Tensor:
@@ -2087,13 +2197,35 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     # async spec decode's optimistic length. plan() keeps such
                     # steps (and any row below MIN_KV) on the production path.
                     is_prefilling = common_attn_metadata.is_prefilling
+                    kf_qls = query_lens_prefill_cpu.tolist()
+                    kf_kvs = seq_lens_ub[prefill_start:num_reqs].tolist()
+                    kf_nsm = 0
+                    if _attn_mixed_fork_enabled() and num_decode_tokens > 0:
+                        # Leave SMs to the concurrent decode (forked in forward()).
+                        kf_nsm = _attn_mixed_fork_kf_sms(
+                            kf_qls,
+                            kf_kvs,
+                            int(seq_lens_ub[:prefill_start].sum()),
+                            kf_rt.nsm,
+                        )
+                        if 0 < kf_nsm < kf_rt.nsm:
+                            _attn_mixed_fork_log_once(
+                                "grid",
+                                "VLLM_ATTN_MIXED_FORK_KF_SMS=%d: first mixed step "
+                                "planned on a reduced KF prefill grid (%d of %d "
+                                "SMs).",
+                                _attn_mixed_fork_kf_sms_env(),
+                                kf_nsm,
+                                kf_rt.nsm,
+                            )
                     kf_plan = kf_rt.plan(
-                        query_lens_prefill_cpu.tolist(),
-                        seq_lens_ub[prefill_start:num_reqs].tolist(),
+                        kf_qls,
+                        kf_kvs,
                         block_table_tensor[prefill_start:num_reqs],
                         None
                         if is_prefilling is None
                         else is_prefilling[prefill_start:num_reqs].tolist(),
+                        nsm=kf_nsm,
                     )
                 # Kept even with a KF plan: a layer that cannot run KF (forward checks)
                 # then falls back to exactly the production choice.
@@ -2466,6 +2598,8 @@ class FlashInferImpl(AttentionImpl):
         # check re-runs this forward on the FlashInfer path.
         self._kf_checks_left = envs.VLLM_KF_PREFILL_ATTN_CHECK
         self._kf_off = False
+        # VLLM_ATTN_MIXED_FORK: join event of this forward's forked KF launch.
+        self._kf_join: torch.cuda.Event | None = None
         # Opt-in routing of eligible FP8 context launches to the trtllm-gen
         # generation kernels (flashinfer_prefill_gen_routing). SM107 has its own
         # generation-kernel prefill (TRTLLMPrefill.gen_sm_count).
@@ -2477,6 +2611,17 @@ class FlashInferImpl(AttentionImpl):
         # Kernel Factory decode kernel: per-layer debug comparisons left
         # (VLLM_KF_DECODE_ATTN_CHECK; eager launches only).
         self._kf_dec_checks_left = envs.VLLM_KF_DECODE_ATTN_CHECK
+        # H211 (VLLM_H211_DL_VERIFY=1 on striped die-local KV): decode launches
+        # of at least VLLM_H211_DL_VERIFY_MIN_ROWS rows run the die-aware verify
+        # kernel (_h211_decode). None: off. Per-KV-cache contract checks: below.
+        self._h211 = die_verify_attn.dispatch_config()
+        self._h211_static: dict[tuple[int, int], str | None] = {}
+        # VLLM_H211_DL_VERIFY_CHECK: eager launches left to compare with trtllm-gen.
+        self._h211_checks_left = (
+            die_verify_attn.check_count(os.environ.get(die_verify_attn.ENV_CHECK))
+            if self._h211 is not None
+            else 0
+        )
 
         # Pre-allocated FP8 output buffer for NVFP4 without fused output quant.
         if self.is_kvcache_nvfp4 and vllm_config is not None:
@@ -2503,6 +2648,225 @@ class FlashInferImpl(AttentionImpl):
     def kv_cache_layout(self) -> KVCacheLayout:
         assert self.cache_config is not None
         return self.cache_config.get_resolved_kv_cache_layout()
+
+    def _die_split(self, out: Any, num_reqs: int) -> bool:
+        """VLLM_DIE_LOCAL_KV: whether this trtllm-gen decode launch may run once
+        per die (it does if ``_raised_splits`` holds too).
+
+        The decision uses the whole-GPU policy's split-k; the per-die launches
+        then run the split-k ``die_local_kv.split_sm_count`` picks for them
+        (bitwise equal to one launch at that split-k).
+        """
+        return (
+            die_local_kv.split_rows_ok(num_reqs)
+            and isinstance(out, torch.Tensor)
+            and not self.is_kvcache_nvfp4
+            and self.dcp_world_size == 1
+        )
+
+    def _h211_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: Any,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor | None,
+        num_reqs: int,
+        max_q_len: int,
+        q_len_per_req: int | None,
+    ) -> Callable[..., None] | None:
+        """H211: the die-aware verify launch that replaces this trtllm-gen decode
+        launch, or None (it stays on trtllm-gen). Each decision is logged once
+        per (part, rows, q_len) (``die_verify_attn.note_choice``).
+
+        The kernel reads KV blocks striped over the dies by
+        ``VLLM_DIE_LOCAL_KV_STRIPE`` (block i of a request on die (i + s) % 2, s
+        the die of its first block): runs of ``pages_per_block`` kernel pages
+        alternate, and a request whose first page is at or past die 1's first
+        page starts on die 1. One persistent wave, grid = the device's SMs.
+        """
+        cfg = self._h211
+        assert cfg is not None
+        part = die_local_stats.part_of(getattr(layer, "layer_name", ""))
+        if part not in cfg.parts:
+            return None
+        rt = die_verify_attn.runtime_if_ready(query.device)
+        if rt is None:
+            why: str | None = "no H211 kernel (die_local_kv.reserve builds it)"
+        elif not die_local_kv.striped():
+            why = "die-local KV is not striped"
+        else:
+            why = die_verify_attn.decide(cfg, part, num_reqs, max_q_len, rt.max_seqs)
+        cu = cu_seqlens_q
+        if why is None and cu is None:
+            assert rt is not None
+            if q_len_per_req is None or query.shape[0] != num_reqs * q_len_per_req:
+                why = "query rows are not uniform"
+            else:
+                cu = rt.cu_uniform(q_len_per_req, num_reqs)
+        if why is None:
+            assert rt is not None and cu is not None
+            why = self._h211_check(
+                layer, rt, query, kv_cache, out, block_tables, seq_lens, cu,
+                num_reqs, max_q_len,
+            )  # fmt: skip
+        die_verify_attn.note_choice(part, num_reqs, max_q_len, why)
+        if why is not None:
+            return None
+        assert rt is not None and cu is not None
+        num_blocks, die1_block = die_local_kv.stripe_geometry()
+        pages_per_block = kv_cache.shape[0] // num_blocks
+
+        def launch(reference: Callable[[Any], None] | None = None) -> None:
+            """``reference``: trtllm-gen into a given buffer, for
+            VLLM_H211_DL_VERIFY_CHECK (eager launches only)."""
+            rt.run(
+                out, query, kv_cache, block_tables, seq_lens, cu, num_reqs,
+                max_q_len, stripe_pages=pages_per_block,
+                stripe_phase_page=die1_block * pages_per_block,
+            )  # fmt: skip
+            if (
+                reference is not None
+                and self._h211_checks_left > 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._check_h211(layer, out, reference, seq_lens, cu, num_reqs)
+
+        return launch
+
+    def _check_h211(
+        self,
+        layer: torch.nn.Module,
+        out: torch.Tensor,
+        reference: Callable[[Any], None],
+        seq_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """VLLM_H211_DL_VERIFY_CHECK: re-run this launch on trtllm-gen (the same
+        striped pool) and log the die-aware kernel's difference over the real
+        rows (seq_len > 0). A launch whose rows are all at most one kernel page
+        long (the dummy rows of CUDA-graph warmup and memory profiling) is not
+        checked or counted. Debug only; syncs."""
+        seq = seq_lens[:num_reqs].tolist()
+        if max(seq, default=0) <= die_verify_attn.PAGE:
+            return
+        self._h211_checks_left -= 1
+        ref = torch.empty_like(out)
+        reference(ref)
+        bounds = cu_seqlens_q[: num_reqs + 1].tolist()
+        rows = [
+            i
+            for b in range(num_reqs)
+            if seq[b] > 0
+            for i in range(bounds[b], bounds[b + 1])
+        ]
+        if not rows:
+            return
+        idx = torch.tensor(rows, dtype=torch.long, device=out.device)
+        n = out.shape[0]
+        got = out.reshape(n, -1).index_select(0, idx).float()
+        want = ref.reshape(n, -1).index_select(0, idx).float()
+        rel = float((got - want).norm() / want.norm().clamp_min(1e-30))
+        worst = float((got - want).abs().max())
+        warn = rel > die_verify_attn.CHECK_REL_L2_WARN
+        (logger.warning if warn else logger.info)(
+            "H211 die-verify check (%s, B=%d, %d query rows, longest %d tokens): rel "
+            "L2 vs trtllm-gen %.5f, max |d| %.5f%s",
+            getattr(layer, "layer_name", "?"),
+            num_reqs,
+            len(rows),
+            max(seq),
+            rel,
+            worst,
+            f" (above {die_verify_attn.CHECK_REL_L2_WARN})" if warn else "",
+        )
+
+    def _h211_check(
+        self,
+        layer: torch.nn.Module,
+        rt: "die_verify_attn.DieVerifyAttn",
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: Any,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        num_reqs: int,
+        max_q_len: int,
+    ) -> str | None:
+        """Why this launch is outside the H211 kernel's contract (None: inside).
+        The per-layer part is checked once per KV cache tensor."""
+        if not isinstance(out, torch.Tensor):
+            return "output is not a tensor"
+        if (
+            block_tables.shape[0] < num_reqs
+            or seq_lens.shape[0] < num_reqs
+            or cu_seqlens_q.shape[0] < num_reqs + 1
+            or cu_seqlens_q.dtype != torch.int32
+        ):
+            return "row tensors"
+        key = (kv_cache.data_ptr(), kv_cache.shape[0])
+        why = self._h211_static.get(key, "")
+        if why == "":
+            num_blocks, _ = die_local_kv.stripe_geometry()
+            if (
+                self.is_kvcache_nvfp4
+                or self.sinks is not None
+                or self.window_left != -1
+                or self.logits_soft_cap
+                or self.o_sf_scale is not None
+                or self.dcp_world_size != 1
+            ):
+                why = "NVFP4 KV, sinks, window, soft cap, output quant or DCP"
+            elif num_blocks <= 0 or kv_cache.shape[0] % num_blocks:
+                why = f"{kv_cache.shape[0]} kernel pages for {num_blocks} blocks"
+            else:
+                bmm2 = self.bmm2_scale if self.bmm2_scale is not None else 1.0
+                why = rt.check(
+                    out, query, kv_cache, block_tables, seq_lens, cu_seqlens_q,
+                    num_reqs, max_q_len, self.get_xqa_bmm1_scale(layer, query.dtype),
+                    bmm2,
+                )  # fmt: skip
+            self._h211_static[key] = why
+        return why
+
+    def _raised_splits(self, sm_count: int) -> bool:
+        """The vLLM split-KV policy raised the KV split (a multi-CTA-KV kernel
+        over long contexts): the case that launches once per die, where both
+        launches may write the output buffer. With FlashInfer's own choice (short
+        contexts; possibly the Persistent kernel) one whole-GPU launch is kept.
+        """
+        return sm_count != self._device_sm_count
+
+    def _die_note(
+        self,
+        part: str,
+        site: str,
+        out: Any,
+        num_reqs: int,
+        q_len: int,
+        sm_count: int,
+        split: bool,
+        eligible: bool = True,
+    ) -> None:
+        """VLLM_DIE_LOCAL_KV_STATS (log only): record whether this trtllm-gen
+        decode launch runs once per die, and if not why (die_local_stats)."""
+        die_local_stats.note(
+            part,
+            site,
+            num_reqs,
+            q_len,
+            die_local_stats.why(
+                split,
+                die_local_kv.active(),
+                die_local_kv.split_rows_ok(num_reqs),
+                eligible and self._die_split(out, num_reqs),
+                self._raised_splits(sm_count),
+            ),
+        )
 
     def _trtllm_gen_decode_launch_config(
         self,
@@ -2637,27 +3001,74 @@ class FlashInferImpl(AttentionImpl):
                 q_len_per_req=1,
             )
         else:
+            split = self._die_split(out_rows, rows.numel())
             sm_count, counter = self._trtllm_gen_decode_launch_config(
-                rows.numel(), 1, pruning.max_seq_len, q, workspace
+                rows.numel(),
+                1,
+                pruning.max_seq_len,
+                q,
+                workspace,
             )
-            with _flashinfer_decode_sm_count(sm_count):
-                trtllm_batch_decode_with_kv_cache(
-                    query=q,
-                    kv_cache=kv_cache_tuple,
-                    workspace_buffer=workspace,
+            split = split and self._raised_splits(sm_count)
+            if die_local_stats.ON:
+                self._die_note(
+                    die_local_stats.part_of(getattr(layer, "layer_name", "")),
+                    "dpr",
+                    out_rows,
+                    rows.numel(),
+                    1,
+                    sm_count,
+                    split,
+                )
+
+            def launch(
+                die: int,
+                seq_lens: torch.Tensor = pruning.seq_lens,
+                o: torch.Tensor = out_rows,
+                sms: int = sm_count,
+            ) -> None:
+                with _flashinfer_decode_sm_count(sms):
+                    trtllm_batch_decode_with_kv_cache(
+                        query=q,
+                        kv_cache=kv_cache_tuple,
+                        workspace_buffer=die_local_kv.workspace(die, workspace),
+                        block_tables=block_tables,
+                        seq_lens=seq_lens,
+                        max_seq_len=pruning.max_seq_len,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=bmm2_scale,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        out=o,
+                        kv_layout=layout,
+                        backend="trtllm-gen",
+                        q_len_per_req=1,
+                        multi_ctas_kv_counter_buffer=(
+                            die_local_kv.twin(counter) if die else counter
+                        ),
+                    )
+
+            if split:
+                die_sms = die_local_kv.split_sm_count(
+                    f"{die_local_stats.part_of(getattr(layer, 'layer_name', ''))} dpr",
+                    rows.numel(),
+                    1,
+                    pruning.max_seq_len,
+                    self.num_kv_heads,
+                    sm_count,
+                )
+                die_local_kv.split_launch(
+                    lambda die, lens, o: launch(die, lens, o, die_sms),
                     block_tables=block_tables,
                     seq_lens=pruning.seq_lens,
-                    max_seq_len=pruning.max_seq_len,
-                    bmm1_scale=bmm1_scale,
-                    bmm2_scale=bmm2_scale,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
                     out=out_rows,
-                    kv_layout=layout,
-                    backend="trtllm-gen",
+                    num_kernel_pages=kv_cache_tuple[0].shape[0],
+                    page_tokens=kv_cache_tuple[0].shape[2],
                     q_len_per_req=1,
-                    multi_ctas_kv_counter_buffer=counter,
+                    multi_cta=True,
                 )
+            else:
+                launch(0)
         out = output.view(-1, self.num_heads, self.head_size)
         out.zero_()
         out.index_copy_(0, rows, out_rows)
@@ -2707,30 +3118,79 @@ class FlashInferImpl(AttentionImpl):
             dtype=out.dtype,
             device=out.device,
         )
+        if block_tables is None:
+            block_tables = prefill.block_tables
+        # Mock (dequantized) caches are not die-homed.
+        split = self._die_split(out_rows, num_prefills) and isinstance(kv_cache, tuple)
         # max_seq_len stays an upper bound of kv_lens.
         sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
-            num_prefills, 1, prefill.max_seq_len, query_rows, workspace_buffer
+            num_prefills,
+            1,
+            prefill.max_seq_len,
+            query_rows,
+            workspace_buffer,
         )
-        with _flashinfer_decode_sm_count(sm_count):
-            trtllm_batch_decode_with_kv_cache(
-                query=query_rows,
-                kv_cache=kv_cache,
-                workspace_buffer=workspace_buffer,
-                block_tables=(
-                    prefill.block_tables if block_tables is None else block_tables
-                ),
-                seq_lens=kv_lens,
-                max_seq_len=prefill.max_seq_len,
-                bmm1_scale=self.bmm1_scale if bmm1_scale is None else bmm1_scale,
-                bmm2_scale=self.bmm2_scale if bmm2_scale is None else bmm2_scale,
-                window_left=self.window_left,
-                sinks=self.sinks,
-                out=out_rows,
-                kv_layout="HND",
-                backend="trtllm-gen",
-                q_len_per_req=1,
-                multi_ctas_kv_counter_buffer=counter_buffer,
+        split = split and self._raised_splits(sm_count)
+        if die_local_stats.ON:
+            self._die_note(
+                "d",
+                "dpl",
+                out_rows,
+                num_prefills,
+                1,
+                sm_count,
+                split,
+                isinstance(kv_cache, tuple),
             )
+
+        def launch(
+            die: int,
+            seq_lens: torch.Tensor = kv_lens,
+            o: torch.Tensor = out_rows,
+            sms: int = sm_count,
+        ) -> None:
+            with _flashinfer_decode_sm_count(sms):
+                trtllm_batch_decode_with_kv_cache(
+                    query=query_rows,
+                    kv_cache=kv_cache,
+                    workspace_buffer=die_local_kv.workspace(die, workspace_buffer),
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    max_seq_len=prefill.max_seq_len,
+                    bmm1_scale=self.bmm1_scale if bmm1_scale is None else bmm1_scale,
+                    bmm2_scale=self.bmm2_scale if bmm2_scale is None else bmm2_scale,
+                    window_left=self.window_left,
+                    sinks=self.sinks,
+                    out=o,
+                    kv_layout="HND",
+                    backend="trtllm-gen",
+                    q_len_per_req=1,
+                    multi_ctas_kv_counter_buffer=(
+                        die_local_kv.twin(counter_buffer) if die else counter_buffer
+                    ),
+                )
+
+        if split:
+            die_sms = die_local_kv.split_sm_count(
+                "d dpl",
+                num_prefills,
+                1,
+                prefill.max_seq_len,
+                self.num_kv_heads,
+                sm_count,
+            )
+            die_local_kv.split_launch(
+                lambda die, lens, o: launch(die, lens, o, die_sms),
+                block_tables=block_tables,
+                seq_lens=kv_lens,
+                out=out_rows,
+                num_kernel_pages=kv_cache[0].shape[0],
+                page_tokens=kv_cache[0].shape[2],
+                q_len_per_req=1,
+                multi_cta=True,
+            )
+        else:
+            launch(0)
         out.zero_()
         out.index_copy_(0, rows, out_rows)
         return rows
@@ -2789,10 +3249,15 @@ class FlashInferImpl(AttentionImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         out: torch.Tensor,
+        fork: bool = False,
     ) -> bool:
         """Run this layer's prefill rows on the Kernel Factory kernel with the step's
         plan. Returns False (nothing launched) if this layer is outside the kernel's
         contract; the caller then takes the trtllm-gen path.
+
+        ``fork`` (VLLM_ATTN_MIXED_FORK, decode rows follow): launch on the
+        high-priority side stream after everything queued so far on the current
+        stream; ``_kf_fork_join`` makes the current stream wait for it.
         """
         prefill = attn_metadata.prefill
         assert isinstance(prefill, TRTLLMPrefill) and prefill.kf is not None
@@ -2819,7 +3284,7 @@ class FlashInferImpl(AttentionImpl):
         runtime = get_runtime(query.device)
         assert runtime is not None
         assert self.bmm1_scale is not None and self.bmm2_scale is not None
-        return runtime.launch(
+        args = (
             prefill.kf,
             query,
             kv_cache,
@@ -2827,6 +3292,35 @@ class FlashInferImpl(AttentionImpl):
             self.bmm1_scale,
             self.bmm2_scale,
         )
+        if not (
+            fork
+            and _attn_mixed_fork_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return runtime.launch(*args)
+        side, fork_ev, join_ev = _attn_mixed_fork_streams()
+        fork_ev.record(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fork_ev.wait(side)
+            launched = runtime.launch(*args)
+            join_ev.record(side)
+        # Joined even when nothing launched (the side stream then carries no work).
+        self._kf_join = join_ev
+        if launched:
+            _attn_mixed_fork_log_once(
+                "fork",
+                "VLLM_ATTN_MIXED_FORK=1: first mixed-step KF prefill launched on the "
+                "high-priority side stream (trtllm-gen decode on the main stream, "
+                "PDL off; KF_SMS=%d).",
+                _attn_mixed_fork_kf_sms_env(),
+            )
+        return launched
+
+    def _kf_fork_join(self) -> None:
+        """VLLM_ATTN_MIXED_FORK: order the current stream after the forked KF launch."""
+        if self._kf_join is not None:
+            self._kf_join.wait(torch.cuda.current_stream())
+            self._kf_join = None
 
     def _check_kf_prefill(
         self,
@@ -3586,6 +4080,10 @@ class FlashInferImpl(AttentionImpl):
                         prefill_query,
                         kv_cache_permute,
                         out,
+                        fork=num_decode_tokens > 0
+                        and decode_with_trtllm_gen
+                        and not use_dcp
+                        and self._kf_checks_left <= 0,
                     )
                 ):
                     # Kernel Factory prefill kernel ran (see _kf_prefill).
@@ -3866,6 +4364,24 @@ class FlashInferImpl(AttentionImpl):
                     assert q_len_per_req is not None
                     decode_batch = decode_query.size(0) // q_len_per_req
                     decode_max_q_len = q_len_per_req
+                # H211: the die-aware verify kernel on striped die-local KV.
+                h211_launch = (
+                    self._h211_decode(
+                        layer, decode_query, kv_cache_permute, out,
+                        block_tables_decode, seq_lens_decode, q_cu_seq_lens,
+                        decode_batch, decode_max_q_len, q_len_per_req,
+                    )  # fmt: skip
+                    if self._h211 is not None
+                    and lse is None
+                    and not needs_fp8_out
+                    and attn_metadata.decode.kf_block_tables is None
+                    else None
+                )
+                die_split = (
+                    self._die_split(out, decode_batch)
+                    and lse is None
+                    and attn_metadata.decode.kf_block_tables is None
+                )
                 sm_count, counter_buffer = self._trtllm_gen_decode_launch_config(
                     decode_batch,
                     decode_max_q_len,
@@ -3873,10 +4389,28 @@ class FlashInferImpl(AttentionImpl):
                     decode_query,
                     workspace_buffer,
                 )
+                die_split = die_split and self._raised_splits(sm_count)
+                if die_local_stats.ON:
+                    self._die_note(
+                        die_local_stats.part_of(getattr(layer, "layer_name", "")),
+                        "dec",
+                        out,
+                        decode_batch,
+                        decode_max_q_len,
+                        sm_count,
+                        die_split,
+                        lse is None and attn_metadata.decode.kf_block_tables is None,
+                    )
                 trt_decode = attn_metadata.decode
 
-                def trtllm_decode(o: Any) -> None:
-                    with _flashinfer_decode_sm_count(sm_count):
+                def trtllm_decode(
+                    o: Any,
+                    seq_lens: torch.Tensor = seq_lens_decode,
+                    workspace: torch.Tensor = workspace_buffer,
+                    counter: torch.Tensor | None = counter_buffer,
+                    sms: int = sm_count,
+                ) -> None:
+                    with _flashinfer_decode_sm_count(sms):
                         trtllm_batch_decode_with_kv_cache(
                             query=decode_query,
                             kv_cache=(
@@ -3884,9 +4418,9 @@ class FlashInferImpl(AttentionImpl):
                                 if self.is_kvcache_nvfp4
                                 else kv_cache_tuple
                             ),
-                            workspace_buffer=workspace_buffer,
+                            workspace_buffer=workspace,
                             block_tables=block_tables_decode,
-                            seq_lens=seq_lens_decode,
+                            seq_lens=seq_lens,
                             max_seq_len=trt_decode.max_seq_len,
                             bmm1_scale=self.get_xqa_bmm1_scale(
                                 layer, decode_query.dtype
@@ -3908,7 +4442,10 @@ class FlashInferImpl(AttentionImpl):
                             ),
                             lse=lse,
                             return_lse=self.need_to_return_lse_for_decode,
-                            multi_ctas_kv_counter_buffer=counter_buffer,
+                            multi_ctas_kv_counter_buffer=counter,
+                            # Forked KF prefill: no early (PDL) residency, so the
+                            # side stream's CTAs claim their SMs first.
+                            enable_pdl=False if self._kf_join is not None else None,
                         )
 
                 if (
@@ -3931,6 +4468,42 @@ class FlashInferImpl(AttentionImpl):
                             out,
                             trtllm_decode,
                         )
+                elif h211_launch is not None:
+                    h211_launch(trtllm_decode)
+                elif die_split:
+                    die_sms = die_local_kv.split_sm_count(
+                        f"{die_local_stats.part_of(getattr(layer, 'layer_name', ''))}"
+                        " dec",
+                        decode_batch,
+                        decode_max_q_len,
+                        trt_decode.max_seq_len,
+                        self.num_kv_heads,
+                        sm_count,
+                    )
+                    die_local_kv.split_launch(
+                        lambda die, lens, o: trtllm_decode(
+                            o,
+                            lens,
+                            die_local_kv.workspace(die, workspace_buffer),
+                            die_local_kv.twin(counter_buffer)
+                            if die
+                            else counter_buffer,
+                            die_sms,
+                        ),
+                        block_tables=block_tables_decode,
+                        seq_lens=seq_lens_decode,
+                        out=out,
+                        num_kernel_pages=kv_cache_permute.shape[0],
+                        page_tokens=kv_cache_permute.shape[2],
+                        q_len_per_req=q_len_per_req,
+                        cu_seqlens_q=q_cu_seq_lens,
+                        multi_cta=True,
+                        # VLLM_DIE_LOCAL_KV_HOST_TRIM: the target model's layers
+                        # share this forward's decode metadata.
+                        cache_masks=die_local_kv.HOST_TRIM
+                        and die_local_stats.part_of(getattr(layer, "layer_name", ""))
+                        == "t",
+                    )
                 else:
                     trtllm_decode(out)
 
@@ -3946,6 +4519,7 @@ class FlashInferImpl(AttentionImpl):
                     )
                 elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out)
+        self._kf_fork_join()
         return output_padded
 
     def kv_cache_write_views(

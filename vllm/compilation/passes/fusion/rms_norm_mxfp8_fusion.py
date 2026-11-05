@@ -54,6 +54,10 @@ _QUANT = torch.ops.vllm.mxfp8_quantize.default
 _FUSED = torch.ops.vllm.add_rms_norm_mxfp8_quant.default
 _FUSED_MOE = torch.ops.vllm.moe_finalize_add_rms_norm_mxfp8_quant.default
 _MOE_FINALIZE = torch.ops.vllm.moe_finalize.default
+# The two-buffer forms (die-split MoE, VLLM_MOE_DIE_SPLIT=1).
+_FUSED_MOE2 = torch.ops.vllm.moe_finalize2_add_rms_norm_mxfp8_quant.default
+_MOE_FINALIZE2 = torch.ops.vllm.moe_finalize2.default
+_MOE_FUSED = {_MOE_FINALIZE: _FUSED_MOE, _MOE_FINALIZE2: _FUSED_MOE2}
 _FUSED_ADD_RMS_NORM = ir.ops.fused_add_rms_norm.torch_op
 _RMS_NORM = ir.ops.rms_norm.torch_op
 _VIEWS = (aten.view.default, aten.reshape.default, aten._unsafe_view.default)
@@ -336,11 +340,11 @@ class RMSNormMxfp8QuantFusionPass(VllmInductorPass):
         target, finalize = _FUSED, None
         if (
             x_src.op == "call_function"
-            and x_src.target is _MOE_FINALIZE
+            and x_src.target in _MOE_FUSED
             and len(x_src.users) == 1
             and all(isinstance(a, fx.Node) for a in x_src.args)
         ):
-            target, finalize = _FUSED_MOE, x_src
+            target, finalize = _MOE_FUSED[x_src.target], x_src
         x_args = (x_src,) if finalize is None else tuple(finalize.args)
         args = (*x_args, x2, residual, weight, eps, weight_offset, store_normed, gate)
         fake_mode = detect_fake_mode(

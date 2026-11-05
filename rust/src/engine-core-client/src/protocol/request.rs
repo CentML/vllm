@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
-use serde_with::serde_as;
+use serde_with::{DeserializeAs, SerializeAs, serde_as};
 
 use crate::protocol::multimodal::MmFeatures;
 use crate::protocol::sampling::EngineCoreSamplingParams;
@@ -67,6 +68,55 @@ pub struct ReasoningParserKwargs {
     pub chat_template_kwargs: HashMap<String, serde_json::Value>,
 }
 
+/// `VLLM_PACKED_PROMPT_IDS=1` (the engine's flag, read once from the shared environment): prompts of at least
+/// `VLLM_PACKED_PROMPT_IDS_MIN` ids (default 1024) that all fit int32 cross to EngineCore as one msgpack bin of
+/// little-endian int32, the format `vllm/v1/engine/packed_prompt_ids.py` unpacks with a memcpy, instead of one
+/// msgpack int per token. Other prompts, and every prompt with the flag off, keep the list encoding. Receiving
+/// accepts the list encoding only (EngineCore never sends prompts back).
+pub struct PackedPromptIds;
+
+static PACKED_PROMPT_IDS_MIN: LazyLock<Option<usize>> = LazyLock::new(|| {
+    (std::env::var("VLLM_PACKED_PROMPT_IDS").as_deref() == Ok("1")).then(|| {
+        std::env::var("VLLM_PACKED_PROMPT_IDS_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&min| min > 0)
+            .unwrap_or(1024)
+    })
+});
+
+fn pack_prompt_ids(ids: &[u32], min: Option<usize>) -> Option<Vec<u8>> {
+    let min = min?;
+    if ids.len() < min || ids.iter().any(|&id| id > i32::MAX as u32) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(ids.len() * 4);
+    for id in ids {
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    Some(bytes)
+}
+
+impl SerializeAs<Vec<u32>> for PackedPromptIds {
+    fn serialize_as<S: serde::Serializer>(
+        ids: &Vec<u32>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match pack_prompt_ids(ids, *PACKED_PROMPT_IDS_MIN) {
+            Some(bytes) => serializer.serialize_bytes(&bytes),
+            None => ids.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> DeserializeAs<'de, Vec<u32>> for PackedPromptIds {
+    fn deserialize_as<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<u32>, D::Error> {
+        Vec::deserialize(deserializer)
+    }
+}
+
 /// Engine-core add-request payload sent from frontend to engine.
 ///
 /// Original Python definition:
@@ -75,6 +125,8 @@ pub struct ReasoningParserKwargs {
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreRequest {
     pub request_id: String,
+    /// Sent as little-endian int32 bytes when the engine packs prompt ids (see [`PackedPromptIds`]).
+    #[serde_as(as = "Option<PackedPromptIds>", no_default)]
     pub prompt_token_ids: Option<Vec<u32>>,
     /// Multimodal features attached to the request.
     pub mm_features: Option<MmFeatures>,
@@ -211,6 +263,20 @@ mod tests {
         };
         assert_eq!(array.len(), 22);
         assert_eq!(array[21], Value::Binary(b"FEH1".to_vec()));
+    }
+
+    #[test]
+    fn prompt_ids_pack_to_le_int32_only_when_enabled_long_enough_and_in_range() {
+        let ids: Vec<u32> = vec![1, 256, 65536, i32::MAX as u32];
+        assert_eq!(pack_prompt_ids(&ids, None), None);
+        assert_eq!(pack_prompt_ids(&ids, Some(5)), None);
+        assert_eq!(pack_prompt_ids(&[1, i32::MAX as u32 + 1], Some(1)), None);
+        let packed = pack_prompt_ids(&ids, Some(4)).unwrap();
+        let unpacked: Vec<u32> = packed
+            .chunks_exact(4)
+            .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()) as u32)
+            .collect();
+        assert_eq!(unpacked, ids);
     }
 
     #[test]

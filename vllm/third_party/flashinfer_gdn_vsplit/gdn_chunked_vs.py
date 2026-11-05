@@ -220,6 +220,7 @@ class GatedDeltaNetChunkedKernel:
         v_split: int = 1,
         cg0_split: bool = False,
         c1_reorder: bool = False,
+        sched: bool = False,
     ):
         # V-split: v_split in {1, 2}: each CTA owns DV/v_split value rows of the
         # state (rows are independent, so the split is exact).
@@ -230,6 +231,25 @@ class GatedDeltaNetChunkedKernel:
         self.cg0_split = bool(cg0_split) and v_split == 2 and use_initial_state
         # c1_reorder: KV (state update) issued before QKV, and CG1 drains O(c) after publishing state(c+1)
         self.c1_reorder = bool(c1_reorder) and use_initial_state
+        # sched (VLLM_GDN_VSPLIT_SCHED, adapter): one CTA per tile, launched
+        # sequence-major over a sequence map that cu_checkpoints carries (the
+        # checkpoint feature stays off), so the host can drop throwaway
+        # sequences and order the rest longest first; plus FlashInfer #6507's
+        # scheduling hooks (bdcfa394: EVICT_NORMAL state load, packed f32x2
+        # epilogue multiplies, fused bf16x2 -> f32x2 beta FMA). Each tile runs
+        # the same math on the same data in the same order, so output and
+        # state are bit-identical.
+        self.sched = bool(sched)
+        assert not (self.sched and (is_persistent or enable_checkpoints)), (
+            "sched needs the non-persistent grid and no checkpoints"
+        )
+        self.sched_hooks = self.sched
+        self.seq_map = self.sched
+        self.state_load_l1c_evict_priority = (
+            cute.nvgpu.CacheEvictionPriority.EVICT_NORMAL
+            if self.sched
+            else cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE
+        )
         self.dv_tile = 128 // v_split
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
@@ -873,14 +893,26 @@ class GatedDeltaNetChunkedKernel:
         # ------------------------------------------------------------------
         # Launch
         # ------------------------------------------------------------------
-        scheduler_params = GDNTileSchedulerParams(
-            num_seqs=batch_size,
-            num_q_heads=h_q,
-            num_v_heads=h_v,
-            is_GQA=self.is_GQA,
-            is_persistent=self.is_persistent,
-            v_split=self.v_split,
-        )
+        if cutlass.const_expr(self.seq_map):
+            # One grid row per mapped sequence (cu_checkpoints = sequence map).
+            scheduler_params = GDNTileSchedulerParams(
+                num_seqs=cu_checkpoints.shape[0],
+                num_q_heads=h_q,
+                num_v_heads=h_v,
+                is_GQA=self.is_GQA,
+                is_persistent=self.is_persistent,
+                v_split=self.v_split,
+                seq_major=True,
+            )
+        else:
+            scheduler_params = GDNTileSchedulerParams(
+                num_seqs=batch_size,
+                num_q_heads=h_q,
+                num_v_heads=h_v,
+                is_GQA=self.is_GQA,
+                is_persistent=self.is_persistent,
+                v_split=self.v_split,
+            )
         grid_shape = GDNTileScheduler.get_grid_shape(
             scheduler_params, self.max_active_clusters
         )
@@ -1333,6 +1365,8 @@ class GatedDeltaNetChunkedKernel:
             work = scheduler.initial_work_tile_info()
             while work.is_valid_tile:
                 batch_idx, head_idx, _ = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_pairs = 2
@@ -1440,6 +1474,8 @@ class GatedDeltaNetChunkedKernel:
             work = scheduler.initial_work_tile_info()
             while work.is_valid_tile:
                 batch_idx, head_idx, v_slice = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
@@ -1572,6 +1608,8 @@ class GatedDeltaNetChunkedKernel:
             work = scheduler.initial_work_tile_info()
             while work.is_valid_tile:
                 batch_idx, _, _ = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * 2)
@@ -1635,6 +1673,8 @@ class GatedDeltaNetChunkedKernel:
             work = scheduler.initial_work_tile_info()
             while work.is_valid_tile:
                 batch_idx, _, _ = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_chunks = cute.ceil_div(seqlen_b, self.b_t * 2) * 2
@@ -1756,6 +1796,8 @@ class GatedDeltaNetChunkedKernel:
 
             while work.is_valid_tile:
                 batch_idx, head_idx, v_slice = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
                 seqlen_b = cutlass.Int32(batch_end - batch_start)
@@ -1873,6 +1915,8 @@ class GatedDeltaNetChunkedKernel:
 
             while work.is_valid_tile:
                 batch_idx, head_idx, v_slice = work.tile_idx
+                if cutlass.const_expr(self.seq_map):
+                    batch_idx = cutlass.Int32(cu_checkpoints[batch_idx])
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
                 seqlen_b = cutlass.Int32(batch_end - batch_start)
@@ -3266,17 +3310,22 @@ class GatedDeltaNetChunkedKernel:
         cute.arch.fence_view_async_tmem_load()
         kk0_handle.release()
         for sub in cutlass.range(tKKrKK.shape[2]):
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_0.shape[0]),
-                vectorize=True,
-                unroll_full=True,
-            ):
-                tKKrKK[k, 0, sub] = (
-                    tKKrKK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * tGrBeta_0
+            if cutlass.const_expr(self.sched_hooks):
+                self._sched_scale_convert(
+                    tKKrKK, tGrCumsumlog_0, tGrBeta_0, tKKrKK_out_cal, self.inverse_dtype, sub
                 )
-            tKKrKK_out_cal[None, 0, sub].store(
-                tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
-            )
+            else:
+                for k in cutlass.range(
+                    cute.size(tGrCumsumlog_0.shape[0]),
+                    vectorize=True,
+                    unroll_full=True,
+                ):
+                    tKKrKK[k, 0, sub] = (
+                        tKKrKK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * tGrBeta_0
+                    )
+                tKKrKK_out_cal[None, 0, sub].store(
+                    tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
+                )
             cute.copy(
                 tiled_ainv_cal_r2s,
                 tCrAICal[None, 0, sub],
@@ -3294,17 +3343,22 @@ class GatedDeltaNetChunkedKernel:
         cute.arch.fence_view_async_tmem_load()
         kk1_handle.release()
         for sub in cutlass.range(tKKrKK.shape[2]):
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_1.shape[0]),
-                vectorize=True,
-                unroll_full=True,
-            ):
-                tKKrKK[k, 0, sub] = (
-                    tKKrKK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * tGrBeta_1
+            if cutlass.const_expr(self.sched_hooks):
+                self._sched_scale_convert(
+                    tKKrKK, tGrCumsumlog_1, tGrBeta_1, tKKrKK_out_cal, self.inverse_dtype, sub
                 )
-            tKKrKK_out_cal[None, 0, sub].store(
-                tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
-            )
+            else:
+                for k in cutlass.range(
+                    cute.size(tGrCumsumlog_1.shape[0]),
+                    vectorize=True,
+                    unroll_full=True,
+                ):
+                    tKKrKK[k, 0, sub] = (
+                        tKKrKK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * tGrBeta_1
+                    )
+                tKKrKK_out_cal[None, 0, sub].store(
+                    tKKrKK[None, 0, sub].load().to(self.inverse_dtype)
+                )
             cute.copy(
                 tiled_ainv_cal_r2s,
                 tCrAICal[None, 0, sub],
@@ -3330,15 +3384,20 @@ class GatedDeltaNetChunkedKernel:
                 tTR_tStS[None, 0, sub, qk0_handle.index],
                 tQKrQK[None, 0, sub],
             )
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_0.shape[0]), vectorize=True, unroll_full=True
-            ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * scale
+            if cutlass.const_expr(self.sched_hooks):
+                self._sched_scale_convert(
+                    tQKrQK, tGrCumsumlog_0, scale, tQKrQK_out, self.io_dtype, sub
                 )
-            tQKrQK_out[None, 0, sub].store(
-                tQKrQK[None, 0, sub].load().to(self.io_dtype)
-            )
+            else:
+                for k in cutlass.range(
+                    cute.size(tGrCumsumlog_0.shape[0]), vectorize=True, unroll_full=True
+                ):
+                    tQKrQK[k, 0, sub] = (
+                        tQKrQK[k, 0, sub] * tGrCumsumlog_0[k, 0, sub] * scale
+                    )
+                tQKrQK_out[None, 0, sub].store(
+                    tQKrQK[None, 0, sub].load().to(self.io_dtype)
+                )
             cute.copy(
                 tiled_qk_r2s,
                 tCrQK[None, 0, sub],
@@ -3364,15 +3423,20 @@ class GatedDeltaNetChunkedKernel:
                 tTR_tStS[None, 0, sub, qk1_handle.index],
                 tQKrQK[None, 0, sub],
             )
-            for k in cutlass.range(
-                cute.size(tGrCumsumlog_1.shape[0]), vectorize=True, unroll_full=True
-            ):
-                tQKrQK[k, 0, sub] = (
-                    tQKrQK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * scale
+            if cutlass.const_expr(self.sched_hooks):
+                self._sched_scale_convert(
+                    tQKrQK, tGrCumsumlog_1, scale, tQKrQK_out, self.io_dtype, sub
                 )
-            tQKrQK_out[None, 0, sub].store(
-                tQKrQK[None, 0, sub].load().to(self.io_dtype)
-            )
+            else:
+                for k in cutlass.range(
+                    cute.size(tGrCumsumlog_1.shape[0]), vectorize=True, unroll_full=True
+                ):
+                    tQKrQK[k, 0, sub] = (
+                        tQKrQK[k, 0, sub] * tGrCumsumlog_1[k, 0, sub] * scale
+                    )
+                tQKrQK_out[None, 0, sub].store(
+                    tQKrQK[None, 0, sub].load().to(self.io_dtype)
+                )
             cute.copy(
                 tiled_qk_r2s,
                 tCrQK[None, 0, sub],
@@ -3503,6 +3567,61 @@ class GatedDeltaNetChunkedKernel:
             )
 
     @cute.jit
+    def _sched_scale_convert(self, frag, tGr, scalar, out_frag, out_dtype, sub):
+        """sched: FlashInfer #6507's packed f32x2 form of the epilogue
+        frag = frag * tGr * scalar (the same two IEEE multiplies in the same
+        order), then the same convert."""
+        num = cute.size(tGr.shape[0])
+        if cutlass.const_expr(num % 2 == 0):
+            s = cutlass.Float32(scalar)
+            for k in cutlass.range_constexpr(0, num, 2):
+                m0, m1 = cute.arch.mul_packed_f32x2(
+                    (frag[k, 0, sub], frag[k + 1, 0, sub]),
+                    (tGr[k, 0, sub], tGr[k + 1, 0, sub]),
+                )
+                f0, f1 = cute.arch.mul_packed_f32x2((m0, m1), (s, s))
+                frag[k, 0, sub] = f0
+                frag[k + 1, 0, sub] = f1
+            out_frag[None, 0, sub].store(frag[None, 0, sub].load().to(out_dtype))
+        else:
+            for k in cutlass.range(
+                cute.size(tGr.shape[0]), vectorize=True, unroll_full=True
+            ):
+                frag[k, 0, sub] = frag[k, 0, sub] * tGr[k, 0, sub] * scalar
+            out_frag[None, 0, sub].store(frag[None, 0, sub].load().to(out_dtype))
+
+    @cute.jit
+    def _sched_beta_upconvert(self, tCrAICal, tKKrBeta, tCrAIAcc):
+        """sched: FlashInfer #6507's fused half -> f32 up-convert and per-column
+        beta multiply (one packed RN FMA with a zero addend per pair)."""
+        num = cute.size(tCrAIAcc)
+        if cutlass.const_expr(
+            self.inverse_dtype in (cutlass.Float16, cutlass.BFloat16) and num % 2 == 0
+        ):
+            zero = cutlass.Float32(0.0)
+            for k in cutlass.range_constexpr(0, num, 2):
+                if cutlass.const_expr(self.inverse_dtype == cutlass.Float16):
+                    p0, p1 = cute.arch.fma_packed_f32x2_f16x2_f32x2_f32x2(
+                        (tCrAICal[k], tCrAICal[k + 1]),
+                        (tKKrBeta[k], tKKrBeta[k + 1]),
+                        (zero, zero),
+                    )
+                else:
+                    p0, p1 = cute.arch.fma_packed_f32x2_bf16x2_f32x2_f32x2(
+                        (tCrAICal[k], tCrAICal[k + 1]),
+                        (tKKrBeta[k], tKKrBeta[k + 1]),
+                        (zero, zero),
+                    )
+                tCrAIAcc[k] = p0
+                tCrAIAcc[k + 1] = p1
+        else:
+            tCrAIAcc.store(tCrAICal.load().to(self.acc_dtype))
+            for k in cutlass.range(
+                cute.size(tCrAIAcc), vectorize=True, unroll_full=True
+            ):
+                tCrAIAcc[k] = tCrAIAcc[k] * tKKrBeta[k]
+
+    @cute.jit
     def _partial_pair_inverse(
         self,
         tidx: cutlass.Int32,
@@ -3619,9 +3738,12 @@ class GatedDeltaNetChunkedKernel:
             coord = tTR_tScS[k]
             tKKrBeta[k] = sBeta[coord[1], 0, beta0_handle.index]
         cute.copy(tiled_ainv_cal_s2r, tCsAI0Cal, tCrAI0Cal)
-        tCrAI0Acc.store(tCrAI0Cal.load().to(self.acc_dtype))
-        for k in cutlass.range(cute.size(tCrAI0), vectorize=True, unroll_full=True):
-            tCrAI0Acc[k] = tCrAI0Acc[k] * tKKrBeta[k]
+        if cutlass.const_expr(self.sched_hooks):
+            self._sched_beta_upconvert(tCrAI0Cal, tKKrBeta, tCrAI0Acc)
+        else:
+            tCrAI0Acc.store(tCrAI0Cal.load().to(self.acc_dtype))
+            for k in cutlass.range(cute.size(tCrAI0), vectorize=True, unroll_full=True):
+                tCrAI0Acc[k] = tCrAI0Acc[k] * tKKrBeta[k]
         tCrAI0.store(tCrAI0Acc.load().to(self.io_dtype))
         cute.copy(tiled_ainv_s2r, tCrAI0, tCsAI0)
         cute.arch.fence_view_async_shared()
@@ -3644,9 +3766,12 @@ class GatedDeltaNetChunkedKernel:
             coord = tTR_tScS[k]
             tKKrBeta[k] = sBeta[coord[1], 0, beta1_handle.index]
         cute.copy(tiled_ainv_cal_s2r, tCsAI1Cal, tCrAI1Cal)
-        tCrAI1Acc.store(tCrAI1Cal.load().to(self.acc_dtype))
-        for k in cutlass.range(cute.size(tCrAI1), vectorize=True, unroll_full=True):
-            tCrAI1Acc[k] = tCrAI1Acc[k] * tKKrBeta[k]
+        if cutlass.const_expr(self.sched_hooks):
+            self._sched_beta_upconvert(tCrAI1Cal, tKKrBeta, tCrAI1Acc)
+        else:
+            tCrAI1Acc.store(tCrAI1Cal.load().to(self.acc_dtype))
+            for k in cutlass.range(cute.size(tCrAI1), vectorize=True, unroll_full=True):
+                tCrAI1Acc[k] = tCrAI1Acc[k] * tKKrBeta[k]
         tCrAI1.store(tCrAI1Acc.load().to(self.io_dtype))
         cute.copy(tiled_ainv_s2r, tCrAI1, tCsAI1)
         cute.arch.fence_view_async_shared()
@@ -4316,7 +4441,7 @@ class GatedDeltaNetChunkedKernel:
             cute.autovec_copy(
                 tGR_tCgState[None, 0, sub],
                 tGR_tCrState[None, 0, sub],
-                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                l1c_evict_priority=self.state_load_l1c_evict_priority,
             )
             if cutlass.const_expr(self.acc_dtype != self.state_dtype):
                 tRT_tCrState[None, 0, sub].store(

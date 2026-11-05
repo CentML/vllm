@@ -51,6 +51,7 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.worker import die_local_stats
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     prepare_inputs_to_capture,
@@ -233,9 +234,11 @@ class DraftOneGraphs:
                 graph = torch.cuda.CUDAGraph()
                 get_offloader().sync_prev_onload()
                 set_graph_pool_id(pool)
+                die_local_stats.capture_begin()
                 with torch.cuda.graph(graph, pool, stream=current_stream()):
                     body()
                     get_offloader().join_after_forward()
+                die_local_stats.bind(graph)
                 self.graphs[key] = graph
         torch.accelerator.synchronize()
         logger.info(

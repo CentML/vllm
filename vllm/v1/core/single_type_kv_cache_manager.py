@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, ClassVar
 from vllm.distributed.kv_events import MEDIUM_CPU
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -37,7 +38,9 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    H58_TAIL_CKPT,
     get_mamba_prefill_checkpoint_position,
+    is_h58_tail_checkpoint,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -88,6 +91,39 @@ _MAMBA_PIN_OWN_CKPT_ENV = "VLLM_MAMBA_PIN_OWN_CKPT"
 # checkpoint unless another request references it or it is a shared-prefix
 # junction. Any request extending this prompt resumes from the deeper one.
 _MAMBA_DROP_OWN_SUPERSEDED_ENV = "VLLM_MAMBA_DROP_OWN_SUPERSEDED"
+# Opt-in (requires VLLM_MAMBA_DROP_SUPERSEDED_STATE): also drop a superseded
+# "prev" checkpoint that the consumer resumed from through a sub-block (partial)
+# hit. The consumer then runs on a private CoW copy, so "prev" is no longer in
+# its block table and only the copy retention holds it; without this flag it
+# returns to the MRU end of the free queue with its hash, one dead block per
+# Mamba group per turn. Dropped once no request references it.
+_MAMBA_DROP_SUPERSEDED_COW_ENV = "VLLM_MAMBA_DROP_SUPERSEDED_COW"
+# Opt-in: drop the cached prompt-tail attention block of a previous turn once
+# the turn that resumed from it has registered a deeper entry on the same path.
+#
+# A follow-up turn hits the previous prompt's tail mid-block (prefix-match-unit
+# granularity) and copies that partial block into a private CoW block, which it
+# then extends and registers. The source block keeps its old partial entry,
+# which only a request ending its hit at that exact boundary could use: none
+# does once the deeper entry exists (and VLLM_MAMBA_DROP_SUPERSEDED_STATE has
+# already dropped the matching Mamba checkpoint). Without this the dead source
+# goes back to the MRU end of the free queue and occupies a full block for a
+# whole LRU lifetime, once per turn. With the flag on it loses its hashes and
+# moves to the front of the free queue (reused first). Blocks that hold a
+# shared-prefix junction, or that another request still references, are kept.
+# Outputs are unaffected: this only changes which evictable cache entries
+# survive.
+_ATTN_DROP_SUPERSEDED_TAIL_ENV = "VLLM_ATTN_DROP_SUPERSEDED_TAIL"
+# Seconds between KV pool composition log lines (0 = off). Also makes the
+# attention manager track superseded tails it would drop, for the log line.
+KV_POOL_STATS_ENV = "VLLM_KV_POOL_STATS"
+
+
+def kv_pool_stats_interval() -> float:
+    try:
+        return max(float(os.getenv(KV_POOL_STATS_ENV, "0") or 0), 0.0)
+    except ValueError:
+        return 0.0
 
 
 def _env_on(name: str) -> bool:
@@ -192,6 +228,9 @@ class SingleTypeKVCacheManager(ABC):
         # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.fine_grained_prefix_cache = False
+        # VLLM_PREFIX_EXACT_JUNCTION; set by ``KVCacheManager`` on the attention
+        # and Mamba groups when the configuration supports it.
+        self.exact_junction = False
         # Initial-state copy-on-write bookkeeping: partial hits and, for
         # copy-initial Mamba backends, full hits. Empty in other managers.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -404,7 +443,10 @@ class SingleTypeKVCacheManager(ABC):
         num_new_blocks = max(
             0, cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
-        allocated_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+        allocated_blocks = self.block_pool.get_new_blocks(
+            num_new_blocks,
+            dies=self._stripe_dies(request_id, len(req_blocks), num_new_blocks),
+        )
         req_blocks.extend(allocated_blocks)
         if self._record_new_block_ids:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
@@ -434,7 +476,9 @@ class SingleTypeKVCacheManager(ABC):
             # correct; the extra block was reserved by
             # get_num_blocks_to_allocate.
             block_idx, source_block = self._partial_hit_reqs.pop(request_id)
-            cow_block = self.block_pool.get_new_blocks(1)[0]
+            cow_block = self.block_pool.get_new_blocks(
+                1, dies=self._stripe_dies(request_id, block_idx, 1)
+            )[0]
             self._apply_cow(request_id, block_idx, source_block, cow_block)
             self.new_block_ids.append(cow_block.block_id)
             cow_blocks.append(cow_block)
@@ -445,11 +489,30 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return cow_blocks
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks,
+                dies=self._stripe_dies(request_id, len(req_blocks), num_new_blocks),
+            )
             req_blocks.extend(new_blocks)
             if self._record_new_block_ids:
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return cow_blocks + new_blocks
+
+    def _stripe_dies(self, request_id: str, start: int, n: int) -> list[int] | None:
+        """VLLM_DIE_LOCAL_KV_STRIPE: the dies of ``n`` new blocks at positions
+        ``start``.. of the request's table in this group (None: the pool's own
+        order). Only full-attention groups are striped."""
+        die_local = getattr(self.block_pool, "die_local", None)
+        if (
+            die_local is None
+            or not die_local.striped
+            or n <= 0
+            or not isinstance(self, FullAttentionManager)
+        ):
+            return None
+        return die_local.dies_for(
+            request_id, self.req_to_blocks.get(request_id, ()), start, n
+        )
 
     @property
     def records_new_block_ids(self) -> bool:
@@ -785,6 +848,241 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.drop_superseded_tail = self.enable_caching and _env_on(
+            _ATTN_DROP_SUPERSEDED_TAIL_ENV
+        )
+        self.track_superseded_tail = self.drop_superseded_tail or (
+            self.enable_caching and kv_pool_stats_interval() > 0
+        )
+        # request_id -> [CoW source block, its primary hash at CoW time, CoW
+        # block index, superseded]. Only while tracking.
+        self._cow_sources: dict[str, list] = {}
+        # Flag off, stats on: block_id -> hash of superseded sources left cached.
+        self.superseded_tails: dict[int, BlockHashWithGroupId] = {}
+        self.num_superseded_tails = 0
+        self.num_superseded_tails_dropped = 0
+        if self.drop_superseded_tail:
+            logger.info_once(
+                "%s=1: dropping superseded partial prompt-tail attention blocks.",
+                _ATTN_DROP_SUPERSEDED_TAIL_ENV,
+            )
+        # VLLM_PREFIX_EXACT_JUNCTION producers: request_id -> (block index,
+        # block) holding the just-registered junction entry. The next
+        # allocation moves the entry to an immutable copy (the request keeps
+        # appending to its own block, whose deeper entries would replace it).
+        self._junction_producer: dict[str, tuple[int, KVCacheBlock]] = {}
+        # Junction entries: never dropped as superseded CoW sources.
+        self._junction_hashes: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        # Junction copies queued this step: only this step's worker copy fills
+        # them, and the worker gathers all copy sources before scattering, so
+        # a same-step CoW from one would read stale KV. Hits on them wait a
+        # step (the Mamba ``cached_blocks_this_step`` rule).
+        self._junction_copies_this_step: set[int] = set()
+        self.num_exact_junctions = 0
+
+    def new_step_starts(self) -> None:
+        self._junction_copies_this_step.clear()
+
+    def _is_junction_source(self, block: KVCacheBlock) -> bool:
+        """Whether any prefix-cache entry of ``block`` (primary or secondary)
+        is an exact junction.
+        """
+        junctions = self._junction_hashes
+        if not junctions:
+            return False
+        if block.block_hash in junctions:
+            return True
+        extra = self.block_pool.cached_block_hashes_by_block.get(block.block_id, ())
+        return any(h in junctions for h in extra)
+
+    def _apply_cow(
+        self,
+        request_id: str,
+        block_idx: int,
+        source_block: KVCacheBlock,
+        cow_block: KVCacheBlock,
+    ) -> None:
+        super()._apply_cow(request_id, block_idx, source_block, cow_block)
+        if (
+            self.track_superseded_tail
+            and source_block.block_hash is not None
+            and not self._is_junction_source(source_block)
+        ):
+            self._cow_sources[request_id] = [
+                source_block,
+                source_block.block_hash,
+                block_idx,
+                False,
+            ]
+
+    def _release_superseded_tail(self, entry: list) -> bool:
+        """Act on a superseded CoW source; False while someone still holds it."""
+        source, source_hash = entry[0], entry[1]
+        if source.block_hash != source_hash:
+            # Evicted (and possibly reused) since the CoW: nothing left to do.
+            return True
+        if source.ref_cnt != 0 or source.is_null:
+            return False
+        self.num_superseded_tails += 1
+        if not self.drop_superseded_tail:
+            self.superseded_tails[source.block_id] = source_hash
+            return True
+        if source.pool is not None and source.pool is not self.block_pool:
+            return True
+        if self.block_pool._maybe_evict_cached_block(source):
+            queue = self.block_pool.free_block_queue
+            queue.remove(source)
+            queue.prepend_n([source])
+            self.num_superseded_tails_dropped += 1
+        return True
+
+    def _check_superseded_tail(self, request: Request) -> None:
+        entry = self._cow_sources.get(request.request_id)
+        if entry is None:
+            return
+        if not entry[3]:
+            block_idx = entry[2]
+            blocks = self.req_to_blocks.get(request.request_id, ())
+            if block_idx >= len(blocks) or blocks[block_idx].block_hash is None:
+                # The private copy has not registered a deeper entry yet.
+                return
+            junction = request.shared_prefix_boundary
+            if (
+                junction
+                and block_idx * self.block_size
+                < junction
+                <= (block_idx + 1) * self.block_size
+            ):
+                # A sibling may resume at a junction inside this block.
+                del self._cow_sources[request.request_id]
+                return
+            entry[3] = True
+        if self._release_superseded_tail(entry):
+            del self._cow_sources[request.request_id]
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        if self._cow_sources:
+            entry = self._cow_sources.pop(request_id, None)
+            if entry is not None and entry[3]:
+                self._release_superseded_tail(entry)
+        if self._junction_producer:
+            self._junction_producer.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        if (
+            self._junction_copies_this_step
+            and new_computed_blocks
+            and new_computed_blocks[-1].block_id in self._junction_copies_this_step
+        ):
+            # Not schedulable now (see ``_junction_copies_this_step``).
+            return self.block_pool.num_gpu_blocks + 1
+        num_blocks = super().get_num_blocks_to_allocate(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_local_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap,
+        )
+        # The junction copy taken by the producer's next allocation.
+        return num_blocks + int(request_id in self._junction_producer)
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        if self._junction_producer:
+            produced = self._junction_producer.pop(request_id, None)
+            if produced is not None:
+                self._preserve_junction(request_id, *produced)
+        return super().allocate_new_blocks(
+            request_id, num_tokens, num_tokens_main_model
+        )
+
+    def _preserve_junction(
+        self, request_id: str, block_idx: int, block: KVCacheBlock
+    ) -> None:
+        """Move a producer's junction entry to an immutable copy of its block.
+
+        Runs before the producer's next step: the junction chunk's KV is in
+        ``block`` (attention KV is append-only, so tokens before the junction
+        never change). Like the Mamba producer tail, the worker block table of
+        a running request is append-only, so the request keeps ``block`` and
+        the cache entry moves to the copy. Both copy endpoints are retained
+        until the copy has run (``take_kv_cache_block_copies``).
+        """
+        req_blocks = self.req_to_blocks.get(request_id)
+        if (
+            req_blocks is None
+            or block_idx >= len(req_blocks)
+            or req_blocks[block_idx] is not block
+            or block.block_hash is None
+        ):
+            return
+        copy = self.block_pool.get_new_blocks(
+            1, dies=self._stripe_dies(request_id, block_idx, 1)
+        )[0]
+        self.block_pool.move_block_hashes(block, copy)
+        self._pending_cow_copies.append((block, copy))
+        block.ref_cnt += 1
+        if self._record_new_block_ids:
+            self.new_block_ids.append(copy.block_id)
+        self._junction_copies_this_step.add(copy.block_id)
+
+    def _cache_exact_junction(self, request: Request, num_tokens: int) -> None:
+        """Producer: register the attention entry of its exact junction."""
+        junction = request.exact_junction
+        if junction is None:
+            return
+        entry = junction[1]
+        if not (request.num_computed_tokens < entry <= num_tokens):
+            return
+        if entry % self.block_size == 0:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        block_idx = entry // self.block_size
+        if block_idx >= len(blocks) or blocks[block_idx].is_null:
+            return
+        block_hash = self.block_pool.cache_partial_block(
+            request=request,
+            block=blocks[block_idx],
+            num_tokens=entry,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if block_hash is None:
+            return
+        self._junction_hashes[block_hash] = None
+        self._junction_hashes.move_to_end(block_hash)
+        while len(self._junction_hashes) > _MAX_JUNCTION_HASHES:
+            self._junction_hashes.popitem(last=False)
+        self._junction_producer[request.request_id] = (block_idx, blocks[block_idx])
+        self.num_exact_junctions += 1
+
+    def count_resident_superseded_tails(self) -> int:
+        """Stats only (flag off): superseded tails still cached and free."""
+        resident = 0
+        blocks = self.block_pool.blocks
+        for block_id, block_hash in list(self.superseded_tails.items()):
+            block = blocks[block_id]
+            if block.block_hash != block_hash:
+                del self.superseded_tails[block_id]
+            elif block.ref_cnt == 0:
+                resident += 1
+        return resident
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -901,6 +1199,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        if self.exact_junction:
+            self._cache_exact_junction(request, num_tokens)
+        if self._cow_sources:
+            self._check_superseded_tail(request)
 
     def _cache_partial_tail_block(
         self,
@@ -1530,6 +1832,16 @@ class MambaManager(SingleTypeKVCacheManager):
             self._checkpoint_initial_states: dict[str, tuple[int, KVCacheBlock]] = {}
             # Side copies remain request-owned as well as copy-endpoint-owned.
             self._preserved_initial_blocks: dict[str, list[KVCacheBlock]] = {}
+            # VLLM_H58_TAIL_CKPT: new admissions whose tail checkpoint goes to
+            # a fresh block substituted at this column (the one before the
+            # initial-state column), set by get_num_blocks_to_allocate.
+            self._h58_tail_reqs: dict[str, int] = {}
+            # Admitted H58 tails awaiting their own-pin in cache_blocks (the
+            # two-step tail is pinned through _partial_hit_reqs, which
+            # allocate_new_blocks has already dropped for these).
+            self._h58_tail_unpinned: set[str] = set()
+            self.num_h58_tail_ckpts = 0
+            self.num_h58_tail_pins = 0
             # Producer tails and full snapshots awaiting an immutable offload
             # handoff. A later CoW offers its preserved destination; non-alias
             # progress offers the original held snapshot, and finishing at
@@ -1560,6 +1872,29 @@ class MambaManager(SingleTypeKVCacheManager):
                 OrderedDict()
             )
             self.num_superseded_states_dropped = 0
+        # Superseded "prev" checkpoints that a partial (sub-block) hit copied
+        # into a private CoW block: no longer in the consumer's block table, so
+        # neither branch of _mark_superseded applies. Counted always (stats);
+        # dropped once free with VLLM_MAMBA_DROP_SUPERSEDED_COW=1.
+        # Not with copy-initial exports (multi-module MTP) or reuse stops, whose
+        # retained replay/extension boundaries can be CoW sources siblings need.
+        self.drop_superseded_cow = (
+            self.drop_superseded_state
+            and _env_on(_MAMBA_DROP_SUPERSEDED_COW_ENV)
+            and not kv_cache_spec.prefill_checkpoint_copies_initial_block
+            and not _env_on("VLLM_GDN_PREFILL_CHECKPOINT_REUSE_STOPS")
+        )
+        # request_id -> (CoW source block, its hash).
+        self._pending_superseded: dict[
+            str, tuple[KVCacheBlock, BlockHashWithGroupId]
+        ] = {}
+        self.num_superseded_cow = 0
+        self.num_superseded_cow_dropped = 0
+        if self.drop_superseded_cow:
+            logger.info_once(
+                "%s=1: dropping superseded Mamba checkpoints left as CoW sources.",
+                _MAMBA_DROP_SUPERSEDED_COW_ENV,
+            )
         align_caching = self.mamba_cache_mode == "align" and self.enable_caching
         self.pin_own_ckpt = align_caching and _env_on(_MAMBA_PIN_OWN_CKPT_ENV)
         self.drop_own_superseded = self.pin_own_ckpt and _env_on(
@@ -1680,8 +2015,30 @@ class MambaManager(SingleTypeKVCacheManager):
         ):
             # Still held only by the consumer; drop when it releases it.
             self._drop_on_release[block.block_id] = block_hash
-        # ref_cnt > 1: another running request also resumed from it (shared
+        elif not any(b is block for b in self.req_to_blocks.get(request_id, ())):
+            # Partial hit: the consumer resumed from a private CoW copy and the
+            # source is held only by the copy retention (or by siblings). Drop
+            # it once nobody references it.
+            self.num_superseded_cow += 1
+            if self.drop_superseded_cow:
+                self._pending_superseded[request_id] = (block, block_hash)
+        # Otherwise another running request also resumed from it (shared
         # prefix); keep it.
+
+    def _flush_pending_superseded(self, request_id: str, final: bool) -> None:
+        entry = self._pending_superseded.get(request_id)
+        if entry is None:
+            return
+        block, block_hash = entry
+        if block.block_hash != block_hash or block_hash in self._junction_hashes:
+            del self._pending_superseded[request_id]
+        elif block.ref_cnt == 0:
+            self._drop_cached_state(block)
+            self.num_superseded_cow_dropped += 1
+            del self._pending_superseded[request_id]
+        elif final:
+            # Still referenced by another request when this one finished.
+            del self._pending_superseded[request_id]
 
     def _record_junction_hashes(self, request: Request, start: int, end: int) -> None:
         junction = request.shared_prefix_boundary
@@ -1992,6 +2349,15 @@ class MambaManager(SingleTypeKVCacheManager):
         checkpoint_idx = cdiv(query_end, self.block_size) - 2
         blocks = self.req_to_blocks[request_id]
         reuse_initial_block = self.kv_cache_spec.prefill_checkpoint_reuses_initial_block
+        if self.h58_tail_ckpt_allowed(request_id) and is_h58_tail_checkpoint(
+            query_start,
+            query_end,
+            checkpoint_position,
+            self.block_pool.hash_block_size,
+            self.block_size,
+            self.kv_cache_spec.prefill_checkpoint_alignment,
+        ):
+            return True
         return (
             self.has_prefill_checkpoint_blocks
             and is_mamba_prefill_checkpoint_valid(
@@ -2025,6 +2391,27 @@ class MambaManager(SingleTypeKVCacheManager):
                     and checkpoint_idx == (query_start - 1) // self.block_size
                 )
             )
+        )
+
+    @property
+    def h58_tail_ckpt_supported(self) -> bool:
+        """VLLM_H58_TAIL_CKPT applies to this group: GDN (whose builder exports
+        the within-block tail) in align mode with prefill checkpoint blocks."""
+        return (
+            H58_TAIL_CKPT
+            and self.has_prefill_checkpoint_blocks
+            and isinstance(self.kv_cache_spec, MambaSpec)
+            and self.kv_cache_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+        )
+
+    def h58_tail_ckpt_allowed(self, request_id: str) -> bool:
+        """VLLM_H58_TAIL_CKPT: whether this manager can export a request's
+        within-block tail checkpoint into a fresh block: a new admission, whose
+        whole block table the worker receives.
+        """
+        return (
+            self.h58_tail_ckpt_supported
+            and request_id not in self._allocated_block_reqs
         )
 
     def get_num_blocks_to_allocate(
@@ -2128,6 +2515,19 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
+            # VLLM_H58_TAIL_CKPT: the export column precedes the initial-state
+            # column; it gets a fresh block of its own.
+            h58_tail = (
+                checkpoint_position > 0
+                and checkpoint_idx == (total_computed_tokens - 1) // self.block_size - 1
+            )
+            if h58_tail:
+                num_new_blocks = max(num_new_blocks, 0) + 1
+            if not apply_admission_cap:
+                if h58_tail:
+                    self._h58_tail_reqs[request_id] = checkpoint_idx
+                else:
+                    self._h58_tail_reqs.pop(request_id, None)
             # Waiting hits are privatized by add_local_computed_blocks only
             # after admission succeeds. Do not retain a tentative source here:
             # a failed admission can be retried after that source is evicted.
@@ -2205,6 +2605,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
             checkpoint_block = int(request_id in self._checkpoints)
+            h58_tail_idx = self._h58_tail_reqs.pop(request_id, None)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             # `num_required_blocks` might be less than `len(req_blocks)` if blocks are
@@ -2257,6 +2658,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_new_blocks = max(num_required_blocks - len(req_blocks), 0)
                 if has_partial_hit:
                     num_new_blocks = max(num_new_blocks, 0) + 1
+                if h58_tail_idx is not None:
+                    assert not blocks_allocated and checkpoint_block
+                    assert 0 <= h58_tail_idx < len(req_blocks)
+                    num_new_blocks += 1
                 max_new_blocks = 1 + int(has_partial_hit) + checkpoint_block
                 if not blocks_allocated:
                     max_new_blocks += self.num_speculative_blocks
@@ -2329,6 +2734,30 @@ class MambaManager(SingleTypeKVCacheManager):
                     else:
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
+                if h58_tail_idx is not None:
+                    tail_block = new_blocks[0]
+                    new_blocks = new_blocks[1:]
+                    old_block = req_blocks[h58_tail_idx]
+                    req_blocks[h58_tail_idx] = tail_block
+                    if not old_block.is_null:
+                        self.block_pool.free_blocks([old_block])
+                    returned_blocks = [tail_block] + returned_blocks
+                    self._h58_tail_unpinned.add(request_id)
+                    self.num_h58_tail_ckpts += 1
+                    if self.num_h58_tail_ckpts == 1 or (
+                        self.num_h58_tail_ckpts % 1000 == 0
+                    ):
+                        logger.info(
+                            "H58 tail checkpoint (VLLM_H58_TAIL_CKPT=1, group %d): "
+                            "%d within-block prefills exported their tail into a "
+                            "fresh block, %d own-pinned so far (latest: request %s, "
+                            "column %d)",
+                            self.kv_cache_group_id,
+                            self.num_h58_tail_ckpts,
+                            self.num_h58_tail_pins,
+                            request_id,
+                            h58_tail_idx,
+                        )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
@@ -2395,6 +2824,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
+            self._h58_tail_reqs.pop(request_id, None)
+            self._h58_tail_unpinned.discard(request_id)
             self._prefill_checkpoint_queries.pop(request_id, None)
             self._checkpoint_initial_states.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
@@ -2410,6 +2841,8 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
             if self.drop_superseded_state:
                 self._consumed_state.pop(request_id, None)
+                if self._pending_superseded:
+                    self._flush_pending_superseded(request_id, final=True)
                 if self._drop_on_release:
                     for block in self.req_to_blocks.get(request_id, ()):
                         if not block.is_null:
@@ -2555,7 +2988,21 @@ class MambaManager(SingleTypeKVCacheManager):
                     self._pending_boundary_state_offloads.append(
                         (request.request_id, self.kv_cache_group_id, block, position)
                     )
+                elif (
+                    self.exact_junction
+                    and self.drop_superseded_state
+                    and checkpoint is not None
+                    and request.exact_junction is not None
+                    and checkpoint[0] == request.exact_junction[0]
+                ):
+                    # Exact junction export (exact_junction.py): keep it like a
+                    # Marconi junction when consumers supersede it.
+                    self._record_junction_hashes(
+                        request, checkpoint[1], checkpoint[1] + 1
+                    )
         if self.drop_superseded_state:
+            if self._pending_superseded:
+                self._flush_pending_superseded(request.request_id, final=False)
             self._after_cache_blocks(
                 request, num_cached_blocks_before, num_cached_blocks_after, partial_hash
             )
@@ -2574,6 +3021,20 @@ class MambaManager(SingleTypeKVCacheManager):
                 and self.kv_cache_spec.prefill_checkpoint_copies_initial_block
             ):
                 self._pin_own_checkpoint(request, blocks[checkpoint[1]])
+            if (
+                self.mamba_cache_mode == "align"
+                and checkpoint is not None
+                and request.request_id in self._h58_tail_unpinned
+            ):
+                # VLLM_H58_TAIL_CKPT: pin the exported tail like the two-step
+                # path's tail, so it outlives this request's next-step retire.
+                self._h58_tail_unpinned.discard(request.request_id)
+                tail_block = blocks[checkpoint[1]]
+                self._pin_own_checkpoint(request, tail_block)
+                if self._own_pin.get(request.request_id) is tail_block:
+                    self.num_h58_tail_pins += 1
+        elif self.mamba_cache_mode == "align":
+            self._h58_tail_unpinned.discard(request.request_id)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):

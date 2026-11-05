@@ -33,6 +33,25 @@ class UnfinalizedMoEOutput:
     expanded_idx_to_permuted_idx: torch.Tensor
 
 
+@dataclass
+class SplitUnfinalizedMoEOutput:
+    """Unfinalized output of a MoE run once per die over that die's half of the
+    experts (``moe_die_split``, ``VLLM_MOE_DIE_SPLIT=1``).
+
+    Fields as ``UnfinalizedMoEOutput`` for die 0's call, plus die 1's GEMM2 rows
+    and permute map. Every (token, k) route is valid (>= 0) in exactly one of the
+    two maps; the routing weights are equal on both dies.
+    ``vllm::moe_finalize2`` (or its fused norm consumer) reduces both. Not an
+    ``UnfinalizedMoEOutput``, so a consumer of the one-buffer form fails loudly.
+    """
+
+    gemm2_permuted: torch.Tensor
+    expert_weights: torch.Tensor
+    expanded_idx_to_permuted_idx: torch.Tensor
+    gemm2_permuted1: torch.Tensor
+    expanded_idx_to_permuted_idx1: torch.Tensor
+
+
 def convert_flashinfer_moe_output(
     flashinfer_output: torch.Tensor | list[torch.Tensor],
     *,

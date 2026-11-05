@@ -36,7 +36,7 @@ from vllm.v1.worker.gpu.glue_pdl import glue_pdl
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.spec_decode import draft_vocab_head
+from vllm.v1.worker.gpu.spec_decode import draft_parity, draft_vocab_head
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
@@ -103,6 +103,9 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
+    # VLLM_H53_DRAFT_PARITY state, set by draft_parity.bind before capture.
+    h53: "draft_parity.ParityState | None" = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device
@@ -433,7 +436,20 @@ class DraftModelSpeculator(BaseSpeculator):
             return draft_vocab_head.sample(
                 self.draft_vocab_head, self.model, hidden_states
             )
-        if draft_logits is not None:
+        if draft_logits is not None and self.h53 is not None:
+            # VLLM_H53_DRAFT_PARITY: draw from the request-processed q.
+            logits = self.model.compute_logits(hidden_states)
+            sampled = draft_parity.sample(
+                self.h53,
+                logits,
+                idx_mapping,
+                temperature,
+                seeds,
+                sample_src_positions,
+                draft_step,
+                self.draft_tokens,
+            )
+        elif draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             sampled = gumbel_sample(
                 logits,

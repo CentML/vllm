@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -39,6 +40,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched import h58_split_diag
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -55,10 +57,13 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
+    H58_TAIL_CKPT,
     KVCacheConfig,
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    is_h58_tail_checkpoint,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -282,6 +287,18 @@ class Scheduler(SchedulerInterface):
         self.use_eagle = False
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        # A new request with one uncached token is padded to 1 + k rows whose k
+        # draft slots were never proposed (placeholders). Verifying them is exact
+        # for greedy (one-hot) drafts but biases probabilistic ones, so with
+        # probabilistic drafts such requests are scheduled unpadded unless their
+        # KV came from a connector (same issue as upstream fedbc3b564).
+        # VLLM_SPEC_LOCAL_TAIL_NO_PAD=0 keeps the padding.
+        self.local_tail_no_pad = (
+            os.environ.get("VLLM_SPEC_LOCAL_TAIL_NO_PAD", "1") == "1"
+            and speculative_config is not None
+            and speculative_config.draft_sample_method == "probabilistic"
+        )
+        self.num_local_tail_no_pad = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
@@ -401,6 +418,41 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_fine_grained_prefix_cache
         )
+        # VLLM_H58_TAIL_CKPT: the Mamba managers that place a within-block
+        # tail checkpoint (is_h58_tail_checkpoint) in a fresh block; empty (the
+        # feature off) unless every Mamba group is a GDN group that supports it.
+        mamba_mgrs = [
+            m
+            for m in self.kv_cache_manager.coordinator.single_type_managers
+            if isinstance(m, MambaManager)
+        ]
+        self._h58_tail_mgrs: list[MambaManager] = (
+            mamba_mgrs
+            if H58_TAIL_CKPT
+            and self.need_mamba_block_aligned_split
+            and mamba_mgrs
+            and all(m.h58_tail_ckpt_supported for m in mamba_mgrs)
+            else []
+        )
+        # Whether a GDN builder may export a within-block tail at all: then
+        # every chunk without a fresh block for it must be kept out of the case.
+        self._h58_gdn = (
+            H58_TAIL_CKPT
+            and self.need_mamba_block_aligned_split
+            and any(m.h58_tail_ckpt_supported for m in mamba_mgrs)
+        )
+        self.num_h58_tail_guards = 0
+        if self._h58_tail_mgrs:
+            logger.info(
+                "VLLM_H58_TAIL_CKPT=1: new prefills that stay inside one %d-token "
+                "Mamba block export their tail checkpoint into a fresh block "
+                "(one step instead of a tail split); %d Mamba group(s)",
+                self.cache_config.block_size,
+                len(self._h58_tail_mgrs),
+            )
+        self._h58_rec = None
+        if h58_split_diag.ENABLED:
+            h58_split_diag.log_config(self)
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -439,6 +491,57 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+    def _h58_tail_ok(self, request: Request) -> bool:
+        """VLLM_H58_TAIL_CKPT: every Mamba manager can give this request's
+        within-block tail checkpoint a fresh block (a new admission)."""
+        return bool(self._h58_tail_mgrs) and all(
+            m.h58_tail_ckpt_allowed(request.request_id) for m in self._h58_tail_mgrs
+        )
+
+    def _h58_tail_guard(self, request: Request, start: int, num_new_tokens: int) -> int:
+        """VLLM_H58_TAIL_CKPT: the GDN builder exports a within-block tail
+        checkpoint for any chunk that qualifies (is_h58_tail_checkpoint); only
+        a new admission has the fresh block for it. Shorten any other request's
+        qualifying chunk to hash_block_size tokens, which exports nothing.
+        """
+        if num_new_tokens <= self.hash_block_size or self._h58_tail_ok(request):
+            return num_new_tokens
+        block_size = self.cache_config.block_size
+        end = start + num_new_tokens
+        position = get_mamba_prefill_checkpoint_position(
+            end,
+            self.hash_block_size,
+            drop_eagle_block=self.use_eagle_block_drop,
+            query_start=start,
+            mamba_block_size=block_size,
+            copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
+        )
+        if not is_h58_tail_checkpoint(
+            start,
+            end,
+            position,
+            self.hash_block_size,
+            block_size,
+            self.mamba_prefill_checkpoint_alignment,
+        ):
+            return num_new_tokens
+        self.num_h58_tail_guards += 1
+        h58_split_diag.note_guard()
+        if self.num_h58_tail_guards <= 20 or self.num_h58_tail_guards % 100 == 0:
+            logger.warning(
+                "H58 GUARD (expected, performance only: allocated continuation, "
+                "e.g. an exact-junction producer or a resumed request): "
+                "VLLM_H58_TAIL_CKPT request "
+                "%s (already allocated) would export a within-block tail "
+                "checkpoint in [%d, %d); chunk shortened to %d tokens (%d times)",
+                request.request_id,
+                start,
+                end,
+                self.hash_block_size,
+                self.num_h58_tail_guards,
+            )
+        return self.hash_block_size
 
     def _mamba_block_aligned_split(
         self,
@@ -502,6 +605,22 @@ class Scheduler(SchedulerInterface):
                 copy_initial_block=self.mamba_prefill_checkpoint_copies_initial_block,
             )
         )
+        if (
+            not use_internal_checkpoint
+            and self._h58_tail_mgrs
+            and end >= prefill_end
+            and is_h58_tail_checkpoint(
+                start,
+                end,
+                checkpoint_position,
+                self.hash_block_size,
+                block_size,
+                self.mamba_prefill_checkpoint_alignment,
+            )
+            and self._h58_tail_ok(request)
+        ):
+            # VLLM_H58_TAIL_CKPT: the manager exports it into a fresh block.
+            use_internal_checkpoint = True
         # Preserve full-block replay states distinct from the internal tail.
         # When the tail itself is a replay boundary, its export already
         # materializes that state and a separate stop would be redundant.
@@ -611,12 +730,21 @@ class Scheduler(SchedulerInterface):
         junction_requires_split = start < junction_stop < end and not (
             use_internal_checkpoint and junction_stop == checkpoint_position
         )
+        # VLLM_PREFIX_EXACT_JUNCTION (exact_junction.py): a producer ends the
+        # chunk where the GDN prefill export lands exactly on its sub-block
+        # junction; that stop replaces the block-floored one.
+        exact_stop = 0
+        exact = request.exact_junction
+        if exact is not None and start < exact[0]:
+            junction_requires_split = False
+            if start < exact[2] < end:
+                exact_stop = exact[2]
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
             if start % block_size != 0
-            and (stop_at_next_boundary or junction_requires_split)
+            and (stop_at_next_boundary or junction_requires_split or exact_stop)
             else 0,
             # Never run past a reusable boundary not covered by the export.
             extension_stop,
@@ -630,9 +758,24 @@ class Scheduler(SchedulerInterface):
             # Marconi shared-prefix junction: cache its state so sibling
             # requests sharing the prefix can reuse it.
             junction_stop if junction_requires_split else 0,
+            exact_stop,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
+        end_before_stops = end
         end = min((s for s in stops if start < s < end), default=end)
+        if h58_split_diag.ENABLED:
+            h58_split_diag.note_split(
+                self,
+                request,
+                start,
+                num_new_tokens,
+                prefill_end,
+                checkpoint_position,
+                use_internal_checkpoint,
+                stops,
+                end_before_stops,
+                end,
+            )
         return max(end - start, 0)
 
     def _get_local_prefix_cache_hit(
@@ -667,6 +810,20 @@ class Scheduler(SchedulerInterface):
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
+
+    def _skip_local_tail_pad(self, num_external_computed_tokens: int) -> bool:
+        """Whether a one-token new request that would be padded with
+        placeholder drafts is scheduled unpadded (see ``local_tail_no_pad``)."""
+        if not self.local_tail_no_pad or num_external_computed_tokens > 0:
+            return False
+        self.num_local_tail_no_pad += 1
+        if self.num_local_tail_no_pad == 1 or self.num_local_tail_no_pad % 1000 == 0:
+            logger.info(
+                "Spec decode: %d new requests with one uncached token scheduled "
+                "without placeholder drafts (VLLM_SPEC_LOCAL_TAIL_NO_PAD).",
+                self.num_local_tail_no_pad,
+            )
+        return True
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -782,6 +939,7 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            h58_after_budget = num_new_tokens
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -812,6 +970,19 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+            if self._h58_gdn:
+                num_new_tokens = self._h58_tail_guard(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
+            if h58_split_diag.ENABLED:
+                h58_split_diag.after_schedule(
+                    self,
+                    request,
+                    "running",
+                    request.num_computed_tokens,
+                    h58_after_budget,
+                    num_new_tokens,
+                )
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -1158,6 +1329,7 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                        and not self._skip_local_tail_pad(num_external_computed_tokens)
                     ):
                         padded_num_tokens = 1 + self.num_spec_tokens
                         # Pad only when there is room for the sampled token(s).
@@ -1189,6 +1361,7 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    h58_after_budget = num_new_tokens
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1233,6 +1406,19 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
                     )
+                    if self._h58_gdn:
+                        num_new_tokens = self._h58_tail_guard(
+                            request, num_computed_tokens, num_new_tokens
+                        )
+                    if h58_split_diag.ENABLED:
+                        h58_split_diag.after_schedule(
+                            self,
+                            request,
+                            "waiting",
+                            num_computed_tokens,
+                            h58_after_budget,
+                            num_new_tokens,
+                        )
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.

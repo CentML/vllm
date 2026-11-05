@@ -30,7 +30,11 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
-from vllm.v1.engine import EngineCoreRequest, frontend_block_hashing
+from vllm.v1.engine import (
+    EngineCoreRequest,
+    frontend_block_hashing,
+    packed_prompt_ids,
+)
 
 logger = init_logger(__name__)
 
@@ -437,6 +441,9 @@ class InputProcessor:
             resumable=resumable,
             session_id=session_id,
         )
+        if packed_prompt_ids.ENABLED:
+            # Before FEH, which drops its int32 array of the prompt when done.
+            packed_prompt_ids.stash(request)
         if frontend_block_hashing.FEH_ENABLED:
             # Hash the prompt blocks here instead of on the EngineCore input
             # thread; EngineCore falls back to its own hashing if unusable.

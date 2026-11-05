@@ -32,6 +32,12 @@ Return value of plan_into:
     -2  no work items (every query length is 0) -- setup() raises TypeError there
     -3  invalid input (a query length < 0, seq_len < query length, nsm < 1, or a merge
         layout with fewer than NMRG grid CTAs, where setup() raises IndexError)
+
+VLLM_KF_PLAN_EARLY (runtime.py): build_async() builds the same planner source with two more
+entry points: plan_submit() (plan_into's arguments) starts one plan on a persistent C++ worker
+thread that never takes the GIL and returns at once; plan_wait() blocks (GIL released) until it
+is done and returns plan_into's tuple plus (waited, failed, planner_us). One plan is in flight at
+a time; the caller keeps the output and grid tensors alive until plan_wait().
 """
 
 import hashlib
@@ -1023,6 +1029,145 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 """
 
+_PYBIND = """PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("plan_into", &plan_into, "Exact C++ port of the KF prefill planner (setup() host plan)");
+}
+"""
+
+# VLLM_KF_PLAN_EARLY: replaces _PYBIND in _CPP (build_async).
+_ASYNC_CPP = r"""
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
+namespace {
+
+struct EarlyJob {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool started = false, queued = false, pending = false, done = false;
+  std::vector<int32_t> q, L;
+  int64_t nsm = 0;
+  Grids gr{};
+  int32_t *po = nullptr, *bo = nullptr, *mo = nullptr, *mbo = nullptr;
+  int64_t cw = 0, cb = 0, cm = 0, cmb = 0;
+  Out out{};
+  bool failed = false;
+  double planner_us = 0.0;
+};
+
+EarlyJob& early_job() {
+  static EarlyJob* job = new EarlyJob();  // never destroyed: the worker is detached
+  return *job;
+}
+
+void early_worker() {
+  EarlyJob& j = early_job();
+  Planner planner;  // this thread's own, as plan_into's thread_local one
+  std::unique_lock<std::mutex> lk(j.mu);
+  for (;;) {
+    j.cv.wait(lk, [&j] { return j.queued; });
+    j.queued = false;
+    lk.unlock();
+    Out o{};
+    bool failed = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+      o = planner.run(j.q.data(), j.L.data(), (int64_t)j.q.size(), j.nsm, j.gr, j.po, j.cw, j.bo, j.cb, j.mo,
+                      j.cm, j.mbo, j.cmb);
+    } catch (...) {
+      failed = true;
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    lk.lock();
+    j.out = o;
+    j.failed = failed;
+    j.planner_us = us;
+    j.done = true;
+    j.cv.notify_all();
+  }
+}
+
+}  // namespace
+
+void plan_submit(torch::Tensor qls, torch::Tensor Ls, int64_t nsm, torch::Tensor plan_out, torch::Tensor bins_out,
+                 torch::Tensor mrg_out, torch::Tensor mbin_out, torch::Tensor kgrid, torch::Tensor base_waves,
+                 torch::Tensor dense_waves, bool filler) {
+  check_i32(qls, "qls");
+  check_i32(Ls, "Ls");
+  check_i32(plan_out, "plan_out");
+  check_i32(bins_out, "bins_out");
+  check_i32(mrg_out, "mrg_out");
+  check_i32(mbin_out, "mbin_out");
+  check_f64(kgrid, "kgrid");
+  check_f64(base_waves, "base_waves");
+  check_f64(dense_waves, "dense_waves");
+  TORCH_CHECK(qls.dim() == 1 && Ls.dim() == 1 && qls.numel() == Ls.numel(), "qls/Ls must be 1-D, same length");
+  TORCH_CHECK(plan_out.dim() == 2 && plan_out.size(1) == PLAN_F, "plan_out must be [cap_work, 12]");
+  TORCH_CHECK(mrg_out.dim() == 2 && mrg_out.size(1) == MRG_F, "mrg_out must be [cap_mrg, 8]");
+  EarlyJob& j = early_job();
+  {
+    std::lock_guard<std::mutex> lk(j.mu);
+    TORCH_CHECK(!j.pending, "plan_submit: the previous plan was not waited for");
+    const int32_t* q = qls.data_ptr<int32_t>();
+    const int32_t* L = Ls.data_ptr<int32_t>();
+    j.q.assign(q, q + qls.numel());
+    j.L.assign(L, L + Ls.numel());
+    j.nsm = nsm;
+    j.gr = Grids{kgrid.data_ptr<double>(), kgrid.numel(), base_waves.data_ptr<double>(), base_waves.numel(),
+                 dense_waves.data_ptr<double>(), dense_waves.numel(), filler};
+    j.po = plan_out.data_ptr<int32_t>();
+    j.bo = bins_out.data_ptr<int32_t>();
+    j.mo = mrg_out.data_ptr<int32_t>();
+    j.mbo = mbin_out.data_ptr<int32_t>();
+    j.cw = plan_out.size(0);
+    j.cb = bins_out.numel();
+    j.cm = mrg_out.size(0);
+    j.cmb = mbin_out.numel();
+    j.pending = true;
+    j.done = false;
+    j.queued = true;
+    if (!j.started) {
+      std::thread(early_worker).detach();
+      j.started = true;
+    }
+  }
+  j.cv.notify_all();
+}
+
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool, bool, double>
+plan_wait() {
+  EarlyJob& j = early_job();
+  Out o{};
+  o.nwork = -9;  // nothing submitted
+  bool waited = false, failed = true;
+  double us = 0.0;
+  {
+    pybind11::gil_scoped_release nogil;
+    std::unique_lock<std::mutex> lk(j.mu);
+    if (j.pending) {
+      if (!j.done) {
+        waited = true;
+        j.cv.wait(lk, [&j] { return j.done; });
+      }
+      j.pending = false;
+      o = j.out;
+      failed = j.failed;
+      us = j.planner_us;
+    }
+  }
+  return {o.nwork, o.nbins, o.nmrg, o.nmbin, o.nslot, o.ngrp, o.variant, o.precise, o.grid, o.use_mcast,
+          waited, failed, us};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("plan_into", &plan_into, "Exact C++ port of the KF prefill planner (setup() host plan)");
+  m.def("plan_submit", &plan_submit, "plan_into on the worker thread; returns at once");
+  m.def("plan_wait", &plan_wait, "Wait for plan_submit: plan_into's tuple + (waited, failed, planner_us)");
+}
+"""
+
 _MOD: Any = None
 _GRIDS: dict[tuple, torch.Tensor] = {}
 
@@ -1051,6 +1196,43 @@ def build(build_dir=None):
             build_directory=bd,
         )
     return _MOD
+
+
+_AMOD: Any = None
+
+
+def build_async(build_dir=None):
+    """VLLM_KF_PLAN_EARLY: JIT-build (once per process) and return the planner
+    extension with plan_submit / plan_wait (build()'s planner source and
+    flags, plus -pthread).
+    """
+    global _AMOD
+    if _AMOD is None:
+        from torch.utils.cpp_extension import load_inline
+
+        from vllm import envs
+
+        assert _CPP.count(_PYBIND) == 1
+        src = _CPP.replace(_PYBIND, _ASYNC_CPP)
+        digest = hashlib.sha256(src.encode()).hexdigest()[:16]
+        # Never build()'s directory: one extension per build directory.
+        base = os.environ.get("KF_PLANNER_BUILD_DIR")
+        bd = (
+            build_dir
+            or (base and os.path.join(base, f"async-{digest}"))
+            or os.path.join(envs.VLLM_CACHE_ROOT, "kf_prefill_attn_planner", digest)
+        )
+        os.makedirs(bd, exist_ok=True)
+        _AMOD = load_inline(
+            name=f"kf_planner_cpp_async_{digest}",
+            cpp_sources=[src],
+            extra_cflags=["-O3", "-ffp-contract=off", "-fno-fast-math", "-pthread"],
+            extra_ldflags=["-pthread"],
+            with_cuda=False,
+            verbose=False,
+            build_directory=bd,
+        )
+    return _AMOD
 
 
 def _grid(t):
@@ -1097,3 +1279,41 @@ def plan_into(
         _grid(tuple(dense_waves)),
         bool(filler),
     )
+
+
+def plan_submit(
+    qls,
+    Ls,
+    nsm,
+    plan_out,
+    bins_out,
+    mrg_out,
+    mbin_out,
+    kgrid=KGRID,
+    base_waves=BASE_WAVE_GRID,
+    dense_waves=DENSE_WAVE_GRID,
+    filler=True,
+):
+    """plan_into's arguments; starts the plan on the worker thread (build_async)."""
+    m = _AMOD if _AMOD is not None else build_async()
+    m.plan_submit(
+        _i32(qls),
+        _i32(Ls),
+        int(nsm),
+        plan_out,
+        bins_out,
+        mrg_out,
+        mbin_out,
+        _grid(tuple(kgrid)),
+        _grid(tuple(base_waves)),
+        _grid(tuple(dense_waves)),
+        bool(filler),
+    )
+
+
+def plan_wait():
+    """plan_into's tuple of the submitted plan + (waited, failed, planner_us);
+    nwork -9: nothing was submitted.
+    """
+    m = _AMOD if _AMOD is not None else build_async()
+    return m.plan_wait()

@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 import numpy as np
@@ -23,6 +24,12 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplingMaskLists
 from vllm.v1.serial_utils import UtilityResult
+
+# VLLM_PACKED_PROMPT_IDS (vllm/v1/engine/packed_prompt_ids.py): the front end may
+# send an ADD request's prompt_token_ids as little-endian int32 bytes, which
+# EngineCore turns back into the list before building the Request. Off: the
+# field keeps its list-only type.
+_PACKED_PROMPT_IDS = os.environ.get("VLLM_PACKED_PROMPT_IDS", "0") == "1"
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -113,7 +120,10 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: list[int] | None
+    if TYPE_CHECKING or not _PACKED_PROMPT_IDS:
+        prompt_token_ids: list[int] | None
+    else:
+        prompt_token_ids: list[int] | bytes | None
     mm_features: list[MultiModalFeatureSpec] | None
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None

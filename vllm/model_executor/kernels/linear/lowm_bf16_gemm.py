@@ -284,6 +284,40 @@ def lowm_bf16_gemm_out(
     return True
 
 
+def lowm_bf16_gemm_pdl_ready(layer: torch.nn.Module) -> bool:
+    """Whether ``layer`` opted in via ``maybe_use_lowm_bf16_gemm`` with a
+    TinyGEMM2 plan and the PDL launch variant runs on its device. Call before
+    graph capture (the first call probes the variant once per device).
+    """
+    zero_bias = getattr(layer, "lowm_zero_bias", None)
+    weight = getattr(layer, "weight", None)
+    if zero_bias is None or weight is None:
+        return False
+    plan = _plan(weight.shape[0], weight.shape[1], weight.device)
+    return (
+        plan is not None
+        and plan[1] == "tinygemm"
+        and _tinygemm_available(weight.device, True)
+    )
+
+
+def lowm_bf16_gemm_pdl(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor | None:
+    """``x @ layer.weight.T`` with the PDL-launched TinyGEMM2 when the layer's
+    plan serves ``x`` with TinyGEMM2: the same kernel and arithmetic as the
+    default launch; only the launch attribute and the grid-dependency wait
+    differ. None otherwise; the caller then runs its own GEMM. Only for layers
+    for which ``lowm_bf16_gemm_pdl_ready`` returned True, from code outside a
+    compiled graph (custom-op bodies), e.g. the MoE router (H82).
+    """
+    zero_bias = getattr(layer, "lowm_zero_bias", None)
+    if zero_bias is None or x.ndim != 2:
+        return None
+    plan = _runtime_plan(x, layer.weight, zero_bias)
+    if plan is None or plan[1] != "tinygemm":
+        return None
+    return _tinygemm(x, layer.weight, zero_bias, use_pdl=True)
+
+
 def maybe_use_lowm_bf16_gemm(layer: torch.nn.Module) -> bool:
     """Route an unquantized bias-free BF16 linear through the low-M kernels.
 

@@ -64,6 +64,10 @@ def test_native_frontend_config_requires_supported_engine_hashing(hasher, monkey
             patch.setattr(target, name, value)
             assert feh.native_frontend_config(CACHE_CONFIG, BLOCK) is None
     assert feh.native_frontend_config(CACHE_CONFIG, 64) is None
+    # prefix-match-unit 8: the engine advertises its own block size when the
+    # front end hashes at it (the native hasher validates the size).
+    monkeypatch.setattr(feh, "FEH_BLOCK", 8)
+    assert feh.native_frontend_config(CACHE_CONFIG, 8)["block_size"] == 8
 
 
 @pytest.mark.parametrize("num_tokens", [5, 31, 32, 33, 64, 1000, 4097])

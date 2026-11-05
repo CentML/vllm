@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -9,13 +10,22 @@ from typing import Literal, overload
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.exact_junction import (
+    EXACT_JUNCTION_ENV,
+    ExactJunctionDetector,
+    exact_junction_enabled,
+)
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, get_group_id
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    kv_pool_stats_interval,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -24,6 +34,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -193,6 +205,9 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.fine_grained_prefix_cache = True
+        self.exact_junction: ExactJunctionDetector | None = None
+        if enable_caching and exact_junction_enabled():
+            self.exact_junction = self._make_exact_junction_detector(kv_cache_config)
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -201,6 +216,8 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self._pool_stats_interval = kv_pool_stats_interval() if enable_caching else 0.0
+        self._pool_stats_next = 0.0
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -221,6 +238,90 @@ class KVCacheManager:
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
+        )
+
+    def _make_exact_junction_detector(
+        self, kv_cache_config: KVCacheConfig
+    ) -> ExactJunctionDetector | None:
+        """Build the VLLM_PREFIX_EXACT_JUNCTION detector, or None (with a
+        warning) when this configuration cannot produce exact junctions: it
+        needs fine-grained (partial) hash hits, single-token MTP lookahead and
+        GDN-style prefill-checkpoint exports in every Mamba "align" group.
+        """
+        coordinator = self.coordinator
+        mamba_specs = [
+            g.kv_cache_spec
+            for g in kv_cache_config.kv_cache_groups
+            if isinstance(g.kv_cache_spec, MambaSpec)
+        ]
+        reason = None
+        if (
+            not isinstance(coordinator, HybridKVCacheCoordinator)
+            or not coordinator.enable_partial_hash_hits
+        ):
+            reason = "fine-grained (prefix_match_unit) hash hits are off"
+        elif coordinator.num_reprefillable_tokens != 0:
+            reason = "multi-module MTP re-prefills the chunk tail"
+        elif self.mamba_fine_grained_prefix_cache:
+            reason = "enable_mamba_fine_grained_prefix_cache is set"
+        elif not mamba_specs or not all(
+            spec.mamba_cache_mode == "align"
+            and spec.num_prefill_checkpoint_blocks > 0
+            and spec.prefill_checkpoint_alignment is not None
+            and not spec.prefill_checkpoint_copies_initial_block
+            for spec in mamba_specs
+        ):
+            reason = "Mamba groups lack align-mode prefill-checkpoint exports"
+        if reason is not None or not isinstance(coordinator, HybridKVCacheCoordinator):
+            logger.warning("%s=1 ignored: %s.", EXACT_JUNCTION_ENV, reason)
+            return None
+        attn = [
+            m
+            for m in coordinator.single_type_managers
+            if isinstance(m, FullAttentionManager)
+        ]
+        mamba = [
+            m for m in coordinator.single_type_managers if isinstance(m, MambaManager)
+        ]
+        eagle_flags = {m.use_eagle for m in attn} | {
+            m.drop_eagle_checkpoint_block for m in mamba
+        }
+        if len(eagle_flags) != 1:
+            logger.warning(
+                "%s=1 ignored: attention and Mamba groups disagree on the EAGLE drop.",
+                EXACT_JUNCTION_ENV,
+            )
+            return None
+        eagle = eagle_flags.pop()
+        hash_block_size = coordinator.hash_block_size
+
+        def export_valid(start: int, stop: int, junction: int) -> bool:
+            if (
+                get_mamba_prefill_checkpoint_position(stop, hash_block_size, eagle)
+                != junction
+            ):
+                return False
+            return all(
+                is_mamba_prefill_checkpoint_valid(
+                    query_start=start,
+                    query_end=stop,
+                    checkpoint_position=junction,
+                    hash_block_size=hash_block_size,
+                    mamba_block_size=spec.block_size,
+                    checkpoint_alignment=spec.prefill_checkpoint_alignment,
+                    reuse_initial_block=spec.prefill_checkpoint_reuses_initial_block,
+                    copy_initial_block=spec.prefill_checkpoint_copies_initial_block,
+                )
+                for spec in mamba_specs
+            )
+
+        for m in (*attn, *mamba):
+            m.exact_junction = True
+        return ExactJunctionDetector(
+            block_size=coordinator.scheduler_block_size,
+            hash_block_size=hash_block_size,
+            eagle_unit=hash_block_size if eagle else 0,
+            export_valid=export_valid,
         )
 
     @property
@@ -316,6 +417,13 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+        if self.exact_junction is not None:
+            shared_prefix_boundary = self.exact_junction.lookup(
+                request,
+                num_new_computed_tokens,
+                num_new_computed_tokens + num_uncached,
+                shared_prefix_boundary,
+            )
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
@@ -564,25 +672,49 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
+        die_local = self.block_pool.die_local
+        die = 0
+        addr_stats = None
+        if die_local is not None:
+            die = die_local.assign(
+                request,
+                new_computed_block_list,
+                self.coordinator.scheduler_block_size,
             )
+            die_local.prefer(die)
+            addr_stats = die_local.addr_stats
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks until now
+                # to avoid the case where the new blocks cannot be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+            attn_lens = (
+                None
+                if addr_stats is None
+                else self._attn_block_table_lens(request.request_id)
+            )
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
+            if attn_lens is not None:
+                self._note_page_order(request.request_id, attn_lens)
+        finally:
+            if die_local is not None:
+                die_local.prefer(None)
+        if die_local is not None and die_local.kv_stats is not None:
+            die_local.note(request, die, num_tokens_main_model)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -601,6 +733,28 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _attn_block_table_lens(self, request_id: str) -> list[int]:
+        """VLLM_DIE_LOCAL_KV_ADDR_ORDER (log only): the request's attention block
+        table lengths, one per full-attention group."""
+        return [
+            len(m.req_to_blocks.get(request_id, ()))
+            for m in self.coordinator.single_type_managers
+            if isinstance(m, FullAttentionManager)
+        ]
+
+    def _note_page_order(self, request_id: str, lens: list[int]) -> None:
+        """VLLM_DIE_LOCAL_KV_ADDR_ORDER (log only): count the block pairs this
+        allocation appended to the request's attention block tables."""
+        die_local = self.block_pool.die_local
+        assert die_local is not None and die_local.addr_stats is not None
+        attn = [
+            m
+            for m in self.coordinator.single_type_managers
+            if isinstance(m, FullAttentionManager)
+        ]
+        for m, n in zip(attn, lens):
+            die_local.addr_stats.note(m.req_to_blocks.get(request_id, ()), n)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
@@ -950,3 +1104,73 @@ class KVCacheManager:
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()
+        if self.block_pool.die_local is not None:
+            self.block_pool.die_local.step()
+        if self._pool_stats_interval > 0:
+            now = time.monotonic()
+            if now >= self._pool_stats_next:
+                self._pool_stats_next = now + self._pool_stats_interval
+                self.log_pool_stats()
+
+    def log_pool_stats(self) -> None:
+        """VLLM_KV_POOL_STATS: one line of block-pool composition per group.
+
+        held: distinct blocks referenced by request block tables; free_c:
+        cached free blocks (LRU); for Mamba groups also the block-aligned share
+        of free_c. Attention: superseded tail sources still resident (flag off)
+        or dropped so far (flag on).
+        """
+        pool = self.block_pool
+        managers = self.coordinator.single_type_managers
+        num_groups = len(managers)
+        free_cached = [0] * num_groups
+        free_aligned = [0] * num_groups
+        for block in pool.blocks:
+            if block.ref_cnt != 0 or block.block_hash is None or block.is_null:
+                continue
+            gid = get_group_id(block.block_hash)
+            if gid >= num_groups:
+                continue
+            free_cached[gid] += 1
+            num_tokens = block.block_hash_num_tokens
+            if num_tokens is not None and num_tokens % managers[gid].block_size == 0:
+                free_aligned[gid] += 1
+        parts = []
+        num_running = 0
+        for gid, mgr in enumerate(managers):
+            held = {
+                b.block_id
+                for blocks in mgr.req_to_blocks.values()
+                for b in blocks
+                if not b.is_null
+            }
+            num_running = max(num_running, len(mgr.req_to_blocks))
+            part = (
+                f"g{gid}:{type(mgr).__name__[:5]} held={len(held)}"
+                f" free_c={free_cached[gid]}"
+            )
+            if isinstance(mgr, MambaManager):
+                part += (
+                    f" aligned={free_aligned[gid]}"
+                    f" pinned={len(mgr._own_pin)}"
+                    f" drop_sup={getattr(mgr, 'num_superseded_states_dropped', 0)}"
+                    f" drop_own={mgr.num_own_checkpoints_dropped}"
+                    f" sup_cow={mgr.num_superseded_cow}"
+                    f" sup_cow_dropped={mgr.num_superseded_cow_dropped}"
+                )
+            elif isinstance(mgr, FullAttentionManager) and mgr.track_superseded_tail:
+                part += (
+                    f" sup_tail={mgr.num_superseded_tails}"
+                    f" sup_tail_resident={mgr.count_resident_superseded_tails()}"
+                    f" sup_tail_dropped={mgr.num_superseded_tails_dropped}"
+                )
+            parts.append(part)
+        num_free = pool.get_num_free_blocks()
+        logger.info(
+            "kv pool stats: blocks=%d free=%d free_uncached=%d reqs=%d | %s",
+            pool.num_gpu_blocks,
+            num_free,
+            num_free - sum(free_cached),
+            num_running,
+            " | ".join(parts),
+        )

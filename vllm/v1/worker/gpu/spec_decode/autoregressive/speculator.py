@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +14,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker import die_local_stats
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -29,6 +31,39 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
 logger = init_logger(__name__)
+
+# Draft glue riders. Both default off; copies only, so
+# every buffer they write holds the same bits as with the flags off.
+# VLLM_DRAFT_TAIL_FUSE=1: the draft prefill's four tail writes (draft_tokens[:, 0],
+#   the next pass's hidden states, positions, sample_src_positions) run as one
+#   kernel, as _update_draft_inputs_kernel does for the later draft passes,
+#   instead of four copies (memcpy nodes in the draft graphs).
+# VLLM_DRAFT_PRELUDE_FUSE=1: the copy of the target hidden states into the
+#   drafter's input buffer runs in the _prepare_prefill_inputs_kernel launch
+#   (one extra program per row) instead of as an eager memcpy, for steps of at
+#   most VLLM_DRAFT_PRELUDE_FUSE_MAX_ROWS (default 512) padded tokens.
+DRAFT_TAIL_FUSE = os.environ.get("VLLM_DRAFT_TAIL_FUSE", "0") == "1"
+DRAFT_PRELUDE_FUSE = os.environ.get("VLLM_DRAFT_PRELUDE_FUSE", "0") == "1"
+DRAFT_PRELUDE_FUSE_MAX_ROWS = int(
+    os.environ.get("VLLM_DRAFT_PRELUDE_FUSE_MAX_ROWS", "512")
+)
+_draft_glue_logged: set[str] = set()
+
+
+def _draft_glue_log_once(key: str, warn: bool, msg: str, *args: Any) -> None:
+    if key in _draft_glue_logged:
+        return
+    _draft_glue_logged.add(key)
+    (logger.warning if warn else logger.info)(msg, *args)
+
+
+def _shares_storage(
+    srcs: tuple[torch.Tensor | None, ...], dsts: tuple[torch.Tensor, ...]
+) -> bool:
+    dst_ptrs = {t.untyped_storage().data_ptr() for t in dsts}
+    return any(
+        t is not None and t.untyped_storage().data_ptr() in dst_ptrs for t in srcs
+    )
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
@@ -336,6 +371,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_rejected_out=one.num_rejected if one is not None else None,
         )
 
+        # VLLM_DRAFT_PRELUDE_FUSE: the hidden-state copy below, in this launch.
+        hidden_copy = (
+            _prelude_hidden_copy(self.hidden_states, hidden_states, num_tokens_padded)
+            if DRAFT_PRELUDE_FUSE and self.pcp_manager is None
+            else None
+        )
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
             self.last_token_indices,
@@ -347,6 +388,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_sampled,
             next_prefill_tokens,
             self.max_num_reqs,
+            hidden_copy=hidden_copy,
         )
 
         if self.pcp_manager is not None:
@@ -358,7 +400,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if prefill is not None:
                 num_tokens = prefill.num_tokens
                 num_tokens_padded = prefill.num_tokens_after_padding
-        self.hidden_states[:num_tokens_padded].copy_(hidden_states)
+        if hidden_copy is None:
+            self.hidden_states[:num_tokens_padded].copy_(hidden_states)
 
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
@@ -410,6 +453,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
             get_offloader().sync_prev_onload()
             graph.replay()
+            if die_local_stats.ON:
+                die_local_stats.replayed(graph)
             one.replays += 1
             if one.replays == 1:
                 logger.info("Draft one-graph: first replay (%d requests)", num_reqs)
@@ -634,7 +679,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         else:
             sample_hidden_states = last_hidden_states[last_token_indices]
             sampled_feedback = None
-        self.draft_tokens[:num_reqs, 0] = self.sample_draft(
+        sampled = self.sample_draft(
             sample_hidden_states,
             sample_src_positions,
             idx_mapping,
@@ -643,6 +688,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.current_draft_step,
             self.draft_logits,
         )
+        if DRAFT_TAIL_FUSE:
+            # The writes below as one kernel (same source rows).
+            if sampled_feedback is not None:
+                src, src_rows = sampled_feedback, None
+            elif last_hidden_states is hidden_states:
+                src, src_rows = sample_hidden_states, None
+            else:
+                src, src_rows = hidden_states, last_token_indices
+            if self._fused_prefill_tail(
+                num_reqs, sampled, src, src_rows, positions, sample_src_positions
+            ):
+                return
+        self.draft_tokens[:num_reqs, 0] = sampled
         if sampled_feedback is not None:
             self.hidden_states[:num_reqs] = sampled_feedback
         elif last_hidden_states is hidden_states:
@@ -651,6 +709,100 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
         self.sample_src_positions[:num_reqs] = sample_src_positions
+
+    def _fused_prefill_tail(
+        self,
+        num_reqs: int,
+        sampled: torch.Tensor,
+        src: torch.Tensor,
+        src_rows: torch.Tensor | None,
+        positions: torch.Tensor,
+        sample_src_positions: torch.Tensor,
+    ) -> bool:
+        """VLLM_DRAFT_TAIL_FUSE: _prefill's tail writes as _draft_tail_kernel.
+
+        draft_tokens[i, 0] = sampled[i], hidden_states[i] = src[src_rows[i]]
+        (src[i] without src_rows), positions[i] and sample_src_positions[i]
+        for i < num_reqs. Returns False, so the caller runs the stock copies,
+        unless every operand is one the kernel copies bit for bit (same dtypes,
+        exact shapes, unit inner strides, no source sharing a destination's
+        storage).
+        """
+        hidden = self.hidden_states
+        out_positions = self.input_buffers.positions
+        out_sample_src = self.sample_src_positions
+        vectors = (sampled, positions, sample_src_positions)
+        reason = None
+        if num_reqs < 1:
+            reason = "no requests"
+        elif any(
+            t.dim() != 1 or t.shape[0] != num_reqs or not t.is_contiguous()
+            for t in vectors
+        ):
+            reason = "token or position operand shape"
+        elif (
+            sampled.dtype != self.draft_tokens.dtype
+            or positions.dtype != out_positions.dtype
+            or sample_src_positions.dtype != out_sample_src.dtype
+        ):
+            reason = "token or position dtype"
+        elif (
+            src.dim() != 2
+            or src.shape[1] != hidden.shape[1]
+            or src.dtype != hidden.dtype
+            or src.stride(1) != 1
+            or (src_rows is None and src.shape[0] != num_reqs)
+        ):
+            reason = "hidden-state operand"
+        elif src_rows is not None and (
+            src_rows.dim() != 1
+            or src_rows.shape[0] != num_reqs
+            or not src_rows.is_contiguous()
+        ):
+            reason = "row indices"
+        elif _shares_storage(
+            (sampled, src, src_rows, positions, sample_src_positions),
+            (self.draft_tokens, hidden, out_positions, out_sample_src),
+        ):
+            reason = "a source shares a destination's storage"
+        if reason is not None:
+            _draft_glue_log_once(
+                "tail-off:" + reason,
+                True,
+                "VLLM_DRAFT_TAIL_FUSE: stock draft-prefill tail copies (%s)",
+                reason,
+            )
+            return False
+        hidden_size = hidden.shape[1]
+        _draft_tail_kernel[(num_reqs,)](
+            sampled,
+            self.draft_tokens,
+            self.draft_tokens.stride(0),
+            src,
+            src.stride(0),
+            src_rows if src_rows is not None else positions,
+            hidden,
+            hidden.stride(0),
+            hidden_size,
+            positions,
+            out_positions,
+            sample_src_positions,
+            out_sample_src,
+            BLOCK_SIZE=min(triton.next_power_of_2(hidden_size), 4096),
+            GATHER=src_rows is not None,
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
+        )
+        _draft_glue_log_once(
+            "tail-on",
+            False,
+            "Draft tail fuse on (VLLM_DRAFT_TAIL_FUSE=1): draft prefill tail as "
+            "_draft_tail_kernel (draft_tokens[:, 0], hidden states%s, positions, "
+            "sample_src_positions; bit-identical copies), first %d requests",
+            " gathered" if src_rows is not None else "",
+            num_reqs,
+        )
+        return True
 
     def _multi_step_decode(
         self,
@@ -928,6 +1080,115 @@ def _prepare_prefill_inputs_kernel(
             tl.store(last_token_indices_ptr + block, 0, mask=mask)
 
 
+@triton.jit(do_not_specialize=["num_rows"])
+def _prepare_prefill_inputs_hidden_kernel(
+    last_token_indices_ptr,
+    draft_current_step_ptr,
+    draft_input_ids_ptr,
+    draft_positions_ptr,
+    draft_query_start_loc_ptr,
+    draft_seq_lens_ptr,
+    target_input_ids_ptr,
+    target_positions_ptr,
+    idx_mapping_ptr,
+    last_sampled_ptr,
+    next_prefill_tokens_ptr,
+    num_sampled_ptr,
+    num_rejected_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    max_num_reqs,
+    hidden_src_ptr,
+    hidden_src_stride,
+    hidden_dst_ptr,
+    hidden_dst_stride,
+    hidden_size,
+    num_rows,
+    BLOCK_SIZE: tl.constexpr,
+    HIDDEN_BLOCK: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
+):
+    """VLLM_DRAFT_PRELUDE_FUSE: programs (r, 0) are _prepare_prefill_inputs_kernel
+    (grid axis 0 is still the request count); programs (r, c >= 1) copy row
+    (c - 1) * num_reqs + r of hidden_dst[:num_rows] = hidden_src.
+    """
+    copy_idx = tl.program_id(1)
+    if copy_idx == 0:
+        _prepare_prefill_inputs_kernel(
+            last_token_indices_ptr,
+            draft_current_step_ptr,
+            draft_input_ids_ptr,
+            draft_positions_ptr,
+            draft_query_start_loc_ptr,
+            draft_seq_lens_ptr,
+            target_input_ids_ptr,
+            target_positions_ptr,
+            idx_mapping_ptr,
+            last_sampled_ptr,
+            next_prefill_tokens_ptr,
+            num_sampled_ptr,
+            num_rejected_ptr,
+            query_start_loc_ptr,
+            seq_lens_ptr,
+            max_num_reqs,
+            BLOCK_SIZE=BLOCK_SIZE,
+            GLUE_PDL=GLUE_PDL,
+        )
+    else:
+        if GLUE_PDL:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
+        row = (copy_idx - 1) * tl.num_programs(0) + tl.program_id(0)
+        if row < num_rows:
+            src_row = hidden_src_ptr + row.to(tl.int64) * hidden_src_stride
+            dst_row = hidden_dst_ptr + row.to(tl.int64) * hidden_dst_stride
+            for i in range(0, hidden_size, HIDDEN_BLOCK):
+                block = i + tl.arange(0, HIDDEN_BLOCK)
+                mask = block < hidden_size
+                h = tl.load(src_row + block, mask=mask)
+                tl.store(dst_row + block, h, mask=mask)
+
+
+def _prelude_hidden_copy(
+    buffer: torch.Tensor, hidden_states: torch.Tensor, num_rows: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """VLLM_DRAFT_PRELUDE_FUSE: (src, dst) of buffer[:num_rows].copy_(hidden_states)
+    when the prepare launch can do it bit for bit (same shape and dtype, unit
+    inner strides, distinct storage) and num_rows is within
+    VLLM_DRAFT_PRELUDE_FUSE_MAX_ROWS; else None (the caller copies).
+    """
+    if not 0 < num_rows <= DRAFT_PRELUDE_FUSE_MAX_ROWS:
+        return None
+    dst = buffer[:num_rows]
+    reason = None
+    if hidden_states.shape != dst.shape:
+        reason = "shape"
+    elif hidden_states.dtype != dst.dtype:
+        reason = "dtype"
+    elif hidden_states.stride(-1) != 1 or dst.stride(-1) != 1:
+        reason = "inner stride"
+    elif _shares_storage((hidden_states,), (dst,)):
+        reason = "shared storage"
+    if reason is not None:
+        _draft_glue_log_once(
+            "prelude-off:" + reason,
+            True,
+            "VLLM_DRAFT_PRELUDE_FUSE: eager hidden-state copy (%s)",
+            reason,
+        )
+        return None
+    _draft_glue_log_once(
+        "prelude-on",
+        False,
+        "Draft prelude fuse on (VLLM_DRAFT_PRELUDE_FUSE=1): target hidden-state "
+        "copy in the _prepare_prefill_inputs_hidden_kernel launch (bit-identical; "
+        "steps of up to %d padded tokens), first %d rows",
+        DRAFT_PRELUDE_FUSE_MAX_ROWS,
+        num_rows,
+    )
+    return hidden_states, dst
+
+
 def prepare_prefill_inputs(
     # [num_reqs]
     last_token_indices: torch.Tensor,
@@ -943,8 +1204,44 @@ def prepare_prefill_inputs(
     # [max_num_reqs]
     next_prefill_tokens: torch.Tensor,
     max_num_reqs,
+    # VLLM_DRAFT_PRELUDE_FUSE: (src, dst) of a dst.copy_(src) done in this launch.
+    hidden_copy: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
+    if hidden_copy is not None:
+        src, dst = hidden_copy
+        num_rows, hidden_size = dst.shape
+        _prepare_prefill_inputs_hidden_kernel[
+            (num_reqs, 1 + triton.cdiv(num_rows, num_reqs))
+        ](
+            last_token_indices,
+            current_draft_step,
+            input_buffers.input_ids,
+            input_buffers.positions,
+            input_buffers.query_start_loc,
+            input_buffers.seq_lens,
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.idx_mapping,
+            last_sampled,
+            next_prefill_tokens,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            max_num_reqs,
+            src,
+            src.stride(0),
+            dst,
+            dst.stride(0),
+            hidden_size,
+            num_rows,
+            BLOCK_SIZE=1024,
+            HIDDEN_BLOCK=min(triton.next_power_of_2(hidden_size), 4096),
+            GLUE_PDL=glue_pdl(),
+            launch_pdl=glue_pdl(),
+        )
+        return last_token_indices
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         last_token_indices,
         current_draft_step,
@@ -1169,3 +1466,50 @@ def update_draft_inputs(
         GLUE_PDL=glue_pdl(),
         launch_pdl=glue_pdl(),
     )
+
+
+@triton.jit
+def _draft_tail_kernel(
+    sampled_ptr,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    src_hidden_ptr,
+    src_hidden_stride,
+    src_rows_ptr,
+    hidden_states_ptr,
+    hidden_states_stride,
+    hidden_size,
+    positions_ptr,
+    out_positions_ptr,
+    sample_src_positions_ptr,
+    out_sample_src_positions_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    GATHER: tl.constexpr,
+    GLUE_PDL: tl.constexpr = False,
+):
+    """VLLM_DRAFT_TAIL_FUSE: the draft prefill's tail writes for one request."""
+    if GLUE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    req_idx = tl.program_id(0)
+
+    draft_token = tl.load(sampled_ptr + req_idx)
+    tl.store(draft_tokens_ptr + req_idx * draft_tokens_stride, draft_token)
+
+    if GATHER:
+        row = tl.load(src_rows_ptr + req_idx).to(tl.int64)
+    else:
+        row = req_idx.to(tl.int64)
+    dst_row = req_idx.to(tl.int64)
+    for i in range(0, hidden_size, BLOCK_SIZE):
+        block = i + tl.arange(0, BLOCK_SIZE)
+        mask = block < hidden_size
+        h = tl.load(src_hidden_ptr + row * src_hidden_stride + block, mask=mask)
+        tl.store(
+            hidden_states_ptr + dst_row * hidden_states_stride + block, h, mask=mask
+        )
+
+    position = tl.load(positions_ptr + req_idx)
+    tl.store(out_positions_ptr + req_idx, position)
+    sample_position = tl.load(sample_src_positions_ptr + req_idx)
+    tl.store(out_sample_src_positions_ptr + req_idx, sample_position)

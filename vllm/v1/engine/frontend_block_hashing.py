@@ -113,6 +113,16 @@ def _int32_array(toks):
     return arr
 
 
+def peek_int32_array(toks):
+    """The array _int32_array cached for this very list on this thread, or
+    None (VLLM_PACKED_PROMPT_IDS reuses it; nothing is built or cached here).
+    """
+    c = getattr(_last_arr, "v", None)
+    if c is not None and c[0] is toks and c[1] == len(toks):
+        return c[2]
+    return None
+
+
 def prompt_id_min_max(toks) -> tuple[int, int]:
     """(min, max) of the prompt token ids. With VLLM_FEH_MEMO=1 one exact int32
     conversion (reused by the memo) + numpy min/max replaces two Python-level
@@ -142,6 +152,12 @@ _memo_next = [0]
 _MAGIC = b"FEH1"
 _HDR = 8  # header: _MAGIC + uint32 block size
 _HASH_BYTES = 32
+# VLLM_FEH_UNPACK_FAST: EngineCore splits a shipped blob into its hashes with one
+# numpy call (the same list of the same bytes objects; see
+# _unpack_block_hashes_fast). Read once at import.
+FEH_UNPACK_FAST = os.environ.get("VLLM_FEH_UNPACK_FAST", "0") == "1"
+_HASH_VOID = f"V{_HASH_BYTES}"
+_UNPACK_FAST_LOGGED = False
 
 STATS = {
     "fe_hashed": 0,
@@ -360,13 +376,18 @@ def attach_prompt_block_hashes(
 def native_frontend_config(
     cache_config: "CacheConfig", hash_block_size: int
 ) -> dict[str, str | int] | None:
+    """Hash metadata the native (vllm-rs) front end needs to hash prompts for
+    this engine (VLLM_NATIVE_FEH=1), or None to keep hashing in EngineCore.
+    The native hasher accepts any block size of at least 4 tokens that divides
+    its 1024-token memo checkpoint (32 by default; 8 at prefix-match-unit 8)
+    and refuses others, in which case EngineCore hashes as before.
+    """
     if (
         not FEH_ENABLED
         or not cache_config.enable_prefix_caching
         or cache_config.prefix_caching_hash_algo != "sha256"
         or SHA256_PICKLE_PROTOCOL != 5
         or hash_block_size != FEH_BLOCK
-        or hash_block_size != 32
     ):
         return None
     from vllm.v1.core import kv_cache_utils as kvu
@@ -401,6 +422,8 @@ def shipped_hashes_usable(
 
 
 def unpack_block_hashes(blob: bytes) -> list["BlockHash"]:
+    if FEH_UNPACK_FAST:
+        return _unpack_block_hashes_fast(blob)
     if FEH_MEMO:
         # lowc2: slice the bytes directly (one object per hash instead of a
         # memoryview slice + a copy); same values, ~2x faster for ~3.5K hashes.
@@ -412,6 +435,29 @@ def unpack_block_hashes(blob: bytes) -> list["BlockHash"]:
     return cast(
         "list[BlockHash]",
         [bytes(mv[i : i + _HASH_BYTES]) for i in range(_HDR, len(blob), _HASH_BYTES)],
+    )
+
+
+def _unpack_block_hashes_fast(blob: bytes) -> list["BlockHash"]:
+    """VLLM_FEH_UNPACK_FAST: the same list of the same 32-byte bytes objects,
+    split in one C-level call (numpy void items convert to bytes, trailing zero
+    bytes included) instead of a Python loop with a slice object per hash.
+    """
+    import numpy as np
+
+    global _UNPACK_FAST_LOGGED
+    if not _UNPACK_FAST_LOGGED:
+        _UNPACK_FAST_LOGGED = True
+        logger.info(
+            "FEH EngineCore unpacks shipped block hashes in one C-level split "
+            "(VLLM_FEH_UNPACK_FAST=1; first: %d hashes)",
+            (len(blob) - _HDR) // _HASH_BYTES,
+        )
+    if len(blob) <= _HDR:
+        return []
+    return cast(
+        "list[BlockHash]",
+        np.frombuffer(blob, dtype=_HASH_VOID, offset=_HDR).tolist(),
     )
 
 

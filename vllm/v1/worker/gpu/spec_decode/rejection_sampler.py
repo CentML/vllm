@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sparse_verify import sparse_rejection_sample
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.spec_decode import draft_parity
 from vllm.v1.worker.gpu.spec_decode.fused_rejection import fused_rejection_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
@@ -115,6 +116,9 @@ def _gather_draft_and_pos(
 
 
 class RejectionSampler:
+    # VLLM_H53_DRAFT_PARITY state, set by draft_parity.bind.
+    h53: draft_parity.ParityState | None = None
+
     def __init__(
         self,
         sampler: Sampler,
@@ -316,6 +320,20 @@ class RejectionSampler:
                 input_batch.expanded_local_pos[lo:hi],
                 **fused_kwargs,
             )
+            if draft_parity.DIAG and draft_logits is not None and start == 0:
+                draft_parity.diag_observe(
+                    self.sampler,
+                    processed_logits,
+                    draft_logits,
+                    draft_sampled[lo:hi],
+                    pos[lo:hi],
+                    chunk_cu_num_logits_np,
+                    input_batch.idx_mapping[start:end],
+                    input_batch.idx_mapping_np[start:end],
+                    input_batch.expanded_idx_mapping[lo:hi],
+                    input_batch.expanded_local_pos[lo:hi],
+                    num_sampled,
+                )
             chunk_logprobs = self._get_logprobs_tensors(
                 sampled,
                 num_sampled,
@@ -402,6 +420,55 @@ class RejectionSampler:
             return None
         return self.sampler.fused_spec_sampling_params(input_batch.idx_mapping_np)
 
+    def _parity_verify(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        fused: tuple[int, bool, bool],
+        num_nans: torch.Tensor | None,
+    ) -> SamplerOutput:
+        assert self.h53 is not None
+        max_top_k, use_top_p, use_penalties = fused
+        states = self.sampler.sampling_states
+        penalties = self.sampler.penalties_state
+        sampled, num_sampled, num_rejected = draft_parity.rejection_sample(
+            self.h53,
+            logits,
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            input_batch.seq_lens,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+            states.temperature.gpu,
+            states.seeds.gpu,
+            states.top_k.gpu,
+            states.top_p.gpu,
+            (
+                penalties.repetition_penalty.gpu,
+                penalties.frequency_penalty.gpu,
+                penalties.presence_penalty.gpu,
+                penalties.prompt_bin_mask,
+                penalties.output_bin_counts,
+            )
+            if use_penalties
+            else None,
+            max_top_k,
+            use_top_p,
+            self.num_speculative_steps,
+            use_fp64=self.sampler.use_fp64_gumbel,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -457,6 +524,19 @@ class RejectionSampler:
                 num_nans=num_nans,
                 num_sampled=fused_num_sampled,
                 num_rejected=fused_num_rejected,
+            )
+
+        if self.h53 is not None and draft_logits is not None:
+            # VLLM_H53_DRAFT_PARITY: the drafts came from the sparse q cached
+            # in self.h53. Verify against it where the fused path applies;
+            # otherwise hand the same q to the unfused path in draft_logits.
+            fused = self._fused_spec_params(input_batch, None, max_num_logprobs)
+            if fused is not None:
+                return self._parity_verify(logits, input_batch, fused, num_nans)
+            draft_parity.densify(
+                self.h53,
+                input_batch.expanded_idx_mapping[: logits.shape[0]],
+                input_batch.expanded_local_pos[: logits.shape[0]],
             )
 
         draft_sampled, pos = _gather_draft_and_pos(

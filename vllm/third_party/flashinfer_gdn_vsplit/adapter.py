@@ -14,6 +14,7 @@ Compiles with plain cute.compile (no on-disk cache), so it works with the instal
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -51,6 +52,97 @@ _fast_ws: dict = {}
 # compile key and of the GDN_HOST_TRIM fast-path key.
 _CG0_SPLIT = envs.VLLM_GDN_VSPLIT_CG0SPLIT
 _C1_REORDER = envs.VLLM_GDN_VSPLIT_C1REORDER
+
+
+# VLLM_GDN_VSPLIT_SCHED=1 (default off; read here because vllm/envs.py cannot
+# be overlaid): every in-place pool launch (initial and final state through
+# state_indices) runs the kernel with sched=True: one CTA per tile, dispatched
+# sequence-major over a sequence map (the caller's ``seq_map``, else the
+# identity), with the scheduling hooks of FlashInfer #6507. Bit-identical output and
+# state; the map may leave out sequences whose results the caller discards
+# (the throwaway checkpoint tails) and orders the rest longest first.
+_SCHED = os.environ.get("VLLM_GDN_VSPLIT_SCHED", "0") == "1"
+_sched_compiled: dict = {}
+# raw stream handle -> (int8 workspace, CUstream); one TMA-descriptor set per
+# CTA, so it grows with the grid (reallocated on the same stream).
+_sched_ws: dict = {}
+_sched_iota: dict = {}  # device index -> int32 arange (identity map)
+
+
+def sched_enabled() -> bool:
+    """Whether VLLM_GDN_VSPLIT_SCHED routes pool launches to the sched kernel."""
+    return _SCHED
+
+
+def _identity_map(device: torch.device, n: int) -> torch.Tensor:
+    t = _sched_iota.get(device.index)
+    if t is None or t.numel() < n:
+        t = torch.arange(max(n, 1024), dtype=torch.int32, device=device)
+        _sched_iota[device.index] = t
+    return t[:n]
+
+
+def _launch_sched(q, k, v, gate, beta, output, cu_seqlens, initial_state,
+                  output_state, scale, state_indices, v_split, seq_map):
+    """VLLM_GDN_VSPLIT_SCHED launch: same contract as the pool path of
+    chunk_gated_delta_rule_vsplit; ``seq_map`` (int32 indices into the
+    cu_seqlens sequences) selects and orders the sequences to run."""
+    HQ, HV, DK = q.size(1), v.size(1), q.size(2)
+    dev = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    if seq_map is None:
+        seq_map = _identity_map(q.device, cu_seqlens.size(0) - 1)
+    use_init = True
+    key = (dev, q.dtype, initial_state.dtype, HQ, HV, state_indices.dtype,
+           initial_state.stride()[1:], output_state.stride()[1:], int(v_split),
+           _cg0_split(v_split, use_init), _c1_reorder(use_init))
+    handle = torch._C._cuda_getCurrentRawStream(dev)
+    HO = HQ if HQ >= HV else HV
+    need = (seq_map.size(0) * HO * int(v_split)
+            * GatedDeltaNetChunkedKernel.bytes_per_tensormap
+            * GatedDeltaNetChunkedKernel.num_tensormaps)
+    ws_stream = _sched_ws.get(handle)
+    if ws_stream is None or ws_stream[0].numel() < need:
+        ws_stream = (torch.empty(max(need, 1 << 20), dtype=torch.int8, device=q.device),
+                     cuda.CUstream(handle))
+        _sched_ws[handle] = ws_stream
+    compiled = _sched_compiled.get(key)
+    if compiled is None:
+        num_sm = _num_sm(dev)
+        dv = 128 // v_split
+        logger.info("gdn_vsplit: compiling V-split sched kernel (one CTA per tile, "
+                    "sequence map, FlashInfer #6507 hooks), key=%s", key)
+        gdn = GatedDeltaNetChunkedKernel(
+            io_dtype=_io(q.dtype), inverse_dtype=_io(q.dtype), acc_dtype=cutlass.Float32,
+            state_dtype=_st(initial_state.dtype),
+            mma_tiler_qk=(64, 64, 128), mma_tiler_qs=(dv, 64, 128), mma_tiler_qkv=(dv, 64, 64),
+            mma_tiler_kv=(dv, 128, 64), max_active_clusters=num_sm, num_sm=num_sm,
+            is_GQA=HQ >= HV, use_initial_state=True, store_final_state=True,
+            enable_checkpoints=False, is_persistent=False, v_split=v_split,
+            cg0_split=_cg0_split(v_split, use_init), c1_reorder=_c1_reorder(use_init),
+            sched=True)
+
+        def dyn(t, nd):
+            x = from_dlpack(t, assumed_align=16)
+            x.mark_compact_shape_dynamic(mode=0, stride_order=tuple(range(nd)), divisibility=1)
+            return x
+        qc, kc, vc = dyn(q, 3), dyn(k, 3), dyn(v, 3)
+        gc, bc, oc = dyn(gate, 2), dyn(beta, 2), dyn(output, 3)
+        cuc = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
+        sic = from_dlpack(initial_state, assumed_align=16)
+        _mark_state(sic, True, DK)
+        soc = from_dlpack(output_state, assumed_align=16)
+        _mark_state(soc, True, DK)
+        sidx = from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+        mapc = from_dlpack(seq_map, assumed_align=4).mark_layout_dynamic()
+        # Dynamic size: the workspace grows with the grid (one descriptor set per CTA).
+        wsc = from_dlpack(ws_stream[0], assumed_align=16).mark_layout_dynamic()
+        compiled = cute.compile(
+            gdn, qc, kc, vc, gc, bc, oc, cuc, sic, soc, sidx, None, mapc, 0, scale, wsc,
+            ws_stream[1], options="--enable-tvm-ffi --opt-level 3")
+        _sched_compiled[key] = compiled
+    # cu_checkpoints carries the sequence map (the checkpoint feature is off).
+    compiled(q, k, v, gate, beta, output, cu_seqlens, initial_state, output_state,
+             state_indices, None, seq_map, 0, scale, ws_stream[0], ws_stream[1])
 
 
 def _cg0_split(v_split: int, use_init: bool) -> bool:
@@ -95,13 +187,21 @@ def chunk_gated_delta_rule_vsplit(
     state_indices: Optional[torch.Tensor] = None,
     v_split: int = 2,
     workspace: Optional[torch.Tensor] = None,
+    seq_map: Optional[torch.Tensor] = None,
 ) -> None:
     """Same contract as flashinfer chunk_gated_delta_rule_sm100 (no checkpoints).
     q/k: [T, HQ, 128] bf16, v/output: [T, HV, 128], gate (=exp(g)) / beta: [T, HV] fp32,
     cu_seqlens int32 [B+1], states [N, HV, 128(V), 128(K)] fp32 or bf16 (pool if state_indices).
     ``workspace``: caller-owned int8 scratch of at least ``get_workspace_size`` bytes (the
     persistent kernel's size depends only on the SM count), used instead of one allocated
-    here; CUDA-graph captures pass one allocated outside the capture."""
+    here; CUDA-graph captures pass one allocated outside the capture.
+    ``seq_map`` (VLLM_GDN_VSPLIT_SCHED only): int32 indices of the sequences to
+    run, in dispatch order; None runs all of them."""
+    if (_SCHED and workspace is None and state_indices is not None
+            and initial_state is not None and output_state is not None):
+        _launch_sched(q, k, v, gate, beta, output, cu_seqlens, initial_state,
+                      output_state, scale, state_indices, v_split, seq_map)
+        return
     HQ, HV, DK = q.size(1), v.size(1), q.size(2)
     assert DK == 128 and v.size(2) == 128
     assert cu_seqlens.dtype == torch.int32

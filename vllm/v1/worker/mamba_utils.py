@@ -38,6 +38,7 @@ _TEMPORAL_TILES = 16
 # Opt-in: plan the align/postprocess state copies in one program and copy from
 # a compact work list (see _plan_mamba_copies_kernel). Default off.
 MAMBA_COPY_COMPACT = os.environ.get("VLLM_MAMBA_COPY_COMPACT", "0") == "1"
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_ring  # noqa: E402
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -761,15 +762,22 @@ def _compact_mamba_copy_kernel(
     state_group_indices_ptr,
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
+    skip_ptr,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
     SLOTS: tl.constexpr,
+    HAS_SKIP: tl.constexpr = False,
 ):
     """Grid (num_states, TEMPORAL_TILES, SLOTS): slot s copies work entries
     s, s + SLOTS, ... of the list written by ``_plan_mamba_copies_kernel``.
+    HAS_SKIP: states with skip[state] != 0 are left to the caller
+    (VLLM_GDN_MTP_RING: the GDN SSM states, see gdn_mtp_ring.ring_copy_work).
     """
     state_idx = tl.program_id(0)
+    if HAS_SKIP:
+        if tl.load(skip_ptr + state_idx) != 0:
+            return
     tile_idx = tl.program_id(1)
     count = tl.load(count_ptr)
     for w in range(tl.program_id(2), count, SLOTS):
@@ -994,6 +1002,9 @@ class MambaSpecDecodeGPUContext:
     # its length for _plan_mamba_copies_kernel / _compact_mamba_copy_kernel.
     compact_work: torch.Tensor | None = None
     compact_count: torch.Tensor | None = None
+    # VLLM_GDN_MTP_RING: [num_states] int32, 1 for the GDN SSM states whose
+    # align copies gdn_mtp_ring.ring_copy_work does instead.
+    ring_skip: torch.Tensor | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1008,6 +1019,8 @@ class MambaSpecDecodeGPUContext:
         make_buffer: Callable[..., CpuGpuBuffer],
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
+        if gdn_mtp_ring.GDN_MTP_RING and not MAMBA_COPY_COMPACT:
+            raise ValueError("VLLM_GDN_MTP_RING=1 requires VLLM_MAMBA_COPY_COMPACT=1")
         mamba_groups = get_mamba_groups(kv_cache_config)
         mamba_group_ids = get_mamba_group_ids(mamba_groups)
         mamba_spec = next(iter(mamba_groups))
@@ -1156,6 +1169,8 @@ class MambaSpecDecodeGPUContext:
         block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
+        ring_idx: list[int] = []
+        ring_entries: list = []
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             kv_cache_group = kv_cache_config.kv_cache_groups[mamba_group_id]
             layer_names = kv_cache_group.layer_names
@@ -1246,6 +1261,12 @@ class MambaSpecDecodeGPUContext:
                             )
 
                     self.state_group_indices[idx] = group_local_idx
+                    if (
+                        copy_func is get_temporal_copy_spec
+                        and getattr(attention, "_ring", None) is not None
+                    ):
+                        ring_idx.append(idx)
+                        ring_entries.append((attention, group_local_idx))
                     idx += 1
 
         assert idx == self.num_states
@@ -1264,6 +1285,14 @@ class MambaSpecDecodeGPUContext:
         self.block_table_stride_req = int(next(iter(strides)))
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+
+        if ring_entries:
+            skip = torch.zeros(self.num_states, dtype=torch.int32)
+            skip[ring_idx] = 1
+            self.ring_skip = skip.to(self.block_table_ptrs.device)
+            gdn_mtp_ring.ring_bind_copy_context(
+                ring_entries, self.block_table_ptrs, self.block_table_stride_req
+            )
 
         self.is_initialized = True
 
@@ -1360,11 +1389,17 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.state_conv_widths if self.ring_skip is None else self.ring_skip,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
             SLOTS=_COMPACT_SLOTS,
+            HAS_SKIP=self.ring_skip is not None,
         )
+        if self.ring_skip is not None:
+            gdn_mtp_ring.ring_copy_work(
+                self.compact_work, self.compact_count, num_reqs, idx_mapping, is_precopy
+            )
 
     def run_fused_postprocess(
         self,

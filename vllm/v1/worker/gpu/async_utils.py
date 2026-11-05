@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -165,7 +166,20 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        # VLLM_INGEST_GATE: the gate exists only where EngineCoreProc made it
+        # (vllm/v1/engine/ingest_gate.py); no import from the worker side.
+        gate_mod = sys.modules.get("vllm.v1.engine.ingest_gate")
+        gate = None if gate_mod is None else gate_mod.GATE
+        if gate is not None and not self.copy_event.query():
+            # VLLM_INGEST_GATE: the EngineCore input thread ingests new requests
+            # while this thread waits without the GIL (ingest_gate.py).
+            gate.open("wait")
+            try:
+                self.copy_event.synchronize()
+            finally:
+                gate.close()
+        else:
+            self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.

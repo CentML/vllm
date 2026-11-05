@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use crate::protocol::handshake::{EngineCoreReadyResponse, FrontendHashConfig};
 use crate::protocol::request::EngineCoreRequest;
 
-const BLOCK_SIZE: usize = 32;
+// Engine hash block sizes the native frontend accepts: at least 4 tokens (CPython pickles shorter tuples with
+// TUPLE1-3 opcodes, which hash_block does not emit) and dividing the memo checkpoint, so memo reuse stays
+// block-aligned. The engine's hash block size is its prefix-match unit (32 by default; 8 with prefix-match-unit 8).
+const MIN_BLOCK_SIZE: usize = 4;
 const MEMO_CHECKPOINT: usize = 1024;
 const MAX_ENTRIES: usize = 512;
 const MAX_CACHED_TOKENS: usize = 16 * 1024 * 1024;
@@ -96,6 +99,7 @@ fn memo_keys(tokens: &[u32], salt: Option<&str>) -> Vec<MemoKey> {
 }
 
 pub(crate) struct FrontendHasher {
+    block_size: usize,
     none_hash: Hash,
     memo: Mutex<Memo>,
     hashed: AtomicU64,
@@ -122,9 +126,9 @@ impl FrontendHasher {
             configs.iter().all(|other| *other == config).then_some(())?;
             Self::new(config)
         });
-        if hasher.is_some() {
+        if let Some(hasher) = &hasher {
             tracing::info!(
-                block_size = BLOCK_SIZE,
+                block_size = hasher.block_size,
                 "native FEH enabled: sha256-pickle5-feh1"
             );
         } else {
@@ -134,11 +138,16 @@ impl FrontendHasher {
     }
 
     fn new(config: &FrontendHashConfig) -> Option<Self> {
-        if config.algorithm != "sha256-pickle5-feh1" || config.block_size != BLOCK_SIZE as u32 {
+        let block_size = config.block_size as usize;
+        if config.algorithm != "sha256-pickle5-feh1"
+            || block_size < MIN_BLOCK_SIZE
+            || !MEMO_CHECKPOINT.is_multiple_of(block_size)
+        {
             return None;
         }
         let none_hash = hex::decode(&config.none_hash).ok()?.try_into().ok()?;
         Some(Self {
+            block_size,
             none_hash,
             memo: Mutex::default(),
             hashed: AtomicU64::new(0),
@@ -163,26 +172,27 @@ impl FrontendHasher {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let tokens = &tokens[..tokens.len() / BLOCK_SIZE * BLOCK_SIZE];
+        let block_size = self.block_size;
+        let tokens = &tokens[..tokens.len() / block_size * block_size];
         let keys = memo_keys(tokens, request.cache_salt.as_deref());
         let cached = self.memo.lock().find(&keys);
         let cached = cached
             .filter(|(length, entry)| entry.tokens.get(..*length) == Some(&tokens[..*length]));
-        let reused = cached.as_ref().map_or(0, |(length, _)| length / BLOCK_SIZE);
-        let mut hashes = Vec::with_capacity(tokens.len() / BLOCK_SIZE);
+        let reused = cached.as_ref().map_or(0, |(length, _)| length / block_size);
+        let mut hashes = Vec::with_capacity(tokens.len() / block_size);
         if let Some((_, entry)) = &cached {
             hashes.extend_from_slice(&entry.hashes[..reused]);
         }
         let mut parent = hashes.last().copied().unwrap_or(self.none_hash);
         let mut pickle = Vec::with_capacity(256);
-        for (index, block) in tokens.chunks_exact(BLOCK_SIZE).enumerate().skip(reused) {
+        for (index, block) in tokens.chunks_exact(block_size).enumerate().skip(reused) {
             let salt = (index == 0).then_some(request.cache_salt.as_deref()).flatten();
             parent = hash_block(&mut pickle, &parent, block, salt);
             hashes.push(parent);
         }
         let mut blob = Vec::with_capacity(8 + hashes.len() * 32);
         blob.extend_from_slice(b"FEH1");
-        blob.extend_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+        blob.extend_from_slice(&(block_size as u32).to_le_bytes());
         for hash in &hashes {
             blob.extend_from_slice(hash);
         }
@@ -212,7 +222,7 @@ impl FrontendHasher {
     }
 }
 
-// CPython pickle protocol 5 for (bytes[32], tuple[u32; 32], optional tuple[str]).
+// CPython pickle protocol 5 for (bytes[32], tuple[u32; block_size >= 4], optional tuple[str]).
 fn hash_block(buffer: &mut Vec<u8>, parent: &Hash, tokens: &[u32], salt: Option<&str>) -> Hash {
     buffer.clear();
     buffer.extend_from_slice(b"\x80\x05\x95\0\0\0\0\0\0\0\0C ");
@@ -258,13 +268,18 @@ mod tests {
 
     const NONE_HASH: &str = "066b1e8987e027138e98701c46128929378935f9b6cd1549105ae6b4f0d71198";
 
-    fn hasher(seed: &str) -> FrontendHasher {
+    const BLOCK: usize = 32;
+
+    fn hasher_with_block(seed: &str, block_size: u32) -> Option<FrontendHasher> {
         FrontendHasher::new(&FrontendHashConfig {
             algorithm: "sha256-pickle5-feh1".into(),
-            block_size: 32,
+            block_size,
             none_hash: seed.into(),
         })
-        .unwrap()
+    }
+
+    fn hasher(seed: &str) -> FrontendHasher {
+        hasher_with_block(seed, BLOCK as u32).unwrap()
     }
 
     fn tokens() -> Vec<u32> {
@@ -332,7 +347,7 @@ mod tests {
         let mut cold = request.clone();
         hasher(NONE_HASH).attach(&mut cold);
         assert_eq!(request.prompt_block_hashes, cold.prompt_block_hashes);
-        let reused = (MEMO_CHECKPOINT * 3 / BLOCK_SIZE) as u64;
+        let reused = (MEMO_CHECKPOINT * 3 / BLOCK) as u64;
         assert_eq!(memoized.reused.load(Ordering::Relaxed), reused);
 
         request.prompt_token_ids.as_mut().unwrap()[MEMO_CHECKPOINT * 2] = 44;
@@ -340,7 +355,7 @@ mod tests {
         cold = request.clone();
         hasher(NONE_HASH).attach(&mut cold);
         assert_eq!(request.prompt_block_hashes, cold.prompt_block_hashes);
-        let reused = reused + (MEMO_CHECKPOINT * 2 / BLOCK_SIZE) as u64;
+        let reused = reused + (MEMO_CHECKPOINT * 2 / BLOCK) as u64;
         assert_eq!(memoized.reused.load(Ordering::Relaxed), reused);
 
         let unsalted = request.prompt_block_hashes.clone();
@@ -377,7 +392,7 @@ mod tests {
         assert_eq!(request.prompt_block_hashes, cold.prompt_block_hashes);
         assert_eq!(
             memoized.reused.load(Ordering::Relaxed) - reused,
-            (MEMO_CHECKPOINT / BLOCK_SIZE) as u64,
+            (MEMO_CHECKPOINT / BLOCK) as u64,
         );
     }
 
@@ -442,6 +457,52 @@ mod tests {
     }
 
     #[test]
+    fn block_size_8_matches_cpython_pickle5_and_memo_reuse() {
+        // Expected values: hashlib.sha256(pickle.dumps((parent, tuple(block), extra), protocol=5)), the engine's
+        // hash_block_tokens chain at prefix-match-unit 8.
+        let hasher = hasher_with_block(NONE_HASH, 8).unwrap();
+        let mut request = EngineCoreRequest {
+            prompt_token_ids: Some(tokens()[..21].to_vec()),
+            ..EngineCoreRequest::default()
+        };
+        hasher.attach(&mut request);
+        assert_eq!(
+            hex::encode(request.prompt_block_hashes.as_ref().unwrap()),
+            concat!(
+                "4645483108000000",
+                "d3c5c0353aa2f6b5c26e455f78af6431170fcbd87a667493ffa1cb84b1df2861",
+                "e2b8a033bec3e2e8b34c69dd5c2fa8e4f22ea77dd6576af528b9651b874c5f75",
+            )
+        );
+        request.prompt_token_ids = Some(tokens()[..16].to_vec());
+        request.cache_salt = Some("salt".into());
+        hasher.attach(&mut request);
+        assert_eq!(
+            hex::encode(&request.prompt_block_hashes.as_ref().unwrap()[8..]),
+            concat!(
+                "42f20483aeadbb9fa3f80adf5656a38d9df7ffa5a80ca2420d125f8558971f3f",
+                "9627c8068253af5309f2c21abd3d3cd0d113aa906b7925103d3d140f48f054c1",
+            )
+        );
+
+        let memoized = hasher_with_block(NONE_HASH, 8).unwrap();
+        let mut request = EngineCoreRequest {
+            prompt_token_ids: Some(vec![11; MEMO_CHECKPOINT * 2]),
+            ..EngineCoreRequest::default()
+        };
+        memoized.attach(&mut request);
+        request.prompt_token_ids.as_mut().unwrap().extend([33; 13]);
+        memoized.attach(&mut request);
+        let mut cold = request.clone();
+        hasher_with_block(NONE_HASH, 8).unwrap().attach(&mut cold);
+        assert_eq!(request.prompt_block_hashes, cold.prompt_block_hashes);
+        assert_eq!(
+            memoized.reused.load(Ordering::Relaxed),
+            (MEMO_CHECKPOINT * 2 / 8) as u64
+        );
+    }
+
+    #[test]
     fn unsupported_inputs_and_config_fall_back_to_engine_hashing() {
         let hasher = hasher(NONE_HASH);
         let mut request = EngineCoreRequest {
@@ -463,5 +524,12 @@ mod tests {
             })
             .is_none()
         );
+        // Tuples shorter than 4 pickle with other opcodes; sizes must divide the memo checkpoint.
+        for block_size in [0, 2, 3, 24] {
+            assert!(
+                hasher_with_block(NONE_HASH, block_size).is_none(),
+                "{block_size}"
+            );
+        }
     }
 }

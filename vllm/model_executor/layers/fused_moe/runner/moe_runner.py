@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -29,7 +30,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
-from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
+from vllm.model_executor.layers.fused_moe.moe_output import (
+    SplitUnfinalizedMoEOutput,
+    UnfinalizedMoEOutput,
+)
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPMonolithic,
 )
@@ -48,6 +52,7 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
+    h155_layer_token_sets,
 )
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.fusion.shared_expert_gate import (
@@ -278,7 +283,7 @@ def _moe_forward_shared_ext_fake(
 
 
 # Variant of moe_forward_shared for shared experts that can hand work to the
-# ops around the MoE (MLPerf submission path; specialized for
+# ops around the MoE (opt-in; specialized for
 # Qwen3.6-35B-A3B). It optionally takes the MoE input pre-quantized to MXFP8
 # (e4m3 plus swizzled scales for the shared expert and linear scales for the
 # routed experts) and, with shared_gate_dim > 0, returns the shared-expert
@@ -392,6 +397,130 @@ direct_register_custom_op(
 )
 
 
+def _moe_forward_shared_ext_unfinalized2(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    act_q: torch.Tensor | None,
+    act_scale_swizzled: torch.Tensor | None,
+    act_scale_linear: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    shared_gate_dim: int,
+    top_k: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    layer._enable_deferred_finalize()
+    quantized_input = (
+        None if act_q is None else (act_q, act_scale_swizzled, act_scale_linear)
+    )
+    shared, gate, routed = cast(
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | SplitUnfinalizedMoEOutput],
+        layer._forward_impl(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            quantized_input=quantized_input,
+        ),
+    )
+    num_tokens = hidden_states.shape[0]
+    if not isinstance(routed, SplitUnfinalizedMoEOutput):
+        # Only the 0-token call runs whole-GPU and keeps the finalized form.
+        assert num_tokens == 0, "the routed experts did not run once per die"
+        rows = routed.new_empty((0, routed.shape[-1]))
+        idx = routed.new_empty((0, top_k), dtype=torch.int32)
+        return (
+            shared,
+            gate,
+            rows,
+            routed.new_empty((0, top_k)),
+            idx,
+            rows.clone(),
+            idx.clone(),
+        )
+    rows = num_tokens * top_k
+    permuted, permuted1 = routed.gemm2_permuted, routed.gemm2_permuted1
+    # As the one-buffer op: each die's buffer has at least tokens * top_k rows
+    # (any route may land on either die); rows are reached via the maps.
+    assert permuted.shape[0] >= rows and permuted.is_contiguous()
+    assert permuted1.shape[0] >= rows and permuted1.is_contiguous()
+    return (
+        shared,
+        gate,
+        permuted[:rows],
+        routed.expert_weights,
+        routed.expanded_idx_to_permuted_idx,
+        permuted1[:rows],
+        routed.expanded_idx_to_permuted_idx1,
+    )
+
+
+def _moe_forward_shared_ext_unfinalized2_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    act_q: torch.Tensor | None,
+    act_scale_swizzled: torch.Tensor | None,
+    act_scale_linear: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    shared_gate_dim: int,
+    top_k: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    shared_out, gate, permuted, weights, idx = (
+        _moe_forward_shared_ext_unfinalized_fake(
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            act_q,
+            act_scale_swizzled,
+            act_scale_linear,
+            layer_name,
+            shared_gate_dim,
+            top_k,
+        )
+    )
+    return (
+        shared_out,
+        gate,
+        permuted,
+        weights,
+        idx,
+        torch.empty_like(permuted),
+        torch.empty_like(idx),
+    )
+
+
+# moe_forward_shared_ext_unfinalized of a layer whose routed experts run once
+# per die (VLLM_MOE_DIE_SPLIT=1, moe_die_split): die 0's GEMM2 rows, the routing
+# weights and die 0's permute map, then die 1's rows and map, for
+# vllm::moe_finalize2 -- which the compiled graph folds into the next norm.
+direct_register_custom_op(
+    op_name="moe_forward_shared_ext_unfinalized2",
+    op_func=_moe_forward_shared_ext_unfinalized2,
+    fake_impl=_moe_forward_shared_ext_unfinalized2_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor
     | UnfinalizedMoEOutput
@@ -490,6 +619,43 @@ class MoERunner(MoERunnerInterface):
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
 
+        # VLLM_H82_ROUTER_PDL=1 (opt-in): wherever the gate's
+        # low-M plan is TinyGEMM2, the router is launched with PDL (same kernel
+        # and arithmetic), so its weight loads overlap the norm that produced
+        # its input; elsewhere the gate runs as before.
+        self._h82_router_pdl = False
+        if (
+            os.environ.get("VLLM_H82_ROUTER_PDL", "0") == "1"
+            and gate is not None
+            and not self._fse_fuse_gate
+        ):
+            from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+                lowm_bf16_gemm_pdl_ready,
+            )
+
+            self._h82_router_pdl = lowm_bf16_gemm_pdl_ready(gate)
+        # VLLM_H105_ROUTER_FIRST=1: the PDL router is captured before the
+        # shared-expert fork (the fork point is recorded first, so the shared
+        # experts still depend on the norm only). In serving the graph executor
+        # placed the after-fork router off the norm's stream, where its PDL
+        # edge cannot take effect.
+        self._h105_router_first = (
+            self._h82_router_pdl
+            and os.environ.get("VLLM_H105_ROUTER_FIRST", "0") == "1"
+        )
+        # H155 (default off), router-first at chosen token counts. Router-first
+        # moves the routed chain (routing -> FC1, PDL) ahead of the shared
+        # experts, so routed FC1 can occupy the SMs before the shared SwiGLU
+        # launches the shared fc2.
+        # VLLM_H155_RF_SHARED_HIPRI_TOKENS: the shared experts run on a
+        # highest-priority stream, so their CTAs are dispatched ahead of
+        # pending routed CTAs. VLLM_H155_RF_SKIP_TOKENS: router-first is not
+        # used (the H82 order) at those token counts; it wins over the first.
+        # Target model only, unless VLLM_H155_RF_DRAFT=1 (h155_layer_token_sets).
+        self._h155_rf_skip_tokens, self._h155_rf_hipri_tokens = h155_layer_token_sets(
+            layer_name
+        )
+
         # The shared expert's sigmoid gate is applied after the MoE op, where
         # the compiled graph fuses it into the next layer's add + RMSNorm.
         self._defer_shared_gate = _can_defer_shared_gate(shared_experts)
@@ -530,7 +696,7 @@ class MoERunner(MoERunnerInterface):
 
         Then forward() runs moe_forward_shared_ext_unfinalized plus
         vllm::moe_finalize, which the compiled graph folds into the next
-        layer's norm (MLPerf submission path; specialized for Qwen3.6-35B-A3B).
+        layer's norm (opt-in; specialized for Qwen3.6-35B-A3B).
         Requires the shared-ext op with a deferred gate, a single-rank
         monolithic kernel whose experts defer (TRT-LLM MXFP8), and no step
         between the experts and the shared + routed add. A read-only
@@ -564,6 +730,15 @@ class MoERunner(MoERunnerInterface):
             and kernel.supports_deferred_moe_finalize()
             and kernel.fused_experts.supports_deferred_finalize()
         )
+
+    def _routed_die_split(self) -> bool:
+        """Whether the routed experts run once per die over die-local halves
+        (``moe_die_split``, set at load), returning two GEMM2 buffers when
+        deferred. A read-only predicate, so Dynamo traces it.
+        """
+        kernel = getattr(self._quant_method, "moe_kernel", None)
+        experts = getattr(kernel, "fused_experts", None)
+        return getattr(experts, "die_split_active", False) is True
 
     def _enable_deferred_finalize(self) -> None:
         """Make the routed experts stop after GEMM2 (idempotent, eager)."""
@@ -1032,7 +1207,33 @@ class MoERunner(MoERunnerInterface):
                 if quantized_input is not None and self.accepts_quantized_input
                 else (None, None, None)
             )
-            if self._routed_finalize_deferred():
+            if self._routed_finalize_deferred() and self._routed_die_split():
+                # Routed experts once per die (VLLM_MOE_DIE_SPLIT=1): two GEMM2
+                # buffers, reduced (and folded into the norm) as one.
+                (
+                    shared_output,
+                    shared_gate,
+                    permuted,
+                    weights,
+                    permuted_idx,
+                    permuted1,
+                    permuted_idx1,
+                ) = torch.ops.vllm.moe_forward_shared_ext_unfinalized2(
+                    hidden_states,
+                    router_logits,
+                    shared_experts_input,
+                    input_ids,
+                    act_q,
+                    act_sf_swizzled,
+                    act_sf_linear,
+                    self._encode_layer_name(),
+                    1,
+                    self.moe_config.experts_per_token,
+                )
+                fused_output = torch.ops.vllm.moe_finalize2(
+                    permuted, weights, permuted_idx, permuted1, permuted_idx1
+                )
+            elif self._routed_finalize_deferred():
                 shared_output, shared_gate, permuted, weights, permuted_idx = (
                     torch.ops.vllm.moe_forward_shared_ext_unfinalized(
                         hidden_states,
@@ -1294,18 +1495,70 @@ class MoERunner(MoERunnerInterface):
             hidden_states, shared_experts_input, quantized_input
         )
 
+        # H105 (VLLM_H105_ROUTER_FIRST): fork point, then the PDL router, then
+        # the shared experts, so the router is the norm's first captured
+        # dependent.
+        input_recorded = False
+        router_logits_done = False
+        num_tokens = hidden_states.shape[0]
+        router_first = self._h105_router_first
+        if router_first and num_tokens in self._h155_rf_skip_tokens:
+            router_first = False
+            logger.info_once(
+                "H155: router-first off at %s tokens (VLLM_H155_RF_SKIP_TOKENS)",
+                str(sorted(self._h155_rf_skip_tokens)),
+            )
+        if router_first:
+            from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+                lowm_bf16_gemm_pdl,
+            )
+
+            if self._shared_experts is not None:
+                input_recorded = self._shared_experts.record_input_ready(
+                    shared_experts_input
+                )
+            logits = lowm_bf16_gemm_pdl(self.gate, hidden_states)
+            if logits is not None:
+                router_logits = logits
+                router_logits_done = True
+                logger.info_once(
+                    "H105: MoE router logits by the PDL-launched TinyGEMM2, "
+                    "captured before the shared-expert fork "
+                    "(VLLM_H105_ROUTER_FIRST)"
+                )
+
         # If using multi-stream overlap for shared experts, we must launch it
         # before routed expert dispatch.
         shared_experts_overlapping = False
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input, shared_q
+                shared_experts_input,
+                shared_q,
+                input_recorded=input_recorded,
+                high_priority=input_recorded
+                and num_tokens in self._h155_rf_hipri_tokens,
             )
+
+        # H82: the same router GEMM, PDL-launched so it chains to the norm that
+        # produced its input (the fork above adds no kernel in between).
+        if self._h82_router_pdl and not router_first:
+            from vllm.model_executor.kernels.linear.lowm_bf16_gemm import (
+                lowm_bf16_gemm_pdl,
+            )
+
+            logits = lowm_bf16_gemm_pdl(self.gate, hidden_states)
+            if logits is not None:
+                router_logits = logits
+                router_logits_done = True
+                logger.info_once(
+                    "H82: MoE router logits by the PDL-launched TinyGEMM2 "
+                    "(VLLM_H82_ROUTER_PDL)"
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        if self.gate is not None and not router_logits_done:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)

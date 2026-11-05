@@ -47,6 +47,7 @@ from vllm.v1.engine import (
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
+    packed_prompt_ids,
 )
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
@@ -966,6 +967,8 @@ class SyncMPClient(MPClient):
 
     def _send_input(self, request_type: EngineCoreRequestType, request: Any):
         self.ensure_alive()
+        if packed_prompt_ids.ENABLED and request_type == EngineCoreRequestType.ADD:
+            request = packed_prompt_ids.pack_request(request)
         # (Identity, RequestType, SerializedRequest)
         msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
         # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
@@ -1195,6 +1198,8 @@ class AsyncMPClient(MPClient):
         if engine is None:
             engine = self.core_engine
 
+        if packed_prompt_ids.ENABLED and request_type == EngineCoreRequestType.ADD:
+            request = packed_prompt_ids.pack_request(request)
         message = (request_type.value, *self.encoder.encode(request))
         return self._send_input_message(message, engine)
 

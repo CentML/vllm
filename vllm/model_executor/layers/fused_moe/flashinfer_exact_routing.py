@@ -63,6 +63,28 @@ Environment:
   ``GS2_ROUTE``; ignored (with a warning) when
   ``VLLM_FI_SM107_MOE_PDL_MAX_TOKENS > 0`` (per-call MoE PDL) or
   ``GS2_ROUTE_PREBUILT`` is set (that module lacks the launcher patch).
+* ``VLLM_H82_ROUTE_EARLY`` (default ``0``): non-zero
+  with ``GS2_ROUTE`` and no ``GS2_ROUTE_PREBUILT`` also applies
+  :data:`H82_ROUTING_PATCH` (module name suffix ``_h82``). A mask of the
+  routing kernels that trigger their PDL dependent right after their own
+  grid-dependency wait instead of after their last write (FlashInfer PR #6449
+  does this for the static block kernel): ``2`` the block-per-token score
+  kernel (17-256 tokens; dependent: the single-CTA permutation), ``1`` the
+  static / dynamic block kernels and the single-CTA permutation (dependent:
+  FC1), ``3`` both. Launch order only: every dependent waits on the grid
+  before reading its outputs, so outputs are unchanged. The patched C++ reads
+  it on every call and copies it to a device flag outside graph capture.
+* ``VLLM_H158_LEAN_ROUTE`` (default ``0``; H158): non-zero
+  together with an ``_h82`` module also applies :data:`H158_ROUTING_PATCH`
+  (module name suffix ``_h158``): logits-routed calls of
+  ``VLLM_H158_LEAN_ROUTE_MIN`` (default 1) to ``VLLM_H158_LEAN_ROUTE_MAX``
+  (default and at most 32) tokens run one lean single-CTA kernel instead of
+  the dyn-block kernel (<= 16 tokens) or the block-per-token score kernel plus
+  the single-CTA permutation (17+). Its top-K is the dyn-block kernel's code
+  (one warp per token, same ``ExpertSelectPolicy::apply``), so ids and
+  weights are bit-identical to both stock paths, and its permutation keeps the
+  dyn-block kernel's token order. The patched C++ re-reads
+  ``VLLM_H158_LEAN_ROUTE`` on every call (``0`` selects the stock kernels).
 
 FlashInfer adapter: FlashInfer builds the module through the module-level
 function ``flashinfer.fused_moe.core.gen_trtllm_gen_fused_moe_sm100_module``
@@ -158,6 +180,23 @@ _FILE_RE = re.compile(rb"^\+\+\+ b/(\S+)")
 # Whether the GS2_ROUTE module is installed (single_cta_routing_covers).
 _installed = False
 _pdl_fc_installed = False
+_h82_installed = False
+_h158_installed = False
+
+
+def h158_lean_route() -> bool:
+    """``VLLM_H158_LEAN_ROUTE``: build the module with :data:`H158_ROUTING_PATCH`
+    (lean single-CTA routing kernel; needs the ``_h82`` module)."""
+    return os.environ.get("VLLM_H158_LEAN_ROUTE", "0") not in ("", "0")
+
+
+def h82_route_early() -> int:
+    """``VLLM_H82_ROUTE_EARLY`` mask (0..3): early PDL trigger in the routing
+    kernels (1: those whose dependent is FC1; 2: the score kernel)."""
+    try:
+        return int(os.environ.get("VLLM_H82_ROUTE_EARLY", "0")) & 3
+    except ValueError:
+        return 0
 
 
 def _split_lines(data: bytes) -> list[bytes]:
@@ -252,13 +291,26 @@ def _write_if_changed(path: Path, data: bytes) -> None:
         raise
 
 
-def patched_sources(stock_sources: list[Path], out_dir: Path) -> dict[Path, Path]:
+def patched_sources(
+    stock_sources: list[Path],
+    out_dir: Path,
+    extra_patch: str | tuple[str, ...] | None = None,
+) -> dict[Path, Path]:
     """Return ``{stock source: patched source}`` for every file the patch
-    touches, generating the patched files in ``out_dir``.
+    touches, generating the patched files in ``out_dir``. ``extra_patch`` (a
+    diff against the patched files, e.g. :data:`H82_ROUTING_PATCH`, or a tuple
+    of diffs applied in order, each against the result of the previous one) is
+    applied in memory on top, so each file is written once (unchanged content
+    keeps its mtime and the JIT build incremental).
     """
     per_file = split_patch(FLASHINFER_PATCH.encode())
+    if isinstance(extra_patch, str):
+        extra_patch = (extra_patch,)
+    extras = [split_patch(p.encode()) for p in extra_patch or ()]
     by_name = {Path(p).name: Path(p) for p in stock_sources}
     missing = set(per_file) - set(by_name)
+    for extra in extras:
+        missing |= set(extra) - set(per_file)
     if missing:
         raise RuntimeError(f"exact MoE routing: {sorted(missing)} not in spec sources")
     result: dict[Path, Path] = {}
@@ -273,7 +325,11 @@ def patched_sources(stock_sources: list[Path], out_dir: Path) -> dict[Path, Path
                 stock,
             )
         out = out_dir / name
-        _write_if_changed(out, apply_unified_diff(original, diff))
+        data = apply_unified_diff(original, diff)
+        for extra in extras:
+            if name in extra:
+                data = apply_unified_diff(data, extra[name])
+        _write_if_changed(out, data)
         result[stock] = out
     return result
 
@@ -428,7 +484,7 @@ def maybe_install() -> None:
     launcher (``VLLM_MOE_PDL_FC=1``). No-op unless one of them is enabled;
     idempotent.
     """
-    global _installed, _pdl_fc_installed
+    global _installed, _pdl_fc_installed, _h82_installed, _h158_installed
     if _installed or _pdl_fc_installed:
         return
     pdl_fc = _pdl_fc_enabled()
@@ -438,6 +494,19 @@ def maybe_install() -> None:
     from flashinfer.jit import env as jit_env
 
     prebuilt = Path(PREBUILT) if ENABLED and PREBUILT else None
+    h82 = ENABLED and h82_route_early() != 0
+    if h82 and prebuilt is not None:
+        logger.warning(
+            "H82 routing: VLLM_H82_ROUTE_EARLY ignored: the GS2_ROUTE_PREBUILT "
+            "module is built without H82_ROUTING_PATCH"
+        )
+        h82 = False
+    h158 = h82 and h158_lean_route()
+    if h158_lean_route() and not h82:
+        logger.warning(
+            "H158 routing: VLLM_H158_LEAN_ROUTE ignored: it needs the _h82 module "
+            "(GS2_ROUTE, VLLM_H82_ROUTE_EARLY non-zero, no GS2_ROUTE_PREBUILT)"
+        )
     if prebuilt is not None and envs.VLLM_FLASHINFER_MOE_ROUTING_MODULE_CACHE:
         logger.warning(
             "exact MoE routing: GS2_ROUTE_PREBUILT is set; ignoring "
@@ -451,13 +520,22 @@ def maybe_install() -> None:
         global _PDL_MODULE_READY
         spec = orig(enable_rubin=enable_rubin)
         name = f"{spec.name}_{TAG}" if ENABLED else spec.name
+        if h82:
+            name = f"{name}_h82"
+        if h158:
+            name = f"{name}_h158"
         if pdl_fc:
             name = f"{name}_pdlfc"
         out_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "vllm_patched" / name
         srcs = list(spec.sources)
         mapping: dict[Path, Path] = {}
         if ENABLED:
-            mapping = patched_sources(srcs, out_dir)
+            extra: tuple[str, ...] = ()
+            if h82:
+                extra = (H82_ROUTING_PATCH,)
+            if h158:
+                extra = (*extra, H158_ROUTING_PATCH)
+            mapping = patched_sources(srcs, out_dir, extra)
             srcs = [mapping.get(Path(p), p) for p in srcs]
         lsrc = None
         if pdl_fc:
@@ -486,6 +564,21 @@ def maybe_install() -> None:
                 f"prebuilt {prebuilt}" if prebuilt is not None else "JIT",
                 sorted(str(p) for p in mapping.values()),
             )
+        if h82:
+            logger.info(
+                "H82 routing: module %s built with H82_ROUTING_PATCH: early PDL "
+                "trigger mask %d (VLLM_H82_ROUTE_EARLY)",
+                new.name,
+                h82_route_early(),
+            )
+        if h158:
+            logger.info(
+                "H158 routing: module %s built with H158_ROUTING_PATCH: lean "
+                "single-CTA routing kernel for %s-%s tokens (VLLM_H158_LEAN_ROUTE)",
+                new.name,
+                os.environ.get("VLLM_H158_LEAN_ROUTE_MIN", "1"),
+                os.environ.get("VLLM_H158_LEAN_ROUTE_MAX", "32"),
+            )
         if pdl_fc:
             _PDL_MODULE_READY = True
             logger.info(
@@ -512,6 +605,8 @@ def maybe_install() -> None:
         )
     _installed = ENABLED
     _pdl_fc_installed = pdl_fc
+    _h82_installed = h82
+    _h158_installed = h158
 
 
 _PREBUILT_CLS: dict[type, type] = {}
@@ -982,4 +1077,465 @@ bypasses FlashInfer's sm_107 clamp only while this patched module is in use.
  }
  
  /// Allocate graph-stable routing metadata storage for each requested tile without launching work.
+"""
+
+# Unified diff against the GS2_ROUTE-patched (FLASHINFER_PATCH) FlashInfer 0.6.18.post1
+# csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_{common,custom}.cu, applied on top of it
+# when VLLM_H82_ROUTE_EARLY is non-zero. The early trigger
+# follows FlashInfer PR #6449 (754cbe9e, open; there for the static block kernel only).
+H82_ROUTING_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu
+@@ -68,6 +68,8 @@
+ };
+ static constexpr int NT = 1024;
+ static constexpr int MaxE = 1024;
++// [H82] Early PDL trigger (VLLM_H82_ROUTE_EARLY; see routingCustom::h82SyncEarlyTrigger).
++__device__ int h82EarlyTrigger = 0;
+ __device__ __forceinline__ int32_t mulT(Params const& p, int32_t a) {
+   return p.isPow2 ? (a << p.paddingLog2) : a * p.tileN;
+ }
+@@ -103,8 +105,12 @@
+   uint32_t const magic = p.topKMagic;
+   // Nothing is read or written in global memory before the wait. The top-K input is written by
+   // the PDL primary (score kernel), so it is read with coherent loads, not ld.global.nc.
++  int const h82Early = h82EarlyTrigger;  // [H82] read before the wait: set before launch
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+-  if (p.usePdl) cudaGridDependencySynchronize();
++  if (p.usePdl) {
++    cudaGridDependencySynchronize();
++    if (h82Early & 1) cudaTriggerProgrammaticLaunchCompletion();  // [H82] early trigger
++  }
+ #endif
+   int32_t eIdx[EPT];
+   int32_t eOff[EPT];
+@@ -278,6 +284,20 @@
+       d.mPtrCtaIdxXyToMnLimit == nullptr || d.mPtrNumNonExitingCtas == nullptr)
+     return false;
+   if (d.mNumTokens < c.minTok) return false;
++  {
++    // [H82] VLLM_H82_ROUTE_EARLY -> h82EarlyTrigger on this device (not while capturing).
++    static int state[64] = {};
++    char const* ev = std::getenv("VLLM_H82_ROUTE_EARLY");
++    int const want = ev != nullptr ? (std::atoi(ev) & 3) : 0;
++    int dev = 0;
++    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64 && state[dev] != want + 1 &&
++        cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(stream), &status) == cudaSuccess &&
++        status == cudaStreamCaptureStatusNone) {
++      CHECK_CUDA_ERROR(cudaMemcpyToSymbol(h82EarlyTrigger, &want, sizeof(int)));
++      state[dev] = want + 1;
++    }
++  }
+   int const n = d.mNumTokens * d.mTopK;
+   if (n > c.maxN) return false;
+   Params p;
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
+@@ -26,6 +26,7 @@
+ //   6. routingIndicesHistogramKernel  — histogram from packed TopK (defined in RoutingKernel.cuh)
+ //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
+ 
++#include <cstdio>
+ #include <cstdlib>
+ #include <string>
+ #include <type_traits>
+@@ -36,6 +37,12 @@
+ 
+ namespace moe::dev::routing {
+ namespace routingCustom {
++
++// [H82] Early PDL trigger of the small-batch routing kernels (VLLM_H82_ROUTE_EARLY, see
++// h82SyncEarlyTrigger): right after their own grid-dependency wait, as FlashInfer PR #6449 does
++// for the static block kernel. Their dependents (FC1, the single-CTA permutation) wait on this
++// grid before reading what it writes.
++__device__ int h82EarlyTrigger = 0;
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ //
+@@ -83,10 +90,14 @@
+   }
+   __syncthreads();
+ 
++  int const h82Early = h82EarlyTrigger;  // [H82] read before the wait: set before launch
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   // then wait on primary grid
+   if (params.mUsePdl) {
+     cudaGridDependencySynchronize();
++    if (h82Early & 1) {
++      cudaTriggerProgrammaticLaunchCompletion();  // [H82] early trigger
++    }
+   }
+ #endif
+ 
+@@ -413,9 +424,13 @@
+   }
+   __syncthreads();
+ 
++  int const h82Early = h82EarlyTrigger;  // [H82] read before the wait: set before launch
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+   if (params.mUsePdl) {
+     cudaGridDependencySynchronize();
++    if (h82Early & 1) {
++      cudaTriggerProgrammaticLaunchCompletion();  // [H82] early trigger
++    }
+   }
+ #endif
+ 
+@@ -1172,9 +1187,13 @@
+     int32_t const warpIdx = threadIdx.x / WarpSize;
+     int32_t const tokenIdx = blockIdx.x;
+ 
++    int const h82Early = h82EarlyTrigger;  // [H82] read before the wait: set before launch
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+     if (params.mUsePdl) {
+       cudaGridDependencySynchronize();
++      if (h82Early & 2) {
++        cudaTriggerProgrammaticLaunchCompletion();  // [H82] early trigger
++      }
+     }
+ #endif
+ 
+@@ -1479,7 +1498,32 @@
+ // when it does not apply (then the stock permutation runs).
+ bool launchGs2PostTopK(Data const& data, void* stream);
+ 
++// [H82] Copies VLLM_H82_ROUTE_EARLY (a mask, default 0: 1 = the kernels whose dependent is FC1 --
++// static and dynamic block kernels and the single-CTA permutation; 2 = the block-per-token score
++// kernel, whose dependent is the permutation) to h82EarlyTrigger on the current device when it
++// changed; never while `stream` is capturing (the device keeps its last value, which the captured
++// kernels read at replay).
++static void h82SyncEarlyTrigger(void* stream) {
++  static int state[64] = {};  // 1 + last value written, per device; 0 = never written
++  char const* v = std::getenv("VLLM_H82_ROUTE_EARLY");
++  int const want = v != nullptr ? (std::atoi(v) & 3) : 0;
++  int dev = 0;
++  if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || state[dev] == want + 1) {
++    return;
++  }
++  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++  if (cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status) != cudaSuccess ||
++      status != cudaStreamCaptureStatusNone) {
++    return;
++  }
++  CHECK_CUDA_ERROR(cudaMemcpyToSymbol(h82EarlyTrigger, &want, sizeof(int)));
++  state[dev] = want + 1;
++  fprintf(stderr, "[h82-route] early PDL trigger mask %d (1: FC1 producers, 2: score kernel; device %d)\n",
++          want, dev);
++}
++
+ void run(Data const& data, void* stream) {
++  h82SyncEarlyTrigger(stream);
+   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
+                  data.mPtrTopKIds != nullptr)
+       << "Routing kernel requires at least one input parameter";
+"""
+
+# Unified diff against the H82-patched (FLASHINFER_PATCH + H82_ROUTING_PATCH) FlashInfer
+# 0.6.18.post1 csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu, applied on
+# top of it when VLLM_H158_LEAN_ROUTE is non-zero: the lean single-CTA
+# routing kernel (routingIndicesH158LeanKernel) and its selection in routingCustom::run.
+H158_ROUTING_PATCH = r"""--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
+@@ -662,6 +662,247 @@
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ //
++// [H158] Lean single-CTA routing kernel from raw logits (VLLM_H158_LEAN_ROUTE).
++//
++// One launch replaces the dyn-block kernel (<= 16 tokens) and the block-per-token score kernel +
++// single-CTA permutation pair (17..32 tokens):
++//   Phase 1 is the dyn-block kernel's: one warp per token through the same
++//     ExpertSelectPolicy::apply (same top-K reduction and postprocess code and arguments), so the
++//     selected experts, their order and their weights are bit-identical to the dyn-block kernel's
++//     and to the block-per-token score kernel's (for the Renormalize policy both run
++//     topk::reduceTopK over the same per-lane layout and then calcSoftmax over the K survivors).
++//   Phases 2-4 replace the dyn-block kernel's per-expert serial loops over the tokens: each expert
++//     keeps a 32-bit token mask (atomicOr), its count is popc(mask) and an entry's slot within the
++//     expert is popc(mask & lower tokens). That is the dyn-block kernel's token order, so the
++//     permutation maps and CTA tables equal the dyn-block kernel's (and the single-CTA
++//     permutation's up to its within-expert order, which is atomics-ordered there).
++// It writes the union of what both stock paths write: weights, packed top-K, replay ids,
++// expanded->permuted / permuted->expanded / permuted->token maps, CTA tables, permuted size,
++// non-exiting CTA count and per-expert counts. Nothing in global memory is touched before the
++// grid-dependency wait; dependents are triggered after the last write (as the dyn-block kernel),
++// or right after the wait with the H82 early-trigger mask bit 1.
++//
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++static constexpr int H158LeanMaxNumTokens = 32;  // one warp per token, token masks are 32 bits
++
++template <typename KernelParams>
++__global__ void __launch_bounds__(1024) routingIndicesH158LeanKernel(KernelParams params) {
++  using OutputT = typename KernelParams::OutputT;
++  using InputT = typename KernelParams::InputT;
++  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
++  static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
++  static constexpr int MaxNumTopExperts = KernelParams::MaxNumTopExperts;
++  static constexpr int NumThreadsExperts = MaxNumExperts <= 1024 ? MaxNumExperts : 1024;
++  static constexpr int ExpertsPerThread = MaxNumExperts / NumThreadsExperts;
++  static constexpr int NumExpertWarps = NumThreadsExperts / WarpSize;
++  static constexpr int VecSize = MaxNumExperts / WarpSize;
++
++  static_assert(MaxNumExperts % WarpSize == 0);
++  static_assert(MaxNumExperts % NumThreadsExperts == 0);
++
++  __shared__ uint32_t smemTokenMask[MaxNumExperts];
++  __shared__ int32_t smemExpertOffset[MaxNumExperts];
++  __shared__ int32_t smemTopKExpert[H158LeanMaxNumTokens * MaxNumTopExperts];
++  __shared__ int32_t smemWarpTotals[NumExpertWarps];
++  __shared__ int32_t smemWarpTotals2[NumExpertWarps];
++
++  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
++  int32_t const laneIdx = cutlass::arch::LaneId();
++  int32_t const numWarps = blockDim.x / WarpSize;
++
++  auto block = cg::this_thread_block();
++  auto warp = cg::tiled_partition<WarpSize>(block);
++
++  for (int e = threadIdx.x; e < MaxNumExperts; e += blockDim.x) {
++    smemTokenMask[e] = 0u;
++  }
++  __syncthreads();
++
++  int const h82Early = h82EarlyTrigger;  // [H82] read before the wait: set before launch
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  if (params.mUsePdl) {
++    cudaGridDependencySynchronize();
++    if (h82Early & 1) {
++      cudaTriggerProgrammaticLaunchCompletion();  // [H82] early trigger
++    }
++  }
++#endif
++
++  int32_t const numTokens = params.mNumTokens;
++  int32_t const topK = params.mTopK;
++
++  // Phase 1: top-K, one warp per token (the host guarantees numTokens <= numWarps).
++  for (int tokenIdx = warpIdx; tokenIdx < numTokens; tokenIdx += numWarps) {
++    BaseType warpTopKScore[MaxNumTopExperts];
++    int32_t warpTopKExpertIdx[MaxNumTopExperts];
++
++    auto scoreOff = tokenIdx * params.mNumExperts;
++    KernelParams::ExpertSelectPolicy::template apply<BaseType, InputT, VecSize, MaxNumTopExperts>(
++        warp, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts, topK,
++        params.mPtrScores + scoreOff, params);
++
++    if (laneIdx < topK) {
++      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
++      int32_t const expandedIdx = tokenIdx * topK + laneIdx;
++      smemTopKExpert[expandedIdx] = expertIdx;
++      if (expertIdx >= 0 && expertIdx < MaxNumExperts) {
++        atomicOr(&smemTokenMask[expertIdx], 1u << tokenIdx);
++      }
++      OutputT const weight = OutputT{warpTopKScore[laneIdx]};
++      if (params.mPtrTopKWeights != nullptr) {
++        params.mPtrTopKWeights[expandedIdx] = weight;
++      }
++      if (params.mPtrTopKPacked != nullptr) {
++        params.mPtrTopKPacked[expandedIdx] =
++            PackedScoreIdx<OutputT>{weight, static_cast<int16_t>(expertIdx)};
++      }
++      if (params.mPtrRoutingReplayOut != nullptr) {
++        params.mPtrRoutingReplayOut[expandedIdx] = static_cast<int16_t>(expertIdx);
++      }
++    }
++  }
++  __syncthreads();
++
++  // Phase 2: per-expert counts and CTA counts, then the dyn-block kernel's dual exclusive scan.
++  int32_t accExpertCount[ExpertsPerThread];
++  int32_t numCtaPerExpert[ExpertsPerThread];
++  int32_t tmpCountPerExpert[ExpertsPerThread];
++  bool isLocalExpert[ExpertsPerThread];
++#pragma unroll
++  for (int e = 0; e < ExpertsPerThread; e++) {
++    int const expert = threadIdx.x * ExpertsPerThread + e;
++    bool isLocal = false;
++    if (threadIdx.x < NumThreadsExperts) {
++      auto localExpIdx = expert - params.mLocalExpertsStartIdx;
++      isLocal = localExpIdx >= 0 &&
++                localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
++                (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
++    }
++    isLocalExpert[e] = isLocal;
++    accExpertCount[e] = isLocal ? __popc(smemTokenMask[expert]) : 0;
++    if (params.mIsPow2) {
++      numCtaPerExpert[e] = divUpLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
++      tmpCountPerExpert[e] = divUpMulLog2<int32_t>(accExpertCount[e], params.mPaddingLog2);
++    } else {
++      numCtaPerExpert[e] = divUpTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
++      tmpCountPerExpert[e] = divUpMulTileN<int32_t>(accExpertCount[e], params.mTileTokensDim);
++    }
++  }
++
++  int32_t ctaOffsetPerExpert[ExpertsPerThread];
++  int32_t expertScanCountsPerExpert[ExpertsPerThread];
++  int32_t numNonExitingCtas;
++  {
++    int32_t localPrefix1[ExpertsPerThread], localPrefix2[ExpertsPerThread];
++    int32_t threadTotal1 = 0, threadTotal2 = 0;
++#pragma unroll
++    for (int e = 0; e < ExpertsPerThread; e++) {
++      localPrefix1[e] = threadTotal1;
++      localPrefix2[e] = threadTotal2;
++      threadTotal1 += numCtaPerExpert[e];
++      threadTotal2 += tmpCountPerExpert[e];
++    }
++    int32_t threadPrefix1, threadPrefix2;
++    warpExclusiveScan<NumExpertWarps>(threadTotal1, threadTotal2, laneIdx, warpIdx, smemWarpTotals,
++                                      smemWarpTotals2, threadPrefix1, threadPrefix2,
++                                      numNonExitingCtas);
++#pragma unroll
++    for (int e = 0; e < ExpertsPerThread; e++) {
++      ctaOffsetPerExpert[e] = threadPrefix1 + localPrefix1[e];
++      expertScanCountsPerExpert[e] = threadPrefix2 + localPrefix2[e];
++    }
++  }
++
++  // Phase 3: expert offsets (smem), CTA configs, per-expert counts, sizes.
++  if (threadIdx.x < NumThreadsExperts) {
++#pragma unroll
++    for (int e = 0; e < ExpertsPerThread; e++) {
++      int const expert = threadIdx.x * ExpertsPerThread + e;
++      smemExpertOffset[expert] = expertScanCountsPerExpert[e];
++      if (params.mPtrNumTokensPerExpert != nullptr && expert < params.mNumExperts) {
++        params.mPtrNumTokensPerExpert[expert] = accExpertCount[e];
++      }
++      if (isLocalExpert[e]) {
++        int32_t const mappedLocalIdx =
++            (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
++        for (int cta = 0; cta < numCtaPerExpert[e]; ++cta) {
++          params.mPtrCtaIdxXyToBatchIdx[ctaOffsetPerExpert[e] + cta] = mappedLocalIdx;
++          int32_t mnLimit1, mnLimit2;
++          if (params.mIsPow2) {
++            mnLimit1 = mulLog2<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mPaddingLog2);
++            mnLimit2 =
++                mulLog2<int32_t>(ctaOffsetPerExpert[e], params.mPaddingLog2) + accExpertCount[e];
++          } else {
++            mnLimit1 = mulTileN<int32_t>(ctaOffsetPerExpert[e] + cta + 1, params.mTileTokensDim);
++            mnLimit2 =
++                mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
++          }
++          params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
++        }
++      }
++    }
++  }
++  if (threadIdx.x == 0) {
++    int32_t permutedIdxSize;
++    if (params.mIsPow2) {
++      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
++    } else {
++      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
++    }
++    params.mPtrPermutedIdxSize[0] = permutedIdxSize;
++    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
++  }
++  __syncthreads();
++
++  // Phase 4: permutation, one thread per (token, k) entry.
++  int32_t const numExpanded = numTokens * topK;
++  for (int expandedIdx = threadIdx.x; expandedIdx < numExpanded; expandedIdx += blockDim.x) {
++    int32_t const tokenIdx = expandedIdx / topK;
++    int32_t const expertIdx = smemTopKExpert[expandedIdx];
++    bool isLocal = false;
++    if (expertIdx >= 0 && expertIdx < MaxNumExperts) {
++      auto localExpIdx = expertIdx - params.mLocalExpertsStartIdx;
++      isLocal = localExpIdx >= 0 &&
++                localExpIdx < (params.mNumLocalExperts << params.mLocalExpertsStrideLog2) &&
++                (localExpIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
++    }
++    int32_t permutedIdx = int32_t{-1};
++    if (isLocal) {
++      uint32_t const lower = (1u << tokenIdx) - 1u;
++      permutedIdx = smemExpertOffset[expertIdx] + __popc(smemTokenMask[expertIdx] & lower);
++    }
++    if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
++      params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
++    }
++    if (isLocal) {
++      if (params.mPtrPermutedIdxToExpandedIdx != nullptr) {
++        params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
++      }
++      if (params.mPtrPermutedIdxToTokenIdx != nullptr) {
++        params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
++      }
++    }
++  }
++
++#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
++  if (params.mUsePdl) {
++    cudaTriggerProgrammaticLaunchCompletion();
++  }
++#endif
++}
++
++// [H158] Launches the lean kernel; returns whether a compiled tier covered the call.
++bool launchH158LeanKernel(Data const& data, void* stream) {
++  int32_t const maxExperts = queryDispatchedMaxExperts(data);
++  int const threads =
++      std::min(std::max(data.mNumTokens * static_cast<int>(WarpSize), maxExperts), 1024);
++  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesH158LeanKernel, 1, threads, 0, stream);
++  return queryPolicyHasCompiledTier(data);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++//
+ // 2. Cluster kernel — single-cluster fused kernel for ≤256 tokens (SM90+).
+ //    Uses distributed shared memory across 8 blocks in a cluster.
+ //
+@@ -1522,6 +1763,30 @@
+           want, dev);
+ }
+ 
++
++// [H158] Whether this logits-routed call runs the lean single-CTA kernel: VLLM_H158_LEAN_ROUTE
++// non-zero (re-read per call, host side only; a captured graph keeps the kernel it captured),
++// VLLM_H158_LEAN_ROUTE_MIN <= tokens <= VLLM_H158_LEAN_ROUTE_MAX (defaults: the kernel's 1..32),
++// at most DynBlockKernelMaxNumExperts experts in the dispatched tier (as the dyn-block kernel),
++// no fused shared experts.
++static bool h158LeanWanted(Data const& data, int32_t dispatchedMaxExperts) {
++  char const* v = std::getenv("VLLM_H158_LEAN_ROUTE");
++  if (v == nullptr || std::atoi(v) == 0) {
++    return false;
++  }
++  static int const lo = [] {
++    char const* s = std::getenv("VLLM_H158_LEAN_ROUTE_MIN");
++    return s != nullptr ? std::max(1, std::atoi(s)) : 1;
++  }();
++  static int const hi = [] {
++    char const* s = std::getenv("VLLM_H158_LEAN_ROUTE_MAX");
++    return std::min(s != nullptr ? std::atoi(s) : H158LeanMaxNumTokens, H158LeanMaxNumTokens);
++  }();
++  return data.mPtrScores != nullptr && data.mPtrTopKIds == nullptr && data.mNumTokens >= lo &&
++         data.mNumTokens <= hi && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts &&
++         data.mNumFusedSharedExperts == 0;
++}
++
+ void run(Data const& data, void* stream) {
+   h82SyncEarlyTrigger(stream);
+   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
+@@ -1569,6 +1834,22 @@
+   // the smem budget.
+   int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
+ 
++  // [H158] Lean single-CTA routing (see routingIndicesH158LeanKernel).
++  if (h158LeanWanted(data, dispatchedMaxExperts)) {
++    bool const launched = launchH158LeanKernel(data, stream);
++    FLASHINFER_CHECK(launched, "routingCustom::run: no compiled tier covers numExperts=",
++                     data.mNumExperts, " topK=", data.mTopK, " (H158 lean routing kernel).");
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      fprintf(stderr,
++              "[h158-route] lean single-CTA routing kernel on (VLLM_H158_LEAN_ROUTE): first call "
++              "tokens=%d experts=%d topK=%d pdl=%d\n",
++              data.mNumTokens, data.mNumExperts, data.mTopK, int(data.mUsePdl));
++    }
++    return;
++  }
++
+   // Does the currently-active policy pair implement the block-per-token interface?
+   bool const policySupportsBlockPerToken = queryPolicySupportsBlockPerToken(data);
+ 
 """

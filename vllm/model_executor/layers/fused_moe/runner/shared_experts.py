@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -20,6 +21,94 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = init_logger(__name__)
+
+# H158 (VLLM_H158_SHARED_PRIO=1): overlapped shared experts of
+# VLLM_H158_SHARED_PRIO_MIN..MAX tokens (a window that depends on the GPU and the
+# model, no defaults: an unset bound is open) run on a stream of the greatest
+# priority instead of the aux stream, so their kernels are dispatched ahead of
+# the routed experts' pending CTAs: a shared-expert kernel launched after a
+# routed FC1 that fills every SM otherwise waits for FC1's last wave. Scheduling
+# only: same kernels, same results. Graph kernel nodes keep the capture stream's
+# priority (PyTorch instantiates with cudaGraphInstantiateFlagUseNodePriority).
+_H158_PRIO = os.environ.get("VLLM_H158_SHARED_PRIO", "0") == "1"
+_H158_PRIO_MIN = int(os.environ.get("VLLM_H158_SHARED_PRIO_MIN") or 0)
+_H158_PRIO_MAX = int(os.environ.get("VLLM_H158_SHARED_PRIO_MAX") or -1)  # -1: open
+_h158_prio_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def _h158_prio_stream(num_tokens: int) -> torch.cuda.Stream | None:
+    """The high-priority shared-experts stream of the current device when
+    VLLM_H158_SHARED_PRIO applies to ``num_tokens``, else None."""
+    if not (
+        _H158_PRIO
+        and _H158_PRIO_MIN <= num_tokens
+        and (_H158_PRIO_MAX < 0 or num_tokens <= _H158_PRIO_MAX)
+    ):
+        return None
+    device = torch.cuda.current_device()
+    stream = _h158_prio_streams.get(device)
+    if stream is None:
+        _, greatest = torch.cuda.Stream.priority_range()
+        stream = torch.cuda.Stream(device=device, priority=greatest)
+        _h158_prio_streams[device] = stream
+        logger.info(
+            "H158: overlapped shared experts of %d-%s tokens on a stream of "
+            "priority %d (VLLM_H158_SHARED_PRIO)",
+            _H158_PRIO_MIN,
+            _H158_PRIO_MAX if _H158_PRIO_MAX >= 0 else "any",
+            stream.priority,
+        )
+    return stream
+
+
+def h155_token_set(name: str) -> frozenset[int]:
+    """H155: the token counts listed in env ``name`` ("N" or "N,M,...";
+    unset or empty: none).
+    """
+    raw = os.environ.get(name, "")
+    return frozenset(int(t) for t in raw.replace(" ", "").split(",") if t)
+
+
+# H155 (default off): token counts at which router-first (VLLM_H105_ROUTER_FIRST)
+# runs the shared experts on a highest-priority side stream. See MoERunner.
+H155_RF_SHARED_HIPRI_TOKENS = h155_token_set("VLLM_H155_RF_SHARED_HIPRI_TOKENS")
+_h155_hipri_streams: dict[int, torch.cuda.Stream] = {}
+
+
+def h155_layer_token_sets(layer_name: str) -> tuple[frozenset[int], frozenset[int]]:
+    """H155: (VLLM_H155_RF_SKIP_TOKENS, VLLM_H155_RF_SHARED_HIPRI_TOKENS) for
+    the MoE layer ``layer_name``. Both are token counts of the target model's
+    decode graphs. The MTP drafter's MoE ("mtp" in its layer name) runs on one
+    row per request, so the same token counts are other batch sizes there: it
+    gets both only with VLLM_H155_RF_DRAFT=1.
+    """
+    skip = h155_token_set("VLLM_H155_RF_SKIP_TOKENS")
+    hipri = H155_RF_SHARED_HIPRI_TOKENS
+    if (
+        (skip or hipri)
+        and "mtp" in layer_name.split(".")
+        and os.environ.get("VLLM_H155_RF_DRAFT", "0") != "1"
+    ):
+        logger.info_once(
+            "H155: drafter MoE %s keeps the parent order (VLLM_H155_RF_DRAFT=0)",
+            layer_name,
+        )
+        return frozenset(), frozenset()
+    return skip, hipri
+
+
+def _h155_hipri_stream() -> torch.cuda.Stream:
+    """One highest-priority stream per device, shared by every MoE layer.
+    Captured kernels take the stream's priority as their node priority, and
+    torch instantiates graphs with cudaGraphInstantiateFlagUseNodePriority.
+    """
+    dev = torch.cuda.current_device()
+    stream = _h155_hipri_streams.get(dev)
+    if stream is None:
+        _, high = torch.cuda.Stream.priority_range()
+        stream = torch.cuda.Stream(priority=high)
+        _h155_hipri_streams[dev] = stream
+    return stream
 
 
 class SharedExpertsOrder(IntEnum):
@@ -79,6 +168,10 @@ class SharedExperts(torch.nn.Module):
                 # One pair per DBO ubatch id to sync aux and main stream.
                 self._input_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
                 self._output_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
+        # H155: created here, never during a capture; None when the env is off.
+        self._hipri_stream: torch.cuda.Stream | None = None
+        if H155_RF_SHARED_HIPRI_TOKENS and self._stream is not None:
+            self._hipri_stream = _h155_hipri_stream()
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -136,17 +229,34 @@ class SharedExperts(torch.nn.Module):
             return self._layer(shared_experts_input, quantized_input)
         return self._layer(shared_experts_input)
 
+    def record_input_ready(self, shared_experts_input: torch.Tensor) -> bool:
+        """H105: record the fork point now (the input's producer), so that
+        kernels the main stream launches before ``maybe_forward_async(...,
+        input_recorded=True)`` are not dependencies of the shared experts."""
+        if (
+            self._determine_shared_experts_order(shared_experts_input)
+            != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
+        ):
+            return False
+        self._input_ready_event[self._output_idx].record(current_stream())
+        return True
+
     def maybe_forward_async(
         self,
         shared_experts_input: torch.Tensor,
         quantized_input: object | None = None,
+        input_recorded: bool = False,
+        high_priority: bool = False,
     ) -> bool:
         """Enqueue shared experts on the aux stream without waiting for them.
 
         Returns true if the shared experts were enqueued, false otherwise. Call
         `wait` to wait for the shared experts to finish if this returns true.
         ``quantized_input`` is an optional pre-quantized copy of the input for
-        layers whose input linear can consume it.
+        layers whose input linear can consume it. ``input_recorded``: the fork
+        point was recorded by ``record_input_ready``. ``high_priority`` (H155):
+        enqueue them on the highest-priority side stream instead (same kernels,
+        inputs and events; only their dispatch priority changes).
         """
         if (
             self._determine_shared_experts_order(shared_experts_input)
@@ -154,13 +264,27 @@ class SharedExperts(torch.nn.Module):
         ):
             return False
         assert self._stream is not None
+        stream = self._stream
+        if high_priority and self._hipri_stream is not None:
+            stream = self._hipri_stream
+            logger.info_once(
+                "H155: router-first shared experts on a highest-priority stream "
+                "at %s tokens (VLLM_H155_RF_SHARED_HIPRI_TOKENS)",
+                str(sorted(H155_RF_SHARED_HIPRI_TOKENS)),
+            )
         idx = self._output_idx
         assert self._output[idx] is None
-        self._input_ready_event[idx].record(current_stream())
-        with torch.cuda.stream(self._stream):
-            self._input_ready_event[idx].wait(self._stream)
+        if not input_recorded:
+            self._input_ready_event[idx].record(current_stream())
+        # H158: the rest of its window, on its own stream of the same (greatest)
+        # priority. H155's cell above (router-first, target, its token set)
+        # keeps H155's stream; either flag alone behaves as it did on its own.
+        if _H158_PRIO and stream is self._stream:
+            stream = _h158_prio_stream(shared_experts_input.shape[0]) or stream
+        with torch.cuda.stream(stream):
+            self._input_ready_event[idx].wait(stream)
             self._output[idx] = self._run_layer(shared_experts_input, quantized_input)
-            self._output_ready_event[idx].record(self._stream)
+            self._output_ready_event[idx].record(stream)
         return True
 
     def wait(self) -> None:

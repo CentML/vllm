@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -10,6 +11,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.gdn import gdn_prefill_census
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
 from vllm.model_executor.layers.mamba.ops.gdn_host_trim import (
     GDN_HOST_TRIM,
     GDN_HOST_TRIM2,
@@ -33,6 +35,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import (
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
+    is_h58_tail_checkpoint,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.worker.gpu.glue_pdl import glue_pdl
@@ -92,6 +95,15 @@ class GDNPrefillCheckpointMetadata:
     # the index of its first tail token in the non-spec conv input block.
     checkpoint_state_indices: torch.Tensor
     conv_token_indices: torch.Tensor
+    # VLLM_GDN_VSPLIT_SCHED: int32 split-layout indices of the heads and
+    # unsplit sequences, longest first; the first chunk-kernel launch runs only
+    # these (the tails there are throwaway). None when off.
+    split_seq_map: torch.Tensor | None = None
+
+
+# VLLM_GDN_VSPLIT_SCHED (os.environ: vllm/envs.py cannot be overlaid); see
+# qwen_gdn_linear_attn.GDN_VSPLIT_SCHED.
+_GDN_VSPLIT_SCHED = os.environ.get("VLLM_GDN_VSPLIT_SCHED", "0") == "1"
 
 
 @dataclass
@@ -121,6 +133,7 @@ class GDNPrefillCheckpointPlan:
     tail_chunk_indices: torch.Tensor | None
     tail_chunk_offsets: torch.Tensor | None
     conv_token_indices: torch.Tensor
+    split_seq_map: torch.Tensor | None = None
 
 
 @dataclass
@@ -449,6 +462,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 checkpoint_alignment=spec.prefill_checkpoint_alignment,
                 reuse_initial_block=spec.prefill_checkpoint_reuses_initial_block,
                 copy_initial_block=spec.prefill_checkpoint_copies_initial_block,
+            ) or is_h58_tail_checkpoint(
+                query_start,
+                seq_len,
+                position,
+                hash_block_size,
+                block_size,
+                spec.prefill_checkpoint_alignment,
             ):
                 checkpoints.append(
                     (i, row, position - query_start, cdiv(seq_len, block_size) - 2)
@@ -497,13 +517,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if flashinfer:
             packed64 += split_qsl + tail_qsl
         device = self.device
+        # VLLM_GDN_VSPLIT_SCHED: the split launch's sequence map, uploaded with
+        # the int32 cu_seqlens. Split entries whose slot source is a checkpoint
+        # slot (>= num_prefills) are the throwaway tails; the rest run longest
+        # first (ties by position).
+        seq_map: list[int] = []
+        if _GDN_VSPLIT_SCHED and flashinfer:
+            seq_map = sorted(
+                (j for j, src in enumerate(split_slot_src) if src < num_prefills),
+                key=lambda j: (split_qsl[j] - split_qsl[j + 1], j),
+            )
         dev64 = async_tensor_h2d(packed64, device=device, dtype=torch.int64)
-        dev32 = async_tensor_h2d(split_qsl + tail_qsl, device=device, dtype=torch.int32)
+        dev32 = async_tensor_h2d(
+            split_qsl + tail_qsl + seq_map, device=device, dtype=torch.int32
+        )
         conv_off = slot_plan_len
         tail_off = conv_off + num_ckpt
         qsl_off = tail_off + len(tail_tokens)
         split_qsl_i32 = dev32[: num_split + 1]
-        tail_qsl_i32 = dev32[num_split + 1 :]
+        tail_qsl_i32 = dev32[num_split + 1 : num_split + 1 + len(tail_qsl)]
+        split_seq_map = dev32[num_split + 1 + len(tail_qsl) :] if seq_map else None
         if flashinfer:
             split_query_start_loc = dev64[qsl_off : qsl_off + num_split + 1]
             tail_query_start_loc = dev64[qsl_off + num_split + 1 :]
@@ -544,6 +577,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             tail_chunk_indices=tail_chunk_indices,
             tail_chunk_offsets=tail_chunk_offsets,
             conv_token_indices=dev64[conv_off:tail_off],
+            split_seq_map=split_seq_map,
         )
 
     def _build_prefill_checkpoint(
@@ -599,6 +633,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             tail_chunk_offsets=plan.tail_chunk_offsets,
             checkpoint_state_indices=slots[num_split + num_ckpt :],
             conv_token_indices=plan.conv_token_indices,
+            split_seq_map=plan.split_seq_map,
         )
 
     def _build_chunk_metadata(
@@ -659,9 +694,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self.use_spec_decode and num_decode_draft_tokens_cpu is not None:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if (
-                num_spec_decodes == 0
-                or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+            # VLLM_GDN_MTP_DEFER_WRITES keeps spec rows without drafts on the
+            # spec path (their state is si[r, num_accepted - 1]; column 0, which
+            # the non-spec path reads, is not kept current).
+            if num_spec_decodes == 0 or (
+                not gdn_mtp_cuda.defer_armed()
+                and num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
                 == 0
             ):
                 num_spec_decodes = 0
@@ -1311,8 +1349,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
-        num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
-        assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
+        num_draft = torch.diff(m.query_start_loc_cpu).sub_(1)
+        assert num_draft.shape == num_accepted_tokens.shape
+        # One-token rows only: captured as non-spec rows (also with
+        # VLLM_GDN_MTP_DEFER_WRITES, which keeps draftless spec rows only at
+        # run time).
+        num_decode_draft_tokens_cpu = num_draft if num_draft.any() else None
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
 

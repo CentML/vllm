@@ -6,6 +6,7 @@ from typing import NamedTuple
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.core import die_local_kv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -100,6 +101,8 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        if die_local_kv.enabled():
+            self.block_pool.enable_die_local()
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -386,6 +389,8 @@ class KVCacheCoordinator(ABC):
         """
         for manager in self.single_type_managers:
             manager.free(request_id)
+        if self.block_pool.die_local is not None:
+            self.block_pool.die_local.forget(request_id)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping from all single-type managers and
@@ -404,6 +409,8 @@ class KVCacheCoordinator(ABC):
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
+        if self.block_pool.die_local is not None:
+            self.block_pool.die_local.forget(request_id)
         return blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:

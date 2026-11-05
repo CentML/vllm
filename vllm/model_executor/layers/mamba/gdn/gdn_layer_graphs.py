@@ -55,6 +55,20 @@ Knobs (``VLLM_GDN_LAYER_GRAPHS_*``): ``T_MAX`` (4096) padded token bound,
 with the eager path on the same inputs and state (state restored in between;
 a mismatch logs, keeps the eager result and disables the graphs),
 ``LOG_EVERY`` (2000) stats period in planned steps.
+
+``VLLM_GDN_LAYER_GRAPHS_CKPT=1`` (default off) also makes steps with one
+in-forward prefill checkpoint eligible (``_chunk_prefill_with_checkpoint``
+with a single tail token range, e.g. H58 tail checkpoints): the graph adds
+eager's conv-checkpoint store before the conv, runs the V-split chunk kernel
+on the split layout, copies the running slot into the checkpoint slot and
+reruns the tail from it, all on absolute rows. A second pack launch per group
+copies the split cu_seqlens (rebased by ``S``), split slots and flags, the
+tail and checkpoint slots and the conv checkpoint token (``+ S``) into fixed
+buffers; the tail range ``[S + cut, S + end]`` comes from the host. The
+split and tail V-split factors and the split sequence count join the variant.
+Steps with several checkpoints stay eager (``ineligible_checkpoint_multi``).
+The null warm-up of a checkpoint variant writes the null block (store and
+snapshot copy on ``NULL_BLOCK_ID``); its rows of both pools are restored.
 """
 
 import dataclasses
@@ -77,6 +91,7 @@ NP = int(os.environ.get(_P + "_NP", "4"))
 NR = int(os.environ.get(_P + "_NR", "64"))
 MAX_GRAPHS = int(os.environ.get(_P + "_MAX_GRAPHS", "6000"))
 LOG_EVERY = int(os.environ.get(_P + "_LOG_EVERY", "2000"))
+CKPT = os.environ.get(_P + "_CKPT", "0") == "1"
 _CHECK = [int(os.environ.get(_P + "_CHECK", "0"))]
 
 _ARMED = [False]  # set after vLLM's capture phase (real KV cache, real buffers)
@@ -122,6 +137,11 @@ def arm() -> None:
             MAX_GRAPHS,
             _CHECK[0],
         )
+        if CKPT:
+            logger.info(
+                "GDN layer graphs: single-checkpoint prefill steps eligible "
+                "(VLLM_GDN_LAYER_GRAPHS_CKPT=1)"
+            )
 
 
 def drop_graphs() -> None:
@@ -174,6 +194,30 @@ def _pack_kernel(spec_si, si_s0, spec_cu, spec_acc, p_cu, ns_si, ns_s0, ns_hi, p
     h = tl.load(p_hi + offs, mask=mp, other=1)
     tl.store(hi_chunk + offs, h, mask=offs < NPC)
     tl.store(rows + offs, tl.where(offs == 0, N, tl.where(offs == 1, lo, hi)), mask=offs < 3)
+
+
+@triton.jit(do_not_specialize=["S", "ns", "t0", "t1"],
+            do_not_specialize_on_alignment=["sp_cu", "sp_si", "sp_hi", "tl_si", "ck_si", "cv_tok"])
+def _pack_ckpt_kernel(sp_cu, sp_si, sp_hi, tl_si, ck_si, cv_tok,
+                      cu_out, si_out, hi_out, tcu_out, tsi_out, csi_out, tok_out,
+                      S, ns, t0, t1, BLOCK: tl.constexpr):
+    """VLLM_GDN_LAYER_GRAPHS_CKPT: one checkpoint of one KV-cache group into
+    the group's fixed buffers. Split cu rebased to absolute rows (+ S) [ns + 1],
+    split slots / initial-state flags [ns], tail cu [S + t0, S + t1], tail and
+    checkpoint slot [1], conv checkpoint token (+ S) [1].
+    """
+    offs = tl.arange(0, BLOCK)
+    c = tl.load(sp_cu + offs, mask=offs <= ns, other=0) + S
+    tl.store(cu_out + offs, c, mask=offs <= ns)
+    m = offs < ns
+    tl.store(si_out + offs, tl.load(sp_si + offs, mask=m, other=0), mask=m)
+    tl.store(hi_out + offs, tl.load(sp_hi + offs, mask=m, other=1), mask=m)
+    tl.store(tcu_out + offs, tl.where(offs == 0, S + t0, S + t1), mask=offs < 2)
+    one = offs < 1
+    tl.store(tsi_out + offs, tl.load(tl_si + offs, mask=one, other=0), mask=one)
+    tl.store(csi_out + offs, tl.load(ck_si + offs, mask=one, other=0), mask=one)
+    tok = tl.load(cv_tok + offs, mask=one, other=0)
+    tl.store(tok_out + offs, tok + S, mask=one)
 # fmt: on
 
 
@@ -196,6 +240,32 @@ class _GroupBufs:
         self.ci_chunk = torch.zeros(NP, dtype=ps_dtype, device=dev)
         self.hi_chunk = torch.ones(NP, dtype=torch.bool, device=dev)
         self.rows = torch.zeros(3, **i32)
+        # VLLM_GDN_LAYER_GRAPHS_CKPT: allocated by the group's first
+        # checkpoint step (ckpt()).
+        self.ck: tuple[torch.Tensor, ...] | None = None
+        self.ck_null_tok = 0
+
+    def ckpt(self, null_tok: int) -> tuple[torch.Tensor, ...]:
+        """(split cu [NP + 2], split slots [NP + 1], split flags [NP + 1],
+        tail cu [2], tail slot [1], checkpoint slot [1], conv checkpoint
+        token [1]); ``null_tok`` (the conv window) keeps the null warm-up's
+        conv-checkpoint store in bounds (it writes the null block, which
+        ``_null_warmup`` restores).
+        """
+        if self.ck is None:
+            dev = self.dev
+            i32 = dict(dtype=torch.int32, device=dev)
+            self.ck = (
+                torch.zeros(NP + 2, **i32),
+                torch.full((NP + 1,), NULL_BLOCK_ID, **i32),
+                torch.ones(NP + 1, dtype=torch.bool, device=dev),
+                torch.zeros(2, **i32),
+                torch.full((1,), NULL_BLOCK_ID, **i32),
+                torch.full((1,), NULL_BLOCK_ID, **i32),
+                torch.full((1,), null_tok, dtype=torch.int64, device=dev),
+            )
+            self.ck_null_tok = null_tok
+        return self.ck
 
     def si(self, width: int) -> torch.Tensor:
         t = self._si.get(width)
@@ -216,6 +286,7 @@ class _GroupBufs:
             self.ci_chunk,
             self.hi_chunk,
             self.rows,
+            *(self.ck or ()),
         )
 
     def fill_null(self) -> None:
@@ -233,6 +304,36 @@ class _GroupBufs:
         self.ci_chunk.fill_(NULL_BLOCK_ID)
         self.hi_chunk.fill_(True)
         self.rows.zero_()
+        if self.ck is not None:
+            cu, si, hi, tcu, tsi, csi, tok = self.ck
+            cu.zero_()
+            si.fill_(NULL_BLOCK_ID)
+            hi.fill_(True)
+            tcu.zero_()
+            tsi.fill_(NULL_BLOCK_ID)
+            csi.fill_(NULL_BLOCK_ID)
+            tok.fill_(self.ck_null_tok)
+
+
+def _launch_pack_ckpt(gb: _GroupBufs, ck, S: int, null_tok: int) -> None:
+    """One checkpoint step of one KV-cache group into ``gb.ckpt()``."""
+    t0, t1 = ck.tail_token_range
+    ns = ck.split_state_indices.numel()
+    _pack_ckpt_kernel[(1,)](
+        ck.split_query_start_loc_i32,
+        ck.split_state_indices,
+        ck.split_has_initial_state,
+        ck.tail_state_indices,
+        ck.checkpoint_state_indices,
+        ck.conv_token_indices,
+        *gb.ckpt(null_tok),
+        S,
+        ns,
+        t0,
+        t1,
+        BLOCK=triton.next_power_of_2(NP + 2),
+        num_warps=1,
+    )
 
 
 def _launch_pack(
@@ -338,6 +439,23 @@ def warm_triton_kernels(layer, num_spec: int, x_dtype: torch.dtype) -> None:
             0,
             (0, 0),
         )
+    if CKPT:
+        from types import SimpleNamespace
+
+        _launch_pack_ckpt(
+            gb,
+            SimpleNamespace(
+                tail_token_range=(0, 0),
+                split_query_start_loc_i32=pcu,
+                split_state_indices=slots[:1],
+                split_has_initial_state=flags[:1],
+                tail_state_indices=slots[:1],
+                checkpoint_state_indices=slots[:1],
+                conv_token_indices=torch.zeros(1, dtype=torch.int64, device=dev),
+            ),
+            0,
+            0,
+        )
     qkv_size = (layer.key_dim * 2 + layer.value_dim) // layer.tp_size
     vdim = layer.value_dim // layer.tp_size
     HV, V = layer.A_log.shape[0], layer.head_v_dim
@@ -402,6 +520,9 @@ class _Step:
     mtp_cfg: tuple[int, int] | None
     T: int
     zero: bool
+    # VLLM_GDN_LAYER_GRAPHS_CKPT: (split sequences, split V-split, tail
+    # V-split) of a single-checkpoint step, else None.
+    ck: tuple[int, int, int] | None = None
 
 
 def _spec_bucket(M, n: int) -> tuple[int, int, tuple[int, int] | None]:
@@ -447,8 +568,25 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
         return "no_prefill"
     if md.num_decodes != 0:
         return "non_spec_decodes"
-    if md.prefill_checkpoint is not None:
-        return "checkpoint"
+    ck = md.prefill_checkpoint
+    if ck is not None:
+        if not CKPT:
+            return "checkpoint"
+        if ck.tail_token_range is None:
+            return "checkpoint_multi"
+        if (
+            ck.split_query_start_loc_i32 is None
+            or ck.split_query_start_loc_i32.dtype != torch.int32
+            or ck.split_state_indices.dtype != torch.int32
+            or ck.split_has_initial_state.dtype != torch.bool
+            or ck.tail_state_indices.dtype != torch.int32
+            or ck.checkpoint_state_indices.dtype != torch.int32
+            or ck.conv_token_indices.dtype != torch.int64
+            or ck.tail_state_indices.numel() != 1
+            or ck.checkpoint_state_indices.numel() != 1
+            or ck.conv_token_indices.numel() != 1
+        ):
+            return "checkpoint_md"
     npf, P = md.num_prefills, md.num_prefill_tokens
     if npf > NP:
         return "num_prefills"
@@ -494,19 +632,39 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
         or not layer.chunk_gated_delta_rule.expects_exp_g
     ):
         return "chunk"
-    if not (npf > 1 or M._gdn_fi_non_cp_max_tokens() >= P):
-        return "cp"
     HV = layer.num_v_heads // layer.tp_size
-    vsf = M._gdn_vsplit_ready[0].choose_vsplit(
-        npf, P, P if npf == 1 else md.prefill_max_seqlen, hv=HV
-    )
-    if vsf <= 1:
-        return "vsplit1"
+    ck_shape = None
+    if ck is not None:
+        # _chunk_prefill_with_checkpoint's two fi_chunk_gated_delta_rule
+        # calls: the split layout (>= 2 sequences: never CP), then the tail
+        # (one sequence of t1 - t0 tokens), each with eager's V-split rule.
+        t0, t1 = ck.tail_token_range
+        ns = ck.split_state_indices.numel()
+        if t1 - t0 > M._gdn_fi_non_cp_max_tokens():
+            return "cp"
+        if ns < 2 or ns > NP + 1:
+            return "checkpoint_md"
+        choose = M._gdn_vsplit_ready[0].choose_vsplit
+        vsf = choose(ns, P, ck.split_max_seqlen, hv=HV)
+        vsf_tail = choose(1, t1 - t0, t1 - t0, hv=HV)
+        if vsf <= 1 or vsf_tail <= 1:
+            return "ckpt_vsplit1"
+        ck_shape = (ns, vsf, vsf_tail)
+    else:
+        if not (npf > 1 or M._gdn_fi_non_cp_max_tokens() >= P):
+            return "cp"
+        vsf = M._gdn_vsplit_ready[0].choose_vsplit(
+            npf, P, P if npf == 1 else md.prefill_max_seqlen, hv=HV
+        )
+        if vsf <= 1:
+            return "vsplit1"
     # Eager CUDA conv launch config (gdn_conv_cuda_prep).
     tph = 4 if 1024 * max(npf, 1) > P else 8
     # Eager zeroes the fresh pool rows unless the builder saw on the host
     # that every prefill row has an initial state (VLLM_GDN_HOST_TRIM).
-    zero = not (GDN_HOST_TRIM and md.prefill_all_initial_state)
+    # Checkpoint steps: eager's head chunk zeroes the split rows (or the
+    # HTRIM3 group launch did, the same rows); zeroing is idempotent.
+    zero = ck is not None or not (GDN_HOST_TRIM and md.prefill_all_initial_state)
     norm_rows = (S, N) if spec == SPEC_CUDA else (0, N)
     nw = _gdn_norm_mxfp8_num_warps(
         norm_rows[1] - norm_rows[0],
@@ -558,6 +716,11 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
         norm_rows,
     )
     variant = (T, spec, W, nrb, npf, vsf, tph, nw, zero)
+    if ck_shape is not None:
+        assert ck is not None
+        # The conv window: the null warm-up's store reads rows [0, window).
+        _launch_pack_ckpt(gb, ck, S, M._host_layer_views(layer)[1].size(-1) - 1)
+        variant += ("ckpt",) + ck_shape
     return _Step(
         variant=variant,
         bufs=gb,
@@ -572,6 +735,7 @@ def _plan(layer, md, fc, core_attn_out: torch.Tensor):
         mtp_cfg=mtp_cfg,
         T=T,
         zero=zero,
+        ck=ck_shape,
     )
 
 
@@ -624,6 +788,9 @@ def graph_core(
     )
     from vllm.model_executor.layers.mamba.ops.gdn_mtp_decode import (
         gdn_mtp_recurrence,
+    )
+    from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
+        store_conv_checkpoint,
     )
 
     gb = st.bufs
@@ -688,6 +855,7 @@ def graph_core(
                 scale,
                 layer.layer_norm_epsilon,
                 layer.norm.activation,
+                layer_key=layer.prefix,
             )
             if not ok:
                 raise RuntimeError("GDN layer graphs: CUDA MTP kernel contract")
@@ -703,6 +871,13 @@ def graph_core(
     g = torch.empty(T, HV, dtype=torch.float32, device=dev)
     beta = torch.empty(T, HV, dtype=torch.float32, device=dev)
     npf = st.npf
+    if st.ck is not None:
+        # _store_conv_checkpoint: the checkpoint's conv window from the
+        # pre-conv inputs, before the conv (absolute token row).
+        ck_slot, ck_tok = gb.ckpt(gb.ck_null_tok)[5:]
+        store_conv_checkpoint(
+            mixed_qkv, conv_state, conv_w.size(-1) - 1, ck_tok, ck_slot
+        )
     ok = gdn_conv_cuda._ext[0].run(
         mixed_qkv,
         conv_w,
@@ -726,23 +901,26 @@ def graph_core(
     )
     if not ok:
         raise RuntimeError("GDN layer graphs: CUDA conv contract")
-    if st.zero:
-        zero_fresh_state_rows(ssm, gb.ci_chunk[:npf], gb.hi_chunk[:npf])
-    M._gdn_vsplit_ready[0].chunk_gated_delta_rule_vsplit(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        core_attn_out,
-        gb.cu_p[: npf + 1],
-        ssm,
-        ssm,
-        K**-0.5,
-        state_indices=gb.ci_chunk[:npf],
-        v_split=st.vsf,
-        workspace=_workspace(dev, H, HV),
-    )
+    if st.ck is not None:
+        _ckpt_chunks(st, q, k, v, g, beta, core_attn_out, ssm, H, HV, K)
+    else:
+        if st.zero:
+            zero_fresh_state_rows(ssm, gb.ci_chunk[:npf], gb.hi_chunk[:npf])
+        M._gdn_vsplit_ready[0].chunk_gated_delta_rule_vsplit(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            core_attn_out,
+            gb.cu_p[: npf + 1],
+            ssm,
+            ssm,
+            K**-0.5,
+            state_indices=gb.ci_chunk[:npf],
+            v_split=st.vsf,
+            workspace=_workspace(dev, H, HV),
+        )
     # Gated RMSNorm + out_proj's MXFP8 activation (_gated_norm_mxfp8) with
     # [num_valid, norm_lo, norm_hi] read on the device.
     assert layer.norm.bias is None and layer.norm.norm_before_gate
@@ -760,6 +938,84 @@ def graph_core(
     )
 
 
+def _ckpt_chunks(st, q, k, v, g, beta, core_attn_out, ssm, H, HV, K) -> None:
+    """VLLM_GDN_LAYER_GRAPHS_CKPT: ``_chunk_prefill_with_checkpoint`` with
+    one checkpoint on absolute rows: the eager calls in order, each V-split
+    launch with eager's factor (both read q/k/v/g/beta and write
+    ``core_attn_out`` at the rows their cu_seqlens name).
+    """
+    M = _gdn()
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_tail_ops import (
+        zero_fresh_state_rows,
+    )
+    from vllm.model_executor.layers.mamba.ops.gdn_prefill_checkpoint import (
+        copy_state_rows,
+    )
+
+    gb = st.bufs
+    ns, vsf, vsf_tail = st.ck
+    cu, si, hi, tcu, tsi, csi, _ = gb.ckpt(gb.ck_null_tok)
+    vsplit = M._gdn_vsplit_ready[0].chunk_gated_delta_rule_vsplit
+    ws = _workspace(q.device, H, HV)
+    # 1. Heads (and unsplit sequences) from their initial state; the tail is
+    # a throwaway sequence on the checkpoint slot.
+    zero_fresh_state_rows(ssm, si[:ns], hi[:ns])
+    vsplit(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        core_attn_out,
+        cu[: ns + 1],
+        ssm,
+        ssm,
+        K**-0.5,
+        state_indices=si[:ns],
+        v_split=vsf,
+        workspace=ws,
+    )
+    # 2. The running slot holds the checkpoint state: snapshot it.
+    copy_state_rows(ssm, csi, tsi)
+    # 3. Rerun the tail [S + cut, S + end) from the running slot, in place.
+    vsplit(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        core_attn_out,
+        tcu,
+        ssm,
+        ssm,
+        K**-0.5,
+        state_indices=tsi,
+        v_split=vsf_tail,
+        workspace=ws,
+    )
+
+
+def _null_warmup(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale):
+    """Null warm-up on the real buffers' addresses (same Triton
+    specializations, every module loaded, V-split compiled): save the packed
+    contents, run on zero-length contents, restore. A checkpoint variant's
+    conv-checkpoint store and snapshot copy target the null block, so its
+    rows of both pools are restored too: the null block (the page the
+    attention layers' null block shares) stays exactly as eager leaves it.
+    """
+    gb = st.bufs
+    keep = list(gb.tensors())
+    if st.ck is not None:
+        keep += [pool[NULL_BLOCK_ID] for pool in layer.kv_cache[:2]]
+    saved = [t.clone() for t in keep]
+    gb.fill_null()
+    try:
+        graph_core(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale)
+    finally:
+        for t, s in zip(keep, saved):
+            t.copy_(s)
+
+
 def _capture(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale):
     dev = core_attn_out.device
     if _CAP[0] is None:
@@ -768,17 +1024,7 @@ def _capture(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale):
         # A private pool lives as long as a graph uses it; never reuse the
         # handle of one that drained (e.g. after a failed first capture).
         _CAP[1] = torch.cuda.graph_pool_handle()
-    gb = st.bufs
-    # Null warm-up on the real buffers' addresses (same Triton
-    # specializations, every module loaded, V-split compiled): save the
-    # packed contents, run on zero-length contents, restore.
-    saved = [t.clone() for t in gb.tensors()]
-    gb.fill_null()
-    try:
-        graph_core(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale)
-    finally:
-        for t, s in zip(gb.tensors(), saved):
-            t.copy_(s)
+    _null_warmup(layer, st, mixed_qkvz, ba, core_attn_out, out_q, out_scale)
     g = torch.cuda.CUDAGraph()
     s = _CAP[0]
     cur = torch.cuda.current_stream()
@@ -838,6 +1084,8 @@ def try_replay(
             _stat("ineligible_" + st)
         else:
             _stat("packed")
+            if st.ck is not None:
+                _stat("packed_ckpt")
         if STATS["steps"] % LOG_EVERY == 1:
             logger.info("GDN layer graphs stats: %s", dict(sorted(STATS.items())))
     if isinstance(st, str) or core_attn_out.size(0) != st.T:
@@ -884,6 +1132,8 @@ def try_replay(
         )
     graph.replay()
     _stat("replays")
+    if st.ck is not None:
+        _stat("replays_ckpt")
     return True
 
 
@@ -893,6 +1143,11 @@ def _touched_slots(md, st) -> torch.Tensor:
         parts.append(md.spec_state_indices_tensor[: st.nr].reshape(-1).long())
     parts.append(md.non_spec_state_indices_tensor[: st.npf].long())
     parts.append(md.prefill_state_indices[: st.npf].long())
+    if st.ck is not None:
+        # Running and checkpoint slots (conv-checkpoint store, split chunk,
+        # snapshot copy).
+        parts.append(md.prefill_checkpoint.split_state_indices.long())
+        parts.append(md.prefill_checkpoint.checkpoint_state_indices.long())
     slots = torch.unique(torch.cat(parts))
     return slots[slots != NULL_BLOCK_ID]
 

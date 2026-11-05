@@ -6,6 +6,8 @@ import dataclasses
 import enum
 import os
 import weakref
+from collections.abc import Callable
+from functools import partial
 from typing import Literal
 
 import torch
@@ -57,7 +59,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda
+from vllm.model_executor.layers.mamba.ops import gdn_gfd_cuda, gdn_mtp_cuda, gdn_mtp_ring
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -165,6 +167,17 @@ GDN_FUSED_DECODE_MAX_TOKENS = min(
     int(os.environ.get("VLLM_GDN_FUSED_DECODE_MAX_TOKENS", "6")),
     MAX_FUSED_DECODE_TOKENS,
 )
+# VLLM_GDN_GFD_MAX_REQS=N > 0: decode-only spec batches of
+# VLLM_GDN_GFD_MIN_REQS..N requests (FULL-graph padded count) run the GDN core
+# (conv window roll + recurrence + gated norm + out_proj's MXFP8 quant) as the
+# fused CUDA kernel of ops/gdn_gfd_cuda.py (gfd_kernel<1, 4, 1>, bitwise to
+# conv + the CUDA MTP kernel), ahead of the one-launch kernel above and the
+# three-kernel chain. Off at 0 (default). VLLM_GDN_GFD_MIN_REQS (default 1) is
+# the smallest batch it takes.
+GDN_GFD_MAX_REQUESTS = int(os.environ.get("VLLM_GDN_GFD_MAX_REQS", "0"))
+GDN_GFD_MIN_REQUESTS = int(os.environ.get("VLLM_GDN_GFD_MIN_REQS", "1"))
+# Batch sizes the gfd kernel has run (logged once each per process).
+_GFD_LOGGED_BATCHES: set[int] = set()
 # Larger spec-decode batches run the register-resident CUDA kernel of
 # ops/gdn_mtp_cuda.py (JIT-built by the GDN warmup; same contract as the csrc
 # MTP kernel, VR 77 requests: 77.0 vs 81.6 us, 48: 48.3 vs 55.3 us) instead of
@@ -208,6 +221,15 @@ GDN_FI_VSPLIT = os.environ.get("VLLM_GDN_FI_VSPLIT", "1") == "1"
 # state stride divisibility hint; the vendored adapter keeps it.
 _GDN_FI_VSPLIT_V1 = envs.VLLM_GDN_FI_VSPLIT_V1
 _gdn_vsplit_ready: list = []  # [module] once the warmup compiled the kernel
+# VLLM_GDN_VSPLIT_SCHED=1 (default off; os.environ because vllm/envs.py cannot
+# be overlaid): the V-split kernel's pool launches run one CTA per tile in
+# sequence-major order with the scheduling hooks of FlashInfer #6507
+# (third_party/flashinfer_gdn_vsplit adapter), always at v_split=2, and the
+# checkpoint split's first launch maps only the heads and unsplit sequences,
+# longest first (its tails are throwaway work: their outputs and states are
+# overwritten by the copy and the tail rerun). Bit-identical.
+GDN_VSPLIT_SCHED = os.environ.get("VLLM_GDN_VSPLIT_SCHED", "0") == "1"
+_gdn_sched_logged: list = []
 _gdn_vsplit_tried: list = []
 # With V-split, the non-CP kernel beats CP for single sequences up to ~8.5k
 # tokens on VR (us, CP -> V-split: 5120 130 -> 107, 6144 138 -> 127, 8192
@@ -230,6 +252,21 @@ GDN_MIXED_FORK_PREFILL_FIRST = int(
     os.environ.get("VLLM_GDN_MIXED_FORK_PREFILL_FIRST", "1500")
 )
 _gdn_mixed_fork_state: list = []  # [(spec_stream, prefill_stream, fork, join)]
+# Engagement only: with VLLM_GDN_MIXED_FORK_PREFILL_FIRST set, log the first
+# step that runs the prefill half first (once per process).
+_GDN_PREFILL_FIRST_SET = "VLLM_GDN_MIXED_FORK_PREFILL_FIRST" in os.environ
+_gdn_prefill_first_logged: list = []
+
+
+def _gdn_log_prefill_first(num_prefill_tokens: int) -> None:
+    if not _gdn_prefill_first_logged:
+        _gdn_prefill_first_logged.append(True)
+        logger.info(
+            "GDN mixed fork: prefill half first on the high-priority stream at "
+            "%d prefill tokens (VLLM_GDN_MIXED_FORK_PREFILL_FIRST=%d)",
+            num_prefill_tokens,
+            GDN_MIXED_FORK_PREFILL_FIRST,
+        )
 
 
 def _gdn_mixed_fork_streams() -> tuple:
@@ -245,6 +282,26 @@ def _gdn_mixed_fork_streams() -> tuple:
             )
         )
     return _gdn_mixed_fork_state[0]
+
+
+# Prefill checkpoint (VLLM_GDN_PREFILL_CHECKPOINT): with VLLM_GDN_CKPT_SIDE=1 the
+# two copies that do not feed the head chunk call, the checkpoint's conv window
+# (pre-conv inputs -> checkpoint conv slots) and the gather of the tail tokens'
+# q/k/v/g/beta, run on a side stream next to the conv and the head chunk call;
+# the prefill stream waits for them only before the tail call (and before the
+# layer ends). Same kernels and inputs: bitwise. Eager launches only.
+GDN_CKPT_SIDE = os.environ.get("VLLM_GDN_CKPT_SIDE", "0") == "1"
+_gdn_ckpt_side_state: list = []  # [(stream, fork, done)]
+
+
+def _gdn_ckpt_side_streams() -> tuple:
+    """Per-process side stream and events of the checkpoint copies."""
+    if not _gdn_ckpt_side_state:
+        _, high = torch.cuda.Stream.priority_range()
+        _gdn_ckpt_side_state.append(
+            (torch.cuda.Stream(priority=high), torch.cuda.Event(), torch.cuda.Event())
+        )
+    return _gdn_ckpt_side_state[0]
 
 
 def _gdn_fi_non_cp_max_tokens() -> int:
@@ -346,6 +403,13 @@ def _gdn_vsplit_warmup(
         "GDN prefill: V-split FlashInfer kernel compiled and enabled (%s state).",
         str(state_dtype).removeprefix("torch."),
     )
+    if GDN_VSPLIT_SCHED:
+        logger.info(
+            "GDN prefill sched: VLLM_GDN_VSPLIT_SCHED=1 (one CTA per tile, "
+            "sequence-major, checkpoint tails skipped in the split launch, "
+            "longest first, FlashInfer #6507 hooks); kernel ready: %s",
+            gdn_vsplit.adapter.sched_enabled(),
+        )
 
 
 def _consumes_swizzled_mxfp8(linear: nn.Module) -> bool:
@@ -487,6 +551,9 @@ class SpecCoreOut(enum.IntEnum):
     # out_proj's MXFP8 activation of every row, the bf16 output unwritten
     # (VLLM_GDN_MTP_FUSED_QUANT)
     QUANTIZED = 2
+    # VLLM_GDN_MTP_RING: the raw output is in the ring output buffer
+    # (layer._ring_y); the caller runs the row-mapped gated norm + quant.
+    RING = 3
 
 
 def _host_spec_args(m: GDNAttentionMetadata) -> tuple:
@@ -670,6 +737,7 @@ def fi_chunk_gated_delta_rule(
     state_indices: torch.Tensor | None = None,
     max_seqlen: int = 0,
     cu_seqlens_i32: torch.Tensor | None = None,
+    seq_map: torch.Tensor | None = None,
 ):
     """FlashInfer chunked GDN prefill.
 
@@ -681,6 +749,8 @@ def fi_chunk_gated_delta_rule(
     rows (SM10x).
     ``max_seqlen`` (longest sequence, host int) and ``cu_seqlens_i32`` (int32
     copy of ``cu_seqlens``) feed the V-split path; both are optional.
+    ``seq_map`` (VLLM_GDN_VSPLIT_SCHED only): int32 indices of the sequences
+    whose results are used, in dispatch order (None: all).
     """
     if GDN_HOST_TRIM:
         # Same tensors as below without the no-op dispatches (contiguous()
@@ -736,17 +806,46 @@ def fi_chunk_gated_delta_rule(
         and fi_state.dtype in (torch.float32, torch.bfloat16)
     ):
         gdn_vsplit = _gdn_vsplit_ready[0]
-        v_split = gdn_vsplit.choose_vsplit(
-            num_seqs,
-            q.shape[0],
-            q.shape[0] if num_seqs == 1 else max_seqlen,
-            hv=v.shape[1],
-        )
+        if GDN_VSPLIT_SCHED:
+            # One CTA per tile: v_split=2.
+            v_split = 2
+        else:
+            v_split = gdn_vsplit.choose_vsplit(
+                num_seqs,
+                q.shape[0],
+                q.shape[0] if num_seqs == 1 else max_seqlen,
+                hv=v.shape[1],
+            )
         if v_split > 1 or _GDN_FI_VSPLIT_V1:
             out = torch.empty_like(v) if output is None else output.view(v.shape)
             if cu_seqlens_i32 is None:
                 assert cu_seqlens is not None
                 cu_seqlens_i32 = cu_seqlens.to(torch.int32)
+            if GDN_VSPLIT_SCHED:
+                if seq_map is not None and not _gdn_sched_logged:
+                    _gdn_sched_logged.append(True)
+                    logger.info(
+                        "GDN prefill sched: first mapped launch runs %d of %d "
+                        "split sequences",
+                        seq_map.shape[0],
+                        num_seqs,
+                    )
+                gdn_vsplit.chunk_gated_delta_rule_vsplit(
+                    q,
+                    k,
+                    v,
+                    fi_g,
+                    fi_beta,
+                    out,
+                    cu_seqlens_i32,
+                    fi_state,
+                    fi_state,
+                    q.shape[-1] ** -0.5,
+                    state_indices=state_indices,
+                    v_split=v_split,
+                    seq_map=seq_map,
+                )
+                return out.unsqueeze(0), fi_state
             gdn_vsplit.chunk_gated_delta_rule_vsplit(
                 q,
                 k,
@@ -846,6 +945,7 @@ class ChunkGatedDeltaRule(CustomOp):
         state_indices: torch.Tensor | None = None,
         max_seqlen: int = 0,
         cu_seqlens_i32: torch.Tensor | None = None,
+        seq_map: torch.Tensor | None = None,
     ):
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
@@ -862,6 +962,7 @@ class ChunkGatedDeltaRule(CustomOp):
             state_indices=state_indices,
             max_seqlen=max_seqlen,
             cu_seqlens_i32=cu_seqlens_i32,
+            seq_map=seq_map,
         )
         return o, final_state
 
@@ -994,6 +1095,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         reduce_results: bool = True,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        # VLLM_GDN_MTP_RING: ring pools per request slot (registered in the
+        # warm-up); one slot per schedulable request.
+        self._ring_num_slots = vllm_config.scheduler_config.max_num_seqs
+        self._ring = None
+        self._ring_y = None
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
@@ -1191,6 +1297,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "requests",
                 GDN_FUSED_DECODE_MAX_REQUESTS,
             )
+        # VLLM_GDN_GFD_MAX_REQS: the fused CUDA decode core (gdn_gfd_cuda) for
+        # decode-only spec batches of GDN_GFD_MIN..MAX_REQUESTS requests.
+        self._gfd_decode = (
+            GDN_GFD_MAX_REQUESTS > 0
+            and self.gdn_out_mxfp8
+            and self.conv_kernel_size == 4
+            and self.conv1d.bias is None
+            and self.activation in ("silu", "swish")
+            and self.norm.bias is None
+            and self.norm.norm_before_gate
+            and self.norm.group_size in (None, self.head_v_dim)
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and self.num_v_heads == 2 * self.num_k_heads
+        )
+        if self._gfd_decode:
+            logger.info_once(
+                "GDN fused decode kernel (gfd_kernel<1, 4, 1>) for decode-only "
+                "spec batches of %d-%d requests (VLLM_GDN_GFD_MIN_REQS / "
+                "VLLM_GDN_GFD_MAX_REQS)",
+                GDN_GFD_MIN_REQUESTS,
+                GDN_GFD_MAX_REQUESTS,
+            )
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -1349,22 +1478,74 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         self._in_proj_ba_launch(hidden_states, ba)
 
-    def _in_proj_ba_launch(self, hidden_states: torch.Tensor, ba: torch.Tensor) -> None:
+    def _in_proj_ba_launch(
+        self,
+        hidden_states: torch.Tensor,
+        ba: torch.Tensor,
+        aux_work: Callable[[], None] | None = None,
+    ) -> None:
         stream = self._ba_stream
         assert stream is not None
         fork_event, join_event = self._ba_events
         with torch.cuda.stream(stream):
             fork_event.wait(stream)
             self._in_proj_ba_gemm(hidden_states, ba)
+            if aux_work is not None:
+                aux_work()
             join_event.record(stream)
 
-    def _in_proj_ba_join(self) -> None:
+    def _in_proj_ba_join(self, aux_work: Callable[[], None] | None = None) -> None:
+        """Wait for the aux-stream in_proj_ba GEMM. ``aux_work`` (a launch that
+        reads b/a, VLLM_GDN_MTP_RING_CONV_OUT's ring a/b copy) runs on the aux
+        stream behind the GEMM when the join is still pending, so it stays off
+        the main stream; otherwise on the current stream."""
         if self._ba_pending:
             if self._ba_late is not None:
-                self._in_proj_ba_launch(*self._ba_late)
+                self._in_proj_ba_launch(*self._ba_late, aux_work=aux_work)
                 self._ba_late = None
+            elif aux_work is not None:
+                stream = self._ba_stream
+                assert stream is not None
+                with torch.cuda.stream(stream):
+                    aux_work()
+                    self._ba_events[1].record(stream)
             self._ba_events[1].wait(torch.cuda.current_stream())
             self._ba_pending = False
+        elif aux_work is not None:
+            aux_work()
+
+    def _ring_conv_on(self) -> bool:
+        return self._ring is not None and gdn_mtp_ring.GDN_MTP_RING_CONV_OUT
+
+    def _ring_conv_out(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_slots: torch.Tensor,
+        accepted: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_query_len: int,
+        num_requests: int,
+    ) -> bool:
+        """VLLM_GDN_MTP_RING_CONV_OUT: the spec rows' conv writes the ring's
+        padded q/k/v rows (ring_core then skips its gather; the a/b rows are
+        copied at the b/a join, see ring_ab); False: run causal_conv1d_update
+        as before. It reads no b/a, so the deferred b/a join stays where it is
+        (VLLM_GDN_BA_LATE_JOIN)."""
+        return gdn_mtp_ring.ring_conv(
+            self,
+            x,
+            conv_state,
+            conv_weights,
+            self.conv1d.bias,
+            self.activation,
+            conv_slots,
+            accepted,
+            cu_seqlens,
+            max_query_len,
+            num_requests,
+        )
 
     def _uses_fused_gdn_decode(self, dtype: torch.dtype) -> bool:
         """Whether forward_cuda takes the fused-norm (packed) core op."""
@@ -1939,6 +2120,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability_family(100)
         ):
             gdn_mtp_cuda.enable()
+        if gdn_mtp_ring.GDN_MTP_RING and self.num_spec > 0:
+            assert GDN_FUSED_DECODE_MAX_REQUESTS == 0 and not gdn_layer_graphs.ENABLED, (
+                "VLLM_GDN_MTP_RING takes every spec decode: it excludes "
+                "VLLM_GDN_FUSED_DECODE_MAX_REQS and VLLM_GDN_LAYER_GRAPHS"
+            )
+            gdn_mtp_ring.ring_register(
+                self,
+                self._ring_num_slots,
+                self.num_k_heads // self.tp_size,
+                self.head_k_dim,
+                self.num_v_heads // self.tp_size,
+                self.head_v_dim,
+                self.num_spec,
+            )
+        if self._gfd_decode and current_platform.is_device_capability_family(100):
+            gdn_gfd_cuda.enable()
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -2199,14 +2396,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         chunk_indices: torch.Tensor | None,
         chunk_offsets: torch.Tensor | None,
         out: torch.Tensor | None,
+        seq_map: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One chunk-kernel call that reads and writes the ssm pool rows at
         ``state_indices`` (int32). ``has_initial_state``/``no_initial_state``
-        None: every sequence starts from its pool row.
+        None: every sequence starts from its pool row. ``seq_map``
+        (VLLM_GDN_VSPLIT_SCHED): the sequences whose results are used.
         """
         if self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
             if has_initial_state is not None:
                 zero_fresh_state_rows(ssm_state, state_indices, has_initial_state)
+            if seq_map is not None:
+                o, _ = self.chunk_gated_delta_rule(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=ssm_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=False,
+                    core_attn_out=out,
+                    state_indices=state_indices,
+                    max_seqlen=max_seqlen,
+                    cu_seqlens_i32=query_start_loc_i32,
+                    seq_map=seq_map,
+                )
+                return o
             o, _ = self.chunk_gated_delta_rule(
                 q=q,
                 k=k,
@@ -2255,6 +2472,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpoint: GDNPrefillCheckpointMetadata,
         out: torch.Tensor | None,
         zeroed: bool = False,
+        side: bool = False,
     ) -> torch.Tensor:
         """Prefill chunk whose checkpointed sequences also leave their state at
         the checkpoint in the checkpoint slots (see
@@ -2262,7 +2480,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         checkpointed sequence as two consecutive chunks split there.
         ``zeroed``: the fresh rows of the head chunk were zeroed already
         (VLLM_GDN_HOST_TRIM3 group launch).
+        ``side`` (VLLM_GDN_CKPT_SIDE): the conv window store is already queued on
+        the checkpoint side stream; the tail gather goes there too, and the
+        current stream waits for both before the tail call.
         """
+        idx = checkpoint.tail_token_indices
+        gathered = None
+        if side:
+            cur = torch.cuda.current_stream()
+            side_stream, fork, done = _gdn_ckpt_side_streams()
+            if checkpoint.tail_token_range is None:
+                # q/k/v/g/beta are ready here (conv prep above, current stream).
+                assert idx is not None
+                fork.record(cur)
+                with torch.cuda.stream(side_stream):
+                    fork.wait(side_stream)
+                    gathered = gather_prefill_rows(idx, q, k, v, g, beta)
+                for t in gathered:
+                    t.record_stream(cur)
+            done.record(side_stream)
         # 1. Heads (and unsplit sequences) from their initial state; the tails
         # here are throwaway sequences on the checkpoint slots.
         o = self._run_prefill_chunk(
@@ -2281,6 +2517,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             checkpoint.split_chunk_indices,
             checkpoint.split_chunk_offsets,
             out,
+            # VLLM_GDN_VSPLIT_SCHED: heads and unsplit sequences only, longest
+            # first (None otherwise).
+            seq_map=checkpoint.split_seq_map,
         )
         # 2. The running slots now hold the checkpoint states: snapshot them.
         copy_state_rows(
@@ -2288,16 +2527,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             checkpoint.checkpoint_state_indices,
             checkpoint.tail_state_indices,
         )
+        if side:
+            done.wait(torch.cuda.current_stream())
         # 3. Rerun the tails from the checkpoint states. One tail is a token
         # range: run it on slices and write its outputs in place.
-        idx = checkpoint.tail_token_indices
         if checkpoint.tail_token_range is not None:
             start, end = checkpoint.tail_token_range
             q_t, k_t, v_t, g_t, beta_t = (t[:, start:end] for t in (q, k, v, g, beta))
             out_t: torch.Tensor | None = o[0, start:end]
         else:
             assert idx is not None
-            q_t, k_t, v_t, g_t, beta_t = gather_prefill_rows(idx, q, k, v, g, beta)
+            q_t, k_t, v_t, g_t, beta_t = (
+                gathered
+                if gathered is not None
+                else gather_prefill_rows(idx, q, k, v, g, beta)
+            )
             out_t = None
         o_tail = self._run_prefill_chunk(
             q_t,
@@ -2448,7 +2692,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec = mixed_qkv
 
         # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None and not spec_done:
+        if (
+            spec_sequence_masks is not None
+            and not spec_done
+            and self._ring_conv_on()
+            and self._ring_conv_out(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                spec_state_indices_tensor[:, 0][  # type: ignore[index]
+                    : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
+                ],
+                num_accepted_tokens,
+                spec_query_start_loc,
+                spec_state_indices_tensor.size(-1),  # type: ignore[union-attr]
+                attn_metadata.num_spec_decodes,  # type: ignore[attr-defined]
+            )
+        ):
+            pass
+        elif spec_sequence_masks is not None and not spec_done:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
@@ -2477,6 +2739,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.conv1d.bias is None
             and non_spec_query_start_loc is not None
         )
+        ckpt_side = False
         if (
             attn_metadata.num_prefills > 0
             and attn_metadata.prefill_checkpoint is not None
@@ -2484,12 +2747,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Both prefill conv paths read the pre-conv inputs; the checkpoint's
             # conv window is taken from them before either conv runs.
             assert mixed_qkv_non_spec is not None
-            self._store_conv_checkpoint(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights.size(-1),
-                attn_metadata.prefill_checkpoint,
-            )
+            # VLLM_GDN_CKPT_SIDE: the tail gather (in the chunk call below) moves
+            # to the side stream; the window store too when the fused conv prep
+            # runs (it only reads its input and writes new buffers, while the
+            # plain conv path may update the input in place).
+            ckpt_side = GDN_CKPT_SIDE and not torch.cuda.is_current_stream_capturing()
+            if ckpt_side and fused_conv_prep:
+                side, fork, _ = _gdn_ckpt_side_streams()
+                fork.record(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    fork.wait(side)
+                    self._store_conv_checkpoint(
+                        mixed_qkv_non_spec,
+                        conv_state,
+                        conv_weights.size(-1),
+                        attn_metadata.prefill_checkpoint,
+                    )
+            else:
+                self._store_conv_checkpoint(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights.size(-1),
+                    attn_metadata.prefill_checkpoint,
+                )
         if fused_conv_prep:
             pass  # mixed_qkv_non_spec stays pre-conv for gdn_fused_conv_prep
         elif attn_metadata.num_prefills > 0:
@@ -2631,7 +2911,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None and not spec_done:
+        if spec_sequence_masks is not None and not spec_done and self._ring is not None:
+            # VLLM_GDN_MTP_RING: the spec rows take the ring kernel (post-conv
+            # mixed_qkv_spec), raw output compacted to token rows.
+            num_spec = attn_metadata.num_spec_decodes
+            spec_cu = spec_query_start_loc[: num_spec + 1]  # type: ignore[index]
+            y = gdn_mtp_ring.ring_core(
+                self, mixed_qkv_spec, a_spec, b_spec, spec_cu, num_spec
+            )
+            if spec_slice is not None:
+                spec_out = core_attn_out[spec_slice]
+            else:
+                spec_out = torch.empty(
+                    (mixed_qkv_spec.shape[0], y.shape[2], y.shape[3]),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+            gdn_mtp_ring.ring_compact(y, spec_cu, spec_out)
+            core_attn_out_spec, last_recurrent_state = spec_out.unsqueeze(0), None
+        elif spec_sequence_masks is not None and not spec_done:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -2707,6 +3005,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     attn_metadata.prefill_checkpoint,
                     non_spec_out,
                     zeroed=GDN_HOST_TRIM3 and _htrim3_group_zero(self, attn_metadata),
+                    side=ckpt_side,
                 )
             elif self.chunk_gated_delta_rule.updates_state_in_place(ssm_state.dtype):
                 # FlashInfer reads and updates the pool rows in place through
@@ -2954,6 +3253,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
         out_q: torch.Tensor | None = None,
         out_scale: torch.Tensor | None = None,
+        ring_quant: bool = False,
     ) -> SpecCoreOut:
         """Conv + recurrence of the spec-decode rows into ``core_attn_out``,
         plus the gated norm in the CUDA MTP kernels (the Triton recurrence
@@ -2970,7 +3270,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # A mixed batch passes its spec rows only (fewer than
             # num_actual_tokens): [:num_actual_tokens] would be the same view.
             n = num_actual_tokens
-            if GDN_HOST_TRIM3 and attn_metadata.num_prefills > 0:
+            if self._ring_conv_on() and self._ring_conv_out(
+                _rows(mixed_qkv, n),
+                conv_state,
+                conv_weights,
+                conv_slots,
+                accepted,
+                cu_seqlens,
+                max_query_len,
+                num_requests,
+            ):
+                pass
+            elif GDN_HOST_TRIM3 and attn_metadata.num_prefills > 0:
                 # Mixed step (eager): the launch is bound once per step.
                 mixed_qkv = causal_conv1d_update_spec_step(
                     attn_metadata,
@@ -3006,6 +3317,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
                 out_q=out_q,
                 out_scale=out_scale,
+                ring_quant=ring_quant,
             )
         state_indices = attn_metadata.spec_state_indices_tensor
         cu_seqlens = attn_metadata.spec_query_start_loc
@@ -3022,18 +3334,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        mixed_qkv = causal_conv1d_update(
+        if not self._ring_conv_on() or not self._ring_conv_out(
             mixed_qkv[:num_actual_tokens],
             conv_state,
             conv_weights,
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=state_indices[:num_requests, 0],
-            num_accepted_tokens=num_accepted_tokens[:num_requests],
-            query_start_loc=cu_seqlens[: num_requests + 1],
-            max_query_len=state_indices.size(1),
-            validate_data=False,
-        )
+            state_indices[:num_requests, 0],
+            num_accepted_tokens[:num_requests],
+            cu_seqlens[: num_requests + 1],
+            state_indices.size(1),
+            num_requests,
+        ):
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv[:num_actual_tokens],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=state_indices[:num_requests, 0],
+                num_accepted_tokens=num_accepted_tokens[:num_requests],
+                query_start_loc=cu_seqlens[: num_requests + 1],
+                max_query_len=state_indices.size(1),
+                validate_data=False,
+            )
         return self._forward_core_decode_spec_post_conv_fused_norm(
             mixed_qkv=mixed_qkv,
             b=b[:num_actual_tokens],
@@ -3043,6 +3365,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata=attn_metadata,
             out_q=out_q,
             out_scale=out_scale,
+            ring_quant=ring_quant,
         )
 
     def _forward_core_decode_spec_post_conv_fused_norm(
@@ -3055,6 +3378,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata: GDNAttentionMetadata,
         out_q: torch.Tensor | None = None,
         out_scale: torch.Tensor | None = None,
+        ring_quant: bool = False,
     ) -> SpecCoreOut:
         """Spec-decode recurrence; the gated norm is applied (CUDA MTP kernels)
         or left to the caller (Triton recurrence). With ``out_q``/``out_scale``
@@ -3064,7 +3388,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         # VLLM_GDN_BA_LATE_JOIN: the deferred aux-stream join (no-op otherwise);
         # the recurrence is the first reader of b/a.
-        self._in_proj_ba_join()
+        conv_out = self._ring is not None and "_ring_conv_rows" in self.__dict__
+        if not conv_out:
+            self._in_proj_ba_join()
         num_requests = attn_metadata.num_spec_decodes
         if GDN_HOST_TRIM:
             _, state_slots, accepted, cu_seqlens, _ = _host_spec_args(attn_metadata)
@@ -3078,6 +3404,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_slots = state_indices[:num_requests]
             cu_seqlens = cu_seqlens[: num_requests + 1]
             accepted = num_accepted_tokens[:num_requests]
+        if conv_out:
+            # VLLM_GDN_MTP_RING_CONV_OUT: the same join, with the ring's a/b
+            # rows copied behind the b/a GEMM on its stream (see ring_ab).
+            self._in_proj_ba_join(
+                partial(gdn_mtp_ring.ring_ab, self, a, b, cu_seqlens, num_requests)
+            )
+        if self._ring is not None:
+            # VLLM_GDN_MTP_RING: every spec decode takes the ring kernel.
+            y = gdn_mtp_ring.ring_core(self, mixed_qkv, a, b, cu_seqlens, num_requests)
+            if ring_quant:
+                self._ring_y = (y, cu_seqlens, num_requests)
+                return SpecCoreOut.RING
+            gdn_mtp_ring.ring_compact(y, cu_seqlens, core_attn_out)
+            return SpecCoreOut.RAW
         if num_requests <= GDN_MTP_TRITON_MAX_REQUESTS:
             gdn_mtp_recurrence(
                 mixed_qkv,
@@ -3115,7 +3455,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 *args, out_q=out_q, out_scale=out_scale
             ):
                 return SpecCoreOut.QUANTIZED
-            if gdn_mtp_cuda.gdn_mtp_cuda(*args):
+            if gdn_mtp_cuda.gdn_mtp_cuda(*args, layer_key=self.prefix):
                 return SpecCoreOut.NORMED
         ops.fused_gdn_decode_post_conv_mtp(*args)
         return SpecCoreOut.NORMED
@@ -3175,6 +3515,71 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             null_block_id=NULL_BLOCK_ID,
         )
+
+    def _forward_core_decode_spec_gfd(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        out_q: torch.Tensor,
+        out_scale: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> bool:
+        """``_forward_core_decode_spec_one_launch`` with the fused CUDA kernel
+        (``gdn_gfd_cuda``, VLLM_GDN_GFD_MAX_REQS): conv window roll,
+        recurrence, gated norm and out_proj's MXFP8 activation of a
+        decode-only spec batch; rows past the valid token count get zeros.
+        False (nothing launched) if the kernel refuses the layout.
+        """
+        state_indices = attn_metadata.spec_state_indices_tensor
+        cu_seqlens = attn_metadata.spec_query_start_loc
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        assert state_indices is not None
+        assert cu_seqlens is not None
+        assert num_accepted_tokens is not None
+        num_requests = attn_metadata.num_spec_decodes
+        conv_state = (
+            self.kv_cache[0]
+            if is_conv_state_dim_first()
+            else self.kv_cache[0].transpose(-1, -2)
+        )
+        ok = gdn_gfd_cuda.gdn_gfd(
+            mixed_qkv,
+            a,
+            b,
+            conv_state,
+            self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            ),
+            self.A_log,
+            self.dt_bias,
+            state_indices[:num_requests],
+            cu_seqlens[: num_requests + 1],
+            num_accepted_tokens[:num_requests],
+            self.kv_cache[1],
+            output_gate,
+            self.norm.weight,
+            self.norm.eps,
+            self.norm.activation,
+            out_q,
+            out_scale,
+            scale=self.head_k_dim**-0.5,
+            null_block_id=NULL_BLOCK_ID,
+        )
+        if ok and num_requests not in _GFD_LOGGED_BATCHES:
+            # Once per process and batch size: FULL-graph capture runs this at
+            # each captured decode batch size; replays do not come here.
+            _GFD_LOGGED_BATCHES.add(num_requests)
+            logger.info(
+                "GDN fused decode kernel (gfd) runs the decode-only spec batches "
+                "of %d requests%s",
+                num_requests,
+                " (FULL-graph capture)"
+                if torch.cuda.is_current_stream_capturing()
+                else "",
+            )
+        return ok
 
     def _forward_core_fused_norm_packed(
         self,
@@ -3333,9 +3738,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out_scale: torch.Tensor,
         norm_rows: tuple[int, int],
         num_valid: int | torch.Tensor,
+        x_rows: torch.Tensor | None = None,
     ) -> None:
         """Gated RMSNorm of ``norm_rows`` plus out_proj's MXFP8 activation of
         every valid row; rows ``>= num_valid`` are zero-filled unread.
+        ``x_rows``: row map into ``core_attn_out`` (VLLM_GDN_MTP_RING).
         """
         assert self.norm.bias is None and self.norm.norm_before_gate
         assert self.norm.group_size in (None, self.head_v_dim)
@@ -3349,6 +3756,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             out_scale,
             norm_rows,
             num_valid,
+            x_rows=x_rows,
         )
 
     def _forward_core_fused_norm(
@@ -3384,6 +3792,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             if (
                 quantize
+                and self._gfd_decode
+                and GDN_GFD_MIN_REQUESTS
+                <= attn_metadata.num_spec_decodes
+                <= GDN_GFD_MAX_REQUESTS
+                and gdn_gfd_cuda.ready()
+            ):
+                self._in_proj_ba_join()
+                if self._forward_core_decode_spec_gfd(
+                    mixed_qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    output_gate=output_gate,
+                    out_q=out_q,  # type: ignore[arg-type]
+                    out_scale=out_scale,  # type: ignore[arg-type]
+                    attn_metadata=attn_metadata,
+                ):
+                    return
+            if (
+                quantize
                 and self._fused_decode_counters is not None
                 and attn_metadata.num_spec_decodes <= GDN_FUSED_DECODE_MAX_REQUESTS
                 and attn_metadata.spec_state_indices_tensor is not None
@@ -3408,7 +3835,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # VLLM_GDN_MTP_FUSED_QUANT: the CUDA MTP kernel may write out_proj's
             # MXFP8 activation itself (every row), instead of the separate
             # quant launch below.
-            fold_quant = quantize and gdn_mtp_cuda.GDN_MTP_FUSED_QUANT
+            ring_quant = quantize and self._ring is not None
+            fold_quant = (
+                quantize and gdn_mtp_cuda.GDN_MTP_FUSED_QUANT and not ring_quant
+            )
             written = self._forward_core_decode_spec_fused_norm(
                 mixed_qkv=mixed_qkv,
                 b=b,
@@ -3418,8 +3848,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
                 out_q=out_q if fold_quant else None,
                 out_scale=out_scale if fold_quant else None,
+                ring_quant=ring_quant,
             )
             if written == SpecCoreOut.QUANTIZED:
+                return
+            if written == SpecCoreOut.RING:
+                # gated norm + quant of the padded ring output, in token order
+                y, cu, nreq = self._ring_y
+                self._ring_y = None
+                num_spec = attn_metadata.num_spec_decodes
+                assert attn_metadata.spec_query_start_loc is not None
+                num_rows = core_attn_out.shape[0]
+                self._gated_norm_mxfp8(
+                    y.view(-1, y.shape[2], y.shape[3]),
+                    output_gate,
+                    out_q,  # type: ignore[arg-type]
+                    out_scale,  # type: ignore[arg-type]
+                    norm_rows=(0, num_rows),
+                    num_valid=attn_metadata.spec_query_start_loc[
+                        num_spec : num_spec + 1
+                    ],
+                    x_rows=gdn_mtp_ring.ring_xmap(attn_metadata, cu, nreq, num_rows),
+                )
                 return
             if quantize:
                 # Only the MTP rows of real requests are valid; their count is
@@ -3501,6 +3951,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     _htrim3_group_zero(self, attn_metadata)
                 fork.record(main)
                 if attn_metadata.num_prefill_tokens >= GDN_MIXED_FORK_PREFILL_FIRST:
+                    if _GDN_PREFILL_FIRST_SET:
+                        _gdn_log_prefill_first(attn_metadata.num_prefill_tokens)
                     with torch.cuda.stream(prefill_stream):
                         fork.wait(prefill_stream)
                         prefill_half()

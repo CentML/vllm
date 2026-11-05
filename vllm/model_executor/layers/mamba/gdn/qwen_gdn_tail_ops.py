@@ -24,6 +24,8 @@ import torch
 from vllm.model_executor.layers.fusion.mxfp8_pdl import mxfp8_producer_early_trigger
 from vllm.model_executor.layers.fusion.rms_norm_mxfp8_quant import (
     MXFP8_BLOCK,
+    NORM_LARGE_M,
+    NORM_LARGE_M_TOKENS,
     mxfp8_quantize_row,
     mxfp8_store_swizzled_scales,
 )
@@ -54,6 +56,7 @@ def _gdn_gated_norm_mxfp8_kernel(
     stride_x,
     stride_z,
     eps,
+    xmap_ptr,
     HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -63,6 +66,7 @@ def _gdn_gated_norm_mxfp8_kernel(
     LAUNCH_PDL: tl.constexpr,
     EARLY_TRIGGER: tl.constexpr,
     STORE_8B: tl.constexpr,
+    X_FROM_MAP: tl.constexpr = False,
 ):
     if LAUNCH_PDL:
         tl.extra.cuda.gdc_wait()
@@ -90,7 +94,13 @@ def _gdn_gated_norm_mxfp8_kernel(
         # so both loads are in flight together.
         normed = (row >= lo) & (row < hi)
         mask = heads[:, None] < HEADS
-        x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=0.0)
+        if X_FROM_MAP:
+            # x row of this output row (VLLM_GDN_MTP_RING: the ring's padded
+            # [B, T_pad] output read in token order)
+            xrow = tl.load(xmap_ptr + row).to(tl.int64)
+        else:
+            xrow = row
+        x = tl.load(x_ptr + xrow * stride_x + offs, mask=mask, other=0.0)
         x = x.to(tl.float32)
         z = tl.load(z_ptr + row * stride_z + offs, mask=mask & normed, other=0.0)
         z = z.to(tl.float32)
@@ -144,11 +154,14 @@ def _gdn_norm_mxfp8_num_warps(
     squares must reduce in the same order as the layer_norm_fwd launch it
     replaces: when that launch uses 1-row tiles (T <= 2 * SMs), its warp holds
     one row with lanes replicated, which only one head per warp reproduces;
-    with >= 2-row tiles any >= 2 heads per warp matches. 8 warps: fastest on
-    VR at T = 2144..8192 (sweep 2/4/8/16).
+    with >= 2-row tiles any >= 2 heads per warp matches. 8 warps for large T.
+    VLLM_MXFP8_NORM_LARGE_M=1: 4 warps from VLLM_MXFP8_NORM_LARGE_M_TOKENS
+    normalized rows (>= 2 heads per warp, so bitwise to 8 warps).
     """
     if num_norm_rows > 0 and calc_rows_per_block(num_norm_rows, device) == 1:
         return min(block_h, 32)
+    if NORM_LARGE_M and num_norm_rows >= NORM_LARGE_M_TOKENS and block_h >= 8:
+        return 4
     return min(8, max(block_h // 2, 1))
 
 
@@ -163,6 +176,7 @@ def gdn_gated_norm_mxfp8(
     norm_rows: tuple[int, int],
     num_valid: int | torch.Tensor,
     rows: torch.Tensor | None = None,
+    x_rows: torch.Tensor | None = None,
 ) -> None:
     """Gated RMSNorm (per head, norm before gate) + swizzled MXFP8 of the output.
 
@@ -178,12 +192,19 @@ def gdn_gated_norm_mxfp8(
     tensor ``[num_valid, norm_lo, norm_hi]`` read by the kernel instead of
     ``num_valid`` and ``norm_rows`` (replay of the GDN layer graphs);
     ``norm_rows`` then only picks the launch config (``num_warps``), so it must
-    be a row range of the same regime.
+    be a row range of the same regime. ``x_rows``: int32 ``[T]`` device row map,
+    output row ``i < num_valid`` reads x row ``x_rows[i]`` (x may then have any
+    row count; ``z`` and the outputs stay in token order).
     """
-    num_rows, heads, head_dim = x.shape
+    if x_rows is not None:
+        num_rows, heads, head_dim = z.shape
+        assert x.shape[1:] == z.shape[1:] and x_rows.numel() >= num_rows
+        assert x.stride(-1) == 1 and x.stride(1) == head_dim
+    else:
+        num_rows, heads, head_dim = x.shape
     hidden = heads * head_dim
     if not GDN_HOST_TRIM:
-        assert z.shape == x.shape
+        assert x_rows is not None or z.shape == x.shape
         assert x.stride(-1) == 1 and z.stride(-1) == 1
         assert x.stride(1) == head_dim and z.stride(1) == head_dim
         assert weight.shape == (head_dim,) and weight.is_contiguous()
@@ -221,6 +242,7 @@ def gdn_gated_norm_mxfp8(
         x.stride(0),
         z.stride(0),
         eps,
+        out_scale if x_rows is None else x_rows,
         HEADS=heads,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
@@ -231,6 +253,7 @@ def gdn_gated_norm_mxfp8(
         EARLY_TRIGGER=launch_pdl and mxfp8_producer_early_trigger(),
         launch_pdl=launch_pdl,
         STORE_8B=block_h * head_dim >= 16 * 32 * num_warps,
+        X_FROM_MAP=x_rows is not None,
         num_warps=num_warps,
     )
 

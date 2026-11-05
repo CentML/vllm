@@ -343,6 +343,7 @@ struct Args {
   __nv_bfloat16* out; int ldo;
   const int8_t* sm_dom;
   Q q;
+  int pdl;  // H105 (k_lm3 only): launched with PDL; wait for the producer of x after the first weight stages
 };
 
 // ---- bf16, K = 2048: stage = LPS x 16 B per row per lane (rows g, g+8) = LPS KB per warp; KIT = 64 / LPS stages
@@ -600,6 +601,8 @@ __global__ void __launch_bounds__(NW * 32, 1) k_lm3(Args a) {
   };
 #pragma unroll
   for (int v = 0; v < PD - 1; v++) issue(ids[v], v);
+  // H105: the work queue (this kernel's own counters) and the weight stages above need nothing from the producer
+  if (a.pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
   // lane (g, t) holds x[n * 8 + g][warp * 256 + 32 j + 8 t .. + 8] for all j (the same for every group)
   uint4 xb16[NT][J];
 #pragma unroll
@@ -681,6 +684,16 @@ static void launch(KF kern, const Args& a, int warps, size_t smem, cudaStream_t 
   static std::unordered_map<const void*, size_t> s_smem;
   size_t& cur = s_smem[(const void*)kern];
   if (smem > cur) { RTC(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem)); cur = smem; }
+  if (a.pdl) {  // H105: k_lm3 only (the other kernels read x without a grid-dependency wait)
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(num_sms(dev)); cfg.blockDim = dim3(warps * 32); cfg.dynamicSmemBytes = smem; cfg.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at; cfg.numAttrs = 1;
+    RTC(cudaLaunchKernelEx(&cfg, kern, a));
+    return;
+  }
   kern<<<num_sms(dev), warps * 32, smem, st>>>(a);
   RTC(cudaGetLastError());
 }
@@ -700,13 +713,15 @@ static Args make_args(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch
   a.sm_dom = sm_dom.data_ptr<int8_t>();
   a.q.list0 = tiles0.data_ptr<int>(); a.q.list1 = tiles1.data_ptr<int>();
   a.q.n0 = (int)tiles0.numel(); a.q.n1 = (int)tiles1.numel(); a.q.ctrs = ctrs.data_ptr<int>();
+  a.pdl = 0;
   return a;
 }
 
 // warps: 8 (256 threads; launch bounds). cfg = 100 * LPS + PD (16-B loads per row per stage, stages in flight);
 // PD must divide 64 / LPS.
-void lm_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor sm_dom, torch::Tensor tiles0,
-             torch::Tensor tiles1, torch::Tensor ctrs, int64_t warps, int64_t cfg) {
+// pdl (H105, lm_bf16_pdl): the cp.async-staged kernel (k_lm3) is launched with PDL; the other kernels never are.
+static void lm_bf16_impl(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor sm_dom, torch::Tensor tiles0,
+                         torch::Tensor tiles1, torch::Tensor ctrs, int64_t warps, int64_t cfg, int pdl) {
   TORCH_CHECK(w.scalar_type() == torch::kBFloat16 && x.size(1) == 2048, "bf16 path: K = 2048");
   Args a = make_args(x, w, out, sm_dom, tiles0, tiles1, ctrs);
   const int M = a.M; TORCH_CHECK(M >= 1 && M <= 32, "bf16 path: 1 <= M <= 32");
@@ -726,9 +741,11 @@ void lm_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor 
     // cfg = 3000 + 100 * (NW / 8 - 1) + PD: NW = 8 or 16 warps
     const int nw = cfg >= 3100 ? 16 : 8, pd = cfg % 10;
     const size_t smem3 = (size_t)nw * pd * 16 * (4096 / nw) + MT * 4 + 2 * nw * 16 * MT * 4;
+    a.pdl = pdl;
 #define S16(nt, p, w) if (NT == nt && nw == w && pd == p && cfg % 100 < 10) { launch(k_lm3<nt, p, w, 1>, a, w, smem3, st, dev); return; }
     S16(1, 2, 8) S16(1, 3, 8) S16(2, 2, 8) S16(2, 3, 8) S16(1, 3, 16) S16(2, 3, 16)
 #undef S16
+    a.pdl = 0;
   }
   {  // cooperative kernel: cfg = 1000 + 100 * LB + PD
     const int NTc = NT == 3 ? 4 : NT, MT = 8 * NTc;
@@ -740,6 +757,16 @@ void lm_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor 
 #undef C16
   }
   TORCH_CHECK(false, "bf16 path: unsupported (M, cfg)");
+}
+
+void lm_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor sm_dom, torch::Tensor tiles0,
+             torch::Tensor tiles1, torch::Tensor ctrs, int64_t warps, int64_t cfg) {
+  lm_bf16_impl(x, w, out, sm_dom, tiles0, tiles1, ctrs, warps, cfg, 0);
+}
+
+void lm_bf16_pdl(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor sm_dom, torch::Tensor tiles0,
+                 torch::Tensor tiles1, torch::Tensor ctrs, int64_t warps, int64_t cfg) {
+  lm_bf16_impl(x, w, out, sm_dom, tiles0, tiles1, ctrs, warps, cfg, 1);
 }
 
 }  // namespace loc
@@ -754,5 +781,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("pointer_domain", &loc::pointer_domain);
   m.def("chunk_ordinals", &loc::chunk_ordinals);
   m.def("lm_bf16", &loc::lm_bf16);
+  m.def("lm_bf16_pdl", &loc::lm_bf16_pdl);
 }
 """

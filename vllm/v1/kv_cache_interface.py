@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, fields, replace
@@ -1124,6 +1125,44 @@ def get_mamba_prefill_checkpoint_position(
         if query_start < next_boundary < num_tokens:
             return next_boundary
     return checkpoint_position
+
+
+# VLLM_H58_TAIL_CKPT: see is_h58_tail_checkpoint.
+H58_TAIL_CKPT = os.environ.get("VLLM_H58_TAIL_CKPT", "0") == "1"
+
+
+def is_h58_tail_checkpoint(
+    query_start: int,
+    query_end: int,
+    checkpoint_position: int,
+    hash_block_size: int,
+    mamba_block_size: int,
+    checkpoint_alignment: int | None,
+) -> bool:
+    """VLLM_H58_TAIL_CKPT: a query inside one Mamba block (it starts mid-block
+    and ends in the same block) whose prompt tail checkpoint lies inside it.
+
+    ``is_mamba_prefill_checkpoint_valid`` rejects it: the export column
+    ``cdiv(query_end, B) - 2`` is the one before the initial-state column, and
+    holds a shared boundary state or nothing. Under this flag the GDN Mamba
+    manager puts a fresh private block in that column for a new admission
+    (MambaManager._h58_tail_reqs) and the scheduler keeps every other request's
+    chunks out of this case, so the GDN builder can export there and the turn
+    prefills in one step instead of stopping at the tail. Same state values as
+    the two-step path: the export splits the sequence at the checkpoint.
+    """
+    if not H58_TAIL_CKPT or checkpoint_alignment is None:
+        return False
+    initial_state_col = (query_start - 1) // mamba_block_size
+    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
+    return (
+        checkpoint_col >= 0
+        and checkpoint_col == initial_state_col - 1
+        and query_start % hash_block_size == 0
+        and query_start + hash_block_size <= checkpoint_position
+        and query_start < checkpoint_position < query_end
+        and (checkpoint_position - query_start) % checkpoint_alignment == 0
+    )
 
 
 def is_mamba_prefill_checkpoint_valid(

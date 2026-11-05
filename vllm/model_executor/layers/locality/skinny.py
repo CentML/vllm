@@ -15,11 +15,19 @@ instance must not.
 
 from __future__ import annotations
 
+import os
+
 import torch
+
+from vllm.logger import init_logger
 
 from . import _ext
 from .memory import Localized, row_group_tiles
 from .topology import Topology
+
+logger = init_logger(__name__)
+
+_H105_PDL = os.environ.get("VLLM_H105_PDL", "0") == "1"
 
 BF16_MAX_M = 32
 # stage configs (see _ext.lm_bf16):
@@ -75,7 +83,13 @@ class DomainGemm:
         cfg = cfg or self.default_cfg(m)
         ext = _ext.load()
         t0, t1 = self.tiles(units_of(cfg))
-        ext.lm_bf16(x, self.w, out, self.topo.sm_domain, t0, t1, self.ctrs, 8, cfg)
+        # H105 (VLLM_H105_PDL): the cp.async-staged kernel launches with PDL
+        lm = ext.lm_bf16_pdl if _H105_PDL and cfg >= 3000 else ext.lm_bf16
+        if lm is ext.lm_bf16_pdl:
+            logger.info_once(
+                "H105 PDL on (VLLM_H105_PDL=1): target lm_head k_lm3 launches with PDL"
+            )
+        lm(x, self.w, out, self.topo.sm_domain, t0, t1, self.ctrs, 8, cfg)
         return out
 
 

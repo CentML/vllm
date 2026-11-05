@@ -11,8 +11,10 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
+from vllm.model_executor.layers.mamba.ops import gdn_mtp_cuda, gdn_mtp_ring
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     GDNDecodeMetadataFusion,
     GDNFusedDecodeStep,
@@ -114,6 +116,22 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        # VLLM_GDN_MTP_DEFER_WRITES: the GDN MTP verify kernel defers its state
+        # snapshots to a commit after sampling (postprocess_state), run here.
+        # Not with adaptive verification or dynamic speculative decoding: their
+        # varlen / K=0 FULL decode graphs are captured with one-token rows as
+        # non-spec rows, which deferral turns into spec rows (prepare_attn).
+        spec_config = vllm_config.speculative_config
+        self._gdn_defer = (
+            vllm_config.num_speculative_tokens > 0
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            and not getattr(spec_config, "enable_adaptive_verification", False)
+            and not (
+                spec_config is not None
+                and spec_config.uses_dynamic_speculative_decoding()
+            )
+            and gdn_mtp_cuda.defer_arm(self.device)
+        )
         # GDN decode-metadata fusion per set of Mamba-family builders, keyed by
         # the builders' identities (see _get_gdn_decode_fusion).
         self._gdn_decode_fusions: dict[
@@ -138,6 +156,10 @@ class MambaHybridModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if gdn_mtp_ring.GDN_MTP_RING:
+            # a new / resumed request starts vLLM-owned (imported at its first
+            # spec decode)
+            gdn_mtp_ring.ring_on_add_request(req_index)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
@@ -313,6 +335,10 @@ class MambaHybridModelState(DefaultModelState):
             # need the -1 sentinel rather than a raw zero draft count.
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            if num_draft_tokens_per_req is None and self._gdn_defer:
+                # No row has drafts this step: decode rows still become
+                # one-token spec rows below (GDN keeps the spec path for them).
+                num_draft_tokens_per_req = np.zeros(input_batch.num_reqs, np.int32)
             if num_draft_tokens_per_req is not None:
                 # A row is a spec-decode row only when its whole prompt is already
                 # computed, i.e. exactly one non-draft (decode) token is scheduled.
@@ -320,10 +346,39 @@ class MambaHybridModelState(DefaultModelState):
                     input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
                 )
                 spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
+                if self._gdn_defer:
+                    # VLLM_GDN_MTP_DEFER_WRITES: a decode row scheduled without
+                    # drafts stays a (one-token) spec row, also when no row has
+                    # drafts, so its SSM state comes from si[r, num_accepted - 1]
+                    # (materialized by the commit) and its conv window is shifted
+                    # by num_accepted, instead of the non-spec path's running
+                    # block column 0 (which holds S_0 of the previous spec step
+                    # at best, and is not kept current by the commit).
+                    spec_decode_mask |= is_decode & ~input_batch.is_prefilling_np
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+
+        if gdn_mtp_ring.GDN_MTP_RING:
+            if (
+                for_capture
+                or getattr(self, "is_dummy_step", False)
+                or num_decode_draft_tokens_cpu is None
+            ):
+                gdn_mtp_ring.ring_step_dummy()
+            else:
+                assert self._align_mode, "VLLM_GDN_MTP_RING needs mamba align mode"
+                spec_rows, other_rows = gdn_mtp_ring.ring_spec_rows(
+                    num_decode_draft_tokens_np, input_batch.num_reqs
+                )
+                gdn_mtp_ring.ring_step_prepare(
+                    input_batch.idx_mapping_np,
+                    spec_rows,
+                    other_rows,
+                    self._mamba_state_idx_gpu,
+                    self.num_accepted_tokens_gpu,
+                )
 
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
@@ -374,7 +429,27 @@ class MambaHybridModelState(DefaultModelState):
                 attn_groups,
                 for_capture=for_capture,
             )
+        if self._gdn_defer and not for_capture:
+            self._gdn_defer_begin_step(attn_metadata, attn_groups)
         return attn_metadata
+
+    def _gdn_defer_begin_step(
+        self,
+        attn_metadata: dict[str, Any],
+        attn_groups: list[list[AttentionGroup]],
+    ) -> None:
+        """VLLM_GDN_MTP_DEFER_WRITES: tag this step's deferred GDN snapshots
+        with the spec rows of the batch (every GDN group has the same rows).
+        """
+        for group_list in attn_groups:
+            for group in group_list:
+                metadata = attn_metadata.get(group.layer_names[0])
+                if isinstance(metadata, GDNAttentionMetadata):
+                    gdn_mtp_cuda.defer_begin_step(
+                        metadata.spec_sequence_masks, metadata.num_spec_decodes
+                    )
+                    return
+        gdn_mtp_cuda.defer_begin_step(None, 0)
 
     def _gather_num_accepted_tokens(
         self, input_batch: InputBatch, num_reqs: int
@@ -425,6 +500,10 @@ class MambaHybridModelState(DefaultModelState):
                 self.num_accepted_tokens_gpu,
                 max(num_sampled, 1),
             )
+        if gdn_mtp_ring.GDN_MTP_RING:
+            # before the align postprocess, which resets the accepted count of
+            # self-copy rows to 1
+            gdn_mtp_ring.ring_step_commit(self.num_accepted_tokens_gpu)
 
         if self.recoverssm is not None:
             self.recoverssm.commit_step(
@@ -432,6 +511,17 @@ class MambaHybridModelState(DefaultModelState):
                 idx_mapping,
                 state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
                 num_accepted_tokens=self.num_accepted_tokens_gpu,
+            )
+
+        if self._gdn_defer:
+            # Materialize the deferred GDN snapshots before anything reads them
+            # (the align postprocess copy below, the next step).
+            ctx = self._mamba_ctx if self._align_mode else None
+            gdn_mtp_cuda.defer_commit(
+                num_sampled,
+                idx_mapping,
+                num_computed_tokens,
+                ctx.block_size if ctx is not None else 0,
             )
 
         if not num_reqs:

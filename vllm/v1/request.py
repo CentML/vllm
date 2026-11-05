@@ -24,6 +24,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
+from vllm.v1.token_buffer import TokenBuffer
 from vllm.v1.utils import ConstantList
 
 # VLLM_PROMPT_TOKEN_ARRAY: build the int32 array of a new request's prompt
@@ -87,6 +88,7 @@ class Request:
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
         block_hashes: list["BlockHash"] | None = None,
+        prompt_token_array: array.array | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -154,7 +156,13 @@ class Request:
         if self.prompt_token_ids is None:
             self._all_token_ids: list[int] = [0] * self.num_prompt_tokens
         elif self.prompt_is_token_ids is None:
-            self._all_token_ids = self.prompt_token_ids.copy()
+            # VLLM_PROMPT_TOKEN_BUFFER (packed_prompt_ids): an int32 prompt stays
+            # int32 (a memcpy, no per-token ints); a list is copied as before.
+            self._all_token_ids = (
+                TokenBuffer(self.prompt_token_ids)
+                if type(self.prompt_token_ids) is TokenBuffer
+                else self.prompt_token_ids.copy()
+            )
         else:
             # Mixed-mode prompt: positions covered by prompt_embeds hold a sentinel
             # special token id that may lie outside the embedding. Zero them, matching
@@ -167,12 +175,21 @@ class Request:
         # VLLM_PROMPT_TOKEN_ARRAY: int32 copy of _all_token_ids as created
         # (prompt only). Valid while _all_token_ids still has exactly these
         # tokens (see prompt_token_array_if_unchanged); dropped once used.
+        # VLLM_PACKED_PROMPT_IDS: the array the prompt list was made from.
         self.prompt_token_array: array.array | None = (
-            array.array("i", self._all_token_ids)
+            (
+                array.array("i", self._all_token_ids)
+                if prompt_token_array is None
+                else prompt_token_array
+            )
             if PROMPT_TOKEN_ARRAY
             and self.prompt_is_token_ids is None
             and self.prompt_token_ids is not None
             else None
+        )
+        assert prompt_token_array is None or (
+            self.prompt_is_token_ids is None
+            and len(prompt_token_array) == len(self._all_token_ids)
         )
 
         # Used in async scheduling.
@@ -220,6 +237,11 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        # VLLM_PREFIX_EXACT_JUNCTION: ``(junction, attention_entry, chunk_stop)``
+        # when this request produces an exact (sub-block) shared-prefix junction
+        # detected at hash granularity, else None. See
+        # ``vllm/v1/core/exact_junction.py``.
+        self.exact_junction: tuple[int, int, int] | None = None
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
@@ -263,6 +285,7 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
         block_hashes: list["BlockHash"] | None = None,
+        prompt_token_array: array.array | None = None,
     ) -> "Request":
         return cls(
             request_id=request.request_id,
@@ -285,6 +308,7 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
             block_hashes=block_hashes,
+            prompt_token_array=prompt_token_array,
         )
 
     def append_output_token_ids(
