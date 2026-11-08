@@ -30,9 +30,12 @@ import math
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -464,18 +467,56 @@ def _kda_conv_new_state(
     return tl.where(rel >= 0, x_val, s_val)
 
 
-def _tma_ok(x: torch.Tensor, out: torch.Tensor) -> bool:
-    # TMA: SM90+, 16-byte aligned base addresses and row strides.
+def kda_planar_conv_impl(
+    impl: str,
+    x: torch.Tensor,
+    out: torch.Tensor | None = None,
+    num_planes: int = 3,
+) -> str:
+    """The kernel ``kda_causal_conv1d_planar(x, ..., impl=impl)`` runs: "tma"
+    or "regs".
+
+    TMA descriptors need SM90+ and 16-byte aligned base addresses and row
+    strides for ``x`` and ``out`` (``out=None`` stands for the dense output
+    the function allocates itself). ``impl="auto"`` takes the TMA kernel when
+    they can address the tensors and the register kernel otherwise;
+    ``impl="tma"`` raises instead of falling back, so a caller that expects
+    the TMA kernel is told rather than served the slower one; ``impl="regs"``
+    is the register kernel.
+    """
+    if impl not in ("auto", "tma", "regs"):
+        raise ValueError(f"Unsupported impl {impl!r}: 'auto', 'tma' or 'regs'")
+    if impl == "regs":
+        return "regs"
     e = x.element_size()
-    return (
+    if out is None:
+        # A fresh allocation: 16-byte aligned base, both strides multiples of
+        # the plane width.
+        plane_dim = x.shape[1] // num_planes
+        out_ok = (plane_dim * e) % 16 == 0
+    else:
+        out_ok = (
+            out.data_ptr() % 16 == 0
+            and (out.stride(0) * e) % 16 == 0
+            and (out.stride(1) * e) % 16 == 0
+        )
+    tma_ok = (
         current_platform.is_cuda()
         and current_platform.has_device_capability(90)
         and x.data_ptr() % 16 == 0
-        and out.data_ptr() % 16 == 0
         and (x.stride(0) * e) % 16 == 0
-        and (out.stride(0) * e) % 16 == 0
-        and (out.stride(1) * e) % 16 == 0
+        and out_ok
     )
+    if tma_ok:
+        return "tma"
+    if impl == "tma":
+        raise ValueError(
+            "impl='tma' needs SM90+ and 16-byte aligned rows: x row stride "
+            f"{x.stride(0) * e} bytes at {x.data_ptr() % 16} mod 16, output "
+            f"{'aligned' if out_ok else 'misaligned'}; use impl='auto' to fall "
+            "back to the register kernel"
+        )
+    return "regs"
 
 
 def kda_causal_conv1d_planar(
@@ -492,7 +533,7 @@ def kda_causal_conv1d_planar(
     block_n: int = 512,
     num_warps: int = 4,
     tiles: int = 8,
-    impl: str = "tma",
+    impl: str = "auto",
     num_stages: int = 3,
 ) -> torch.Tensor:
     """Causal conv1d (+ SiLU) over a varlen token batch, planar output.
@@ -518,9 +559,10 @@ def kda_causal_conv1d_planar(
         num_warps: warps per program.
         tiles: consecutive 16-token blocks per program.
         impl: "regs" (16-row tiles loaded into registers, the next tile
-            prefetched) or "tma" (TMA loads/stores through shared memory,
-            pipelined over the tiles; needs SM90+ and 16-byte aligned rows,
-            else "regs" is used).
+            prefetched), "tma" (TMA loads/stores through shared memory,
+            pipelined over the tiles; needs SM90+ and 16-byte aligned rows and
+            raises otherwise) or "auto" ("tma" where possible, else "regs";
+            see ``kda_planar_conv_impl``). The kernel in use is logged once.
         num_stages: TMA pipeline depth (impl="tma").
 
     Returns:
@@ -556,8 +598,6 @@ def kda_causal_conv1d_planar(
         raise ValueError(
             f"Unsupported activation {activation!r}: 'silu', 'swish' or None"
         )
-    if impl not in ("tma", "regs"):
-        raise ValueError(f"Unsupported impl {impl!r}: 'tma' or 'regs'")
     if block_n < 1 or block_n & (block_n - 1):
         raise ValueError(f"block_n must be a power of two, got {block_n}")
     num_seqs = query_start_loc.numel() - 1
@@ -590,6 +630,16 @@ def kda_causal_conv1d_planar(
             f"out must match x in dtype and device ({x.dtype}, {x.device}), got "
             f"{out.dtype}, {out.device}"
         )
+    impl_used = kda_planar_conv_impl(impl, x, out, num_planes)
+    logger.info_once(
+        "kda_causal_conv1d_planar: %s kernel for %d channels in %d planes (x row "
+        "stride %d bytes, impl=%r)",
+        impl_used,
+        dim,
+        num_planes,
+        x.stride(0) * x.element_size(),
+        impl,
+    )
     if num_tokens == 0 or num_seqs <= 0:
         return out[:, :num_tokens]
     silu = activation in ("silu", "swish")
@@ -601,7 +651,7 @@ def kda_causal_conv1d_planar(
         TILES=tiles,
         num_warps=num_warps,
     )
-    if impl == "tma" and _tma_ok(x, out):
+    if impl_used == "tma":
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         x_desc = TensorDescriptor(x, [num_tokens, dim], [x.stride(0), 1], [16, block_n])

@@ -23,6 +23,7 @@ import torch
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
     kda_causal_conv1d_planar,
+    kda_planar_conv_impl,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -136,9 +137,14 @@ def test_planar_conv_matches_causal_conv1d(
 
 @torch.inference_mode()
 def test_planar_conv_unaligned_rows_fall_back():
-    # Rows that are not 16-byte aligned cannot use TMA descriptors; the
-    # register kernel must take over with the same results.
-    _run("starts_inside_tiles", 2, True, row_pad=3, impl="tma")
+    # Rows that are not 16-byte aligned cannot use TMA descriptors: impl="auto"
+    # must take the register kernel with the same results, and impl="tma" must
+    # say so instead of silently doing the same.
+    _run("starts_inside_tiles", 2, True, row_pad=3, impl="auto")
+    x = torch.empty(8, 3 * 2 * D + 3, device="cuda", dtype=torch.bfloat16)[:, :-3]
+    assert kda_planar_conv_impl("auto", x) == "regs"
+    with pytest.raises(ValueError, match="aligned"):
+        kda_planar_conv_impl("tma", x)
 
 
 @torch.inference_mode()
