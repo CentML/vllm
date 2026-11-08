@@ -357,6 +357,34 @@ def _kda_conv_fixup_kernel(
 
 
 @triton.jit
+def _kda_conv_new_state(
+    x_ptr,
+    state_base,
+    seq_start,
+    seq_len,
+    has_state,
+    offs_f,
+    mask_f,
+    stride_x_token,
+    stride_state_tok,
+    k: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+):
+    rel = seq_len - (KERNEL_WIDTH - 1) + k
+    x_val = tl.load(
+        x_ptr + (seq_start + tl.maximum(rel, 0)) * stride_x_token + offs_f,
+        mask=mask_f & (rel >= 0),
+        other=0.0,
+    )
+    s_val = tl.load(
+        state_base + tl.minimum(k + seq_len, KERNEL_WIDTH - 2) * stride_state_tok,
+        mask=mask_f & (rel < 0) & has_state,
+        other=0.0,
+    )
+    return tl.where(rel >= 0, x_val, s_val)
+
+
+@triton.jit
 def _kda_conv_state_update_kernel(
     x_ptr,
     state_ptr,
@@ -437,34 +465,6 @@ def _kda_conv_state_update_kernel(
         tl.store(state_base + stride_state_tok, v1, mask=mask_f)
     if KERNEL_WIDTH >= 4:
         tl.store(state_base + 2 * stride_state_tok, v2, mask=mask_f)
-
-
-@triton.jit
-def _kda_conv_new_state(
-    x_ptr,
-    state_base,
-    seq_start,
-    seq_len,
-    has_state,
-    offs_f,
-    mask_f,
-    stride_x_token,
-    stride_state_tok,
-    k: tl.constexpr,
-    KERNEL_WIDTH: tl.constexpr,
-):
-    rel = seq_len - (KERNEL_WIDTH - 1) + k
-    x_val = tl.load(
-        x_ptr + (seq_start + tl.maximum(rel, 0)) * stride_x_token + offs_f,
-        mask=mask_f & (rel >= 0),
-        other=0.0,
-    )
-    s_val = tl.load(
-        state_base + tl.minimum(k + seq_len, KERNEL_WIDTH - 2) * stride_state_tok,
-        mask=mask_f & (rel < 0) & has_state,
-        other=0.0,
-    )
-    return tl.where(rel >= 0, x_val, s_val)
 
 
 def kda_planar_conv_impl(
@@ -581,8 +581,10 @@ def kda_causal_conv1d_planar(
             state pool (any strides, so both SD and DS layouts work); updated
             in place for every sequence with a real cache slot.
         query_start_loc: ``[N + 1]`` int32 cumulative token offsets.
-        cache_indices: ``[>= N]`` cache slot per sequence (pad/null skipped),
-            may be strided (e.g. column 0 of the block table).
+        cache_indices: ``[>= N]`` cache slot per sequence, may be strided
+            (e.g. column 0 of the block table). Sequences on a pad or null
+            slot read and write no state; their output rows are computed with
+            zero history (``causal_conv1d_fn`` leaves them unset).
         has_initial_state: ``[>= N]`` bool, read the old state as history.
         num_planes: output planes; ``dim`` must be divisible by it.
         activation: ``"silu"``/``"swish"`` or ``None``.

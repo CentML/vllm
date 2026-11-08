@@ -167,18 +167,20 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
-def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> bool:
-    """Whether chunked prefill runs the q|k|v short conv through
-    ``kda_causal_conv1d_planar`` (dense q/k/v planes, width 4 only) instead of
-    ``causal_conv1d_fn``. ``conv`` comes from
-    ``additional_config.kda_prefill_conv`` (causal_conv1d / planar)."""
+def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> str:
+    """The kernel of the q|k|v short conv in chunked prefill: "causal_conv1d"
+    (``causal_conv1d_fn``) or "planar" (``kda_causal_conv1d_planar``: dense
+    q/k/v planes, width 4, CUDA only). ``conv`` comes from
+    ``additional_config.kda_prefill_conv``."""
     if conv not in ("causal_conv1d", "planar"):
-        raise ValueError(f"Unsupported KDA prefill conv: {conv}")
+        raise ValueError(
+            f"Unsupported KDA prefill conv {conv!r}: 'causal_conv1d' or 'planar'"
+        )
     if conv == "planar" and not current_platform.is_cuda():
         raise ValueError("kda_prefill_conv=planar is only available on CUDA")
     if conv == "planar" and conv_size != 4:
         raise ValueError(f"kda_prefill_conv=planar needs width 4, got {conv_size}")
-    return conv == "planar"
+    return conv
 
 
 def _fused_qkv_conv1d(
@@ -217,7 +219,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     conv_size: int
     # Class default for layers built without __init__ (tests assemble the
     # layer attribute by attribute); __init__ overwrites it from the config.
-    _planar_prefill_conv: bool = False
+    kda_prefill_conv: str = "causal_conv1d"
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
@@ -379,7 +381,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
         )
-        self._planar_prefill_conv = _resolve_kda_prefill_conv(
+        self.kda_prefill_conv = _resolve_kda_prefill_conv(
             additional_config.get("kda_prefill_conv", "causal_conv1d")
             if isinstance(additional_config, dict)
             else "causal_conv1d",
@@ -515,7 +517,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         assert attn_metadata.non_spec_query_start_loc is not None
         assert attn_metadata.non_spec_state_indices_tensor is not None
         assert attn_metadata.has_initial_state is not None
-        if self._planar_prefill_conv and planar_conv_pays_off(
+        if self.kda_prefill_conv == "planar" and planar_conv_pays_off(
             attn_metadata.num_prefill_tokens,
             attn_metadata.num_decodes,
             self.local_num_heads,
