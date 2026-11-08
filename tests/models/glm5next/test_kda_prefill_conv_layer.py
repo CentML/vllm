@@ -57,26 +57,27 @@ def _make_layer(kda, backend: str, dim_first: bool, device, monkeypatch):
             FlashKDAPrefillCheckpointExporter,
         )
 
-        num_tokens, num_seqs = sum(LONG_STEP[0]), len(LONG_STEP[0])
-        state_shape = (num_seqs, HEADS, D, D)
-        layer._flashkda_buffer_specs = (
-            (state_shape, torch.float32),
-            (state_shape, torch.float32),
-            (
-                (
-                    torch.ops._flashkda_C.get_workspace_size(
-                        num_tokens, HEADS, num_seqs
-                    ),
-                ),
-                torch.uint8,
-            ),
-            ((1, num_tokens, HEADS, D), torch.bfloat16),
-        )
         layer._checkpoint_exporter = FlashKDAPrefillCheckpointExporter(state_len=3)
         monkeypatch.setattr(
             kda, "current_workspace_manager", lambda: WorkspaceManager(device)
         )
     return layer
+
+
+def _flashkda_buffer_specs(step):
+    """The layer's FlashKDA workspace buffers, sized for one step as __init__
+    would size them for the whole batch."""
+    num_tokens, num_seqs = sum(step[0]), len(step[0])
+    state_shape = (num_seqs, HEADS, D, D)
+    return (
+        (state_shape, torch.float32),
+        (state_shape, torch.float32),
+        (
+            (torch.ops._flashkda_C.get_workspace_size(num_tokens, HEADS, num_seqs),),
+            torch.uint8,
+        ),
+        ((1, num_tokens, HEADS, D), torch.bfloat16),
+    )
 
 
 def _metadata(step, device):
@@ -122,6 +123,8 @@ def _run_step(kda, layer, step, conv, recurrent, conv_option, monkeypatch, devic
     conv, recurrent = conv.clone(), recurrent.clone()
     layer.kv_cache = (conv, recurrent)
     layer.kda_prefill_conv = conv_option
+    if layer.kda_prefill_backend == "flashkda":
+        layer._flashkda_buffer_specs = _flashkda_buffer_specs(step)
     monkeypatch.setattr(
         kda,
         "get_forward_context",
