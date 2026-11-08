@@ -519,6 +519,40 @@ def kda_planar_conv_impl(
     return "regs"
 
 
+# Dispatch guard. The planar path (three launches, no per-token metadata) beats
+# causal_conv1d_fn once the prefill tokens pay for the launches and for the
+# single-token decode rows that share the step: a decode row costs the planar
+# path about twice what it costs the stock kernel, about 6 prefill tokens of
+# saving. Break-even from a conv-only sweep on one SM10x GPU (bf16; local head
+# counts of the TP1 to TP8 shards of GLM-5.3-Flash): about 0.5K prefill tokens
+# at 64 heads, 1K at 32, 1.8K at 16 and 3.5K at 8 for a single sequence, plus
+# 5 to 6 tokens per decode row at every head count. The intercepts below add a
+# margin; below 8 heads nothing was measured and the trend puts break-even
+# higher still. Re-measure on other GPUs before changing them.
+PLANAR_MIN_PREFILL_TOKENS = {64: 1024, 32: 1536, 16: 2048, 8: 4096}
+PLANAR_TOKENS_PER_DECODE_ROW = 6
+
+
+def planar_conv_pays_off(
+    num_prefill_tokens: int, num_decode_rows: int, local_num_heads: int
+) -> bool:
+    """Whether ``kda_causal_conv1d_planar`` is expected to beat
+    ``causal_conv1d_fn`` on a step with ``num_prefill_tokens`` prefill tokens
+    and ``num_decode_rows`` single-token rows at ``local_num_heads`` heads:
+    ``prefill tokens > intercept(heads) + 6 x decode rows``, with the intercept
+    of the largest tabulated head count not above ``local_num_heads`` (twice
+    the largest intercept below the table).
+    """
+    intercept = 2 * max(PLANAR_MIN_PREFILL_TOKENS.values())
+    for heads, tokens in sorted(PLANAR_MIN_PREFILL_TOKENS.items(), reverse=True):
+        if local_num_heads >= heads:
+            intercept = tokens
+            break
+    return (
+        num_prefill_tokens > intercept + PLANAR_TOKENS_PER_DECODE_ROW * num_decode_rows
+    )
+
+
 def kda_causal_conv1d_planar(
     x: torch.Tensor,
     weight: torch.Tensor,

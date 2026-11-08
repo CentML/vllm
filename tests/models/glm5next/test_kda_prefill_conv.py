@@ -28,8 +28,10 @@ import torch
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
+    PLANAR_MIN_PREFILL_TOKENS,
     kda_causal_conv1d_planar,
     kda_planar_conv_impl,
+    planar_conv_pays_off,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -258,6 +260,23 @@ def test_planar_conv_full_chunked_prefill_step(impl):
     # About 65K tokens at the TP8 shard: the full grid and the TMA coordinates
     # at the serving size.
     _run(LARGE_CASE, 8, True, model_row_pad(8), impl)
+
+
+def test_planar_conv_pays_off_rule():
+    # The dispatch guard: prefill tokens > intercept(heads) + 6 x decode rows.
+    for heads, intercept in PLANAR_MIN_PREFILL_TOKENS.items():
+        assert planar_conv_pays_off(intercept + 1, 0, heads)
+        assert not planar_conv_pays_off(intercept, 0, heads)
+        assert planar_conv_pays_off(intercept + 6 * 500 + 1, 500, heads)
+        assert not planar_conv_pays_off(intercept + 6 * 500, 500, heads)
+    # Measured brackets at 64 heads: two 4K prompts next to 500 decode rows win
+    # (1.4x), one 1K prompt next to 1000 rows loses (0.6x).
+    assert planar_conv_pays_off(8192, 500, 64)
+    assert not planar_conv_pays_off(1024, 1000, 64)
+    # Head counts between table entries take the next smaller entry; below
+    # the table (unmeasured) the bar doubles.
+    assert planar_conv_pays_off(2049, 0, 24) and not planar_conv_pays_off(2048, 0, 24)
+    assert planar_conv_pays_off(8193, 0, 4) and not planar_conv_pays_off(8192, 0, 4)
 
 
 @torch.inference_mode()

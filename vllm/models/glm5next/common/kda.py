@@ -46,7 +46,10 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
-from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import kda_causal_conv1d_planar
+from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
+    kda_causal_conv1d_planar,
+    planar_conv_pays_off,
+)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -499,11 +502,22 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         ``kda_causal_conv1d_planar`` (``kda_prefill_conv=planar``) returns
         ``[3, T, P]``, so each is dense and a consumer that needs contiguous
         inputs (the Triton chunk path) copies nothing.
+
+        The planar kernel runs only where it pays off (``planar_conv_pays_off``:
+        enough prefill tokens for the decode rows that share the step); the
+        stock kernel is the fallback. In steps with speculative rows the
+        metadata builder folds plain decode rows into the prefill counts, so
+        they weigh as one prefill token each here instead of six; such steps
+        carry few of them.
         """
         assert attn_metadata.non_spec_query_start_loc is not None
         assert attn_metadata.non_spec_state_indices_tensor is not None
         assert attn_metadata.has_initial_state is not None
-        if self._planar_prefill_conv:
+        if self._planar_prefill_conv and planar_conv_pays_off(
+            attn_metadata.num_prefill_tokens,
+            attn_metadata.num_decodes,
+            self.local_num_heads,
+        ):
             planes = kda_causal_conv1d_planar(
                 qkv,
                 conv_weights,
