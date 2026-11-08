@@ -61,6 +61,7 @@ else:
     from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
         kda_causal_conv1d_planar,
         planar_conv_pays_off,
+        register_planar_conv_warmup,
     )
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
@@ -387,6 +388,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             else "causal_conv1d",
             self.conv_size,
         )
+        if self.kda_prefill_conv == "planar":
+            # Startup JIT warmup of the stencil kernel this shard's rows select,
+            # the fixup and the state update (docs/contributing/jit_kernel_warmup.md).
+            register_planar_conv_warmup(
+                dtype=vllm_config.model_config.dtype,
+                weight_dtype=self.conv1d.weight.dtype,
+                bias_dtype=None if self.conv1d.bias is None else self.conv1d.bias.dtype,
+                dim=3 * self.local_projection_size,
+                num_planes=3,
+                row_strides=(
+                    # q|k|v is the leading slice of the fused projection's row;
+                    # spec-decode steps gather the non-spec rows densely.
+                    self.in_proj_qkvbfg_a.output_size_per_partition,
+                    3 * self.local_projection_size,
+                ),
+                conv_state_dim_first=self._conv_state_dim_first,
+            )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
         ) = None

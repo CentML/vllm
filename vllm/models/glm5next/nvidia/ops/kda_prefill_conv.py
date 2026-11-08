@@ -28,10 +28,17 @@ initial state) where ``causal_conv1d_fn`` leaves them unset.
 """
 
 import math
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -541,10 +548,6 @@ def kda_planar_conv_impl(
     the TMA kernel is told rather than served the slower one; ``impl="regs"``
     is the register kernel.
     """
-    if impl not in ("auto", "tma", "regs"):
-        raise ValueError(f"Unsupported impl {impl!r}: 'auto', 'tma' or 'regs'")
-    if impl == "regs":
-        return "regs"
     e = x.element_size()
     if out is None:
         # A fresh allocation: 16-byte aligned base, both strides multiples of
@@ -557,19 +560,45 @@ def kda_planar_conv_impl(
             and (out.stride(0) * e) % 16 == 0
             and (out.stride(1) * e) % 16 == 0
         )
+    return _resolve_impl(
+        impl,
+        x.data_ptr() % 16 == 0 and (x.stride(0) * e) % 16 == 0,
+        out_ok,
+        f"x row stride {x.stride(0) * e} bytes at {x.data_ptr() % 16} mod 16",
+    )
+
+
+def planar_conv_impl_for_rows(
+    impl: str, dtype: torch.dtype, row_stride: int, plane_dim: int
+) -> str:
+    """``kda_planar_conv_impl`` from the shapes alone: ``x`` rows of
+    ``row_stride`` elements at an aligned base and the function's own dense
+    output (used to register the JIT warmup of the kernel that will run)."""
+    e = dtype.itemsize
+    return _resolve_impl(
+        impl,
+        (row_stride * e) % 16 == 0,
+        (plane_dim * e) % 16 == 0,
+        f"x row stride {row_stride * e} bytes",
+    )
+
+
+def _resolve_impl(impl: str, x_ok: bool, out_ok: bool, x_text: str) -> str:
+    if impl not in ("auto", "tma", "regs"):
+        raise ValueError(f"Unsupported impl {impl!r}: 'auto', 'tma' or 'regs'")
+    if impl == "regs":
+        return "regs"
     tma_ok = (
         current_platform.is_cuda()
         and current_platform.has_device_capability(90)
-        and x.data_ptr() % 16 == 0
-        and (x.stride(0) * e) % 16 == 0
+        and x_ok
         and out_ok
     )
     if tma_ok:
         return "tma"
     if impl == "tma":
         raise ValueError(
-            "impl='tma' needs SM90+ and 16-byte aligned rows: x row stride "
-            f"{x.stride(0) * e} bytes at {x.data_ptr() % 16} mod 16, output "
+            f"impl='tma' needs SM90+ and 16-byte aligned rows: {x_text}, output "
             f"{'aligned' if out_ok else 'misaligned'}; use impl='auto' to fall "
             "back to the register kernel"
         )
@@ -608,6 +637,388 @@ def planar_conv_pays_off(
     return (
         num_prefill_tokens > intercept + PLANAR_TOKENS_PER_DECODE_ROW * num_decode_rows
     )
+
+
+# --- launches and JIT warmup -------------------------------------------------
+# Every launch goes through a dispatcher that doubles as the kernel's warmup
+# entry (docs/contributing/jit_kernel_warmup.md): the dispatch function maps a
+# call's tensors to the grid and the kernel arguments, and a warmup-inputs
+# function describes the tensors of one layer configuration (dtype, shape,
+# strides, alignment) so that the same mapping yields the compile keys at
+# startup without real tensors or launches. The TMA kernel builds its
+# descriptors inside the dispatch; Triton accepts them on warmup tensors.
+
+
+def _warmup_bias(dtype: torch.dtype | None, dim: int) -> TritonWarmupTensor | None:
+    return None if dtype is None else TritonWarmupTensor(dtype, shape=(dim,))
+
+
+def _warmup_conv_states(
+    dtype: torch.dtype, dim: int, dim_first: bool
+) -> TritonWarmupTensor:
+    # One slot of the pool as the kernels see it, [slot, dim, width - 1]: the
+    # DS layout directly, the SD layout as the transposed view kda.py passes.
+    w = CONV_WIDTH.value - 1
+    strides = (w * dim, w, 1) if dim_first else (w * dim, 1, dim)
+    return TritonWarmupTensor(dtype, shape=(1, dim, w), strides=strides)
+
+
+def _stencil_case(
+    dtype, weight_dtype, bias_dtype, dim, num_planes, row_stride, num_tokens, **launch
+):
+    plane_dim = dim // num_planes
+    case = dict(
+        x=TritonWarmupTensor(dtype, shape=(num_tokens, dim), strides=(row_stride, 1)),
+        weight=TritonWarmupTensor(weight_dtype, shape=(dim, CONV_WIDTH.value)),
+        bias=_warmup_bias(bias_dtype, dim),
+        out=TritonWarmupTensor(dtype, shape=(num_planes, num_tokens, plane_dim)),
+        activation="silu",
+    )
+    case.update(launch)
+    return case
+
+
+def _stencil_regs_warmup_inputs(
+    *,
+    dtype,
+    weight_dtype,
+    bias_dtype,
+    dim,
+    num_planes,
+    row_stride,
+    block_n,
+    tiles,
+    num_warps,
+):
+    # 16 and 17 tokens: both classes of the output's plane stride.
+    num_tokens = WarmupChoices(16, 17)
+    return _stencil_case(
+        dtype,
+        weight_dtype,
+        bias_dtype,
+        dim,
+        num_planes,
+        row_stride,
+        num_tokens,
+        block_n=block_n,
+        tiles=tiles,
+        num_warps=num_warps,
+    )
+
+
+def _stencil_tma_warmup_inputs(
+    *,
+    dtype,
+    weight_dtype,
+    bias_dtype,
+    dim,
+    num_planes,
+    row_stride,
+    block_n,
+    tiles,
+    num_warps,
+    num_stages,
+):
+    num_tokens = WarmupChoices(16, 17)
+    return _stencil_case(
+        dtype,
+        weight_dtype,
+        bias_dtype,
+        dim,
+        num_planes,
+        row_stride,
+        num_tokens,
+        block_n=block_n,
+        tiles=tiles,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def _state_update_case(
+    dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+):
+    # The warmup replays a case through the dispatch, so a case holds exactly
+    # the dispatch's parameters.
+    return dict(
+        x=TritonWarmupTensor(dtype, shape=(num_tokens, dim), strides=(row_stride, 1)),
+        conv_states=_warmup_conv_states(dtype, dim, conv_state_dim_first),
+        cache_indices=TritonWarmupTensor(
+            torch.int32, shape=(2,), strides=(cache_indices_stride,)
+        ),
+        has_initial_state=TritonWarmupTensor(torch.bool, shape=(2,)),
+        query_start_loc=TritonWarmupTensor(torch.int32, shape=(3,)),
+    )
+
+
+def _fixup_case(
+    dtype,
+    weight_dtype,
+    bias_dtype,
+    dim,
+    num_planes,
+    row_stride,
+    conv_state_dim_first,
+    cache_indices_stride,
+    num_tokens,
+):
+    plane_dim = dim // num_planes
+    case = _state_update_case(
+        dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+    )
+    case.update(
+        weight=TritonWarmupTensor(weight_dtype, shape=(dim, CONV_WIDTH.value)),
+        bias=_warmup_bias(bias_dtype, dim),
+        out=TritonWarmupTensor(dtype, shape=(num_planes, num_tokens, plane_dim)),
+        activation="silu",
+    )
+    return case
+
+
+def _fixup_warmup_inputs(
+    *,
+    dtype,
+    weight_dtype,
+    bias_dtype,
+    dim,
+    num_planes,
+    row_stride,
+    conv_state_dim_first,
+    cache_indices_stride,
+):
+    num_tokens = WarmupChoices(16, 17)
+    return _fixup_case(
+        dtype,
+        weight_dtype,
+        bias_dtype,
+        dim,
+        num_planes,
+        row_stride,
+        conv_state_dim_first,
+        cache_indices_stride,
+        num_tokens,
+    )
+
+
+def _state_update_warmup_inputs(
+    *, dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride
+):
+    num_tokens = WarmupChoices(16, 17)
+    return _state_update_case(
+        dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+    )
+
+
+def _stencil_kwargs(x, weight, bias, out, block_n, tiles, num_warps, activation):
+    num_tokens, dim = x.shape
+    plane_dim = out.shape[2]
+    grid = (
+        triton.cdiv(num_tokens, TILE_TOKENS.value * tiles),
+        triton.cdiv(dim, block_n),
+    )
+    return grid, dict(
+        w_ptr=weight,
+        bias_ptr=bias,
+        num_tokens=num_tokens,
+        dim=dim,
+        plane_dim=plane_dim,
+        stride_w_dim=weight.stride(0),
+        stride_w_width=weight.stride(1),
+        HAS_BIAS=bias is not None,
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        BLOCK_N=block_n,
+        TILES=tiles,
+        num_warps=num_warps,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_kda_conv_fwd_planar_kernel, warmup_inputs=_stencil_regs_warmup_inputs
+)
+def _planar_stencil_regs(
+    x, weight, bias, out, block_n, tiles, num_warps, activation
+) -> DispatchSpec:
+    grid, kwargs = _stencil_kwargs(
+        x, weight, bias, out, block_n, tiles, num_warps, activation
+    )
+    kwargs.update(
+        x_ptr=x,
+        out_ptr=out,
+        stride_x_token=x.stride(0),
+        stride_out_plane=out.stride(0),
+        stride_out_token=out.stride(1),
+    )
+    return grid, kwargs
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_kda_conv_fwd_planar_tma_kernel, warmup_inputs=_stencil_tma_warmup_inputs
+)
+def _planar_stencil_tma(
+    x, weight, bias, out, block_n, tiles, num_warps, num_stages, activation
+) -> DispatchSpec:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    num_tokens, dim = x.shape
+    num_planes, _, plane_dim = out.shape
+    grid, kwargs = _stencil_kwargs(
+        x, weight, bias, out, block_n, tiles, num_warps, activation
+    )
+    kwargs.update(
+        x_desc=TensorDescriptor(
+            x, [num_tokens, dim], [x.stride(0), 1], [TILE_TOKENS.value, block_n]
+        ),
+        x_halo_desc=TensorDescriptor(
+            x, [num_tokens, dim], [x.stride(0), 1], [CONV_WIDTH.value, block_n]
+        ),
+        out_desc=TensorDescriptor(
+            out,
+            [num_planes, num_tokens, plane_dim],
+            [out.stride(0), out.stride(1), 1],
+            [1, TILE_TOKENS.value, block_n],
+        ),
+        NUM_STAGES=num_stages,
+    )
+    return grid, kwargs
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_kda_conv_fixup_kernel, warmup_inputs=_fixup_warmup_inputs
+)
+def _planar_fixup(
+    x,
+    weight,
+    bias,
+    conv_states,
+    cache_indices,
+    has_initial_state,
+    query_start_loc,
+    out,
+    activation,
+) -> DispatchSpec:
+    dim, plane_dim = x.shape[1], out.shape[2]
+    num_seqs = query_start_loc.shape[0] - 1
+    block_n = math.gcd(_SEQ_BLOCK_N, plane_dim)
+    return (num_seqs, triton.cdiv(dim, block_n)), dict(
+        x_ptr=x,
+        w_ptr=weight,
+        bias_ptr=bias,
+        state_ptr=conv_states,
+        cache_indices_ptr=cache_indices,
+        has_initial_state_ptr=has_initial_state,
+        query_start_loc_ptr=query_start_loc,
+        out_ptr=out,
+        dim=dim,
+        plane_dim=plane_dim,
+        stride_x_token=x.stride(0),
+        stride_w_dim=weight.stride(0),
+        stride_w_width=weight.stride(1),
+        stride_state_seq=conv_states.stride(0),
+        stride_state_dim=conv_states.stride(1),
+        stride_state_tok=conv_states.stride(2),
+        stride_out_plane=out.stride(0),
+        stride_out_token=out.stride(1),
+        stride_cache_indices=cache_indices.stride(0),
+        stride_has_initial_state=has_initial_state.stride(0),
+        pad_slot_id=PAD_SLOT_ID,
+        null_block_id=NULL_BLOCK_ID,
+        HAS_BIAS=bias is not None,
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_kda_conv_state_update_kernel, warmup_inputs=_state_update_warmup_inputs
+)
+def _planar_state_update(
+    x, conv_states, cache_indices, has_initial_state, query_start_loc
+) -> DispatchSpec:
+    dim = x.shape[1]
+    num_seqs = query_start_loc.shape[0] - 1
+    return (num_seqs, triton.cdiv(dim, _SEQ_BLOCK_N)), dict(
+        x_ptr=x,
+        state_ptr=conv_states,
+        cache_indices_ptr=cache_indices,
+        has_initial_state_ptr=has_initial_state,
+        query_start_loc_ptr=query_start_loc,
+        dim=dim,
+        stride_x_token=x.stride(0),
+        stride_state_seq=conv_states.stride(0),
+        stride_state_dim=conv_states.stride(1),
+        stride_state_tok=conv_states.stride(2),
+        stride_cache_indices=cache_indices.stride(0),
+        stride_has_initial_state=has_initial_state.stride(0),
+        pad_slot_id=PAD_SLOT_ID,
+        null_block_id=NULL_BLOCK_ID,
+        BLOCK_N=_SEQ_BLOCK_N,
+        num_warps=4,
+    )
+
+
+def planar_conv_warmup_plan(
+    *,
+    dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    bias_dtype: torch.dtype | None,
+    dim: int,
+    num_planes: int,
+    row_strides: tuple[int, ...],
+    conv_state_dim_first: bool,
+    impl: str = "auto",
+    block_n: int = _DEFAULT_BLOCK_N,
+    tiles: int = _DEFAULT_TILES,
+    num_warps: int = _DEFAULT_NUM_WARPS,
+    num_stages: int = _DEFAULT_NUM_STAGES,
+    cache_indices_strides: tuple[int, ...] = (1, 2, 16),
+) -> list[tuple[Any, dict[str, Any]]]:
+    """The (dispatcher, warmup kwargs) pairs that cover one layer's planar conv.
+
+    For each row stride of ``x`` (the fused projection's row; the dense row of
+    the gathered non-spec rows of a spec-decode step) the stencil kernel that
+    ``kda_planar_conv_impl`` selects for it, plus the fixup and the state
+    update for the conv-state layout and every specialization class of the
+    cache-index stride (contiguous, generic, multiple of 16: the block table's
+    width is not known at init).
+    """
+    plane_dim = dim // num_planes
+    block_n = math.gcd(block_n, plane_dim)
+    plan: list[tuple[Any, dict[str, Any]]] = []
+    for row_stride in dict.fromkeys(row_strides):
+        common = dict(
+            dtype=dtype,
+            weight_dtype=weight_dtype,
+            bias_dtype=bias_dtype,
+            dim=dim,
+            num_planes=num_planes,
+            row_stride=row_stride,
+        )
+        launch = dict(common, block_n=block_n, tiles=tiles, num_warps=num_warps)
+        if planar_conv_impl_for_rows(impl, dtype, row_stride, plane_dim) == "tma":
+            plan.append((_planar_stencil_tma, dict(launch, num_stages=num_stages)))
+        else:
+            plan.append((_planar_stencil_regs, launch))
+        for cache_indices_stride in cache_indices_strides:
+            per_seq = dict(
+                conv_state_dim_first=conv_state_dim_first,
+                cache_indices_stride=cache_indices_stride,
+            )
+            plan.append((_planar_fixup, dict(common, **per_seq)))
+            plan.append(
+                (
+                    _planar_state_update,
+                    dict(per_seq, dtype=dtype, dim=dim, row_stride=row_stride),
+                )
+            )
+    return plan
+
+
+def register_planar_conv_warmup(**config: Any) -> None:
+    """Register one layer configuration's planar conv kernels for startup JIT
+    warmup (``planar_conv_warmup_plan`` lists what is registered)."""
+    for dispatcher, kwargs in planar_conv_warmup_plan(**config):
+        dispatcher.register_warmup(**kwargs)
 
 
 def kda_causal_conv1d_planar(
@@ -737,65 +1148,15 @@ def kda_causal_conv1d_planar(
     )
     if num_tokens == 0 or num_seqs <= 0:
         return out[:, :num_tokens]
-    silu = activation in ("silu", "swish")
-    grid = (
-        triton.cdiv(num_tokens, TILE_TOKENS.value * tiles),
-        triton.cdiv(dim, block_n),
-    )
-    meta = dict(
-        HAS_BIAS=bias is not None,
-        SILU_ACTIVATION=silu,
-        BLOCK_N=block_n,
-        TILES=tiles,
-        num_warps=num_warps,
-    )
     if impl_used == "tma":
-        from triton.tools.tensor_descriptor import TensorDescriptor
-
-        x_desc = TensorDescriptor(
-            x, [num_tokens, dim], [x.stride(0), 1], [TILE_TOKENS.value, block_n]
-        )
-        x_halo_desc = TensorDescriptor(
-            x, [num_tokens, dim], [x.stride(0), 1], [CONV_WIDTH.value, block_n]
-        )
-        out_desc = TensorDescriptor(
-            out,
-            [num_planes, num_tokens, plane_dim],
-            [out.stride(0), out.stride(1), 1],
-            [1, TILE_TOKENS.value, block_n],
-        )
-        _kda_conv_fwd_planar_tma_kernel[grid](
-            x_desc,
-            x_halo_desc,
-            out_desc,
-            weight,
-            bias,
-            num_tokens,
-            dim,
-            plane_dim,
-            weight.stride(0),
-            weight.stride(1),
-            NUM_STAGES=num_stages,
-            **meta,
+        _planar_stencil_tma(
+            x, weight, bias, out, block_n, tiles, num_warps, num_stages, activation
         )
     else:
-        _kda_conv_fwd_planar_kernel[grid](
-            x,
-            weight,
-            bias,
-            out,
-            num_tokens,
-            dim,
-            plane_dim,
-            x.stride(0),
-            weight.stride(0),
-            weight.stride(1),
-            out.stride(0),
-            out.stride(1),
-            **meta,
+        _planar_stencil_regs(
+            x, weight, bias, out, block_n, tiles, num_warps, activation
         )
-    fixup_block_n = math.gcd(_SEQ_BLOCK_N, plane_dim)
-    _kda_conv_fixup_kernel[(num_seqs, triton.cdiv(dim, fixup_block_n))](
+    _planar_fixup(
         x,
         weight,
         bias,
@@ -804,42 +1165,9 @@ def kda_causal_conv1d_planar(
         has_initial_state,
         query_start_loc,
         out,
-        dim,
-        plane_dim,
-        x.stride(0),
-        weight.stride(0),
-        weight.stride(1),
-        conv_states.stride(0),
-        conv_states.stride(1),
-        conv_states.stride(2),
-        out.stride(0),
-        out.stride(1),
-        cache_indices.stride(0),
-        has_initial_state.stride(0),
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
-        HAS_BIAS=bias is not None,
-        SILU_ACTIVATION=silu,
-        BLOCK_N=fixup_block_n,
-        num_warps=4,
+        activation,
     )
-    update_block_n = _SEQ_BLOCK_N
-    _kda_conv_state_update_kernel[(num_seqs, triton.cdiv(dim, update_block_n))](
-        x,
-        conv_states,
-        cache_indices,
-        has_initial_state,
-        query_start_loc,
-        dim,
-        x.stride(0),
-        conv_states.stride(0),
-        conv_states.stride(1),
-        conv_states.stride(2),
-        cache_indices.stride(0),
-        has_initial_state.stride(0),
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
-        BLOCK_N=update_block_n,
-        num_warps=4,
+    _planar_state_update(
+        x, conv_states, cache_indices, has_initial_state, query_start_loc
     )
     return out[:, :num_tokens]
