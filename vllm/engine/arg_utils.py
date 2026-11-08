@@ -877,6 +877,7 @@ class EngineArgs:
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
     ) = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
+    kda_prefill_conv: Literal["causal_conv1d", "planar"] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1975,6 +1976,16 @@ class EngineArgs:
             default=None,
             help="Select KDA decode backend.",
         )
+        parser.add_argument(
+            "--kda-prefill-conv",
+            dest="kda_prefill_conv",
+            choices=["causal_conv1d", "planar"],
+            default=None,
+            help="Kernel of the KDA q|k|v short conv in chunked prefill "
+            "(GLM-5.3-Flash): 'causal_conv1d' (default) or 'planar', a CUDA-only "
+            "Triton kernel with dense q/k/v outputs that is faster on long "
+            "prefill chunks and falls back to causal_conv1d on short ones.",
+        )
         return parser
 
     @classmethod
@@ -2890,6 +2901,10 @@ class EngineArgs:
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
         if self.kda_decode_backend is not None:
             self.additional_config["kda_decode_backend"] = self.kda_decode_backend
+        if self.kda_prefill_conv is not None:
+            if self.kda_prefill_conv == "planar" and not current_platform.is_cuda():
+                raise ValueError("--kda-prefill-conv=planar is only available on CUDA.")
+            self.additional_config["kda_prefill_conv"] = self.kda_prefill_conv
 
         config = VllmConfig(
             model_config=model_config,

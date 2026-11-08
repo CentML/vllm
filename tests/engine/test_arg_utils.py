@@ -93,6 +93,16 @@ def test_watermark_config_cli():
     assert config.deduplicate_contexts_max_history == 32
 
 
+def test_kda_prefill_conv_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--model", "dummy"])
+    assert EngineArgs.from_cli_args(args).kda_prefill_conv is None
+    args = parser.parse_args(["--model", "dummy", "--kda-prefill-conv", "planar"])
+    assert EngineArgs.from_cli_args(args).kda_prefill_conv == "planar"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "dummy", "--kda-prefill-conv", "fused"])
+
+
 @pytest.mark.parametrize(
     "option",
     ["--gpu-memory-utilization", "--device-memory-utilization"],
