@@ -527,12 +527,45 @@ def kda_causal_conv1d_planar(
         ``[num_planes, T, dim // num_planes]`` output in ``x.dtype``.
 
     """
-    assert x.dim() == 2 and x.stride(1) == 1
+    if x.dim() != 2 or x.stride(1) != 1:
+        raise ValueError(
+            "x must be a 2D [T, dim] tensor with dense channels, got shape "
+            f"{tuple(x.shape)} with strides {x.stride()}"
+        )
     num_tokens, dim = x.shape
+    if weight.dim() != 2 or weight.shape[1] != 4:
+        raise ValueError(
+            "kda_causal_conv1d_planar implements conv width 4 only, got a weight "
+            f"of shape {tuple(weight.shape)}"
+        )
     width = weight.shape[1]
-    assert width == 4
-    assert weight.shape[0] == dim and dim % num_planes == 0
-    assert conv_states.shape[1] == dim and conv_states.shape[2] >= width - 1
+    if weight.shape[0] != dim:
+        raise ValueError(f"weight has {weight.shape[0]} channels, x has {dim}")
+    if num_planes < 1 or dim % num_planes != 0:
+        raise ValueError(f"dim {dim} is not divisible by num_planes {num_planes}")
+    if (
+        conv_states.dim() != 3
+        or conv_states.shape[1] != dim
+        or conv_states.shape[2] < width - 1
+    ):
+        raise ValueError(
+            f"conv_states must be [num_slots, {dim}, >= {width - 1}], got shape "
+            f"{tuple(conv_states.shape)}"
+        )
+    if activation not in ("silu", "swish", None):
+        raise ValueError(
+            f"Unsupported activation {activation!r}: 'silu', 'swish' or None"
+        )
+    if impl not in ("tma", "regs"):
+        raise ValueError(f"Unsupported impl {impl!r}: 'tma' or 'regs'")
+    if block_n < 1 or block_n & (block_n - 1):
+        raise ValueError(f"block_n must be a power of two, got {block_n}")
+    num_seqs = query_start_loc.numel() - 1
+    if cache_indices.numel() < num_seqs or has_initial_state.numel() < num_seqs:
+        raise ValueError(
+            f"cache_indices ({cache_indices.numel()}) and has_initial_state "
+            f"({has_initial_state.numel()}) need an entry per sequence ({num_seqs})"
+        )
     plane_dim = dim // num_planes
     # Programs must not straddle planes.
     block_n = math.gcd(block_n, plane_dim)
@@ -540,9 +573,23 @@ def kda_causal_conv1d_planar(
         out = torch.empty(
             (num_planes, num_tokens, plane_dim), dtype=x.dtype, device=x.device
         )
-    assert out.shape[0] == num_planes and out.shape[2] == plane_dim
-    assert out.stride(2) == 1
-    num_seqs = query_start_loc.numel() - 1
+    elif (
+        out.dim() != 3
+        or out.shape[0] != num_planes
+        or out.shape[1] < num_tokens
+        or out.shape[2] != plane_dim
+        or out.stride(2) != 1
+    ):
+        raise ValueError(
+            f"out must be [{num_planes}, >= {num_tokens}, {plane_dim}] with a "
+            f"dense last dim, got shape {tuple(out.shape)} with strides "
+            f"{out.stride()}"
+        )
+    elif out.dtype != x.dtype or out.device != x.device:
+        raise TypeError(
+            f"out must match x in dtype and device ({x.dtype}, {x.device}), got "
+            f"{out.dtype}, {out.device}"
+        )
     if num_tokens == 0 or num_seqs <= 0:
         return out[:, :num_tokens]
     silu = activation in ("silu", "swish")

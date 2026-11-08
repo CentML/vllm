@@ -139,3 +139,54 @@ def test_planar_conv_unaligned_rows_fall_back():
     # Rows that are not 16-byte aligned cannot use TMA descriptors; the
     # register kernel must take over with the same results.
     _run("starts_inside_tiles", 2, True, row_pad=3, impl="tma")
+
+
+@torch.inference_mode()
+def test_planar_conv_rejects_bad_inputs():
+    # Contract violations raise with a message instead of failing inside a
+    # kernel (or, with a short out=, writing past its end).
+    device = "cuda"
+    dim, num_tokens = 3 * 2 * D, 8
+    x = torch.randn(num_tokens, dim, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(dim, WIDTH, device=device)
+    pool = torch.zeros(3, dim, WIDTH - 1, device=device, dtype=torch.bfloat16)
+    query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+    cache_indices = torch.tensor([1], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([False], device=device)
+
+    def call(**overrides):
+        kwargs = dict(
+            x=x,
+            weight=weight,
+            bias=None,
+            conv_states=pool,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+        )
+        kwargs.update(overrides)
+        return kda_causal_conv1d_planar(**kwargs)
+
+    call()  # the valid baseline
+    with pytest.raises(ValueError, match="width 4"):
+        call(weight=weight[:, :3])
+    with pytest.raises(ValueError, match="dense channels"):
+        call(x=x.transpose(0, 1))
+    with pytest.raises(ValueError, match="num_planes"):
+        call(num_planes=5)
+    with pytest.raises(ValueError, match="conv_states"):
+        call(conv_states=pool[:, :, :1])
+    with pytest.raises(ValueError, match="activation"):
+        call(activation="gelu")
+    with pytest.raises(ValueError, match="impl"):
+        call(impl="TMA")
+    with pytest.raises(ValueError, match="power of two"):
+        call(block_n=48)
+    with pytest.raises(ValueError, match="entry per sequence"):
+        call(cache_indices=cache_indices[:0])
+    short = torch.empty(3, num_tokens - 1, dim // 3, device=device, dtype=x.dtype)
+    with pytest.raises(ValueError, match="out must be"):
+        call(out=short)
+    wrong_dtype = torch.empty(3, num_tokens, dim // 3, device=device)
+    with pytest.raises(TypeError, match="dtype"):
+        call(out=wrong_dtype)
