@@ -15,9 +15,10 @@ its last ``W-1`` tokens), with two differences:
   load (registers, the next tile prefetched; or TMA through shared memory,
   pipelined over TILES tiles per program), rows are unpacked in registers
   and slid through the window, and a tile's last 3 rows are the next one's
-  halo. A second launch recomputes the first 3 tokens of every sequence with
-  the initial conv state (or zeros) as history; a third updates the state.
-  causal_conv1d_fn instead loops token by token with 4-byte loads.
+  halo in both variants. A second launch recomputes the first 3 tokens of
+  every sequence with the initial conv state (or zeros) as history; a third
+  updates the state. causal_conv1d_fn instead loops token by token with
+  4-byte loads.
 
 Outputs and conv states are bit-identical to ``causal_conv1d_fn`` (fp32
 weights accumulate through explicit fused multiply-adds, the form that
@@ -279,7 +280,9 @@ def _kda_conv_fwd_planar_tma_kernel(
     NUM_STAGES: tl.constexpr,
 ):
     # As _kda_conv_fwd_planar_kernel, with TMA loads (pipelined over the
-    # tiles; rows outside [0, num_tokens) read as zero) and TMA stores.
+    # tiles; rows outside [0, num_tokens) read as zero) and TMA stores. The
+    # halo is loaded once per program; a tile's last rows are the next tile's
+    # history, as in the register kernel.
     t_first = tl.program_id(0) * (TILE_TOKENS * TILES)
     f0 = tl.program_id(1) * BLOCK_N
     offs_f = f0 + tl.arange(0, BLOCK_N)
@@ -290,11 +293,11 @@ def _kda_conv_fwd_planar_tma_kernel(
     plane = f0 // plane_dim
     col0 = f0 - plane * plane_dim
     dt: tl.constexpr = out_desc.dtype
+    _, h1, h2, h3 = _rows4(tl.trans(x_halo_desc.load([t_first - CONV_WIDTH, f0])))
     for it in tl.range(0, TILES, num_stages=NUM_STAGES):
         t0 = t_first + it * TILE_TOKENS
-        _, h1, h2, h3 = _rows4(tl.trans(x_halo_desc.load([t0 - CONV_WIDTH, f0])))
         xt = tl.trans(x_desc.load([t0, f0]))  # [BLOCK_N, TILE_TOKENS]
-        yt, _, _, _ = _conv_tile(
+        yt, h1, h2, h3 = _conv_tile(
             xt, h1, h2, h3, w0, w1, w2, w3, acc0, dt, SILU_ACTIVATION
         )
         out_desc.store(
