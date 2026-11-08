@@ -19,9 +19,11 @@ its last ``W-1`` tokens), with two differences:
   the initial conv state (or zeros) as history; a third updates the state.
   causal_conv1d_fn instead loops token by token with 4-byte loads.
 
-Outputs and conv states are bit-identical to ``causal_conv1d_fn``, except
-that rows of sequences on a null cache slot are written (as if the
-sequence had no initial state) where ``causal_conv1d_fn`` leaves them unset.
+Outputs and conv states are bit-identical to ``causal_conv1d_fn`` (fp32
+weights accumulate through explicit fused multiply-adds, the form that
+kernel's multiply-adds compile to; see ``_conv_silu``), except that rows of
+sequences on a null cache slot are written (as if the sequence had no
+initial state) where ``causal_conv1d_fn`` leaves them unset.
 """
 
 import math
@@ -71,11 +73,23 @@ def _unrows4(r0, r1, r2, r3):
 
 @triton.jit
 def _conv_silu(a, b, c, d, w0, w1, w2, w3, acc0, SILU_ACTIVATION: tl.constexpr):
-    # Same accumulation order as causal_conv1d_fn (oldest tap first).
-    acc = acc0 + a * w0
-    acc += b * w1
-    acc += c * w2
-    acc += d * w3
+    # Same accumulation order as causal_conv1d_fn (oldest tap first). With fp32
+    # weights the taps are explicit fused multiply-adds (one rounding per tap):
+    # that is what causal_conv1d_fn's fp32 multiply-adds compile to, and
+    # written as separate multiplies and adds the compiler does not always
+    # contract them, which costs 1 bf16 ulp on a few outputs per million. With
+    # bf16 weights the product is a bf16 multiply in both kernels, so
+    # mul-then-add stays.
+    if w0.dtype == tl.float32:
+        acc = tl.fma(a.to(tl.float32), w0, acc0)
+        acc = tl.fma(b.to(tl.float32), w1, acc)
+        acc = tl.fma(c.to(tl.float32), w2, acc)
+        acc = tl.fma(d.to(tl.float32), w3, acc)
+    else:
+        acc = acc0 + a * w0
+        acc += b * w1
+        acc += c * w2
+        acc += d * w3
     if SILU_ACTIVATION:
         acc = acc / (1 + tl.exp(-acc))
     return acc

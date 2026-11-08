@@ -8,6 +8,13 @@ it for every batch shape the scheduler produces: decode rows mixed with
 prefills, sequences shorter than the conv window, sequences starting inside a
 program's tiles, fresh and continued sequences, null cache slots and both
 conv-state layouts.
+
+The identity holds because both kernels accumulate the fp32 weights with fused
+multiply-adds in tap order (the planar kernel writes them out explicitly). If
+a compiler stops contracting the stock kernel's multiply-adds, the outputs
+can differ by 1 bf16 ulp on a few elements per million while the conv states
+stay exact; relax the output tolerance to 1 ulp here in that case rather than
+dropping the comparison.
 """
 
 import pytest
