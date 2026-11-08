@@ -37,6 +37,16 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 logger = init_logger(__name__)
 
+# Geometry the kernels are written for: the stencil kernels unpack tiles of
+# TILE_TOKENS tokens in registers (_conv_tile spells out its 16 rows), the conv
+# has CONV_WIDTH taps (so a sequence's history is CONV_WIDTH - 1 tokens) and the
+# per-sequence kernels (fixup, state update) take _SEQ_BLOCK_N channels each.
+# Globals read inside a kernel must be tl.constexpr instances; host code
+# reads their .value.
+TILE_TOKENS = tl.constexpr(16)
+CONV_WIDTH = tl.constexpr(4)
+_SEQ_BLOCK_N = 1024
+
 
 @triton.jit
 def _split_rows(v):
@@ -112,8 +122,11 @@ def _conv_tile(
     dt: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
 ):
-    """Conv + SiLU of 16 rows ``xt`` [BN, 16] given the 3 rows before them;
-    returns the outputs [BN, 16] and the tile's last 3 rows."""
+    """Conv + SiLU of the TILE_TOKENS (16) rows ``xt`` [BN, 16] given the 3
+    rows before them; returns the outputs [BN, 16] and the tile's last 3 rows
+    (the next tile's history)."""
+    tl.static_assert(xt.shape[1] == TILE_TOKENS)
+    tl.static_assert(CONV_WIDTH == 4)
     e, o = _split_rows(xt)
     s0, s2 = _split_rows(e)  # rows 0,4,8,12 / 2,6,10,14
     s1, s3 = _split_rows(o)  # rows 1,5,9,13 / 3,7,11,15
@@ -185,13 +198,14 @@ def _kda_conv_fwd_planar_kernel(
     BLOCK_N: tl.constexpr,
     TILES: tl.constexpr,
 ):
-    # Sequence-agnostic width-4 stencil over TILES consecutive 16-token
-    # blocks x BLOCK_N channels: every token takes its 3 predecessors from x.
-    # The first 3 tokens of each sequence are redone by the fixup kernel.
-    # The next block's rows are loaded before the current block is computed
-    # and stored; a block's last 3 rows are the next block's halo.
-    rows = tl.arange(0, 16)
-    t_first = tl.program_id(0).to(tl.int64) * (16 * TILES)
+    # Sequence-agnostic width-4 stencil over TILES consecutive TILE_TOKENS-token
+    # blocks x BLOCK_N channels: every token takes its CONV_WIDTH - 1
+    # predecessors from x. The first CONV_WIDTH - 1 tokens of each sequence are
+    # redone by the fixup kernel. The next block's rows are loaded before the
+    # current block is computed and stored; a block's last CONV_WIDTH - 1 rows
+    # are the next block's halo.
+    rows = tl.arange(0, TILE_TOKENS)
+    t_first = tl.program_id(0).to(tl.int64) * (TILE_TOKENS * TILES)
     offs_f = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_f = offs_f < dim
     w0, w1, w2, w3, acc0 = _load_weights(
@@ -205,7 +219,7 @@ def _kda_conv_fwd_planar_kernel(
     x_base = x_ptr + offs_f
     dt: tl.constexpr = out_ptr.dtype.element_ty
 
-    halo_t = t_first - 4 + tl.arange(0, 4)
+    halo_t = t_first - CONV_WIDTH + tl.arange(0, CONV_WIDTH)
     hx = tl.load(
         x_base[:, None] + halo_t[None, :] * stride_x_token,
         mask=mask_f[:, None] & ((halo_t >= 0) & (halo_t < num_tokens))[None, :],
@@ -218,8 +232,8 @@ def _kda_conv_fwd_planar_kernel(
         other=0.0,
     )
     for it in range(TILES):
-        offs_t = t_first + it * 16 + rows
-        nxt_t = offs_t + 16
+        offs_t = t_first + it * TILE_TOKENS + rows
+        nxt_t = offs_t + TILE_TOKENS
         xn = tl.load(
             x_base[:, None] + nxt_t[None, :] * stride_x_token,
             mask=mask_f[:, None] & ((nxt_t < num_tokens) & (it + 1 < TILES))[None, :],
@@ -256,7 +270,7 @@ def _kda_conv_fwd_planar_tma_kernel(
 ):
     # As _kda_conv_fwd_planar_kernel, with TMA loads (pipelined over the
     # tiles; rows outside [0, num_tokens) read as zero) and TMA stores.
-    t_first = tl.program_id(0) * (16 * TILES)
+    t_first = tl.program_id(0) * (TILE_TOKENS * TILES)
     f0 = tl.program_id(1) * BLOCK_N
     offs_f = f0 + tl.arange(0, BLOCK_N)
     mask_f = offs_f < dim
@@ -267,13 +281,40 @@ def _kda_conv_fwd_planar_tma_kernel(
     col0 = f0 - plane * plane_dim
     dt: tl.constexpr = out_desc.dtype
     for it in tl.range(0, TILES, num_stages=NUM_STAGES):
-        t0 = t_first + it * 16
-        _, h1, h2, h3 = _rows4(tl.trans(x_halo_desc.load([t0 - 4, f0])))
-        xt = tl.trans(x_desc.load([t0, f0]))  # [BLOCK_N, 16]
+        t0 = t_first + it * TILE_TOKENS
+        _, h1, h2, h3 = _rows4(tl.trans(x_halo_desc.load([t0 - CONV_WIDTH, f0])))
+        xt = tl.trans(x_desc.load([t0, f0]))  # [BLOCK_N, TILE_TOKENS]
         yt, _, _, _ = _conv_tile(
             xt, h1, h2, h3, w0, w1, w2, w3, acc0, dt, SILU_ACTIVATION
         )
-        out_desc.store([plane, t0, col0], tl.reshape(tl.trans(yt), [1, 16, BLOCK_N]))
+        out_desc.store(
+            [plane, t0, col0], tl.reshape(tl.trans(yt), [1, TILE_TOKENS, BLOCK_N])
+        )
+
+
+@triton.jit
+def _slot_flags(
+    cache_indices_ptr,
+    has_initial_state_ptr,
+    seq,
+    stride_cache_indices,
+    stride_has_initial_state,
+    pad_slot_id: tl.constexpr,
+    null_block_id: tl.constexpr,
+):
+    """The conv-state contract of sequence ``seq``, shared by the fixup and
+    the state update: ``(cache_idx, null_or_pad, has_state)``. A sequence on a
+    pad or null slot owns no state: nothing is read from or written to the
+    pool for it and ``has_state`` is false, so its first tokens are computed
+    with zero history."""
+    cache_idx = tl.load(cache_indices_ptr + seq * stride_cache_indices).to(tl.int64)
+    null_or_pad = (cache_idx == pad_slot_id) | (cache_idx == null_block_id)
+    has_state = (
+        tl.load(has_initial_state_ptr + seq * stride_has_initial_state).to(tl.int1)
+        & (cache_idx != pad_slot_id)
+        & (cache_idx != null_block_id)
+    )
+    return cache_idx, null_or_pad, has_state
 
 
 @triton.jit
@@ -304,8 +345,10 @@ def _kda_conv_fixup_kernel(
     SILU_ACTIVATION: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Recompute the first 3 tokens of sequence program_id(0): their taps
-    # before the sequence start come from the initial conv state (or zero).
+    # Recompute the first CONV_WIDTH - 1 (3) tokens of sequence program_id(0):
+    # their taps before the sequence start come from the initial conv state
+    # (or zero).
+    tl.static_assert(CONV_WIDTH == 4)
     seq = tl.program_id(0)
     offs_f = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_f = offs_f < dim
@@ -313,11 +356,14 @@ def _kda_conv_fixup_kernel(
     seq_len = (tl.load(query_start_loc_ptr + seq + 1) - start).to(tl.int32)
     if seq_len <= 0:
         return
-    cache_idx = tl.load(cache_indices_ptr + seq * stride_cache_indices).to(tl.int64)
-    has_state = (
-        tl.load(has_initial_state_ptr + seq * stride_has_initial_state).to(tl.int1)
-        & (cache_idx != pad_slot_id)
-        & (cache_idx != null_block_id)
+    cache_idx, _, has_state = _slot_flags(
+        cache_indices_ptr,
+        has_initial_state_ptr,
+        seq,
+        stride_cache_indices,
+        stride_has_initial_state,
+        pad_slot_id,
+        null_block_id,
     )
     cache_idx = tl.where(has_state, cache_idx, 0)
     w0, w1, w2, w3, acc0 = _load_weights(
@@ -368,16 +414,17 @@ def _kda_conv_new_state(
     stride_x_token,
     stride_state_tok,
     k: tl.constexpr,
-    KERNEL_WIDTH: tl.constexpr,
 ):
-    rel = seq_len - (KERNEL_WIDTH - 1) + k
+    # New state position k holds sequence position seq_len - (CONV_WIDTH - 1) + k:
+    # from x, or (short sequences) the old state shifted left by seq_len.
+    rel = seq_len - (CONV_WIDTH - 1) + k
     x_val = tl.load(
         x_ptr + (seq_start + tl.maximum(rel, 0)) * stride_x_token + offs_f,
         mask=mask_f & (rel >= 0),
         other=0.0,
     )
     s_val = tl.load(
-        state_base + tl.minimum(k + seq_len, KERNEL_WIDTH - 2) * stride_state_tok,
+        state_base + tl.minimum(k + seq_len, CONV_WIDTH - 2) * stride_state_tok,
         mask=mask_f & (rel < 0) & has_state,
         other=0.0,
     )
@@ -400,24 +447,28 @@ def _kda_conv_state_update_kernel(
     stride_has_initial_state,
     pad_slot_id: tl.constexpr,
     null_block_id: tl.constexpr,
-    KERNEL_WIDTH: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    # Write the CONV_WIDTH - 1 (3) state positions of sequence program_id(0).
+    tl.static_assert(CONV_WIDTH == 4)
     seq = tl.program_id(0)
     offs_f = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask_f = offs_f < dim
-    cache_idx = tl.load(cache_indices_ptr + seq * stride_cache_indices).to(tl.int64)
+    cache_idx, null_or_pad, has_state = _slot_flags(
+        cache_indices_ptr,
+        has_initial_state_ptr,
+        seq,
+        stride_cache_indices,
+        stride_has_initial_state,
+        pad_slot_id,
+        null_block_id,
+    )
     seq_start = tl.load(query_start_loc_ptr + seq).to(tl.int64)
     seq_len = (tl.load(query_start_loc_ptr + seq + 1) - seq_start).to(tl.int32)
-    if (cache_idx == pad_slot_id) | (cache_idx == null_block_id) | (seq_len <= 0):
+    if null_or_pad | (seq_len <= 0):
         return
-    has_state = tl.load(has_initial_state_ptr + seq * stride_has_initial_state).to(
-        tl.int1
-    )
     state_base = state_ptr + cache_idx * stride_state_seq + offs_f * stride_state_dim
-    # New state position k holds sequence position seq_len - (W-1) + k: from x,
-    # or (short sequences) the old state shifted left by seq_len. All loads
-    # happen before the first store.
+    # All loads happen before the first store.
     v0 = _kda_conv_new_state(
         x_ptr,
         state_base,
@@ -429,42 +480,35 @@ def _kda_conv_state_update_kernel(
         stride_x_token,
         stride_state_tok,
         0,
-        KERNEL_WIDTH,
     )
-    if KERNEL_WIDTH >= 3:
-        v1 = _kda_conv_new_state(
-            x_ptr,
-            state_base,
-            seq_start,
-            seq_len,
-            has_state,
-            offs_f,
-            mask_f,
-            stride_x_token,
-            stride_state_tok,
-            1,
-            KERNEL_WIDTH,
-        )
-    if KERNEL_WIDTH >= 4:
-        v2 = _kda_conv_new_state(
-            x_ptr,
-            state_base,
-            seq_start,
-            seq_len,
-            has_state,
-            offs_f,
-            mask_f,
-            stride_x_token,
-            stride_state_tok,
-            2,
-            KERNEL_WIDTH,
-        )
+    v1 = _kda_conv_new_state(
+        x_ptr,
+        state_base,
+        seq_start,
+        seq_len,
+        has_state,
+        offs_f,
+        mask_f,
+        stride_x_token,
+        stride_state_tok,
+        1,
+    )
+    v2 = _kda_conv_new_state(
+        x_ptr,
+        state_base,
+        seq_start,
+        seq_len,
+        has_state,
+        offs_f,
+        mask_f,
+        stride_x_token,
+        stride_state_tok,
+        2,
+    )
     tl.debug_barrier()
     tl.store(state_base, v0, mask=mask_f)
-    if KERNEL_WIDTH >= 3:
-        tl.store(state_base + stride_state_tok, v1, mask=mask_f)
-    if KERNEL_WIDTH >= 4:
-        tl.store(state_base + 2 * stride_state_tok, v2, mask=mask_f)
+    tl.store(state_base + stride_state_tok, v1, mask=mask_f)
+    tl.store(state_base + 2 * stride_state_tok, v2, mask=mask_f)
 
 
 def kda_planar_conv_impl(
@@ -611,10 +655,10 @@ def kda_causal_conv1d_planar(
             f"{tuple(x.shape)} with strides {x.stride()}"
         )
     num_tokens, dim = x.shape
-    if weight.dim() != 2 or weight.shape[1] != 4:
+    if weight.dim() != 2 or weight.shape[1] != CONV_WIDTH.value:
         raise ValueError(
-            "kda_causal_conv1d_planar implements conv width 4 only, got a weight "
-            f"of shape {tuple(weight.shape)}"
+            f"kda_causal_conv1d_planar implements conv width {CONV_WIDTH.value} "
+            f"only, got a weight of shape {tuple(weight.shape)}"
         )
     width = weight.shape[1]
     if weight.shape[0] != dim:
@@ -679,7 +723,10 @@ def kda_causal_conv1d_planar(
     if num_tokens == 0 or num_seqs <= 0:
         return out[:, :num_tokens]
     silu = activation in ("silu", "swish")
-    grid = (triton.cdiv(num_tokens, 16 * tiles), triton.cdiv(dim, block_n))
+    grid = (
+        triton.cdiv(num_tokens, TILE_TOKENS.value * tiles),
+        triton.cdiv(dim, block_n),
+    )
     meta = dict(
         HAS_BIAS=bias is not None,
         SILU_ACTIVATION=silu,
@@ -690,15 +737,17 @@ def kda_causal_conv1d_planar(
     if impl_used == "tma":
         from triton.tools.tensor_descriptor import TensorDescriptor
 
-        x_desc = TensorDescriptor(x, [num_tokens, dim], [x.stride(0), 1], [16, block_n])
+        x_desc = TensorDescriptor(
+            x, [num_tokens, dim], [x.stride(0), 1], [TILE_TOKENS.value, block_n]
+        )
         x_halo_desc = TensorDescriptor(
-            x, [num_tokens, dim], [x.stride(0), 1], [4, block_n]
+            x, [num_tokens, dim], [x.stride(0), 1], [CONV_WIDTH.value, block_n]
         )
         out_desc = TensorDescriptor(
             out,
             [num_planes, num_tokens, plane_dim],
             [out.stride(0), out.stride(1), 1],
-            [1, 16, block_n],
+            [1, TILE_TOKENS.value, block_n],
         )
         _kda_conv_fwd_planar_tma_kernel[grid](
             x_desc,
@@ -730,7 +779,7 @@ def kda_causal_conv1d_planar(
             out.stride(1),
             **meta,
         )
-    fixup_block_n = math.gcd(1024, plane_dim)
+    fixup_block_n = math.gcd(_SEQ_BLOCK_N, plane_dim)
     _kda_conv_fixup_kernel[(num_seqs, triton.cdiv(dim, fixup_block_n))](
         x,
         weight,
@@ -759,7 +808,7 @@ def kda_causal_conv1d_planar(
         BLOCK_N=fixup_block_n,
         num_warps=4,
     )
-    update_block_n = 1024
+    update_block_n = _SEQ_BLOCK_N
     _kda_conv_state_update_kernel[(num_seqs, triton.cdiv(dim, update_block_n))](
         x,
         conv_states,
@@ -775,7 +824,6 @@ def kda_causal_conv1d_planar(
         has_initial_state.stride(0),
         pad_slot_id=PAD_SLOT_ID,
         null_block_id=NULL_BLOCK_ID,
-        KERNEL_WIDTH=width,
         BLOCK_N=update_block_n,
         num_warps=4,
     )
