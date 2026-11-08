@@ -46,10 +46,6 @@ from vllm.model_executor.utils import (
     maybe_disable_graph_partition,
     set_weight_attrs,
 )
-from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
-    kda_causal_conv1d_planar,
-    planar_conv_pays_off,
-)
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -62,6 +58,10 @@ if current_platform.is_rocm():
         fused_recurrent_kda,
     )
 else:
+    from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
+        kda_causal_conv1d_planar,
+        planar_conv_pays_off,
+    )
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
@@ -174,6 +174,8 @@ def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> bool:
     ``additional_config.kda_prefill_conv`` (causal_conv1d / planar)."""
     if conv not in ("causal_conv1d", "planar"):
         raise ValueError(f"Unsupported KDA prefill conv: {conv}")
+    if conv == "planar" and not current_platform.is_cuda():
+        raise ValueError("kda_prefill_conv=planar is only available on CUDA")
     if conv == "planar" and conv_size != 4:
         raise ValueError(f"kda_prefill_conv=planar needs width 4, got {conv_size}")
     return conv == "planar"
