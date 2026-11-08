@@ -12,8 +12,12 @@ the stock kernel's column slices (FlashKDA takes them strided, so it pays
 only ``stock``); ``planar-<impl>`` is kda_causal_conv1d_planar, labelled with
 the kernel that actually ran. Outputs and conv states are compared with the
 stock kernel before timing and any difference is reported (count, fraction,
-largest distance in bf16 ulps); times are medians from triton's do_bench with
-L2 flushed between runs.
+largest distance in bf16 ulps); GPU times are medians from triton's do_bench
+with L2 flushed between runs, and ``host us`` is the wall-clock cost of one
+call on the host (launches, descriptors, metadata), measured without
+synchronizing: prefill steps run eagerly, so the planar path's three launches
+(and, on the TMA path, three descriptor constructions) per layer are paid
+there, next to the stock kernel's one launch over precomputed metadata.
 
 The default shapes cover the prefill-dominated regime (8K prompts), mixed
 chunked-prefill steps with decode rows and a decode-heavy step where the
@@ -22,6 +26,7 @@ GLM-5.3-Flash plus 12, whose rows are not 16-byte aligned (register kernel).
 """
 
 import argparse
+import time
 from types import SimpleNamespace
 
 import torch
@@ -147,6 +152,17 @@ def time_ms(fn, warmup_ms: int, rep_ms: int) -> float:
     )
 
 
+def host_us(fn, iters: int = 200) -> float:
+    """Wall-clock host time of one call, launches queued without a sync."""
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    elapsed = time.perf_counter() - start
+    torch.cuda.synchronize()
+    return elapsed / iters * 1e6
+
+
 def bench_case(num_heads: int, spec: str, args: argparse.Namespace) -> None:
     c = make_inputs(num_heads, parse_batch(spec), args.layout == "DS")
     nums_dict, batch_ptr, offset_ptr = compute_causal_conv1d_metadata(
@@ -193,7 +209,7 @@ def bench_case(num_heads: int, spec: str, args: argparse.Namespace) -> None:
         base = base or ms
         print(
             f"{num_heads:>3} {spec:>14} {name:>16} {ms:>8.3f} "
-            f"{nbytes / ms / 1e9:>6.2f} {base / ms:>7.2f}x"
+            f"{nbytes / ms / 1e9:>6.2f} {base / ms:>7.2f}x {host_us(fn):>8.1f}"
         )
 
 
@@ -214,8 +230,8 @@ def main() -> None:
     args = parser.parse_args()
 
     print(f"{torch.cuda.get_device_name()}, conv-state layout {args.layout}")
-    header = ["H", "batch", "path", "ms", "TB/s", "vs stock"]
-    print("{:>3} {:>14} {:>16} {:>8} {:>6} {:>8}".format(*header))
+    header = ["H", "batch", "path", "ms", "TB/s", "vs stock", "host us"]
+    print("{:>3} {:>14} {:>16} {:>8} {:>6} {:>8} {:>8}".format(*header))
     with torch.inference_mode():
         for num_heads in args.heads:
             for spec in args.batches:
