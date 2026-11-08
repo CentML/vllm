@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
-from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
     PLANAR_MIN_PREFILL_TOKENS,
     kda_causal_conv1d_planar,
     kda_planar_conv_impl,

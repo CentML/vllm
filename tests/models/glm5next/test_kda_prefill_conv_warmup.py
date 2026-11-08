@@ -12,7 +12,7 @@ cache for all three launches.
 import pytest
 import torch
 
-from vllm.models.glm5next.nvidia.ops import kda_prefill_conv as planar
+from vllm.model_executor.layers.mamba.ops import causal_conv1d_planar as planar
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 

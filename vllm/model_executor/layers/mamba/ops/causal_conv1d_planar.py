@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Varlen causal short conv + SiLU for the KDA prefill path, planar output.
+"""Varlen causal short conv + SiLU as a tile stencil, planar output.
+
+Written for the GLM-5.3-Flash KDA prefill path (``kda_prefill_conv=planar``);
+the kernels are width-4 ``causal_conv1d_fn`` replacements for any caller.
 
 Same math and conv-state contract as ``causal_conv1d_fn`` (vLLM Triton, width
 ``W``; state positions ``0..W-2`` of ``conv_states[cache_indices[s]]`` hold the

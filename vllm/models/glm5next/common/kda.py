@@ -37,6 +37,11 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
+    kda_causal_conv1d_planar,
+    planar_conv_pays_off,
+    register_planar_conv_warmup,
+)
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
@@ -58,11 +63,6 @@ if current_platform.is_rocm():
         fused_recurrent_kda,
     )
 else:
-    from vllm.models.glm5next.nvidia.ops.kda_prefill_conv import (
-        kda_causal_conv1d_planar,
-        planar_conv_pays_off,
-        register_planar_conv_warmup,
-    )
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
