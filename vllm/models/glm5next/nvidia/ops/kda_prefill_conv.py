@@ -47,6 +47,16 @@ TILE_TOKENS = tl.constexpr(16)
 CONV_WIDTH = tl.constexpr(4)
 _SEQ_BLOCK_N = 1024
 
+# Launch defaults of the stencil kernels, chosen with the conv-only benchmark
+# (benchmarks/kernels/benchmark_glm5next_kda_prefill_conv.py) on one SM10x GPU
+# at 64 to 8 local heads: 512 channels x 8 tiles of 16 tokens per program, 4
+# warps, a 3-stage TMA pipeline. Nothing is autotuned; the public keyword
+# arguments exist to re-measure on other GPUs.
+_DEFAULT_BLOCK_N = 512
+_DEFAULT_NUM_WARPS = 4
+_DEFAULT_TILES = 8
+_DEFAULT_NUM_STAGES = 3
+
 
 @triton.jit
 def _split_rows(v):
@@ -608,11 +618,11 @@ def kda_causal_conv1d_planar(
     num_planes: int = 3,
     activation: str | None = "silu",
     out: torch.Tensor | None = None,
-    block_n: int = 512,
-    num_warps: int = 4,
-    tiles: int = 8,
+    block_n: int = _DEFAULT_BLOCK_N,
+    num_warps: int = _DEFAULT_NUM_WARPS,
+    tiles: int = _DEFAULT_TILES,
     impl: str = "auto",
-    num_stages: int = 3,
+    num_stages: int = _DEFAULT_NUM_STAGES,
 ) -> torch.Tensor:
     """Causal conv1d (+ SiLU) over a varlen token batch, planar output.
 
@@ -637,7 +647,9 @@ def kda_causal_conv1d_planar(
         block_n: channels per program (16 tokens each), a power of 2;
             reduced to the largest power of 2 dividing ``dim // num_planes``.
         num_warps: warps per program.
-        tiles: consecutive 16-token blocks per program.
+        tiles: consecutive 16-token blocks per program. The defaults of these
+            three and of ``num_stages`` are the module's ``_DEFAULT_*`` values
+            (measured on one GPU, see there).
         impl: "regs" (16-row tiles loaded into registers, the next tile
             prefetched), "tma" (TMA loads/stores through shared memory,
             pipelined over the tiles; needs SM90+ and 16-byte aligned rows and
