@@ -8,6 +8,11 @@
 import numpy as np
 import torch
 
+from vllm import envs
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
+    kda_causal_conv1d_planar,
+    planar_conv_pays_off,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -380,6 +385,41 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+def _stencil_applies(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_states: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    activation: str | None,
+) -> bool:
+    """Whether the tile-stencil kernels (causal_conv1d_planar.py) take this
+    call and are expected to beat the per-token kernel: a channel-last bf16
+    ``[dim, T]`` input with bf16 states, width 4, per-sequence slots and
+    state flags, a known activation, and enough tokens per sequence
+    (``planar_conv_pays_off`` with every sequence counted as a decode row: a
+    short sequence costs the stencil about what a decode row does; its
+    thresholds are tabulated by KDA head counts of 384 channels each)."""
+    if (
+        x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or x.stride(0) != 1
+        or conv_states is None
+        or conv_states.dim() != 3
+        or conv_states.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] != 4
+        or cache_indices is None
+        or has_initial_state is None
+        or activation not in (None, "silu", "swish")
+    ):
+        return False
+    dim, num_tokens = x.shape
+    num_seqs = query_start_loc.numel() - 1
+    return planar_conv_pays_off(num_tokens - num_seqs, num_seqs, dim // 384)
+
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -437,6 +477,33 @@ def causal_conv1d_fn(
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
+
+    if envs.VLLM_CAUSAL_CONV1D_STENCIL and _stencil_applies(
+        x,
+        weight,
+        conv_states,
+        query_start_loc,
+        cache_indices,
+        has_initial_state,
+        activation,
+    ):
+        # Same values, and the same dense token-major output that
+        # `torch.empty_like(x)` gives below for a channel-last x. Rows of
+        # sequences on a null slot are written (zero history) where the
+        # per-token kernel leaves them unset.
+        return kda_causal_conv1d_planar(
+            x.transpose(0, 1),
+            weight,
+            bias,
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_state,
+            num_planes=1,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+            null_block_id=null_block_id,
+        )[0].transpose(0, 1)
 
     args = None
     # Store original dtype to cast back at the end

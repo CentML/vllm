@@ -751,6 +751,8 @@ def _state_update_case(
         ),
         has_initial_state=TritonWarmupTensor(torch.bool, shape=(2,)),
         query_start_loc=TritonWarmupTensor(torch.int32, shape=(3,)),
+        pad_slot_id=PAD_SLOT_ID,
+        null_block_id=NULL_BLOCK_ID,
     )
 
 
@@ -898,6 +900,8 @@ def _planar_fixup(
     query_start_loc,
     out,
     activation,
+    pad_slot_id,
+    null_block_id,
 ) -> DispatchSpec:
     dim, plane_dim = x.shape[1], out.shape[2]
     num_seqs = query_start_loc.shape[0] - 1
@@ -923,8 +927,8 @@ def _planar_fixup(
         stride_out_token=out.stride(1),
         stride_cache_indices=cache_indices.stride(0),
         stride_has_initial_state=has_initial_state.stride(0),
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
+        pad_slot_id=pad_slot_id,
+        null_block_id=null_block_id,
         HAS_BIAS=bias is not None,
         SILU_ACTIVATION=activation in ("silu", "swish"),
         BLOCK_N=block_n,
@@ -936,7 +940,13 @@ def _planar_fixup(
     kernel=_kda_conv_state_update_kernel, warmup_inputs=_state_update_warmup_inputs
 )
 def _planar_state_update(
-    x, conv_states, cache_indices, has_initial_state, query_start_loc
+    x,
+    conv_states,
+    cache_indices,
+    has_initial_state,
+    query_start_loc,
+    pad_slot_id,
+    null_block_id,
 ) -> DispatchSpec:
     dim = x.shape[1]
     num_seqs = query_start_loc.shape[0] - 1
@@ -953,8 +963,8 @@ def _planar_state_update(
         stride_state_tok=conv_states.stride(2),
         stride_cache_indices=cache_indices.stride(0),
         stride_has_initial_state=has_initial_state.stride(0),
-        pad_slot_id=PAD_SLOT_ID,
-        null_block_id=NULL_BLOCK_ID,
+        pad_slot_id=pad_slot_id,
+        null_block_id=null_block_id,
         BLOCK_N=_SEQ_BLOCK_N,
         num_warps=4,
     )
@@ -1040,6 +1050,8 @@ def kda_causal_conv1d_planar(
     tiles: int = _DEFAULT_TILES,
     impl: str = "auto",
     num_stages: int = _DEFAULT_NUM_STAGES,
+    pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int = NULL_BLOCK_ID,
 ) -> torch.Tensor:
     """Causal conv1d (+ SiLU) over a varlen token batch, planar output.
 
@@ -1073,6 +1085,11 @@ def kda_causal_conv1d_planar(
             raises otherwise) or "auto" ("tma" where possible, else "regs";
             see ``kda_planar_conv_impl``). The kernel in use is logged once.
         num_stages: TMA pipeline depth (impl="tma").
+        pad_slot_id: the cache slot that marks a padded (empty) sequence
+            (vLLM's constant by default).
+        null_block_id: the cache slot that marks a sequence without a slot
+            (vLLM's constant by default); its rows are computed with zero
+            history and no state is read or written.
 
     Returns:
         ``[num_planes, T, dim // num_planes]`` output in ``x.dtype``.
@@ -1169,8 +1186,16 @@ def kda_causal_conv1d_planar(
         query_start_loc,
         out,
         activation,
+        pad_slot_id,
+        null_block_id,
     )
     _planar_state_update(
-        x, conv_states, cache_indices, has_initial_state, query_start_loc
+        x,
+        conv_states,
+        cache_indices,
+        has_initial_state,
+        query_start_loc,
+        pad_slot_id,
+        null_block_id,
     )
     return out[:, :num_tokens]
