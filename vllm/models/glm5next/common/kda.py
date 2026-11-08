@@ -482,6 +482,53 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
         return out, final_state
 
+    def _prefill_conv(
+        self,
+        qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        conv_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The q|k|v short conv (+ SiLU) of a chunked-prefill step, with the
+        conv-state update, as (q, k, v).
+
+        Both kernels compute the same values and update ``conv_state`` in
+        place for every sequence with a real slot. ``causal_conv1d_fn`` returns
+        the merged ``[T, 3P]`` tensor, so q, k and v are column slices of it;
+        ``kda_causal_conv1d_planar`` (``kda_prefill_conv=planar``) returns
+        ``[3, T, P]``, so each is dense and a consumer that needs contiguous
+        inputs (the Triton chunk path) copies nothing.
+        """
+        assert attn_metadata.non_spec_query_start_loc is not None
+        assert attn_metadata.non_spec_state_indices_tensor is not None
+        assert attn_metadata.has_initial_state is not None
+        if self._planar_prefill_conv:
+            planes = kda_causal_conv1d_planar(
+                qkv,
+                conv_weights,
+                conv_bias,
+                conv_state,
+                query_start_loc=attn_metadata.non_spec_query_start_loc,
+                cache_indices=attn_metadata.non_spec_state_indices_tensor,
+                has_initial_state=attn_metadata.has_initial_state,
+                activation="silu",
+            )
+            return planes[0], planes[1], planes[2]
+        qkv = causal_conv1d_fn(
+            qkv.transpose(0, 1),
+            conv_weights,
+            conv_bias,
+            activation="silu",
+            conv_states=conv_state,
+            has_initial_state=attn_metadata.has_initial_state,
+            cache_indices=attn_metadata.non_spec_state_indices_tensor,
+            query_start_loc=attn_metadata.non_spec_query_start_loc,
+            metadata=attn_metadata,
+        ).transpose(0, 1)
+        q, k, v = qkv.split(self.local_projection_size, dim=-1)
+        return q, k, v
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -643,35 +690,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
         raw_qkv_ns = qkv_ns
         q_ns = k_ns = v_ns = None
-        if attn_metadata_narrowed.num_prefills > 0 and self._planar_prefill_conv:
+        if attn_metadata_narrowed.num_prefills > 0:
             assert qkv_ns is not None
-            assert non_spec_query_start_loc is not None
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            # Planar [3, T, P] output: q, k and v are each dense.
-            q_ns, k_ns, v_ns = kda_causal_conv1d_planar(
-                qkv_ns,
-                conv_weights,
-                conv_bias,
-                conv_state,
-                query_start_loc=non_spec_query_start_loc,
-                cache_indices=non_spec_state_indices_tensor,
-                has_initial_state=has_initial_state,
-            ).unbind(0)
-        elif attn_metadata_narrowed.num_prefills > 0:
-            assert qkv_ns is not None
-            qkv_ns = causal_conv1d_fn(
-                qkv_ns.transpose(0, 1),
-                conv_weights,
-                conv_bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+            q_ns, k_ns, v_ns = self._prefill_conv(
+                qkv_ns, conv_weights, conv_bias, conv_state, attn_metadata_narrowed
+            )
         elif attn_metadata_narrowed.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
