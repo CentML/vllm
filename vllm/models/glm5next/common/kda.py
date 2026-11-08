@@ -210,6 +210,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
     head_dim: int
     num_heads: int
     conv_size: int
+    # Class default for layers built without __init__ (tests assemble the
+    # layer attribute by attribute); __init__ overwrites it from the config.
+    _planar_prefill_conv: bool = False
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
