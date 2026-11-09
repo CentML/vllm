@@ -395,14 +395,16 @@ def _stencil_applies(
     activation: str | None,
 ) -> bool:
     """Whether the tile-stencil kernels (causal_conv1d_planar.py) take this
-    call and are expected to beat the per-token kernel: a channel-last bf16
-    ``[dim, T]`` input with bf16 states, width 4, per-sequence slots and
-    state flags, a known activation, and enough tokens per sequence
-    (``planar_conv_pays_off`` with every sequence counted as a decode row: a
-    short sequence costs the stencil about what a decode row does; its
-    thresholds are tabulated by KDA head counts of 384 channels each)."""
+    call and are expected to beat the per-token kernel: CUDA (the kernels are
+    untested elsewhere), a channel-last bf16 ``[dim, T]`` input with bf16
+    states, width 4, per-sequence slots and state flags, a known activation,
+    and enough tokens per sequence (``planar_conv_pays_off`` with every
+    sequence counted as a decode row: a short sequence costs the stencil about
+    what a decode row does; its thresholds are tabulated by KDA head counts of
+    384 channels each)."""
     if (
-        x.dim() != 2
+        not current_platform.is_cuda()
+        or x.dim() != 2
         or x.dtype != torch.bfloat16
         or x.stride(0) != 1
         or conv_states is None

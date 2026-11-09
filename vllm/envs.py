@@ -771,7 +771,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of vllm/model_executor/layers/mamba/ops/causal_conv1d_planar.py where
     # they pay off (enough prefill tokens for the step's sequences): same
     # values and output layout, one pass over memory instead of a per-token
-    # loop. Off by default while the gain is measured on more GPUs.
+    # loop. CUDA only. Off by default while the gain is measured on more
+    # GPUs; the layers that call causal_conv1d_fn register no startup JIT
+    # warmup for these kernels, so with the variable set the first prefill
+    # that takes the path compiles them (GLM-5.3-Flash's own opt-in,
+    # kda_prefill_conv=planar, does register the warmup).
     "VLLM_CAUSAL_CONV1D_STENCIL": lambda: bool(
         int(os.getenv("VLLM_CAUSAL_CONV1D_STENCIL", "0"))
     ),
