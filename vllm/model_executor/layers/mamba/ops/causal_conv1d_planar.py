@@ -204,7 +204,7 @@ def _load_weights(
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
-def _kda_conv_fwd_planar_kernel(
+def _planar_conv_kernel(
     x_ptr,
     w_ptr,
     bias_ptr,
@@ -275,7 +275,7 @@ def _kda_conv_fwd_planar_kernel(
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
-def _kda_conv_fwd_planar_tma_kernel(
+def _planar_conv_tma_kernel(
     x_desc,
     x_halo_desc,
     out_desc,
@@ -292,7 +292,7 @@ def _kda_conv_fwd_planar_tma_kernel(
     TILES: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    # As _kda_conv_fwd_planar_kernel, with TMA loads (pipelined over the
+    # As _planar_conv_kernel, with TMA loads (pipelined over the
     # tiles; rows outside [0, num_tokens) read as zero) and TMA stores. The
     # halo is loaded once per program; a tile's last rows are the next tile's
     # history, as in the register kernel.
@@ -344,7 +344,7 @@ def _slot_flags(
 
 
 @triton.jit
-def _kda_conv_fixup_kernel(
+def _planar_conv_fixup_kernel(
     x_ptr,
     w_ptr,
     bias_ptr,
@@ -429,7 +429,7 @@ def _kda_conv_fixup_kernel(
 
 
 @triton.jit
-def _kda_conv_new_state(
+def _planar_conv_new_state(
     x_ptr,
     state_base,
     seq_start,
@@ -458,7 +458,7 @@ def _kda_conv_new_state(
 
 
 @triton.jit
-def _kda_conv_state_update_kernel(
+def _planar_conv_state_update_kernel(
     x_ptr,
     state_ptr,
     cache_indices_ptr,
@@ -495,7 +495,7 @@ def _kda_conv_state_update_kernel(
         return
     state_base = state_ptr + cache_idx * stride_state_seq + offs_f * stride_state_dim
     # All loads happen before the first store.
-    v0 = _kda_conv_new_state(
+    v0 = _planar_conv_new_state(
         x_ptr,
         state_base,
         seq_start,
@@ -507,7 +507,7 @@ def _kda_conv_state_update_kernel(
         stride_state_tok,
         0,
     )
-    v1 = _kda_conv_new_state(
+    v1 = _planar_conv_new_state(
         x_ptr,
         state_base,
         seq_start,
@@ -519,7 +519,7 @@ def _kda_conv_state_update_kernel(
         stride_state_tok,
         1,
     )
-    v2 = _kda_conv_new_state(
+    v2 = _planar_conv_new_state(
         x_ptr,
         state_base,
         seq_start,
@@ -537,13 +537,13 @@ def _kda_conv_state_update_kernel(
     tl.store(state_base + 2 * stride_state_tok, v2, mask=mask_f)
 
 
-def kda_planar_conv_impl(
+def planar_conv_impl(
     impl: str,
     x: torch.Tensor,
     out: torch.Tensor | None = None,
     num_planes: int = 3,
 ) -> str:
-    """The kernel ``kda_causal_conv1d_planar(x, ..., impl=impl)`` runs: "tma"
+    """The kernel ``causal_conv1d_planar(x, ..., impl=impl)`` runs: "tma"
     or "regs".
 
     TMA descriptors need SM90+ and 16-byte aligned base addresses and row
@@ -577,7 +577,7 @@ def kda_planar_conv_impl(
 def planar_conv_impl_for_rows(
     impl: str, dtype: torch.dtype, row_stride: int, plane_dim: int
 ) -> str:
-    """``kda_planar_conv_impl`` from the shapes alone: ``x`` rows of
+    """``planar_conv_impl`` from the shapes alone: ``x`` rows of
     ``row_stride`` elements at an aligned base and the function's own dense
     output (used to register the JIT warmup of the kernel that will run)."""
     e = dtype.itemsize
@@ -628,7 +628,7 @@ PLANAR_TOKENS_PER_DECODE_ROW = 6
 def planar_conv_pays_off(
     num_prefill_tokens: int, num_decode_rows: int, local_num_heads: int
 ) -> bool:
-    """Whether ``kda_causal_conv1d_planar`` is expected to beat
+    """Whether ``causal_conv1d_planar`` is expected to beat
     ``causal_conv1d_fn`` on a step with ``num_prefill_tokens`` prefill tokens
     and ``num_decode_rows`` single-token rows at ``local_num_heads`` heads:
     ``prefill tokens > intercept(heads) + 6 x decode rows``, with the intercept
@@ -883,7 +883,7 @@ def _stencil_kwargs(x, weight, bias, out, block_n, tiles, num_warps, activation)
 
 
 @triton_kernel_dispatcher_with_warmup(
-    kernel=_kda_conv_fwd_planar_kernel, warmup_inputs=_stencil_regs_warmup_inputs
+    kernel=_planar_conv_kernel, warmup_inputs=_stencil_regs_warmup_inputs
 )
 def _planar_stencil_regs(
     x, weight, bias, out, block_n, tiles, num_warps, activation
@@ -902,7 +902,7 @@ def _planar_stencil_regs(
 
 
 @triton_kernel_dispatcher_with_warmup(
-    kernel=_kda_conv_fwd_planar_tma_kernel, warmup_inputs=_stencil_tma_warmup_inputs
+    kernel=_planar_conv_tma_kernel, warmup_inputs=_stencil_tma_warmup_inputs
 )
 def _planar_stencil_tma(
     x, weight, bias, out, block_n, tiles, num_warps, num_stages, activation
@@ -933,7 +933,7 @@ def _planar_stencil_tma(
 
 
 @triton_kernel_dispatcher_with_warmup(
-    kernel=_kda_conv_fixup_kernel, warmup_inputs=_fixup_warmup_inputs
+    kernel=_planar_conv_fixup_kernel, warmup_inputs=_fixup_warmup_inputs
 )
 def _planar_fixup(
     x,
@@ -982,7 +982,7 @@ def _planar_fixup(
 
 
 @triton_kernel_dispatcher_with_warmup(
-    kernel=_kda_conv_state_update_kernel, warmup_inputs=_state_update_warmup_inputs
+    kernel=_planar_conv_state_update_kernel, warmup_inputs=_state_update_warmup_inputs
 )
 def _planar_state_update(
     x,
@@ -1037,7 +1037,7 @@ def planar_conv_warmup_plan(
 
     For each row stride of ``x`` (the fused projection's row; the dense row of
     the gathered non-spec rows of a spec-decode step) the stencil kernel that
-    ``kda_planar_conv_impl`` selects for it, plus the fixup and the state
+    ``planar_conv_impl`` selects for it, plus the fixup and the state
     update for the conv-state pool (``conv_state_dtype``, default the
     activation dtype; ``state_len`` positions per channel, width - 1 plus the
     speculative tokens; the layout) and every specialization class of the
@@ -1087,7 +1087,7 @@ def register_planar_conv_warmup(**config: Any) -> None:
         dispatcher.register_warmup(**kwargs)
 
 
-def kda_causal_conv1d_planar(
+def causal_conv1d_planar(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
@@ -1138,7 +1138,7 @@ def kda_causal_conv1d_planar(
             prefetched), "tma" (TMA loads/stores through shared memory,
             pipelined over the tiles; needs SM90+ and 16-byte aligned rows and
             raises otherwise) or "auto" ("tma" where possible, else "regs";
-            see ``kda_planar_conv_impl``). The kernel in use is logged once.
+            see ``planar_conv_impl``). The kernel in use is logged once.
         num_stages: TMA pipeline depth (impl="tma").
         pad_slot_id: the cache slot that marks a padded (empty) sequence
             (vLLM's constant by default).
@@ -1158,7 +1158,7 @@ def kda_causal_conv1d_planar(
     num_tokens, dim = x.shape
     if weight.dim() != 2 or weight.shape[1] != CONV_WIDTH.value:
         raise ValueError(
-            f"kda_causal_conv1d_planar implements conv width {CONV_WIDTH.value} "
+            f"causal_conv1d_planar implements conv width {CONV_WIDTH.value} "
             f"only, got a weight of shape {tuple(weight.shape)}"
         )
     width = weight.shape[1]
@@ -1223,9 +1223,9 @@ def kda_causal_conv1d_planar(
             f"out must match x in dtype and device ({x.dtype}, {x.device}), got "
             f"{out.dtype}, {out.device}"
         )
-    impl_used = kda_planar_conv_impl(impl, x, out, num_planes)
+    impl_used = planar_conv_impl(impl, x, out, num_planes)
     logger.info_once(
-        "kda_causal_conv1d_planar: %s kernel for %d channels in %d planes (x row "
+        "causal_conv1d_planar: %s kernel for %d channels in %d planes (x row "
         "stride %d bytes, impl=%r)",
         impl_used,
         dim,

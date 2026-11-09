@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash planar KDA prefill conv (``kda_prefill_conv=planar``).
 
-``kda_causal_conv1d_planar`` replaces ``causal_conv1d_fn`` on the chunked
+``causal_conv1d_planar`` replaces ``causal_conv1d_fn`` on the chunked
 prefill path, so its outputs and conv-state updates must be bit-identical to
 it for every batch shape the scheduler produces: decode rows mixed with
 prefills, sequences shorter than the conv window, sequences starting inside a
@@ -29,8 +29,8 @@ import torch
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
     PLANAR_MIN_PREFILL_TOKENS,
-    kda_causal_conv1d_planar,
-    kda_planar_conv_impl,
+    causal_conv1d_planar,
+    planar_conv_impl,
     planar_conv_pays_off,
 )
 from vllm.platforms import current_platform
@@ -133,7 +133,7 @@ def _run(
 
     ref_pool, pool = pool.clone(), pool.clone()
     ref = stock(ref_pool, cache_indices, has_initial_state)
-    out = kda_causal_conv1d_planar(
+    out = causal_conv1d_planar(
         x,
         weight,
         bias_t,
@@ -195,7 +195,7 @@ def test_planar_conv_matches_causal_conv1d(
     case: str, num_heads: int, dim_first: bool, impl: str
 ):
     x = _run(case, num_heads, dim_first, model_row_pad(num_heads), impl)
-    assert kda_planar_conv_impl(impl, x) == _expected_impl(impl, num_heads)
+    assert planar_conv_impl(impl, x) == _expected_impl(impl, num_heads)
 
 
 @pytest.mark.parametrize(
@@ -216,7 +216,7 @@ def test_planar_conv_bias_and_bf16_weights(bias, weight_dtype, impl):
         bias=bias,
         weight_dtype=weight_dtype,
     )
-    assert kda_planar_conv_impl(impl, x) == _expected_impl(impl, 16)
+    assert planar_conv_impl(impl, x) == _expected_impl(impl, 16)
 
 
 @pytest.mark.parametrize("impl", ["regs", "auto"])
@@ -231,7 +231,7 @@ def test_planar_conv_single_plane_without_activation(impl):
         num_planes=1,
         activation=None,
     )
-    assert kda_planar_conv_impl(impl, x, num_planes=1) == _expected_impl(impl, 16)
+    assert planar_conv_impl(impl, x, num_planes=1) == _expected_impl(impl, 16)
 
 
 @torch.inference_mode()
@@ -242,7 +242,7 @@ def test_planar_conv_empty_batch():
     weight = torch.randn(dim, WIDTH, device="cuda")
     pool = torch.randn(3, dim, WIDTH - 1, device="cuda", dtype=torch.bfloat16)
     before = pool.clone()
-    out = kda_causal_conv1d_planar(
+    out = causal_conv1d_planar(
         x,
         weight,
         None,
@@ -262,7 +262,7 @@ def test_planar_conv_full_chunked_prefill_step(impl):
     # About 65K tokens at the TP8 shard: the full grid and the TMA coordinates
     # at the serving size.
     x = _run(LARGE_CASE, 8, True, model_row_pad(8), impl)
-    assert kda_planar_conv_impl(impl, x) == _expected_impl(impl, 8)
+    assert planar_conv_impl(impl, x) == _expected_impl(impl, 8)
 
 
 def test_planar_conv_pays_off_rule():
@@ -288,9 +288,9 @@ def test_planar_conv_unaligned_rows_fall_back():
     # must take the register kernel with the same results, and impl="tma" must
     # say so instead of silently doing the same.
     x = _run("starts_inside_tiles", 2, True, 3, "auto")
-    assert kda_planar_conv_impl("auto", x) == "regs"
+    assert planar_conv_impl("auto", x) == "regs"
     with pytest.raises(ValueError, match="aligned"):
-        kda_planar_conv_impl("tma", x)
+        planar_conv_impl("tma", x)
 
 
 @torch.inference_mode()
@@ -317,7 +317,7 @@ def test_planar_conv_rejects_bad_inputs():
             has_initial_state=has_initial_state,
         )
         kwargs.update(overrides)
-        return kda_causal_conv1d_planar(**kwargs)
+        return causal_conv1d_planar(**kwargs)
 
     call()  # the valid baseline
     with pytest.raises(ValueError, match="width 4"):

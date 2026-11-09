@@ -17,7 +17,7 @@ import torch
 from vllm import envs
 from vllm.model_executor.layers.mamba.ops import causal_conv1d as stock
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
-    kda_planar_conv_impl,
+    planar_conv_impl,
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -119,13 +119,13 @@ def test_stencil_fast_path_matches_per_token_kernel(
 ):
     dim, weight_dtype, bias, activation = CONFIGS[config]
     calls = []
-    planar = stock.kda_causal_conv1d_planar
+    planar = stock.causal_conv1d_planar
 
     def counting_planar(*args, **kwargs):
         calls.append(1)
         return planar(*args, **kwargs)
 
-    monkeypatch.setattr(stock, "kda_causal_conv1d_planar", counting_planar)
+    monkeypatch.setattr(stock, "causal_conv1d_planar", counting_planar)
     args = (dim, weight_dtype, bias, activation, state_len, dim_first, row_pad)
 
     ref, ref_pool, _ = _run(monkeypatch, False, LONG_STEP, *args)
@@ -135,7 +135,7 @@ def test_stencil_fast_path_matches_per_token_kernel(
     # Which stencil kernel took the call: TMA on SM90+ with 16-byte aligned
     # rows, registers otherwise (the wrapper sees the [T, dim] view).
     tma = current_platform.has_device_capability(90) and row_pad % 8 == 0
-    assert kda_planar_conv_impl("auto", x.transpose(0, 1), num_planes=1) == (
+    assert planar_conv_impl("auto", x.transpose(0, 1), num_planes=1) == (
         "tma" if tma else "regs"
     )
     assert out.shape == ref.shape and out.stride() == ref.stride()
@@ -161,13 +161,13 @@ def test_stencil_fast_path_is_off_by_default(monkeypatch):
     # With the variable unset and nothing patched, the long step must stay on
     # the per-token kernel: the default read from vllm.envs is False.
     calls = []
-    planar = stock.kda_causal_conv1d_planar
+    planar = stock.causal_conv1d_planar
 
     def counting_planar(*args, **kwargs):
         calls.append(1)
         return planar(*args, **kwargs)
 
-    monkeypatch.setattr(stock, "kda_causal_conv1d_planar", counting_planar)
+    monkeypatch.setattr(stock, "causal_conv1d_planar", counting_planar)
     _run(monkeypatch, None, LONG_STEP, *CONFIGS["gdn"], 3, True)
     assert envs.VLLM_CAUSAL_CONV1D_STENCIL is False
     assert not calls

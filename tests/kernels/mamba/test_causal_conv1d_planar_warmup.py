@@ -33,7 +33,7 @@ def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor, stat
     weight = torch.randn(dim, 4, device="cuda")
     shape = (8, dim, state_len) if dim_first else (8, state_len, dim)
     pool = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    return planar.kda_causal_conv1d_planar(
+    return planar.causal_conv1d_planar(
         x,
         weight,
         None,

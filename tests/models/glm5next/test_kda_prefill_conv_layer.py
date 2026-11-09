@@ -158,13 +158,13 @@ def test_planar_prefill_conv_matches_stock_in_layer(monkeypatch, backend, dim_fi
     recurrent = torch.randn(num_slots, HEADS, D, D, device=device) * 0.1
 
     planar_calls = []
-    planar = kda.kda_causal_conv1d_planar
+    planar = kda.causal_conv1d_planar
 
     def counting_planar(*args, **kwargs):
         planar_calls.append(1)
         return planar(*args, **kwargs)
 
-    monkeypatch.setattr(kda, "kda_causal_conv1d_planar", counting_planar)
+    monkeypatch.setattr(kda, "causal_conv1d_planar", counting_planar)
 
     args = (kda, layer, LONG_STEP, conv, recurrent)
     out_stock, conv_stock, rec_stock = _run_step(

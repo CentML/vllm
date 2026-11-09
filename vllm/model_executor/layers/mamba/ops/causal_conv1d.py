@@ -10,7 +10,7 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
-    kda_causal_conv1d_planar,
+    causal_conv1d_planar,
     planar_conv_pays_off,
 )
 from vllm.platforms import current_platform
@@ -493,7 +493,7 @@ def causal_conv1d_fn(
         # `torch.empty_like(x)` gives below for a channel-last x. Rows of
         # sequences on a null slot are written (zero history) where the
         # per-token kernel leaves them unset.
-        return kda_causal_conv1d_planar(
+        return causal_conv1d_planar(
             x.transpose(0, 1),
             weight,
             bias,

@@ -9,7 +9,7 @@ carry an initial conv state (continued chunked prefills). ``stock`` is
 causal_conv1d_fn with precomputed metadata (as in serving); ``stock+copies``
 adds the q/k/v ``.contiguous()`` copies that the Triton chunk path makes of
 the stock kernel's column slices (FlashKDA takes them strided, so it pays
-only ``stock``); ``planar-<impl>`` is kda_causal_conv1d_planar, labelled with
+only ``stock``); ``planar-<impl>`` is causal_conv1d_planar, labelled with
 the kernel that actually ran. Outputs and conv states are compared with the
 stock kernel before timing and any difference is reported (count, fraction,
 largest distance in bf16 ulps); GPU times are medians from triton's do_bench
@@ -33,8 +33,8 @@ import torch
 
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
-    kda_causal_conv1d_planar,
-    kda_planar_conv_impl,
+    causal_conv1d_planar,
+    planar_conv_impl,
 )
 from vllm.triton_utils import triton
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
@@ -120,7 +120,7 @@ def run_stock(c, pool: torch.Tensor, metadata, copies: bool):
 
 
 def run_planar(c, pool: torch.Tensor, **kwargs):
-    return kda_causal_conv1d_planar(
+    return causal_conv1d_planar(
         c.x,
         c.weight,
         None,
@@ -184,7 +184,7 @@ def bench_case(num_heads: int, spec: str, args: argparse.Namespace) -> None:
     impls: dict[str, str] = {}
     for impl in args.impl:
         try:
-            impls[impl] = kda_planar_conv_impl(impl, c.x)
+            impls[impl] = planar_conv_impl(impl, c.x)
         except ValueError as e:
             print(f"{num_heads:>3} {spec:>14} planar-{impl}: skipped ({e})")
 

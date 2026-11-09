@@ -38,7 +38,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
-    kda_causal_conv1d_planar,
+    causal_conv1d_planar,
     planar_conv_pays_off,
     register_planar_conv_warmup,
 )
@@ -175,7 +175,7 @@ def _resolve_kda_prefill_conv(
     conv_state_dtype: torch.dtype = torch.bfloat16,
 ) -> str:
     """The kernel of the q|k|v short conv in chunked prefill: "causal_conv1d"
-    (``causal_conv1d_fn``) or "planar" (``kda_causal_conv1d_planar``: dense
+    (``causal_conv1d_fn``) or "planar" (``causal_conv1d_planar``: dense
     q/k/v planes, width 4, CUDA only, bf16 activations and conv states: the
     stock kernel rounds its input through the conv-state dtype, the planar
     kernel does not, so the two agree bit for bit only when both are bf16).
@@ -541,7 +541,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         Both kernels compute the same values and update ``conv_state`` in
         place for every sequence with a real slot. ``causal_conv1d_fn`` returns
         the merged ``[T, 3P]`` tensor, so q, k and v are column slices of it;
-        ``kda_causal_conv1d_planar`` (``kda_prefill_conv=planar``) returns
+        ``causal_conv1d_planar`` (``kda_prefill_conv=planar``) returns
         ``[3, T, P]``, so each is dense and a consumer that needs contiguous
         inputs (the Triton chunk path) copies nothing.
 
@@ -560,7 +560,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             attn_metadata.num_decodes,
             self.local_num_heads,
         ):
-            planes = kda_causal_conv1d_planar(
+            planes = causal_conv1d_planar(
                 qkv,
                 conv_weights,
                 conv_bias,
