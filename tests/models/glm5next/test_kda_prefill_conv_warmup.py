@@ -48,7 +48,10 @@ def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor, stat
     )
 
 
-@pytest.mark.parametrize("num_heads", [2, 16])
+# Head counts no other glm5next test compiles (4: register kernel at the
+# model's row stride; 24: TMA), so the cache probe below is live when the
+# directory runs in one process.
+@pytest.mark.parametrize("num_heads", [4, 24])
 @pytest.mark.parametrize("dim_first", [True, False], ids=["DS", "SD"])
 # 3 state positions (no speculative tokens) and 16 (13 speculative tokens):
 # the two Triton stride classes of the conv-state pool.

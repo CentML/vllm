@@ -16,6 +16,9 @@ import torch
 
 from vllm import envs
 from vllm.model_executor.layers.mamba.ops import causal_conv1d as stock
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_planar import (
+    kda_planar_conv_impl,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -40,13 +43,14 @@ CONFIGS = {
 }
 
 
-def _inputs(step, dim, weight_dtype, bias, state_len, dim_first):
+def _inputs(step, dim, weight_dtype, bias, state_len, dim_first, row_pad):
     lens, has_init, slots = step
     set_random_seed(0)
     num_tokens = sum(lens)
     # The layers pass the conv input as the [dim, T] view of a column slice of
     # a wider projection: channel stride 1, token stride the row width.
-    proj = torch.randn(num_tokens, dim + 64, device="cuda", dtype=torch.bfloat16)
+    # An even row_pad keeps the row 16-byte aligned (TMA), an odd one does not.
+    proj = torch.randn(num_tokens, dim + row_pad, device="cuda", dtype=torch.bfloat16)
     x = proj[:, :dim].transpose(0, 1)
     weight = (torch.randn(dim, 4, device="cuda") * 0.5).to(weight_dtype)
     bias_t = (torch.randn(dim, device="cuda") * 0.1).to(weight_dtype) if bias else None
@@ -81,10 +85,16 @@ def _run(
     activation,
     state_len,
     dim_first,
+    row_pad=64,
 ):
-    monkeypatch.setattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL", enabled)
+    if enabled is None:
+        # The default: nothing set in the environment, nothing patched.
+        monkeypatch.delenv("VLLM_CAUSAL_CONV1D_STENCIL", raising=False)
+        monkeypatch.delattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL", raising=False)
+    else:
+        monkeypatch.setattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL", enabled)
     x, weight, bias_t, pool, states, qsl, ci, his = _inputs(
-        step, dim, weight_dtype, bias, state_len, dim_first
+        step, dim, weight_dtype, bias, state_len, dim_first, row_pad
     )
     out = stock.causal_conv1d_fn(
         x,
@@ -96,15 +106,16 @@ def _run(
         has_initial_state=his,
         activation=activation,
     )
-    return out, pool
+    return out, pool, x
 
 
 @pytest.mark.parametrize("config", list(CONFIGS))
 @pytest.mark.parametrize("dim_first", [True, False], ids=["DS", "SD"])
 @pytest.mark.parametrize("state_len", [3, 6])
+@pytest.mark.parametrize("row_pad", [64, 65], ids=["aligned", "misaligned"])
 @torch.inference_mode()
 def test_stencil_fast_path_matches_per_token_kernel(
-    monkeypatch, config, dim_first, state_len
+    monkeypatch, config, dim_first, state_len, row_pad
 ):
     dim, weight_dtype, bias, activation = CONFIGS[config]
     calls = []
@@ -115,12 +126,18 @@ def test_stencil_fast_path_matches_per_token_kernel(
         return planar(*args, **kwargs)
 
     monkeypatch.setattr(stock, "kda_causal_conv1d_planar", counting_planar)
-    args = (dim, weight_dtype, bias, activation, state_len, dim_first)
+    args = (dim, weight_dtype, bias, activation, state_len, dim_first, row_pad)
 
-    ref, ref_pool = _run(monkeypatch, False, LONG_STEP, *args)
+    ref, ref_pool, _ = _run(monkeypatch, False, LONG_STEP, *args)
     assert not calls
-    out, pool = _run(monkeypatch, True, LONG_STEP, *args)
+    out, pool, x = _run(monkeypatch, True, LONG_STEP, *args)
     assert len(calls) == 1
+    # Which stencil kernel took the call: TMA on SM90+ with 16-byte aligned
+    # rows, registers otherwise (the wrapper sees the [T, dim] view).
+    tma = current_platform.has_device_capability(90) and row_pad % 8 == 0
+    assert kda_planar_conv_impl("auto", x.transpose(0, 1), num_planes=1) == (
+        "tma" if tma else "regs"
+    )
     assert out.shape == ref.shape and out.stride() == ref.stride()
     # The per-token kernel leaves the rows of null-slot sequences unset.
     lens, _, slots = LONG_STEP
@@ -133,7 +150,24 @@ def test_stencil_fast_path_matches_per_token_kernel(
     assert torch.equal(pool, ref_pool)
 
     # A short step stays on the per-token kernel.
-    out, pool = _run(monkeypatch, True, SHORT_STEP, *args)
-    ref, ref_pool = _run(monkeypatch, False, SHORT_STEP, *args)
+    out, pool, _ = _run(monkeypatch, True, SHORT_STEP, *args)
+    ref, ref_pool, _ = _run(monkeypatch, False, SHORT_STEP, *args)
     assert len(calls) == 1
     assert torch.equal(out, ref) and torch.equal(pool, ref_pool)
+
+
+@torch.inference_mode()
+def test_stencil_fast_path_is_off_by_default(monkeypatch):
+    # With the variable unset and nothing patched, the long step must stay on
+    # the per-token kernel: the default read from vllm.envs is False.
+    calls = []
+    planar = stock.kda_causal_conv1d_planar
+
+    def counting_planar(*args, **kwargs):
+        calls.append(1)
+        return planar(*args, **kwargs)
+
+    monkeypatch.setattr(stock, "kda_causal_conv1d_planar", counting_planar)
+    _run(monkeypatch, None, LONG_STEP, *CONFIGS["gdn"], 3, True)
+    assert envs.VLLM_CAUSAL_CONV1D_STENCIL is False
+    assert not calls
