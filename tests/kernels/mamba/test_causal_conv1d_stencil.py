@@ -88,9 +88,11 @@ def _run(
     row_pad=64,
 ):
     if enabled is None:
-        # The default: nothing set in the environment, nothing patched.
+        # The default: nothing set in the environment, nothing patched (vllm.envs
+        # computes attributes lazily, so only a patched attribute can be deleted).
         monkeypatch.delenv("VLLM_CAUSAL_CONV1D_STENCIL", raising=False)
-        monkeypatch.delattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL", raising=False)
+        if "VLLM_CAUSAL_CONV1D_STENCIL" in vars(envs):
+            monkeypatch.delattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL")
     else:
         monkeypatch.setattr(envs, "VLLM_CAUSAL_CONV1D_STENCIL", enabled)
     x, weight, bias_t, pool, states, qsl, ci, his = _inputs(
