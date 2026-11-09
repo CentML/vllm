@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer: the wiring of ``kda_prefill_conv=planar``.
 
-tests/models/glm5next/test_kda_prefill_conv.py covers the kernel alone. Here
-the layer's ``_forward`` runs one mixed chunked-prefill step (decode rows next
+tests/kernels/mamba/test_causal_conv1d_planar.py covers the kernel alone.
+Here the layer's ``_forward`` runs one mixed chunked-prefill step (decode rows next
 to a fresh and a continued prompt) with the stock conv and with the planar
 conv on cloned caches, through the Triton chunk path and, where it is
 available, FlashKDA; outputs and conv states must agree bit for bit. The
