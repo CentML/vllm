@@ -23,11 +23,14 @@ its last ``W-1`` tokens), with two differences:
   updates the state. causal_conv1d_fn instead loops token by token with
   4-byte loads.
 
-Outputs and conv states are bit-identical to ``causal_conv1d_fn`` (fp32
-weights accumulate through explicit fused multiply-adds, the form that
-kernel's multiply-adds compile to; see ``_conv_silu``), except that rows of
-sequences on a null cache slot are written (as if the sequence had no
-initial state) where ``causal_conv1d_fn`` leaves them unset.
+Outputs and conv states are bit-identical to ``causal_conv1d_fn`` as long as
+Triton contracts that kernel's fp32 multiply-adds into fused multiply-adds in
+tap order, which it does on the GPUs this was tested on (the planar kernel
+writes them explicitly, see ``_conv_silu``); otherwise outputs may differ by
+1 bf16 ulp on a few elements per million while the conv states stay exact.
+The one intended difference: rows of sequences on a null cache slot are
+written (as if the sequence had no initial state) where ``causal_conv1d_fn``
+leaves them unset.
 """
 
 import math
@@ -696,7 +699,10 @@ def _stencil_regs_warmup_inputs(
     tiles,
     num_warps,
 ):
-    # 16 and 17 tokens: both classes of the output's plane stride.
+    # Token counts are not specialized; 16 and 17 tokens differ only in the
+    # output's plane stride, whose Triton class changes with the token count
+    # only when the plane width is not a multiple of 16 (never for the KDA
+    # planes of 128-wide heads, where the second case dedupes away).
     num_tokens = WarmupChoices(16, 17)
     return _stencil_case(
         dtype,
@@ -1112,9 +1118,11 @@ def kda_causal_conv1d_planar(
             in place for every sequence with a real cache slot.
         query_start_loc: ``[N + 1]`` int32 cumulative token offsets.
         cache_indices: ``[>= N]`` cache slot per sequence, may be strided
-            (e.g. column 0 of the block table). Sequences on a pad or null
-            slot read and write no state; their output rows are computed with
-            zero history (``causal_conv1d_fn`` leaves them unset).
+            (e.g. column 0 of the block table). Sequences on a null slot read
+            and write no state and their output rows are computed with zero
+            history (``causal_conv1d_fn`` skips them and leaves the rows
+            unset); a pad slot is treated the same way here, while
+            ``causal_conv1d_fn`` expects pad slots on empty sequences only.
         has_initial_state: ``[>= N]`` bool, read the old state as history.
         num_planes: output planes; ``dim`` must be divisible by it.
         activation: ``"silu"``/``"swish"`` or ``None``.

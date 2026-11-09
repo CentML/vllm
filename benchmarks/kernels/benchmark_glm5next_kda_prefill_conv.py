@@ -133,14 +133,15 @@ def run_planar(c, pool: torch.Tensor, **kwargs):
 
 
 def describe_mismatch(out: torch.Tensor, ref: torch.Tensor) -> str:
-    """Count, fraction and largest distance (in bf16 ulps of ``ref``)."""
+    """Count, fraction and largest distance in ulps of ``ref`` (its dtype)."""
     diff = out != ref
     n = int(diff.sum())
     if n == 0:
         return "identical"
-    o, r = out[diff].float(), ref[diff].float()
-    ulp = torch.ldexp(torch.ones_like(r), torch.frexp(r).exponent - 8)
-    max_ulps = float(((o - r).abs() / ulp).max())
+    o, r = out[diff], ref[diff]
+    # One ulp at each reference value, zero included (the smallest subnormal).
+    ulp = (torch.nextafter(r, torch.full_like(r, torch.inf)) - r).float()
+    max_ulps = float(((o.float() - r.float()).abs() / ulp).max())
     return (
         f"{n} of {ref.numel()} differ ({n / ref.numel():.2e}), max {max_ulps:.1f} ulp"
     )
@@ -152,8 +153,14 @@ def time_ms(fn, warmup_ms: int, rep_ms: int) -> float:
     )
 
 
-def host_us(fn, iters: int = 200) -> float:
-    """Wall-clock host time of one call, launches queued without a sync."""
+def host_us(fn, iters: int = 100) -> float:
+    """Wall-clock host time of one call, launches queued without a sync.
+
+    Valid while ``iters`` x launches per call stays well below the stream's
+    launch queue depth (on the order of a thousand entries): beyond that the
+    host blocks on the queue and the figure turns into GPU time. The paths
+    here launch at most four kernels per call.
+    """
     torch.cuda.synchronize()
     start = time.perf_counter()
     for _ in range(iters):
