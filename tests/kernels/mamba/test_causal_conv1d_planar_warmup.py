@@ -21,17 +21,22 @@ pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires
 D = 128
 
 
-def _compiled(dispatchers) -> list[int]:
-    """Compiled variants per kernel in Triton's cache for the current device."""
+def _kernel_caches(dispatchers) -> list[dict]:
+    """Triton's compiled-variant caches of the kernels for the current device."""
     device = triton.runtime.driver.active.get_current_device()
-    return [len(d.kernel.device_caches[device][0]) for d in dispatchers]
+    return [d.kernel.device_caches[device][0] for d in dispatchers]
+
+
+def _compiled(dispatchers) -> list[int]:
+    return [len(c) for c in _kernel_caches(dispatchers)]
 
 
 def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor, state_len):
     lens = [1, 1, 300, 40]
     x = torch.randn(sum(lens), row, device="cuda", dtype=torch.bfloat16)[:, :dim]
     weight = torch.randn(dim, 4, device="cuda")
-    shape = (8, dim, state_len) if dim_first else (8, state_len, dim)
+    num_slots = int(cache_indices.max()) + 1  # every index must own a slot
+    shape = (num_slots, dim, state_len) if dim_first else (num_slots, state_len, dim)
     pool = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     return planar.causal_conv1d_planar(
         x,
@@ -82,13 +87,18 @@ def test_planar_conv_warmup_covers_the_runtime_variants(
         planar._planar_fixup,
         planar._planar_state_update,
     ] * 3
+    dispatchers = [stencil, planar._planar_fixup, planar._planar_state_update]
+    # Start from empty kernel caches so the probe below sees this case's
+    # compiles only (another case or test may have compiled the same variants;
+    # the disk cache keeps the recompile cheap).
+    for cache in _kernel_caches(dispatchers):
+        cache.clear()
     for dispatcher, kwargs in plan:
         keys = dispatcher.get_warmup_keys(**kwargs)
         assert keys, (dispatcher.__name__, kwargs)
         dispatcher.compile_many(keys)
-
-    dispatchers = [stencil, planar._planar_fixup, planar._planar_state_update]
     before = _compiled(dispatchers)
+    assert all(before)
     # Cache indices as column 0 of block tables of three widths: the three
     # specialization classes of their stride (16-multiple, generic, 1).
     for width in (16, 7, 1):
