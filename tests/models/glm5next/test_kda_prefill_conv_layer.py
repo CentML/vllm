@@ -197,3 +197,10 @@ def test_resolve_kda_prefill_conv():
         kda._resolve_kda_prefill_conv("fused", 4)
     with pytest.raises(ValueError, match="width 4"):
         kda._resolve_kda_prefill_conv("planar", 3)
+    # The stock kernel rounds x through the conv-state dtype; bit-identity
+    # with the planar kernel holds for bf16 states only.
+    with pytest.raises(ValueError, match="bfloat16"):
+        kda._resolve_kda_prefill_conv("planar", 4, torch.bfloat16, torch.float16)
+    assert kda._resolve_kda_prefill_conv(
+        "causal_conv1d", 4, torch.bfloat16, torch.float32
+    )

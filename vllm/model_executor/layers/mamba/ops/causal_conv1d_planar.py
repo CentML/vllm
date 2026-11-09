@@ -657,13 +657,16 @@ def _warmup_bias(dtype: torch.dtype | None, dim: int) -> TritonWarmupTensor | No
 
 
 def _warmup_conv_states(
-    dtype: torch.dtype, dim: int, dim_first: bool
+    dtype: torch.dtype, dim: int, dim_first: bool, state_len: int
 ) -> TritonWarmupTensor:
-    # One slot of the pool as the kernels see it, [slot, dim, width - 1]: the
-    # DS layout directly, the SD layout as the transposed view kda.py passes.
-    w = CONV_WIDTH.value - 1
-    strides = (w * dim, w, 1) if dim_first else (w * dim, 1, dim)
-    return TritonWarmupTensor(dtype, shape=(1, dim, w), strides=strides)
+    # One slot of the pool as the kernels see it, [slot, dim, state_len] with
+    # state_len >= width - 1 (plus the speculative tokens, which changes the
+    # stride classes): the DS layout directly, the SD layout as the transposed
+    # view kda.py passes.
+    strides = (
+        (state_len * dim, state_len, 1) if dim_first else (state_len * dim, 1, dim)
+    )
+    return TritonWarmupTensor(dtype, shape=(1, dim, state_len), strides=strides)
 
 
 def _stencil_case(
@@ -739,13 +742,22 @@ def _stencil_tma_warmup_inputs(
 
 
 def _state_update_case(
-    dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+    dtype,
+    conv_state_dtype,
+    state_len,
+    dim,
+    row_stride,
+    conv_state_dim_first,
+    cache_indices_stride,
+    num_tokens,
 ):
     # The warmup replays a case through the dispatch, so a case holds exactly
     # the dispatch's parameters.
     return dict(
         x=TritonWarmupTensor(dtype, shape=(num_tokens, dim), strides=(row_stride, 1)),
-        conv_states=_warmup_conv_states(dtype, dim, conv_state_dim_first),
+        conv_states=_warmup_conv_states(
+            conv_state_dtype, dim, conv_state_dim_first, state_len
+        ),
         cache_indices=TritonWarmupTensor(
             torch.int32, shape=(2,), strides=(cache_indices_stride,)
         ),
@@ -758,6 +770,8 @@ def _state_update_case(
 
 def _fixup_case(
     dtype,
+    conv_state_dtype,
+    state_len,
     weight_dtype,
     bias_dtype,
     dim,
@@ -769,7 +783,14 @@ def _fixup_case(
 ):
     plane_dim = dim // num_planes
     case = _state_update_case(
-        dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+        dtype,
+        conv_state_dtype,
+        state_len,
+        dim,
+        row_stride,
+        conv_state_dim_first,
+        cache_indices_stride,
+        num_tokens,
     )
     case.update(
         weight=TritonWarmupTensor(weight_dtype, shape=(dim, CONV_WIDTH.value)),
@@ -783,6 +804,8 @@ def _fixup_case(
 def _fixup_warmup_inputs(
     *,
     dtype,
+    conv_state_dtype,
+    state_len,
     weight_dtype,
     bias_dtype,
     dim,
@@ -794,6 +817,8 @@ def _fixup_warmup_inputs(
     num_tokens = WarmupChoices(16, 17)
     return _fixup_case(
         dtype,
+        conv_state_dtype,
+        state_len,
         weight_dtype,
         bias_dtype,
         dim,
@@ -806,11 +831,25 @@ def _fixup_warmup_inputs(
 
 
 def _state_update_warmup_inputs(
-    *, dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride
+    *,
+    dtype,
+    conv_state_dtype,
+    state_len,
+    dim,
+    row_stride,
+    conv_state_dim_first,
+    cache_indices_stride,
 ):
     num_tokens = WarmupChoices(16, 17)
     return _state_update_case(
-        dtype, dim, row_stride, conv_state_dim_first, cache_indices_stride, num_tokens
+        dtype,
+        conv_state_dtype,
+        state_len,
+        dim,
+        row_stride,
+        conv_state_dim_first,
+        cache_indices_stride,
+        num_tokens,
     )
 
 
@@ -979,6 +1018,8 @@ def planar_conv_warmup_plan(
     num_planes: int,
     row_strides: tuple[int, ...],
     conv_state_dim_first: bool,
+    conv_state_dtype: torch.dtype | None = None,
+    state_len: int = CONV_WIDTH.value - 1,
     impl: str = "auto",
     block_n: int = _DEFAULT_BLOCK_N,
     tiles: int = _DEFAULT_TILES,
@@ -991,12 +1032,16 @@ def planar_conv_warmup_plan(
     For each row stride of ``x`` (the fused projection's row; the dense row of
     the gathered non-spec rows of a spec-decode step) the stencil kernel that
     ``kda_planar_conv_impl`` selects for it, plus the fixup and the state
-    update for the conv-state layout and every specialization class of the
+    update for the conv-state pool (``conv_state_dtype``, default the
+    activation dtype; ``state_len`` positions per channel, width - 1 plus the
+    speculative tokens; the layout) and every specialization class of the
     cache-index stride (contiguous, generic, multiple of 16: the block table's
     width is not known at init).
     """
     plane_dim = dim // num_planes
     block_n = math.gcd(block_n, plane_dim)
+    if conv_state_dtype is None:
+        conv_state_dtype = dtype
     plan: list[tuple[Any, dict[str, Any]]] = []
     for row_stride in dict.fromkeys(row_strides):
         common = dict(
@@ -1014,6 +1059,8 @@ def planar_conv_warmup_plan(
             plan.append((_planar_stencil_regs, launch))
         for cache_indices_stride in cache_indices_strides:
             per_seq = dict(
+                conv_state_dtype=conv_state_dtype,
+                state_len=state_len,
                 conv_state_dim_first=conv_state_dim_first,
                 cache_indices_stride=cache_indices_stride,
             )

@@ -168,11 +168,18 @@ def _resolve_kda_prefill_backend(
     return "flashkda" if supported and backend != "triton" else "triton"
 
 
-def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> str:
+def _resolve_kda_prefill_conv(
+    conv: str,
+    conv_size: int,
+    dtype: torch.dtype = torch.bfloat16,
+    conv_state_dtype: torch.dtype = torch.bfloat16,
+) -> str:
     """The kernel of the q|k|v short conv in chunked prefill: "causal_conv1d"
     (``causal_conv1d_fn``) or "planar" (``kda_causal_conv1d_planar``: dense
-    q/k/v planes, width 4, CUDA only). ``conv`` comes from
-    ``additional_config.kda_prefill_conv``."""
+    q/k/v planes, width 4, CUDA only, bf16 activations and conv states: the
+    stock kernel rounds its input through the conv-state dtype, the planar
+    kernel does not, so the two agree bit for bit only when both are bf16).
+    ``conv`` comes from ``additional_config.kda_prefill_conv``."""
     if conv not in ("causal_conv1d", "planar"):
         raise ValueError(
             f"Unsupported KDA prefill conv {conv!r}: 'causal_conv1d' or 'planar'"
@@ -181,6 +188,14 @@ def _resolve_kda_prefill_conv(conv: str, conv_size: int) -> str:
         raise ValueError("kda_prefill_conv=planar is only available on CUDA")
     if conv == "planar" and conv_size != 4:
         raise ValueError(f"kda_prefill_conv=planar needs width 4, got {conv_size}")
+    if conv == "planar" and (dtype, conv_state_dtype) != (
+        torch.bfloat16,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            "kda_prefill_conv=planar needs bfloat16 activations and conv states, "
+            f"got {dtype} and {conv_state_dtype}"
+        )
     return conv
 
 
@@ -387,6 +402,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if isinstance(additional_config, dict)
             else "causal_conv1d",
             self.conv_size,
+            vllm_config.model_config.dtype,
+            self.get_state_dtype()[0],
         )
         if self.kda_prefill_conv == "planar":
             # Startup JIT warmup of the stencil kernel this shard's rows select,
@@ -404,6 +421,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     3 * self.local_projection_size,
                 ),
                 conv_state_dim_first=self._conv_state_dim_first,
+                conv_state_dtype=self.get_state_dtype()[0],
+                # width - 1 history positions plus the speculative tokens.
+                state_len=self.conv_size - 1 + self.num_spec,
             )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None

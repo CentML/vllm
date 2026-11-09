@@ -27,11 +27,11 @@ def _compiled(dispatchers) -> list[int]:
     return [len(d.kernel.device_caches[device][0]) for d in dispatchers]
 
 
-def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor):
+def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor, state_len):
     lens = [1, 1, 300, 40]
     x = torch.randn(sum(lens), row, device="cuda", dtype=torch.bfloat16)[:, :dim]
     weight = torch.randn(dim, 4, device="cuda")
-    shape = (8, dim, 3) if dim_first else (8, 3, dim)
+    shape = (8, dim, state_len) if dim_first else (8, state_len, dim)
     pool = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     return planar.kda_causal_conv1d_planar(
         x,
@@ -50,8 +50,13 @@ def _step(dim: int, row: int, dim_first: bool, cache_indices: torch.Tensor):
 
 @pytest.mark.parametrize("num_heads", [2, 16])
 @pytest.mark.parametrize("dim_first", [True, False], ids=["DS", "SD"])
+# 3 state positions (no speculative tokens) and 16 (13 speculative tokens):
+# the two Triton stride classes of the conv-state pool.
+@pytest.mark.parametrize("state_len", [3, 16])
 @torch.inference_mode()
-def test_planar_conv_warmup_covers_the_runtime_variants(num_heads, dim_first):
+def test_planar_conv_warmup_covers_the_runtime_variants(
+    num_heads, dim_first, state_len
+):
     dim = 3 * num_heads * D
     row = dim + num_heads + 2 * D  # the fused projection's row
     plan = planar.planar_conv_warmup_plan(
@@ -62,6 +67,7 @@ def test_planar_conv_warmup_covers_the_runtime_variants(num_heads, dim_first):
         num_planes=3,
         row_strides=(row,),
         conv_state_dim_first=dim_first,
+        state_len=state_len,
     )
     expected = "tma" if current_platform.has_device_capability(90) else "regs"
     if num_heads % 8:
@@ -84,7 +90,7 @@ def test_planar_conv_warmup_covers_the_runtime_variants(num_heads, dim_first):
     # specialization classes of their stride (16-multiple, generic, 1).
     for width in (16, 7, 1):
         table = torch.arange(1, 1 + 4 * width, dtype=torch.int32, device="cuda")
-        out = _step(dim, row, dim_first, table.view(4, width)[:, 0])
+        out = _step(dim, row, dim_first, table.view(4, width)[:, 0], state_len)
         torch.cuda.synchronize()
         assert out.shape == (3, 342, dim // 3)
         assert _compiled(dispatchers) == before, (
@@ -93,6 +99,6 @@ def test_planar_conv_warmup_covers_the_runtime_variants(num_heads, dim_first):
         )
     # Positive control for the probe: int64 cache indices are a new variant.
     table = torch.arange(1, 5, dtype=torch.int64, device="cuda")
-    _step(dim, row, dim_first, table)
+    _step(dim, row, dim_first, table, state_len)
     torch.cuda.synchronize()
     assert _compiled(dispatchers)[1:] == [n + 1 for n in before[1:]]
