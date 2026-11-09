@@ -1156,6 +1156,13 @@ def kda_causal_conv1d_planar(
     width = weight.shape[1]
     if weight.shape[0] != dim:
         raise ValueError(f"weight has {weight.shape[0]} channels, x has {dim}")
+    if bias is not None and (
+        bias.dim() != 1 or bias.numel() != dim or bias.device != x.device
+    ):
+        raise ValueError(
+            f"bias must be a [{dim}] tensor on {x.device}, got shape "
+            f"{tuple(bias.shape)} on {bias.device}"
+        )
     if num_planes < 1 or dim % num_planes != 0:
         raise ValueError(f"dim {dim} is not divisible by num_planes {num_planes}")
     if (
@@ -1173,6 +1180,11 @@ def kda_causal_conv1d_planar(
         )
     if block_n < 1 or block_n & (block_n - 1):
         raise ValueError(f"block_n must be a power of two, got {block_n}")
+    if tiles < 1 or num_stages < 1 or num_warps < 1 or num_warps & (num_warps - 1):
+        raise ValueError(
+            f"tiles ({tiles}) and num_stages ({num_stages}) must be positive and "
+            f"num_warps ({num_warps}) a positive power of two"
+        )
     num_seqs = query_start_loc.numel() - 1
     if cache_indices.numel() < num_seqs or has_initial_state.numel() < num_seqs:
         raise ValueError(

@@ -207,7 +207,7 @@ def test_planar_conv_matches_causal_conv1d(
 @torch.inference_mode()
 def test_planar_conv_bias_and_bf16_weights(bias, weight_dtype, impl):
     # Dead for GLM-5.3-Flash (fp32 weights, no bias), alive for a generic op.
-    _run(
+    x = _run(
         "starts_inside_tiles",
         16,
         True,
@@ -216,12 +216,13 @@ def test_planar_conv_bias_and_bf16_weights(bias, weight_dtype, impl):
         bias=bias,
         weight_dtype=weight_dtype,
     )
+    assert kda_planar_conv_impl(impl, x) == _expected_impl(impl, 16)
 
 
 @pytest.mark.parametrize("impl", ["regs", "auto"])
 @torch.inference_mode()
 def test_planar_conv_single_plane_without_activation(impl):
-    _run(
+    x = _run(
         "short_and_null",
         16,
         False,
@@ -230,6 +231,7 @@ def test_planar_conv_single_plane_without_activation(impl):
         num_planes=1,
         activation=None,
     )
+    assert kda_planar_conv_impl(impl, x, num_planes=1) == _expected_impl(impl, 16)
 
 
 @torch.inference_mode()
@@ -259,7 +261,8 @@ def test_planar_conv_empty_batch():
 def test_planar_conv_full_chunked_prefill_step(impl):
     # About 65K tokens at the TP8 shard: the full grid and the TMA coordinates
     # at the serving size.
-    _run(LARGE_CASE, 8, True, model_row_pad(8), impl)
+    x = _run(LARGE_CASE, 8, True, model_row_pad(8), impl)
+    assert kda_planar_conv_impl(impl, x) == _expected_impl(impl, 8)
 
 
 def test_planar_conv_pays_off_rule():
@@ -319,6 +322,10 @@ def test_planar_conv_rejects_bad_inputs():
     call()  # the valid baseline
     with pytest.raises(ValueError, match="width 4"):
         call(weight=weight[:, :3])
+    with pytest.raises(ValueError, match="channels"):
+        call(weight=weight[: dim - 1])
+    with pytest.raises(ValueError, match="bias"):
+        call(bias=torch.randn(dim - 1, device=device))
     with pytest.raises(ValueError, match="dense channels"):
         call(x=x.transpose(0, 1))
     with pytest.raises(ValueError, match="num_planes"):
@@ -331,11 +338,22 @@ def test_planar_conv_rejects_bad_inputs():
         call(impl="TMA")
     with pytest.raises(ValueError, match="power of two"):
         call(block_n=48)
+    with pytest.raises(ValueError, match="tiles"):
+        call(tiles=0)
+    with pytest.raises(ValueError, match="num_warps"):
+        call(num_warps=3)
     with pytest.raises(ValueError, match="entry per sequence"):
         call(cache_indices=cache_indices[:0])
+    with pytest.raises(ValueError, match="entry per sequence"):
+        call(has_initial_state=has_initial_state[:0])
     short = torch.empty(3, num_tokens - 1, dim // 3, device=device, dtype=x.dtype)
     with pytest.raises(ValueError, match="out must be"):
         call(out=short)
     wrong_dtype = torch.empty(3, num_tokens, dim // 3, device=device)
     with pytest.raises(TypeError, match="dtype"):
         call(out=wrong_dtype)
+    strided = torch.empty(3, num_tokens, 2 * (dim // 3), device=device, dtype=x.dtype)
+    with pytest.raises(ValueError, match="dense last dim"):
+        call(out=strided[:, :, ::2])
+    with pytest.raises(TypeError, match="device"):
+        call(out=torch.empty(3, num_tokens, dim // 3, dtype=x.dtype))
