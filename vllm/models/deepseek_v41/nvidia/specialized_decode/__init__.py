@@ -82,7 +82,12 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
     compilation = vllm_config.compilation_config
     cudagraph_mode = compilation.cudagraph_mode
     requirements = {
-        "a GB300 (SM103) GPU": current_platform.is_device_capability(103),
+        # Rubin (SM107) runs the same kernels: FlashInfer lists SM107 for the
+        # low-latency MXFP8 GEMM, and the other paths gate on the SM100 family.
+        "a GB300 (SM103) or Rubin (SM107) GPU": (
+            current_platform.is_device_capability(103)
+            or current_platform.is_device_capability(107)
+        ),
         "Model Runner V2": vllm_config.use_v2_model_runner,
         "tensor parallel size 4 without pipeline, data, expert or context "
         "parallelism or micro-batching": (

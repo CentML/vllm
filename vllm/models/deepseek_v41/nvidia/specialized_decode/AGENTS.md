@@ -12,7 +12,8 @@ model keeps its stock paths.
 target model is built. Any deployment other than the one below raises at
 startup on every TP rank with the missing requirements:
 
-- GPU: GB300 (SM103).
+- GPU: GB300 (SM103) or Rubin (SM107). The pinned MXFP8 GEMM tactics stay
+  GB300-only; on Rubin the GEMMs tune over every tactic.
 - Runner: Model Runner V2.
 - Parallelism: TP=4; no pipeline, data, expert or context parallelism, no
   micro-batching.

@@ -63,6 +63,14 @@ from .routed_expert_gemm_cute import (
     RoutedExpertGemm2,
     tile_scale_bytes,
 )
+from .routed_expert_gemm_nvfp4_cute import (
+    SF_VEC as NVFP4_SF_VEC,
+)
+from .routed_expert_gemm_nvfp4_cute import (
+    RoutedExpertGemm1Nvfp4,
+    RoutedExpertGemm2Nvfp4,
+    tile_scale_bytes_nvfp4,
+)
 from .routed_expert_route_cute import RoutedExpertRoute
 
 if TYPE_CHECKING:
@@ -76,6 +84,9 @@ logger = init_logger(__name__)
 HIDDEN = 5120
 SLICE = 576
 PADDED = 640
+# The NVFP4 experts' intermediate at TP4: vLLM pads a gated NVFP4 intermediate
+# to a multiple of 64 only, so 576 stays unpadded.
+NV_INTERMEDIATE = 576
 # The fused front is built for exactly the target layers' routing.
 EXPERTS = 384
 TOP_K = 6
@@ -318,6 +329,133 @@ class RoutedExpertGemm:
         )
 
 
+class RoutedExpertGemmNvfp4(RoutedExpertGemm):
+    """The route kernel and the NVFP4 (W4A4) GEMM pair bound to one MoE
+    layer's TRT-LLM-gen NVFP4 experts (``routed_expert_gemm_nvfp4_cute.py``).
+
+    The input is quantized by the modular kernel's prepare (NVFP4 with the
+    layer's static global scale, linear E4M3 block scales), so the activations
+    match the stock path bit for bit; routing takes the router's top-k (the
+    fused front is MXFP8-only).
+    """
+
+    def __init__(
+        self,
+        w13: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        clamp: torch.Tensor,
+        g1_alphas: torch.Tensor,
+        g1_scale_c: torch.Tensor,
+        g2_alphas: torch.Tensor,
+        top_k: int,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        check_weights_nvfp4(
+            w13, w13_scale, w2, w2_scale, clamp, g1_alphas, g1_scale_c, g2_alphas, top_k
+        )
+        self.experts = int(w13.size(0))
+        self.top_k = top_k
+        index = w13.device.index
+        self.device_index = (
+            torch.accelerator.current_device_index() if index is None else index
+        )
+        _route_kernel(self.device_index)
+        _gemm1_nvfp4_kernel(self.device_index)
+        _gemm2_nvfp4_kernel(self.device_index)
+        self.prepare_finalize = prepare_finalize
+        self.quant_config = quant_config
+        self.front_config = None
+        self.w13, self.w13_scale, self.w2, self.w2_scale = w13, w13_scale, w2, w2_scale
+        self.clamp = clamp
+        self.g1_alphas, self.g1_scale_c, self.g2_alphas = g1_alphas, g1_scale_c, g2_alphas
+
+    def set_front(self, config: FrontConfig) -> None:
+        raise ValueError("the fused front quantizes to MXFP8 only")
+
+    def route(
+        self,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> Routing:
+        routing = super().route(x, topk_ids, topk_weights)
+        rows = x.size(0)
+        if routing.x_quant.shape != (rows, HIDDEN // 2) or routing.x_scale.numel() != (
+            rows * HIDDEN // NVFP4_SF_VEC
+        ):
+            raise ValueError(
+                "unexpected NVFP4 input layout "
+                f"{tuple(routing.x_quant.shape)} / {tuple(routing.x_scale.shape)}"
+            )
+        return routing
+
+    def gemm1(self, routing: Routing) -> tuple[torch.Tensor, torch.Tensor]:
+        """Launch GEMM1; returns the NVFP4 intermediate H (two values a byte)
+        and its block scales (one 128-row atom set per token tile)."""
+        device = routing.x_quant.device
+        padded_rows = TILE * routing.ctas
+        h_values = torch.empty(
+            (padded_rows, NV_INTERMEDIATE // 2), dtype=torch.uint8, device=device
+        )
+        h_scales = torch.empty(
+            routing.ctas * tile_scale_bytes_nvfp4(NV_INTERMEDIATE),
+            dtype=torch.uint8,
+            device=device,
+        )
+        _gemm1_nvfp4_kernel(self.device_index)(
+            _pointer(cutlass.Float4E2M1FN, self.w13, 32),
+            _pointer(cutlass.Float8E4M3FN, self.w13_scale, 16),
+            _pointer(cutlass.Float4E2M1FN, routing.x_quant, 16),
+            _pointer(cutlass.Uint32, routing.x_scale, 16),
+            _pointer(cutlass.Uint8, h_values, 16),
+            _pointer(cutlass.Uint8, h_scales, 16),
+            _pointer(cutlass.Int32, routing.record, 16),
+            _pointer(cutlass.Float32, self.clamp, 16),
+            _pointer(cutlass.Float32, self.g1_alphas, 16),
+            _pointer(cutlass.Float32, self.g1_scale_c, 16),
+            Int32(routing.x_quant.size(0)),
+            Int32(self.experts),
+            Int32(cta_words(routing.ctas)),
+            Int32(padded_rows),
+            Int32(_sm_count(self.device_index)),
+            current_cu_stream(),
+        )
+        return h_values, h_scales
+
+    def gemm2(
+        self, routing: Routing, h_values: torch.Tensor, h_scales: torch.Tensor
+    ) -> UnfinalizedMoEOutput:
+        """Launch GEMM2 on GEMM1's outputs."""
+        rows, top_k = routing.topk_ids.shape
+        gemm2_rows = torch.empty(
+            (rows * top_k * TILE, HIDDEN),
+            dtype=torch.bfloat16,
+            device=routing.x_quant.device,
+        )
+        _gemm2_nvfp4_kernel(self.device_index)(
+            _pointer(cutlass.Float4E2M1FN, self.w2, 32),
+            _pointer(cutlass.Float8E4M3FN, self.w2_scale, 16),
+            _pointer(cutlass.Float4E2M1FN, h_values, 16),
+            _pointer(cutlass.Float8E4M3FN, h_scales, 16),
+            _pointer(cutlass.BFloat16, gemm2_rows, 16),
+            _pointer(cutlass.Int32, routing.record, 16),
+            _pointer(cutlass.Float32, self.g2_alphas, 16),
+            Int32(TILE * routing.ctas),
+            Int32(self.experts),
+            Int32(cta_words(routing.ctas)),
+            Int32(_sm_count(self.device_index)),
+            current_cu_stream(),
+        )
+        return UnfinalizedMoEOutput(
+            gemm2_permuted=gemm2_rows,
+            expert_weights=routing.topk_weights.contiguous().view(rows, top_k),
+            expanded_idx_to_permuted_idx=routing.permuted,
+        )
+
+
 def _pointer(dtype: type[cutlass.Numeric], tensor: torch.Tensor, align: int):
     """A CuTe DSL global-memory pointer to ``tensor``'s data."""
     return make_ptr(
@@ -416,6 +554,52 @@ def _gemm2_kernel(device_index: int):
 
 
 @cache
+def _gemm1_nvfp4_kernel(device_index: int):
+    """``RoutedExpertGemm1Nvfp4`` compiled for a device."""
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertGemm1Nvfp4(HIDDEN, NV_INTERMEDIATE),
+            _fake(cutlass.Float4E2M1FN, 32),
+            _fake(cutlass.Float8E4M3FN, 16),
+            _fake(cutlass.Float4E2M1FN, 16),
+            _fake(cutlass.Uint32, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Uint8, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            _fake(cutlass.Float32, 16),
+            Int32(1),
+            Int32(MAX_EXPERTS),
+            Int32(4),
+            Int32(TILE),
+            Int32(1),
+            make_fake_stream(),
+        )
+
+
+@cache
+def _gemm2_nvfp4_kernel(device_index: int):
+    """``RoutedExpertGemm2Nvfp4`` compiled for a device."""
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            RoutedExpertGemm2Nvfp4(HIDDEN, NV_INTERMEDIATE),
+            _fake(cutlass.Float4E2M1FN, 32),
+            _fake(cutlass.Float8E4M3FN, 16),
+            _fake(cutlass.Float4E2M1FN, 16),
+            _fake(cutlass.Float8E4M3FN, 16),
+            _fake(cutlass.BFloat16, 16),
+            _fake(cutlass.Int32, 16),
+            _fake(cutlass.Float32, 16),
+            Int32(TILE),
+            Int32(MAX_EXPERTS),
+            Int32(4),
+            Int32(1),
+            make_fake_stream(),
+        )
+
+
+@cache
 def _sm_count(device_index: int) -> int:
     """Streaming multiprocessors of a device: the persistent GEMMs' CTAs."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -470,15 +654,97 @@ def check_weights(
         raise ValueError("the intermediate padding of w13/w2 is not zero")
 
 
+def check_weights_nvfp4(
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    clamp: torch.Tensor | None,
+    g1_alphas: torch.Tensor | None,
+    g1_scale_c: torch.Tensor | None,
+    g2_alphas: torch.Tensor | None,
+    top_k: int,
+) -> None:
+    """Raise ``ValueError`` unless the NVFP4 weights have the layout the
+    kernels read and the routing fits the route kernel."""
+    experts = w13.size(0)
+    i = NV_INTERMEDIATE
+    for tensor, shape in (
+        (w13, (experts, 2 * i, HIDDEN // 2)),
+        (w13_scale, (experts, 2 * i, HIDDEN // NVFP4_SF_VEC)),
+        (w2, (experts, HIDDEN, i // 2)),
+        (w2_scale, (experts, HIDDEN, i // NVFP4_SF_VEC)),
+    ):
+        if (
+            tuple(tensor.shape) != shape
+            or tensor.element_size() != 1
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"expected a contiguous {shape} 1-byte tensor, got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+    if w13.data_ptr() % 32 or w2.data_ptr() % 32:
+        raise ValueError("packed expert weights must be 32-byte aligned")
+    if w13_scale.data_ptr() % 16 or w2_scale.data_ptr() % 16:
+        raise ValueError("weight scales must be 16-byte aligned")
+    if experts % 32 or not 0 < experts <= MAX_EXPERTS:
+        raise ValueError(f"{experts} local experts")
+    if not 1 <= top_k <= MAX_TOP_K:
+        raise ValueError(f"top-k {top_k}")
+    for name, tensor in (
+        ("SwiGLU clamp limit", clamp),
+        ("g1_alphas", g1_alphas),
+        ("g1_scale_c", g1_scale_c),
+        ("g2_alphas", g2_alphas),
+    ):
+        if (
+            tensor is None
+            or tensor.dtype != torch.float32
+            or tuple(tensor.shape) != (experts,)
+            or not tensor.is_contiguous()
+            or tensor.data_ptr() % 16
+        ):
+            raise ValueError(f"no FP32 [E] {name}")
+
+
+def _unsupported_reason_nvfp4(runner: torch.nn.Module, impl) -> str | None:
+    """Why the runner's TRT-LLM-gen NVFP4 experts cannot take the NVFP4 pair."""
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    config = impl.moe_config
+    quant = impl.quant_config
+    if config.activation != MoEActivation.SILU:
+        return f"activation {config.activation}"
+    if impl.gemm1_alpha is not None or impl.gemm1_beta is not None:
+        return "gemm1 alpha/beta"
+    if impl.expects_unquantized_inputs:
+        return "per-token NVFP4 activations"
+    if impl.local_num_experts != config.num_experts:
+        return "expert parallelism"
+    if runner.routed_scaling_factor != 1.0:
+        return "routed scaling"
+    if quant.quant_dtype != "nvfp4" or quant.is_scale_swizzled:
+        return "activations are not NVFP4 with linear scales"
+    if impl.intermediate_size_per_partition != NV_INTERMEDIATE:
+        return f"intermediate {impl.intermediate_size_per_partition}"
+    return None
+
+
 def _unsupported_reason(runner: torch.nn.Module) -> str | None:
     """Why the MoE runner's routed experts cannot take the GEMM pair."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
         TrtLlmMxfp4ExpertsModular,
     )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsModular,
+    )
 
     kernel = runner.routed_experts.quant_method.moe_kernel
     impl = kernel.fused_experts if kernel is not None else None
+    if isinstance(impl, TrtLlmNvFp4ExpertsModular):
+        return _unsupported_reason_nvfp4(runner, impl)
     if not isinstance(impl, TrtLlmMxfp4ExpertsModular):
         return f"experts kernel {type(impl).__name__}"
     config = impl.moe_config
@@ -578,19 +844,35 @@ def build_routed_expert_gemms(
             kernel = routed.quant_method.moe_kernel
             impl = kernel.fused_experts
             try:
-                gemm = RoutedExpertGemm(
-                    routed.w13_weight,
-                    impl.w1_scale,
-                    routed.w2_weight,
-                    impl.w2_scale,
-                    impl.gemm1_clamp_limit,
-                    impl.topk,
-                    kernel.prepare_finalize,
-                    impl.quant_config,
-                )
+                if impl.quant_config.quant_dtype == "nvfp4":
+                    quant = impl.quant_config
+                    gemm = RoutedExpertGemmNvfp4(
+                        routed.w13_weight,
+                        quant.w1_scale,
+                        routed.w2_weight,
+                        quant.w2_scale,
+                        impl.gemm1_clamp_limit,
+                        quant.g1_alphas,
+                        impl.g1_scale_c,
+                        quant.g2_alphas,
+                        impl.topk,
+                        kernel.prepare_finalize,
+                        quant,
+                    )
+                else:
+                    gemm = RoutedExpertGemm(
+                        routed.w13_weight,
+                        impl.w1_scale,
+                        routed.w2_weight,
+                        impl.w2_scale,
+                        impl.gemm1_clamp_limit,
+                        impl.topk,
+                        kernel.prepare_finalize,
+                        impl.quant_config,
+                    )
             except ValueError as error:
                 reasons[str(error)] += 1
-        if gemm is not None:
+        if gemm is not None and not isinstance(gemm, RoutedExpertGemmNvfp4):
             front = _front_config(runner)
             if isinstance(front, str):
                 reasons[f"fused front: {front}"] += 1

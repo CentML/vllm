@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
     TrtLlmMxfp4ExpertsModular,
 )
+from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+    TrtLlmNvFp4ExpertsModular,
+)
 from vllm.model_executor.layers.fused_moe.moe_output import (
     MoEOutput,
     UnfinalizedMoEOutput,
@@ -55,12 +58,12 @@ def deferred_finalize(config: FusedMoEConfig, max_num_tokens: int) -> Iterator[N
 
 def defers_finalize(ffn: "DeepseekV4MoE", max_num_tokens: int) -> bool:
     """Whether ``ffn``'s experts can leave the top-k reduction to the fused
-    all-reduce + mHC: the modular TRT-LLM MXFP4 experts without routed scaling,
-    on a TP-only deployment."""
+    all-reduce + mHC: the modular TRT-LLM MXFP4 or NVFP4 experts without routed
+    scaling, on a TP-only deployment."""
     runner = ffn.experts
     experts_cls = getattr(runner.routed_experts.quant_method, "experts_cls", None)
     if (
-        experts_cls is not TrtLlmMxfp4ExpertsModular
+        experts_cls not in (TrtLlmMxfp4ExpertsModular, TrtLlmNvFp4ExpertsModular)
         or runner.routed_scaling_factor != 1.0
         or ffn.use_native_mega_moe
     ):

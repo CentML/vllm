@@ -583,7 +583,12 @@ def _selected_tactic(
     runner = gemm_base._cutedsl_low_latency_blockscaled_gemm_runner(
         major * 10 + minor, True
     )
-    workspace = gemm_base._get_cache_buf(
+    # The workspace mm_mxfp8 itself takes: per stream from FlashInfer 0.7.5
+    # (_get_stream_cache_buf, flashinfer-ai/flashinfer#3618), per device before.
+    get_buf = getattr(gemm_base, "_get_stream_cache_buf", None) or getattr(
+        gemm_base, "_get_cache_buf"
+    )
+    workspace = get_buf(
         "mm_mxfp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
     )
     inputs = [a, weight, a_scale, weight_scale, out.dtype, out, workspace]
