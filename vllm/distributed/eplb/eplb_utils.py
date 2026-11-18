@@ -9,6 +9,7 @@ import threading
 import torch
 
 from vllm.config import ParallelConfig
+from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -92,7 +93,7 @@ def override_envs_for_eplb(
     """
     is_data_parallel = parallel_config.data_parallel_size > 1
     is_eplb_enabled = parallel_config.enable_eplb
-    is_mega_moe = moe_backend == "deep_gemm_mega_moe"
+    is_mega_moe = moe_backend in NATIVE_MEGA_MOE_BACKENDS
     is_nccl_based_eplb_communicator = parallel_config.eplb_config.communicator in (
         "torch_nccl",
         "pynccl",
@@ -122,6 +123,6 @@ def override_envs_for_eplb(
         logger.info_once(
             f"EPLB: Setting NCCL_MAX_CTAS={override_value} "
             f"for expert parallel with NCCL-based EPLB communicator and "
-            f"cooperative MoE backend (deep_gemm_mega_moe)",
+            f"cooperative MoE backend ({moe_backend})",
             scope="global",
         )

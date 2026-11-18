@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_MAX_STOP_STRINGS: int = 4
     VLLM_MAX_NUM_BAD_WORDS: int = 128
     VLLM_MAX_BAD_WORDS_TOTAL_TOKENS: int = 1024
+    VLLM_DSV41_FLASHINFER_W4A4_DRAFT: bool = False
     VLLM_PLUGINS: list[str] | None = None
     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
     VLLM_LORA_RESOLVER_HF_REPO_LIST: str | None = None
@@ -1205,6 +1206,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAX_BAD_WORDS_TOTAL_TOKENS": lambda: int(
         os.environ.get("VLLM_MAX_BAD_WORDS_TOTAL_TOKENS", "1024")
     ),
+    # Use the bundled SM107 MXFP8 x MXFP4 backend for DSpark draft layers
+    # when the target uses the native FlashInfer Rubin MegaMoE backend.
+    "VLLM_DSV41_FLASHINFER_W4A4_DRAFT": lambda: os.getenv(
+        "VLLM_DSV41_FLASHINFER_W4A4_DRAFT", "0"
+    ) == "1",
     # a list of plugin names to load, separated by commas.
     # if this is not set, it means all plugins will be loaded
     # if this is set to an empty string, no plugins will be loaded

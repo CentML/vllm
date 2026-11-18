@@ -10,7 +10,11 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
+from vllm.config.kernel import (
+    FLASHINFER_SM107_NVFP4_MEGA_MOE,
+    MEGA_MOE_BACKENDS,
+    NATIVE_MEGA_MOE_BACKENDS,
+)
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -379,7 +383,27 @@ class DeepseekV4MoE(nn.Module):
             and (self.use_sequence_parallel or self.tp_size == 1)
         )
 
-        self.experts = DeepGemmMegaMoEExperts(
+        experts_cls = DeepGemmMegaMoEExperts
+        if vllm_config.kernel_config.moe_backend == FLASHINFER_SM107_NVFP4_MEGA_MOE:
+            from vllm.model_executor.layers.fused_moe.flashinfer_sm107_nvfp4.experts import (  # noqa: E501
+                VllmNvfp4MegaMoEExperts,
+                is_nvfp4_routed_layer,
+            )
+
+            if is_nvfp4_routed_layer(vllm_config, f"{prefix}.experts"):
+                experts_cls = VllmNvfp4MegaMoEExperts
+            elif (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.method == "dspark"
+                and extract_layer_index(prefix) >= config.num_hidden_layers
+            ):
+                if envs.VLLM_DSV41_FLASHINFER_W4A4_DRAFT:
+                    from vllm.model_executor.layers.fused_moe.flashinfer_sm107_w4a4_draft import (  # noqa: E501
+                        FlashInferSm107W4A4DraftExperts,
+                    )
+
+                    experts_cls = FlashInferSm107W4A4DraftExperts
+        self.experts = experts_cls(
             vllm_config,
             num_experts=self.n_physical_experts,
             num_local_experts=self.n_local_physical_experts,

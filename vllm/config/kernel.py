@@ -130,6 +130,7 @@ MoEBackend = Literal[
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
     "flashinfer_moe_ep_cutedsl",
+    "flashinfer_sm107_nvfp4_mega_moe",
     "flashinfer_b12x",
     "b12x",
     "flashinfer_moe_ep_mega_deep_gemm",
@@ -147,6 +148,7 @@ MoEBackend = Literal[
 ]
 
 FLASHINFER_MOE_EP_CUTEDSL = "flashinfer_moe_ep_cutedsl"
+FLASHINFER_SM107_NVFP4_MEGA_MOE = "flashinfer_sm107_nvfp4_mega_moe"
 FLASHINFER_MOE_EP_DEEP_GEMM = "flashinfer_moe_ep_mega_deep_gemm"
 
 # Backends implemented by the shared FlashInfer MoE-EP adapter.
@@ -161,12 +163,11 @@ FLASHINFER_MOE_EP_BACKENDS = frozenset(
 PASSTHROUGH_ALL2ALL_BACKEND: Final = "passthrough"
 
 # "Native" here meaning that the backend does not use the fused MoE path.
-# Currently only relevant for the vLLM provided DeepGEMM MegaMoE.,
-# TODO: migrate to the fused MoE path ultimately.
-NATIVE_MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"})
+NATIVE_MEGA_MOE_BACKENDS = frozenset(
+    {"deep_gemm_mega_moe", FLASHINFER_SM107_NVFP4_MEGA_MOE}
+)
 
-# Every megakernel backend. The FlashInfer variants run through the standard
-# fused-MoE model path; the quantization method binds the kernel.
+# Every megakernel backend, including the standard FusedMoE adapter backends.
 MEGA_MOE_BACKENDS = NATIVE_MEGA_MOE_BACKENDS | FLASHINFER_MOE_EP_BACKENDS
 
 SparseIndexerTopkBackend = Literal[
@@ -323,7 +324,10 @@ class KernelConfig:
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_moe_ep_cutedsl": Use FlashInfer's CuTeDSL MoE-EP
       mega-kernel with NVFP4 weights (MXFP4 checkpoints are requantized at
-      load); requires Blackwell, expert parallelism, and NVSHMEM
+      load); requires Blackwell, expert parallelism, and NVSHMEM.
+      DeepSeek-V4.1 NVFP4 on Rubin resolves to the native SM107 backend.
+    - "flashinfer_sm107_nvfp4_mega_moe": Native FlashInfer MegaMoE for
+      DeepSeek-V4.1 NVFP4 on Rubin
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "b12x": Use b12x FP4 MoE kernels on SM12x
@@ -485,10 +489,30 @@ class KernelConfig:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
 
-        if vllm_config.model_config is not None:
-            validate_flashinfer_moe_ep_model(
-                self.moe_backend, vllm_config.model_config.architectures
-            )
+        model_config = vllm_config.model_config
+        if model_config is not None:
+            architectures = model_config.architectures
+            if self.moe_backend in (
+                FLASHINFER_MOE_EP_CUTEDSL,
+                FLASHINFER_SM107_NVFP4_MEGA_MOE,
+            ):
+                quant_config = getattr(model_config.hf_config, "quantization_config", None) or {}
+                use_rubin_nvfp4 = (
+                    "DeepseekV41ForCausalLM" in architectures
+                    and str(quant_config.get("moe_quant_algo", "")).upper() == "NVFP4"
+                    and current_platform.is_device_capability((10, 7))
+                )
+                if use_rubin_nvfp4:
+                    self.moe_backend = FLASHINFER_SM107_NVFP4_MEGA_MOE
+                    logger.info_once(
+                        "Using native FlashInfer SM107 NVFP4 MegaMoE for DeepSeek-V4.1."
+                    )
+                elif self.moe_backend == FLASHINFER_SM107_NVFP4_MEGA_MOE:
+                    raise ValueError(
+                        "flashinfer_sm107_nvfp4_mega_moe requires DeepSeek-V4.1 "
+                        "with NVFP4 expert weights on Rubin (SM107)."
+                    )
+            validate_flashinfer_moe_ep_model(self.moe_backend, architectures)
         bind_passthrough_all2all_backend(self.moe_backend, vllm_config.parallel_config)
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)

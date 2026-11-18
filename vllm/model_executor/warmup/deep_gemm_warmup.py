@@ -167,7 +167,9 @@ def _mega_moe_may_use_deep_gemm(
     module: torch.nn.Module,
 ) -> "TypeGuard[DeepseekV4MoE | KimiMoE]":
     if _mega_moe_uses_mega_gate(module):
-        return module.use_native_mega_moe
+        return module.use_native_mega_moe and not getattr(
+            module.experts, "uses_flashinfer_w4a4", False
+        )
     kimi = sys.modules.get("vllm.models.kimi_k3.nvidia.model")
     return kimi is not None and isinstance(module, kimi.KimiMoE) and module.use_mega_moe
 
