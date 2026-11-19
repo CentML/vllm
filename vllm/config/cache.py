@@ -6,6 +6,7 @@ from dataclasses import field
 from functools import cache
 from typing import Any, ClassVar, Literal
 
+import os
 from pydantic import Field, field_validator, model_validator
 
 from vllm.config.utils import config
@@ -55,6 +56,7 @@ CacheDType = Literal[
     "fp8_per_token_head",
     "nvfp4",
     "nvfp4_4over6",
+    "mxfp4k_fp8v",
 ]
 
 
@@ -334,6 +336,12 @@ class CacheConfig:
     @field_validator("cache_dtype", mode="after")
     @classmethod
     def _validate_cache_dtype(cls, cache_dtype: CacheDType) -> CacheDType:
+        # dec107: DEC107_KV_CACHE_DTYPE=mxfp4k_fp8v replaces an fp8 / fp8_e4m3 request (lets launchers whose
+        # argparse predates the new dtype pass --kv-cache-dtype fp8 and switch by env)
+        _ovr = os.environ.get("DEC107_KV_CACHE_DTYPE", "").strip()
+        if _ovr and cache_dtype in ("fp8", "fp8_e4m3"):
+            logger.info("dec107: kv cache dtype %s -> %s (DEC107_KV_CACHE_DTYPE)", cache_dtype, _ovr)
+            cache_dtype = _ovr
         if kv_cache_uses_per_token_head_scales(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "

@@ -3,35 +3,29 @@
 """``VLLM_LOCALITY_LM_HEAD``: lm_head weights in domain-local memory, read by
 domain-aware skinny GEMMs.
 
-On a GPU with two locality domains (VR200), after the model and the drafter
-are loaded (``maybe_enable``, called by the model runner before memory
-profiling, so the profile accounts for it):
+On a supported locality-domain GPU, ``maybe_enable`` runs after the model and
+drafter are loaded and before memory profiling so the profile accounts for
+localized allocations.
 
-- target head (BF16, ``[vocab, hidden]``): the weight is copied into a
-  2 MiB-interleaved localized range (chunk i on domain i % 2) that replaces
-  ``lm_head.weight``'s storage (the drafter shares this module), and the
-  ``cudaMalloc`` original is freed. Logits for M <= ``TARGET_MAX_M`` rows run on
-  ``skinny.DomainGemm``; larger M keep the cuBLAS GEMM, now reading the
-  interleaved localized weight.
-- MXFP8 draft head (``Mxfp8DraftLmHead``, ``VLLM_MTP_DRAFT_LM_HEAD_MXFP8``): the
-  e4m3 weight moves to a localized range the same way and
-  ``mxgemm.DomainMxGemm`` (tcgen05 block-scaled, x quantized in the kernel with
-  FlashInfer's MXFP8 rule) serves M <= ``DRAFT_MAX_M`` rows; larger M keep the
-  FlashInfer GEMM on the localized weight and the domain-0 copy of the scales.
+- The target BF16 head's weight moves into chunk-interleaved localized
+  storage shared with the drafter. ``skinny.DomainGemm`` serves supported
+  small batches; larger batches keep the cuBLAS GEMM on the localized weight.
+- The MXFP8 draft head's weight moves into localized storage similarly.
+  ``mxgemm.DomainMxGemm`` uses tcgen05 block-scaled GEMM and FlashInfer's MXFP8
+  input quantization rule for supported small batches. Larger batches retain
+  FlashInfer GEMM on localized weights and the primary domain's scale copy.
 
-Values: ``1`` / ``both`` (both heads), ``target``, ``draft``; unset / ``0``: off
-(no code path changes). Numerics: fp32 accumulation in a different order than
-cuBLAS / FlashInfer (not bitwise; same products, logits within bf16 rounding).
-Memory: the localized copies replace the originals (padding to 2 MiB chunks),
-plus a second 16 MB copy of the draft head's E8M0 scales (one per domain) and
-the draft kernel's fixup workspace (``DomainMxGemm.extra_bytes``).
-Knobs: ``VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M`` (default 16: the BF16 domain
-kernel beats cuBLAS up to M = 16 on VR200, -11 % at M <= 8),
-``VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M`` (default 32, the kernel's limit),
-``VLLM_LOCALITY_LM_HEAD_PDL`` (default 1: the draft kernel is launched with
-programmatic dependent launch, so its weight stream starts before the
-producer of x finishes), ``VLLM_LOCALITY_LM_HEAD_CFG16`` (BF16 stage config,
-see ``_ext``).
+``VLLM_LOCALITY_LM_HEAD`` accepts ``1`` / ``both``, ``target``, or ``draft``;
+unset / ``0`` leaves the existing paths unchanged. Enabled kernels accumulate
+in a different order from cuBLAS / FlashInfer and are not bitwise equivalent.
+Localized copies replace original allocations, with chunk padding, duplicated
+draft scales, and a fixup workspace (``DomainMxGemm.extra_bytes``).
+
+The HBM-clock gate in ``gate.py`` may disable this consumer.
+``VLLM_LOCALITY_LM_HEAD_TARGET_MAX_M`` and
+``VLLM_LOCALITY_LM_HEAD_DRAFT_MAX_M`` control batch limits;
+``VLLM_LOCALITY_LM_HEAD_PDL`` controls programmatic dependent launch for the
+draft kernel; ``VLLM_LOCALITY_LM_HEAD_CFG16`` selects the BF16 stage config.
 """
 
 from __future__ import annotations
@@ -122,9 +116,14 @@ def maybe_enable(model: torch.nn.Module, drafter_model: torch.nn.Module | None) 
     """
     if not enabled():
         return
+    from .gate import locality_active
     from .topology import get_topology
 
-    topo = get_topology(torch.accelerator.current_device_index())
+    dev = torch.accelerator.current_device_index()
+    if not locality_active(dev):  # logs the gate decision
+        logger.warning("VLLM_LOCALITY_LM_HEAD ignored: HBM-clock gate (VLLM_LOCALITY_MIN_MEMCLK).")
+        return
+    topo = get_topology(dev)
     if topo is None:
         logger.warning(
             "VLLM_LOCALITY_LM_HEAD ignored: the GPU has no 2 locality domains."

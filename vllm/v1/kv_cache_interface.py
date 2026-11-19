@@ -55,6 +55,7 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
     NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
+    MXFP4K_FP8V = 11  # dec107: MXFP4 K (UE8M0 / 32) + FP8 V, byte pages
 
     @property
     def is_per_token_head(self) -> bool:
@@ -64,6 +65,11 @@ class KVQuantMode(IntEnum):
             KVQuantMode.FP8_PER_TOKEN_HEAD,
             KVQuantMode.INT4_PER_TOKEN_HEAD,
         )
+
+    @property
+    def is_mxk(self) -> bool:
+        """True for the dec107 MXFP4-K / FP8-V byte-page mode."""
+        return self == KVQuantMode.MXFP4K_FP8V
 
     @property
     def is_nvfp4(self) -> bool:
@@ -96,6 +102,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.NVFP4_DS_MLA
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "mxfp4k_fp8v":
+        return KVQuantMode.MXFP4K_FP8V
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode[kv_cache_dtype.upper()]
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):

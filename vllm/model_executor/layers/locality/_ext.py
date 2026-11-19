@@ -3,12 +3,9 @@
 # ruff: noqa: E501
 """CUDA extension of the locality package (JIT-built with nvcc on first use).
 
-Rubin-class GPUs (VR200, sm_107) consist of two locality domains ("micro-GPUs",
-one per die), each with its own HBM stacks and about half of the SMs. Reads by
-an SM from its own domain's HBM never cross the die-to-die fabric; interleaved
-(``cudaMalloc``) memory sends half of every stream across it, which caps a
-streaming read at ~13.5-14 TB/s on Hecate (HBM 4752 MHz) against ~17 TB/s for
-domain-local reads.
+SM107 (sm_107) supports locality domains with domain-local memory placement.
+Domain-aware kernels can read locally placed buffers without crossing the
+inter-domain fabric.
 
 The source is kept in this module (``_SOURCE``) so the package ships only
 Python; ``load()`` builds it with torch.utils.cpp_extension for the device's
@@ -24,22 +21,26 @@ Exported functions (all take/return torch tensors or ints):
   ``CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID``) contains, -1 for the SMs left
   in the remainder (the unassigned TPCs). The green contexts are destroyed again.
 - ``probe_sm_latency(buf0, buf1, flush) -> float32[num_sms, 2]``: cycles per
-  dependent DRAM-miss load from each SM into buffers placed on domain 0 / 1
-  (per-SM chains of 32 lines 4 KB apart, L2 flushed by reading ``flush``
-  first). A remote line costs ~1.4-1.7x a local one; this places the
-  unassigned SMs. (L2-hit latency does not depend on the domain.)
+  dependent DRAM-miss load into domain-local buffers, using per-SM pointer
+  chains after flushing L2. The relative latency identifies the domain of
+  unassigned SMs.
 - ``alloc_localized(nbytes, chunk_domains, chunk_bytes, dev) -> uint8 tensor``:
-  one VA range; chunk i (``chunk_bytes`` each, a multiple of the 2 MiB
-  granularity) is a ``cuMemCreate`` allocation on locality domain
+  one VA range; each chunk is aligned to the required allocation granularity
+  and backed by a ``cuMemCreate`` allocation on locality domain
   ``chunk_domains[i]`` (``CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN``),
   mapped with read/write access for ``dev``. The tensor's deleter synchronizes
   the device, unmaps and frees the range.
 - ``granularity(dev)``, ``pointer_domain(ptr)``, ``chunk_ordinals(ptr, nbytes,
   chunk_bytes)`` (``CU_POINTER_ATTRIBUTE_LOCALITY_DOMAIN_ORDINAL``; -1 for
   interleaved memory).
-- ``green_streams(dev) -> [stream0, stream1, sms0, sms1, remainder]``: a
-  persistent green context + non-blocking stream per domain (process lifetime),
-  for fork/join dispatch on 100+100 SMs.
+- ``green_streams(dev, extra0=0, extra1=0) -> [stream0, stream1, sms0, sms1,
+  remainder, coscheduled]``: a persistent green context + non-blocking stream
+  per domain (process lifetime, one set per argument tuple). ``extra*`` > 0
+  makes group k a BACKFILL group of (domain-k SMs + extra_k) SMs. The driver
+  chooses remainder SMs; ``streams.get_domain_streams`` requests extras from
+  the topology probe and reports the actual binding.
+- ``stream_smids(dev, stream) -> int32[num_sms]``: the SMs a kernel launched on
+  ``stream`` reaches (binding check).
 - ``lm_bf16(x, w, out, sm_dom, tiles0, tiles1, ctrs, warps, cfg)``: the
   domain-aware skinny GEMM ``out[M, N] = x[M, K] @ w[N, K]^T`` for a BF16
   weight (see the kernel comment); bf16 output, fp32 accumulation. (The MXFP8
@@ -118,6 +119,8 @@ _SOURCE = r"""
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <type_traits>
 
@@ -147,14 +150,28 @@ std::vector<int64_t> device_info(int64_t dev) {
 
 __global__ void k_record_smid(int* seen) { if (threadIdx.x == 0) seen[smid()] = 1; }
 
-static void split_domains(CUdevice d, CUdevResource part[2], CUdevResource* rem) {
+// Per-domain SM split. extra == nullptr (or both <= 0): the domain SMs only (the map probe below needs exactly this).
+// extra[k] > 0: group k requests its domain SMs plus extra[k] SMs via BACKFILL.
+// BACKFILL takes the domain's own SMs first, then unassigned SMs, then another domain's.
+// The caller requests extras based on the topology probe; actual binding must be checked.
+// Try TPC-granular coscheduling first, then the driver default if rejected.
+static int split_domains(CUdevice d, CUdevResource part[2], CUdevResource* rem, const int* extra = nullptr) {
   CUdevResource all; memset(&all, 0, sizeof(all));
   DRV(cuDeviceGetDevResource(d, &all, CU_DEV_RESOURCE_TYPE_SM));
-  CU_DEV_SM_RESOURCE_GROUP_PARAMS gp[2]; memset(gp, 0, sizeof(gp));
-  // coscheduledSmCount 2 (TPC granularity): the default (8) rounds each domain down below its SM count
-  for (int k = 0; k < 2; k++) { gp[k].smCount = 0; gp[k].coscheduledSmCount = 2; gp[k].flags = CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID; gp[k].localityDomainId = k; }
-  memset(part, 0, 2 * sizeof(CUdevResource)); memset(rem, 0, sizeof(CUdevResource));
-  DRV(cuDevSmResourceSplit(part, 2, &all, rem, 0, gp));
+  const bool bf = extra != nullptr && (extra[0] > 0 || extra[1] > 0);
+  for (int cs : {2, 0}) {
+    CU_DEV_SM_RESOURCE_GROUP_PARAMS gp[2]; memset(gp, 0, sizeof(gp));
+    for (int k = 0; k < 2; k++) { gp[k].smCount = 0; gp[k].coscheduledSmCount = cs; gp[k].flags = CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID; gp[k].localityDomainId = k; }
+    memset(part, 0, 2 * sizeof(CUdevResource)); memset(rem, 0, sizeof(CUdevResource));
+    if (cuDevSmResourceSplit(part, 2, &all, rem, 0, gp) != CUDA_SUCCESS) continue;
+    if (!bf) return cs;
+    const unsigned dom[2] = {part[0].sm.smCount, part[1].sm.smCount};
+    for (int k = 0; k < 2; k++) if (extra[k] > 0) { gp[k].flags |= CU_DEV_SM_RESOURCE_GROUP_BACKFILL; gp[k].smCount = dom[k] + (unsigned)extra[k]; }
+    memset(part, 0, 2 * sizeof(CUdevResource)); memset(rem, 0, sizeof(CUdevResource));
+    if (cuDevSmResourceSplit(part, 2, &all, rem, 0, gp) == CUDA_SUCCESS) return cs;
+  }
+  TORCH_CHECK(false, "cuDevSmResourceSplit failed (backfill extra ", bf ? extra[0] : 0, "/", bf ? extra[1] : 0, ")");
+  return -1;
 }
 
 torch::Tensor green_sm_map(int64_t dev) {
@@ -180,26 +197,47 @@ torch::Tensor green_sm_map(int64_t dev) {
   return out;
 }
 
-// persistent per-domain green contexts + streams (process lifetime)
-static CUgreenCtx g_gctx[2]; static CUstream g_gst[2]; static int g_gsm[3] = {0, 0, 0}; static bool g_have_gc = false;
-std::vector<int64_t> green_streams(int64_t dev) {
-  if (!g_have_gc) {
+// persistent per-domain green contexts + streams (process lifetime), one set per (device, extra0, extra1)
+struct GreenSet { CUgreenCtx g[2]; CUstream s[2]; int64_t n[3]; int64_t cs; };
+static std::map<std::tuple<int64_t, int64_t, int64_t>, GreenSet> g_green;
+std::vector<int64_t> green_streams(int64_t dev, int64_t extra0, int64_t extra1) {
+  auto key = std::make_tuple(dev, extra0, extra1);
+  auto it = g_green.find(key);
+  if (it == g_green.end()) {
     CUdevice d = cu_dev(dev);
-    CUdevResource part[2], rem; split_domains(d, part, &rem);
+    const int ex[2] = {(int)extra0, (int)extra1};
+    CUdevResource part[2], rem;
+    GreenSet gs; memset(&gs, 0, sizeof(gs));
+    gs.cs = split_domains(d, part, &rem, ex);
     for (int k = 0; k < 2; k++) {
       CUdevResourceDesc desc; DRV(cuDevResourceGenerateDesc(&desc, &part[k], 1));
-      DRV(cuGreenCtxCreate(&g_gctx[k], desc, d, CU_GREEN_CTX_DEFAULT_STREAM));
-      DRV(cuGreenCtxStreamCreate(&g_gst[k], g_gctx[k], CU_STREAM_NON_BLOCKING, 0));
-      g_gsm[k] = (int)part[k].sm.smCount;
+      DRV(cuGreenCtxCreate(&gs.g[k], desc, d, CU_GREEN_CTX_DEFAULT_STREAM));
+      DRV(cuGreenCtxStreamCreate(&gs.s[k], gs.g[k], CU_STREAM_NON_BLOCKING, 0));
+      gs.n[k] = (int64_t)part[k].sm.smCount;
     }
-    g_gsm[2] = rem.type == CU_DEV_RESOURCE_TYPE_SM ? (int)rem.sm.smCount : 0;
-    g_have_gc = true;
+    gs.n[2] = rem.type == CU_DEV_RESOURCE_TYPE_SM ? (int64_t)rem.sm.smCount : 0;
     RTC(cudaSetDevice((int)dev));
+    it = g_green.emplace(key, gs).first;
   }
-  return {(int64_t)(uintptr_t)g_gst[0], (int64_t)(uintptr_t)g_gst[1], g_gsm[0], g_gsm[1], g_gsm[2]};
+  const GreenSet& gs = it->second;
+  return {(int64_t)(uintptr_t)gs.s[0], (int64_t)(uintptr_t)gs.s[1], gs.n[0], gs.n[1], gs.n[2], gs.cs};
 }
 
-// pointer chase: per-SM chain of N_PROBE dependent ld.global.cg 4 KB apart (fresh lines, L2 flushed) into buf0, then buf1
+// SMs a kernel launched on `stream` actually reaches (binding check for green streams): int32[num_sms] of 0/1.
+torch::Tensor stream_smids(int64_t dev, int64_t stream) {
+  cu_dev(dev);
+  int nsm = 0; RTC(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, (int)dev));
+  int* d_seen; RTC(cudaMalloc(&d_seen, 4 * nsm));
+  RTC(cudaMemset(d_seen, 0, 4 * nsm)); RTC(cudaDeviceSynchronize());
+  k_record_smid<<<64 * nsm, 32, 0, (cudaStream_t)(uintptr_t)stream>>>(d_seen);
+  RTC(cudaGetLastError()); RTC(cudaStreamSynchronize((cudaStream_t)(uintptr_t)stream));
+  auto out = torch::zeros({nsm}, torch::dtype(torch::kInt32));
+  RTC(cudaMemcpy(out.data_ptr<int>(), d_seen, 4 * nsm, cudaMemcpyDeviceToHost));
+  RTC(cudaFree(d_seen));
+  return out;
+}
+
+// Pointer chase: per-SM chain of N_PROBE dependent ld.global.cg loads into buf0, then buf1.
 constexpr int N_PROBE = 32, PROBE_STRIDE_WORDS = 512;
 __global__ void k_chain_init(uint64_t* b) {
   if (threadIdx.x != 0) return;
@@ -307,9 +345,9 @@ std::vector<int64_t> chunk_ordinals(int64_t ptr, int64_t nbytes, int64_t chunk_b
 // queue is empty it steals from the other one, so any CTA placement completes all groups. The next group is grabbed
 // one group ahead and its first stages are prefetched while the current one finishes, so the load pipeline never
 // drains between groups. The last warp to finish resets the counters, so the kernel is CUDA-graph safe.
-// Loads go straight to registers (ld.global.nc, PD stages of 4 KB per warp); the MMA is mma.sync with w as the
-// 16-row A operand and x (held in shared memory, padded rows) as the 8-column B operand ("swap AB"). The K order
-// inside an MMA is permuted identically for both operands so that every lane loads contiguous 16 B.
+// Loads go straight to registers with ld.global.nc; the MMA uses w as its A operand and
+// x (held in shared memory with padded rows) as its B operand ("swap AB"). The K order
+// inside an MMA is permuted identically for both operands for contiguous lane loads.
 struct Q { const int* list0; const int* list1; int n0, n1; int* ctrs; };  // ctrs: [q0, q1, done, pad]
 
 __device__ __forceinline__ int grab(const Q& q, int d) {
@@ -345,8 +383,8 @@ struct Args {
   Q q;
 };
 
-// ---- bf16, K = 2048: stage = LPS x 16 B per row per lane (rows g, g+8) = LPS KB per warp; KIT = 64 / LPS stages
-// per group. A slot is reused every PD stages across group boundaries, so PD must divide KIT.
+// BF16 staging uses LPS vector loads per row per lane; KIT counts stages per group.
+// A slot is reused every PD stages across group boundaries, so PD must divide KIT.
 template <int NT, int PD, int LPS>
 __global__ void __launch_bounds__(256, 1) k_lm_bf16(Args a) {
   extern __shared__ __align__(16) unsigned char xs[];
@@ -418,12 +456,11 @@ __global__ void __launch_bounds__(256, 1) k_lm_bf16(Args a) {
   finish(a.q, lane);
 }
 
-// ---- cooperative variant (k_lm2): one 16-row group per CTA at a time, K split over the 8 warps (256 K each), partial
-// sums reduced through shared memory (double-buffered; one __syncthreads per group). The unit of work is 32-64 KB
-// (~0.5-0.8 us of a CTA's bandwidth) instead of a warp's 64 KB at 1/8 of it, so the end-of-kernel tail is ~1 us.
-// Group ids come from the same per-domain queues; thread 0 grabs them L groups ahead through a 2-deep software
-// pipeline (atomic -> list lookup -> publish to shared ids[]), so its atomics' latency is hidden and every warp knows
-// the group its register pipeline (PD stages, SPU stages per group) prefetches for.
+// Cooperative variant (k_lm2): each CTA owns a row group, with K split across warps.
+// Partial sums are reduced through double-buffered shared memory with a barrier per group.
+// Group IDs come from the same per-domain queues. Thread 0 grabs them ahead through
+// a software pipeline (atomic -> list lookup -> shared ids[]) to overlap lookup with work.
+// Every warp prefetches the group selected for its register pipeline.
 __device__ __forceinline__ int lookup(const Q& q, int i, int own) {
   const int n = own ? q.n1 : q.n0;
   if (i < n) return __ldg((own ? q.list1 : q.list0) + i);
@@ -542,8 +579,8 @@ done:
 }
 
 // ---- k_lm3: cooperative structure of k_lm2 with the weight stream staged through shared memory by cp.async
-// (LDGSTS): every warp instruction copies 512 contiguous bytes (fully coalesced, no register cost per byte in
-// flight), PD groups ahead per warp; the fragments are read back from padded rows (bank-conflict free).
+// (LDGSTS): coalesced warp copies keep PD groups ahead without staging weights in registers.
+// Fragments are read back from padded rows to avoid bank conflicts.
 // bf16 weights, mma.sync m16n8k16 (M <= 8 * NT); x is held in registers.
 __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
@@ -580,7 +617,7 @@ __global__ void __launch_bounds__(NW * 32, 1) k_lm3(Args a) {
   __syncthreads();
   const uint8_t* W = (const uint8_t*)a.w;
   const uint32_t ring0 = (uint32_t)__cvta_generic_to_shared(ring) + warp * PD * STG;
-  // copy one group's warp slice: 16 rows x RB bytes, 512 contiguous bytes per instruction
+  // Copy one group's warp slice with contiguous vector loads.
   auto issue = [&](int grp, int slot) {
     if (grp >= 0) {
       constexpr int CPR = RB / 16, RPI = 32 / CPR;  // 16-B chunks per row; rows per instruction
@@ -747,7 +784,8 @@ void lm_bf16(torch::Tensor x, torch::Tensor w, torch::Tensor out, torch::Tensor 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("device_info", &loc::device_info);
   m.def("green_sm_map", &loc::green_sm_map);
-  m.def("green_streams", &loc::green_streams);
+  m.def("green_streams", &loc::green_streams, pybind11::arg("dev"), pybind11::arg("extra0") = 0, pybind11::arg("extra1") = 0);
+  m.def("stream_smids", &loc::stream_smids);
   m.def("probe_sm_latency", &loc::probe_sm_latency);
   m.def("granularity", &loc::granularity);
   m.def("alloc_localized", &loc::alloc_localized);

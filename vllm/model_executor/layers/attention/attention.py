@@ -467,6 +467,7 @@ class Attention(nn.Module, AttentionLayerBase):
             and (
                 self.kv_cache_dtype.startswith("fp8")
                 or self.kv_cache_dtype.startswith("nvfp4")
+                or self.kv_cache_dtype == "mxfp4k_fp8v"
             )
             and not self.kv_cache_dtype.endswith("per_token_head")
         ):
@@ -474,6 +475,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
             )
             block_size = self.head_size * self.num_heads // self.num_kv_heads
+            self._mxk_rotate_q = False
+            if self.kv_cache_dtype == "mxfp4k_fp8v":
+                from vllm.v1.attention.ops import dec107_mxk
+
+                self._mxk_rotate_q = dec107_mxk.HADAMARD
             self.query_quant = QuantFP8(
                 static=True,
                 group_shape=GroupShape(-1, block_size)
@@ -517,9 +523,16 @@ class Attention(nn.Module, AttentionLayerBase):
             # which reduces overheads during decoding.
             # Otherwise queries are quantized using custom ops
             # which causes decoding overheads
-            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"} or (
+            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3", "mxfp4k_fp8v"} or (
                 self.kv_cache_dtype.startswith("nvfp4")
             )
+            if self.kv_cache_dtype == "mxfp4k_fp8v":
+                # dec107 MXFP4-K: K is stored Hadamard-rotated per head (dec107_mxk.HADAMARD); (Q H)(K H)^T = Q K^T
+                if self._mxk_rotate_q:
+                    from vllm.v1.attention.ops import dec107_mxk
+
+                    # fp32 FWHT (same butterfly order as the MXFP4-aware CUDA prologue), back to the model dtype
+                    query = dec107_mxk.fwht256(query.reshape(-1, self.head_size)).to(query.dtype).view(query.shape)
 
             # check if query quantization is supported
             if self.impl.supports_quant_query_input:

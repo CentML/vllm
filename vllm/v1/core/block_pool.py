@@ -160,6 +160,7 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
+        locality_boundary: int | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -174,6 +175,20 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # [dp2g] VLLM_LOCALITY_SPLIT=1: one free queue per locality domain (blocks
+        # [0, ppd) in domain 0, [ppd, N) in domain 1; ppd = the worker's block-granular boundary
+        # (locality_kv.ppd_block_of, pure function of the KV config), N/2 if not given).
+        from vllm.v1.core import locality as _loc
+
+        self.domain_assigner: _loc.DomainAssigner | None = None
+        if _loc.enabled() and medium == MEDIUM_GPU and num_gpu_blocks >= 4:
+            self.free_block_queue = _loc.DomainFreeKVCacheBlockQueue(  # type: ignore[assignment]
+                self.blocks,
+                locality_boundary
+                if locality_boundary and 0 < locality_boundary < num_gpu_blocks
+                else num_gpu_blocks // 2,
+            )
+            self.domain_assigner = _loc.DomainAssigner(self.free_block_queue)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
