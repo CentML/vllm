@@ -973,13 +973,14 @@ ARG GDRCOPY_CUDA_VERSION=12.8
 ARG GDRCOPY_OS_VERSION=Ubuntu24_04
 ARG TARGETPLATFORM
 COPY tools/install_gdrcopy.sh /tmp/install_gdrcopy.sh
+# The CUDA base image sets GDRCOPY_VERSION=2.5.1, but the arm64 package file name carries the -1 revision.
 RUN set -eux; \
     case "${TARGETPLATFORM}" in \
       linux/arm64) UUARCH="aarch64" ;; \
       linux/amd64) UUARCH="x64" ;; \
       *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" >&2; exit 1 ;; \
     esac; \
-    /tmp/install_gdrcopy.sh "${GDRCOPY_OS_VERSION}" "${GDRCOPY_CUDA_VERSION}" "${UUARCH}" && \
+    GDRCOPY_VERSION=2.5.1-1 /tmp/install_gdrcopy.sh "${GDRCOPY_OS_VERSION}" "${GDRCOPY_CUDA_VERSION}" "${UUARCH}" && \
     rm /tmp/install_gdrcopy.sh
 
 # Install vllm-openai dependencies (saves ~2.6s per build)
@@ -1328,6 +1329,42 @@ RUN --mount=type=cache,target=/opt/uv/cache \
             assert ext, 'NIXL EP has no build for torch ' + torch.__version__; \
             print('NIXL EP extension:', ext[0])"; \
     fi
+
+# Serving additions for the DSV4.1 Rubin image, installed last so nothing above can replace them.
+# - FlashInfer: the SM107 MegaMoE fork, built from source with its submodules, in place of the stock wheel. The stock
+#   jit-cache and cubin packages belong to the stock version and are removed. NVSHMEM, nvshmem4py and cuda-core are
+#   the fork's moe_ep dependencies.
+# - Dynamo: the published wheels, installed under constraints that hold the packages above fixed.
+# - etcd: the binary Dynamo's service discovery uses.
+ARG FLASHINFER_FORK_REPO=https://github.com/zihaok/flashinfer.git
+ARG FLASHINFER_FORK_REF=235988acb1078c94e03d4798467e93e8fc729bf2
+ARG DYNAMO_VERSION=1.6.0.dev20261016
+ARG ETCD_VERSION=3.5.21
+RUN --mount=type=cache,target=/opt/uv/cache \
+    set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*; \
+    uv pip list --system --format freeze | awk -F== '/^flashinfer[-_]jit[-_]cache([-_a-z0-9]*)==/ || /^flashinfer[-_]cubin==/ {print $1}' | xargs -r uv pip uninstall --system; \
+    uv pip install --system 'setuptools>=77' 'packaging>=24' wheel; \
+    git clone --recursive "${FLASHINFER_FORK_REPO}" /tmp/flashinfer; \
+    git -C /tmp/flashinfer checkout --detach "${FLASHINFER_FORK_REF}"; \
+    git -C /tmp/flashinfer submodule update --init --recursive; \
+    BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 uv build --wheel --no-build-isolation --out-dir /tmp/flashinfer-dist /tmp/flashinfer; \
+    uv pip install --system --no-deps /tmp/flashinfer-dist/flashinfer_python-*.whl \
+        nvidia-nvshmem-cu13==3.8.0 nvshmem4py-cu13==0.4.1 cuda-core==1.1.0; \
+    rm -rf /tmp/flashinfer /tmp/flashinfer-dist; \
+    uv pip list --system --format freeze \
+        | grep -E '^(vllm|torch|transformers|flashinfer-python|nvidia-cutlass-dsl|nixl|nixl-cu13|cuda-core|cuda-python|nvidia-nvshmem-cu13|nvshmem4py-cu13)==' \
+        > /tmp/serving-constraints.txt; \
+    cat /tmp/serving-constraints.txt; \
+    uv pip install --system --prerelease=allow -c /tmp/serving-constraints.txt \
+        "ai-dynamo==${DYNAMO_VERSION}" "ai-dynamo-runtime==${DYNAMO_VERSION}"; \
+    rm /tmp/serving-constraints.txt; \
+    printf '%s\n' /usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib > /etc/ld.so.conf.d/recipe-nvshmem.conf; \
+    ldconfig; \
+    curl -fsSL "https://github.com/etcd-io/etcd/releases/download/v${ETCD_VERSION}/etcd-v${ETCD_VERSION}-linux-$(dpkg --print-architecture).tar.gz" -o /tmp/etcd.tar.gz; \
+    tar -xzf /tmp/etcd.tar.gz -C /tmp; \
+    install -m 0755 /tmp/etcd-v${ETCD_VERSION}-linux-*/etcd /tmp/etcd-v${ETCD_VERSION}-linux-*/etcdctl /usr/local/bin/; \
+    rm -rf /tmp/etcd.tar.gz /tmp/etcd-v${ETCD_VERSION}-linux-*
 
 ENV VLLM_USAGE_SOURCE production-docker-image
 ENV VLLM_BUILD_COMMIT=${VLLM_BUILD_COMMIT:-unknown} \
